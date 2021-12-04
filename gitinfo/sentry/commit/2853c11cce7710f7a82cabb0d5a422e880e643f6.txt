@@ -1,0 +1,449 @@
+commit 2853c11cce7710f7a82cabb0d5a422e880e643f6
+Author: Leander Rodrigues <leandergrodrigues@gmail.com>
+Date:   Fri Apr 17 12:38:51 2020 -0400
+
+    feat(async-csv): Setup Async CSV downloads for Discover (#17603)
+    
+    Add asynchronous CSV downloads for full result-sets of Discover Queries 👌
+
+diff --git a/src/sentry/api/event_search.py b/src/sentry/api/event_search.py
+index 4c9999984f..bd5ffd0171 100644
+--- a/src/sentry/api/event_search.py
++++ b/src/sentry/api/event_search.py
+@@ -1185,6 +1185,8 @@ def is_function(field):
+ 
+ def get_function_alias(field):
+     match = FUNCTION_PATTERN.search(field)
++    if match is None:
++        return field
+     columns = [c.strip() for c in match.group("columns").split(",") if len(c.strip()) > 0]
+     return get_function_alias_with_columns(match.group("function"), columns)
+ 
+diff --git a/src/sentry/data_export/endpoints/data_export.py b/src/sentry/data_export/endpoints/data_export.py
+index d61fb9101a..11d6dcb9af 100644
+--- a/src/sentry/data_export/endpoints/data_export.py
++++ b/src/sentry/data_export/endpoints/data_export.py
+@@ -60,11 +60,13 @@ class DataExportEndpoint(OrganizationEndpoint, EnvironmentMixin):
+                 projects = self._get_projects_by_id({int(project_query)}, request, organization)
+             data["query_info"]["project"] = [project.id for project in projects]
+ 
+-        # Ensure discover features are enabled if necessary
+-        if data["query_type"] == ExportQueryType.DISCOVER_STR and not features.has(
+-            "organizations:discover-basic", organization, actor=request.user
+-        ):
+-            return Response({"detail": "You do not have access to discover features"}, status=403)
++        # Discover Pre-processing
++        if data["query_type"] == ExportQueryType.DISCOVER_STR:
++            if not features.has("organizations:discover-basic", organization, actor=request.user):
++                return Response(status=403)
++            if "project" not in data["query_info"]:
++                projects = self.get_projects(request, organization)
++                data["query_info"]["project"] = [project.id for project in projects]
+ 
+         try:
+             # If this user has sent a sent a request with the same payload and organization,
+diff --git a/src/sentry/data_export/processors/discover.py b/src/sentry/data_export/processors/discover.py
+new file mode 100644
+index 0000000000..9a38fe491d
+--- /dev/null
++++ b/src/sentry/data_export/processors/discover.py
+@@ -0,0 +1,75 @@
++from __future__ import absolute_import
++
++import logging
++
++from sentry.api.event_search import get_function_alias
++from sentry.api.utils import get_date_range_from_params
++from sentry.models import Group, Project
++from sentry.snuba import discover
++from sentry.utils.compat import map
++
++from ..base import ExportError
++
++logger = logging.getLogger(__name__)
++
++
++class DiscoverProcessor(object):
++    """
++    Processor for exports of discover data based on a provided query
++    """
++
++    def __init__(self, organization_id, discover_query):
++        self.projects = self.get_projects(organization_id, discover_query)
++        self.start, self.end = get_date_range_from_params(discover_query)
++        self.params = {
++            "organization_id": organization_id,
++            "project_id": [project.id for project in self.projects],
++            "start": self.start,
++            "end": self.end,
++        }
++        self.header_fields = map(lambda x: get_function_alias(x), discover_query["field"])
++        self.data_fn = self.get_data_fn(
++            fields=discover_query["field"], query=discover_query["query"], params=self.params
++        )
++
++    @staticmethod
++    def get_projects(organization_id, query):
++        projects = list(Project.objects.filter(id__in=query.get("project")))
++        if len(projects) == 0:
++            raise ExportError("Requested project does not exist")
++        return projects
++
++    @staticmethod
++    def get_data_fn(fields, query, params):
++        def data_fn(offset, limit):
++            return discover.query(
++                selected_columns=fields,
++                query=query,
++                params=params,
++                offset=offset,
++                limit=limit,
++                referrer="data_export.tasks.discover",
++                auto_fields=True,
++                use_aggregate_conditions=True,
++            )
++
++        return data_fn
++
++    def handle_fields(self, result_list):
++        # Find issue short_id if present
++        # (originally in `/api/bases/organization_events.py`)
++        new_result_list = result_list[:]
++        if "issue" in self.header_fields:
++            issue_ids = set(result["issue.id"] for result in new_result_list)
++            issues = {
++                i.id: i.qualified_short_id
++                for i in Group.objects.filter(
++                    id__in=issue_ids,
++                    project__in=self.params["project_id"],
++                    project__organization_id=self.params["organization_id"],
++                )
++            }
++            for result in new_result_list:
++                if "issue.id" in result:
++                    result["issue"] = issues.get(result["issue.id"], "unknown")
++        return new_result_list
+diff --git a/src/sentry/data_export/tasks.py b/src/sentry/data_export/tasks.py
+index 8e61d738ef..4b290b0b29 100644
+--- a/src/sentry/data_export/tasks.py
++++ b/src/sentry/data_export/tasks.py
+@@ -14,6 +14,7 @@ from sentry.utils.sdk import capture_exception
+ from .base import ExportError, ExportQueryType, SNUBA_MAX_RESULTS
+ from .models import ExportedData
+ from .utils import convert_to_utf8, snuba_error_handler
++from .processors.discover import DiscoverProcessor
+ from .processors.issues_by_tag import IssuesByTagProcessor
+ 
+ 
+@@ -69,8 +70,6 @@ def assemble_download(data_export_id, limit=None, environment_id=None):
+                 raise ExportError("Failed to save the assembled file")
+     except ExportError as error:
+         return data_export.email_failure(message=six.text_type(error))
+-    except NotImplementedError as error:
+-        return data_export.email_failure(message=six.text_type(error))
+     except BaseException as error:
+         metrics.incr("dataexport.error", tags={"error": six.text_type(error)}, sample_rate=1.0)
+         logger.info(
+@@ -99,7 +98,6 @@ def process_issues_by_tag(data_export, file, limit, environment_id):
+         capture_exception(error)
+         raise error
+ 
+-    # Iterate through all the GroupTagValues
+     writer = create_writer(file, processor.header_fields)
+     iteration = 0
+     with snuba_error_handler(logger=logger):
+@@ -113,7 +111,6 @@ def process_issues_by_tag(data_export, file, limit, environment_id):
+             # See associated comment in './utils.py'
+             gtv_list = convert_to_utf8(gtv_list_unicode)
+             if limit and limit < next_offset:
+-                # Since the next offset will pass the limit, write the remainder and quit
+                 writer.writerows(gtv_list[: limit % SNUBA_MAX_RESULTS])
+                 break
+             else:
+@@ -121,12 +118,44 @@ def process_issues_by_tag(data_export, file, limit, environment_id):
+                 iteration += 1
+ 
+ 
+-def process_discover(data_export, file):
+-    # TODO(Leander): Implement processing for Discover
+-    raise NotImplementedError("Discover processing has not been implemented yet")
++def process_discover(data_export, file, limit, environment_id):
++    """
++    Convert the discovery query to a CSV, writing it to the provided file.
++    """
++    try:
++        processor = DiscoverProcessor(
++            discover_query=data_export.query_info, organization_id=data_export.organization_id
++        )
++    except ExportError as error:
++        metrics.incr("dataexport.error", tags={"error": six.text_type(error)}, sample_rate=1.0)
++        logger.info("dataexport.error: {}".format(six.text_type(error)))
++        capture_exception(error)
++        raise error
++
++    writer = create_writer(file, processor.header_fields)
++    iteration = 0
++    with snuba_error_handler(logger=logger):
++        is_completed = False
++        while not is_completed:
++            offset = SNUBA_MAX_RESULTS * iteration
++            next_offset = SNUBA_MAX_RESULTS * (iteration + 1)
++            is_exceeding_limit = limit and limit < next_offset
++            raw_data_unicode = processor.data_fn(offset=offset, limit=SNUBA_MAX_RESULTS)["data"]
++            # TODO(python3): Remove next line once the 'csv' module has been updated to Python 3
++            # See associated comment in './utils.py'
++            raw_data = convert_to_utf8(raw_data_unicode)
++            raw_data = processor.handle_fields(raw_data)
++            if is_exceeding_limit:
++                # Since the next offset will pass the limit, just write the remainder
++                writer.writerows(raw_data[: limit % SNUBA_MAX_RESULTS])
++            else:
++                writer.writerows(raw_data)
++                iteration += 1
++            # If there are no returned results, or we've passed the limit, stop iterating
++            is_completed = len(raw_data) == 0 or is_exceeding_limit
+ 
+ 
+ def create_writer(file, fields):
+-    writer = csv.DictWriter(file, fields)
++    writer = csv.DictWriter(file, fields, extrasaction="ignore")
+     writer.writeheader()
+     return writer
+diff --git a/src/sentry/static/sentry/app/components/dataExport.tsx b/src/sentry/static/sentry/app/components/dataExport.tsx
+index 6250d3ff03..7f42a7b5aa 100644
+--- a/src/sentry/static/sentry/app/components/dataExport.tsx
++++ b/src/sentry/static/sentry/app/components/dataExport.tsx
+@@ -71,7 +71,7 @@ class DataExport extends React.Component<Props, State> {
+     const {inProgress, dataExportId} = this.state;
+     const {children, disabled} = this.props;
+     return (
+-      <Feature features={['data-export']}>
++      <Feature features={['organizations:data-export']}>
+         {inProgress && dataExportId ? (
+           <NewButton
+             size="small"
+diff --git a/src/sentry/static/sentry/app/components/gridEditable/index.tsx b/src/sentry/static/sentry/app/components/gridEditable/index.tsx
+index 7435ff3b89..1f2ab39c8e 100644
+--- a/src/sentry/static/sentry/app/components/gridEditable/index.tsx
++++ b/src/sentry/static/sentry/app/components/gridEditable/index.tsx
+@@ -1,13 +1,14 @@
+ import React from 'react';
++import {Location} from 'history';
+ 
+ import {t} from 'app/locale';
+ import EmptyStateWarning from 'app/components/emptyStateWarning';
+ import Feature from 'app/components/acl/feature';
++import {ExportQueryType} from 'app/components/dataExport';
+ import FeatureDisabled from 'app/components/acl/featureDisabled';
+ import Hovercard from 'app/components/hovercard';
+-import InlineSvg from 'app/components/inlineSvg';
+ import LoadingIndicator from 'app/components/loadingIndicator';
+-import {IconEdit, IconWarning} from 'app/icons';
++import {IconDownload, IconEdit, IconWarning} from 'app/icons';
+ import theme from 'app/utils/theme';
+ 
+ import {
+@@ -22,6 +23,7 @@ import {
+   HeaderTitle,
+   HeaderButton,
+   HeaderButtonContainer,
++  HeaderDownloadButton,
+   Body,
+   Grid,
+   GridRow,
+@@ -43,7 +45,7 @@ type GridEditableProps<DataRow, ColumnKey> = {
+    */
+   editFeatures: string[];
+   noEditMessage?: string;
+-
++  location: Location;
+   isLoading?: boolean;
+   error?: React.ReactNode | null;
+ 
+@@ -301,7 +303,6 @@ class GridEditable<
+         {p.children(p)}
+       </Hovercard>
+     );
+-
+     return (
+       <Feature
+         hookName="feature-disabled:grid-editable-actions"
+@@ -310,7 +311,7 @@ class GridEditable<
+       >
+         {({hasFeature}) => (
+           <React.Fragment>
+-            {this.renderDownloadCsvButton(hasFeature)}
++            {this.renderDownloadButton(hasFeature)}
+             {this.renderEditButton(hasFeature)}
+           </React.Fragment>
+         )}
+@@ -318,7 +319,23 @@ class GridEditable<
+     );
+   }
+ 
+-  renderDownloadCsvButton(canEdit: boolean) {
++  renderDownloadButton(canEdit: boolean) {
++    const {data} = this.props;
++    if (data.length < 50) {
++      return this.renderBrowserExportButton(canEdit);
++    } else {
++      return (
++        <Feature
++          features={['organizations:data-export']}
++          renderDisabled={() => this.renderBrowserExportButton(canEdit)}
++        >
++          {this.renderAsyncExportButton(canEdit)}
++        </Feature>
++      );
++    }
++  }
++
++  renderBrowserExportButton(canEdit: boolean) {
+     const disabled = this.props.isLoading || canEdit === false;
+     const onClick = disabled ? undefined : this.props.actions.downloadAsCsv;
+ 
+@@ -328,12 +345,29 @@ class GridEditable<
+         onClick={onClick}
+         data-test-id="grid-download-csv"
+       >
+-        <InlineSvg src="icon-download" />
+-        {t('Download CSV')}
++        <IconDownload size="xs" />
++        {t('Export Page')}
+       </HeaderButton>
+     );
+   }
+ 
++  renderAsyncExportButton(canEdit: boolean) {
++    const {isLoading, location} = this.props;
++    const disabled = isLoading || canEdit === false;
++    return (
++      <HeaderDownloadButton
++        payload={{
++          queryType: ExportQueryType.Discover,
++          queryInfo: location.query,
++        }}
++        disabled={disabled}
++      >
++        <IconDownload size="xs" />
++        {t('Export All')}
++      </HeaderDownloadButton>
++    );
++  }
++
+   renderEditButton(canEdit: boolean) {
+     const onClick = canEdit ? this.handleToggleEdit : undefined;
+     return (
+diff --git a/src/sentry/static/sentry/app/components/gridEditable/styles.tsx b/src/sentry/static/sentry/app/components/gridEditable/styles.tsx
+index 94504f7a48..998a7e2497 100644
+--- a/src/sentry/static/sentry/app/components/gridEditable/styles.tsx
++++ b/src/sentry/static/sentry/app/components/gridEditable/styles.tsx
+@@ -2,6 +2,7 @@ import React from 'react';
+ import styled from '@emotion/styled';
+ 
+ import {Panel, PanelBody} from 'app/components/panels';
++import DataExport from 'app/components/dataExport';
+ import space from 'app/styles/space';
+ 
+ export const GRID_HEAD_ROW_HEIGHT = 45;
+@@ -62,6 +63,21 @@ export const HeaderButton = styled('div')<{disabled?: boolean}>`
+   }
+ `;
+ 
++export const HeaderDownloadButton = styled(DataExport)<{disabled: boolean}>`
++  border: none;
++  font-weight: normal;
++  box-shadow: none;
++  color: ${p => (p.disabled ? p.theme.gray6 : p.theme.gray3)};
++  svg {
++    margin-right: ${space(0.5)};
++  }
++  &:hover,
++  &:active {
++    color: ${p => (p.disabled ? p.theme.gray6 : p.theme.gray4)};
++    box-shadow: none;
++  }
++`;
++
+ const PanelWithProtectedBorder = styled(Panel)`
+   overflow: hidden;
+   z-index: ${Z_INDEX_PANEL};
+diff --git a/src/sentry/static/sentry/app/views/eventsV2/table/tableView.tsx b/src/sentry/static/sentry/app/views/eventsV2/table/tableView.tsx
+index e1cb4c9d95..0e771eae6e 100644
+--- a/src/sentry/static/sentry/app/views/eventsV2/table/tableView.tsx
++++ b/src/sentry/static/sentry/app/views/eventsV2/table/tableView.tsx
+@@ -213,7 +213,15 @@ class TableView extends React.Component<TableViewProps> {
+   };
+ 
+   render() {
+-    const {isLoading, error, tableData, eventView, title, organization} = this.props;
++    const {
++      isLoading,
++      error,
++      location,
++      tableData,
++      eventView,
++      title,
++      organization,
++    } = this.props;
+ 
+     const columnOrder = eventView.getColumns();
+     const columnSortBy = eventView.getSorts();
+@@ -234,6 +242,7 @@ class TableView extends React.Component<TableViewProps> {
+           renderPrependColumns: this._renderPrependColumns as any,
+           prependColumnWidths: ['40px'],
+         }}
++        location={location}
+         actions={{
+           editColumns: this.handleEditColumns,
+           downloadAsCsv: () => {
+diff --git a/tests/sentry/data_export/processors/test_discover.py b/tests/sentry/data_export/processors/test_discover.py
+new file mode 100644
+index 0000000000..5117bb7bd3
+--- /dev/null
++++ b/tests/sentry/data_export/processors/test_discover.py
+@@ -0,0 +1,44 @@
++from __future__ import absolute_import
++
++from sentry.data_export.base import ExportError
++from sentry.data_export.processors.discover import DiscoverProcessor
++from sentry.testutils import TestCase, SnubaTestCase
++
++
++class DiscoverProcessorTest(TestCase, SnubaTestCase):
++    def setUp(self):
++        super(DiscoverProcessorTest, self).setUp()
++        self.user = self.create_user()
++        self.org = self.create_organization(owner=self.user)
++        self.project1 = self.create_project(organization=self.org)
++        self.project2 = self.create_project(organization=self.org)
++        self.group = self.create_group(project=self.project1)
++        self.discover_query = {
++            "statsPeriod": "14d",
++            "project": [self.project1.id, self.project2.id],
++            "field": ["count(id)", "fake(field)", "issue"],
++            "query": "",
++        }
++
++    def test_get_projects(self):
++        project = DiscoverProcessor.get_projects(
++            organization_id=self.org.id, query={"project": [self.project1.id]}
++        )
++        assert isinstance(project, list)
++        assert project[0] == self.project1
++        projects = DiscoverProcessor.get_projects(
++            organization_id=self.org.id, query={"project": [self.project1.id, self.project2.id]}
++        )
++        assert sorted([p.id for p in projects]) == sorted([self.project1.id, self.project2.id])
++        with self.assertRaises(ExportError):
++            DiscoverProcessor.get_projects(organization_id=self.org.id, query={"project": [-1]})
++
++    def test_handle_fields(self):
++        processor = DiscoverProcessor(
++            organization_id=self.org.id, discover_query=self.discover_query
++        )
++        assert processor.header_fields == ["count_id", "fake_field", "issue"]
++        result_list = [{"issue": self.group.id, "issue.id": self.group.id}]
++        new_result_list = processor.handle_fields(result_list)
++        assert new_result_list[0] != result_list
++        assert new_result_list[0]["issue"] == self.group.qualified_short_id

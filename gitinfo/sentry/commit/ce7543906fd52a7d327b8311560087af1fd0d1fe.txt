@@ -1,0 +1,219 @@
+commit ce7543906fd52a7d327b8311560087af1fd0d1fe
+Author: Bruno Garcia <github@brunogarcia.com>
+Date:   Thu Dec 13 15:09:59 2018 -0800
+
+    feat(unreal): Add Unreal crash context data to event (#11042)
+    
+    * feat(unreal): read context data into event
+    * ref: prefer set_path over setdefault
+    * fix: addr from context
+    * ref: use minidump logger
+    * deps: require symbolic 5.7.3
+
+diff --git a/requirements-base.txt b/requirements-base.txt
+index a0232f274e..b54caff563 100644
+--- a/requirements-base.txt
++++ b/requirements-base.txt
+@@ -63,7 +63,7 @@ sqlparse>=0.1.16,<0.2.0
+ statsd>=3.1.0,<3.2.0
+ strict-rfc3339>=0.7
+ structlog==16.1.0
+-symbolic>=5.7.0,<6.0.0
++symbolic>=5.7.3,<6.0.0
+ toronado>=0.0.11,<0.1.0
+ ua-parser>=0.6.1,<0.8.0
+ # for bitbucket client
+diff --git a/src/sentry/lang/native/unreal.py b/src/sentry/lang/native/unreal.py
+index bb4ba54f35..b87c6737fc 100644
+--- a/src/sentry/lang/native/unreal.py
++++ b/src/sentry/lang/native/unreal.py
+@@ -1,6 +1,16 @@
+ from __future__ import absolute_import
+ from symbolic import Unreal4Crash
+ from sentry.lang.native.minidump import MINIDUMP_ATTACHMENT_TYPE
++from sentry.models import UserReport
++from sentry.utils.safe import set_path
++
++import re
++import uuid
++
++_frame_regexp = re.compile(
++    r'^(?P<package>[\w]+)(!(?P<function>[^\[\n]+)?(\[(?P<filename>.*):(?P<lineno>\d+)\])?)?$')
++_portable_callstack_regexp = re.compile(
++    r'(?P<module>[\w]+) (?P<baseaddr>0x[\da-fA-F]+) \+ (?P<offset>[\da-fA-F]+)')
+ 
+ 
+ def process_unreal_crash(data):
+@@ -13,3 +23,86 @@ def unreal_attachment_type(unreal_file):
+     unreal file type or None if not recognized"""
+     if unreal_file.type == "minidump":
+         return MINIDUMP_ATTACHMENT_TYPE
++
++
++def merge_unreal_context_event(unreal_context, event, project):
++    """Merges the context from an Unreal Engine 4 crash
++    with the given event."""
++    runtime_prop = unreal_context.get('runtime_properties')
++    if runtime_prop is None:
++        return
++
++    message = runtime_prop.pop('error_message', None)
++    if message is not None:
++        event['message'] = message
++
++    username = runtime_prop.pop('username', None)
++    user = None
++    if username is not None:
++        set_path(event, 'user', 'username', value=username)
++
++    memory_physical = runtime_prop.pop('memory_stats_total_physical', None)
++    if memory_physical is not None:
++        set_path(event, 'contexts', 'device', 'memory_size', value=memory_physical)
++
++    # Likely overwritten by minidump processing
++    os_major = runtime_prop.pop('misc_os_version_major', None)
++    if os_major is not None:  # i.e: Windows 10
++        set_path(event, 'contexts', 'os', 'name', value=os_major)
++
++    gpu_brand = runtime_prop.pop('misc_primary_cpu_brand', None)
++    if gpu_brand is not None:
++        set_path(event, 'contexts', 'gpu', 'name', value=gpu_brand)
++
++    user_desc = runtime_prop.pop('user_description', None)
++    if user_desc is not None:
++        event_id = event.setdefault('event_id', uuid.uuid4().hex)
++        feedback_user = 'unknown'
++        if user is not None:
++            feedback_user = user.get('username', feedback_user)
++
++        UserReport.objects.create(
++            project=project,
++            event_id=event_id,
++            name=feedback_user,
++            email='',
++            comments=user_desc,
++        )
++
++    portable_callstack_list = []
++    portable_callstack = runtime_prop.pop('portable_call_stack', None)
++    if portable_callstack is not None:
++        for match in _portable_callstack_regexp.finditer(portable_callstack):
++            addr = hex(int(match.group('baseaddr'), 16) + int(match.group('offset'), 16))
++            portable_callstack_list.append(addr)
++
++    legacy_callstack = runtime_prop.pop('legacy_call_stack', None)
++    if legacy_callstack is not None:
++        traces = legacy_callstack.split('\n')
++
++        frames = []
++        for i, trace in enumerate(traces):
++            match = _frame_regexp.match(trace)
++            if not match:
++                continue
++
++            frames.append({
++                'package': match.group('package'),
++                'lineno': match.group('lineno'),
++                'filename': match.group('filename'),
++                'function': match.group('function'),
++                'in_app': match.group('function') is not None,
++                'instruction_addr': portable_callstack_list[i],
++            })
++
++        frames.reverse()
++        event['stacktrace'] = {
++            'frames': frames
++        }
++
++    # drop modules. minidump processing adds 'images loaded'
++    runtime_prop.pop('modules', None)
++
++    # add everything else as extra
++    extra = event.setdefault('extra', {})
++    extra.update(**runtime_prop)
+diff --git a/src/sentry/web/api.py b/src/sentry/web/api.py
+index f8ed845337..0647355db4 100644
+--- a/src/sentry/web/api.py
++++ b/src/sentry/web/api.py
+@@ -36,7 +36,7 @@ from sentry.coreapi import (
+ from sentry.event_manager import EventManager
+ from sentry.interfaces import schemas
+ from sentry.interfaces.base import get_interface
+-from sentry.lang.native.unreal import process_unreal_crash, unreal_attachment_type
++from sentry.lang.native.unreal import process_unreal_crash, unreal_attachment_type, merge_unreal_context_event
+ from sentry.lang.native.minidump import merge_process_state_event, process_minidump, MINIDUMP_ATTACHMENT_TYPE
+ from sentry.models import Project, OrganizationOption, Organization
+ from sentry.signals import (
+@@ -824,6 +824,14 @@ class UnrealView(StoreView):
+         else:
+             raise APIError("missing minidump in unreal crash report")
+ 
++        try:
++            unreal_context = unreal.get_context()
++            if unreal_context is not None:
++                merge_unreal_context_event(unreal_context, data, project)
++        except Unreal4Error as e:
++            # we'll continue without the context data
++            minidumps_logger.exception(e)
++
+         for file in unreal.files():
+             # Always store the minidump in attachments so we can access it during
+             # processing, regardless of the event-attachments feature. This will
+diff --git a/tests/sentry/lang/native/test_unreal.py b/tests/sentry/lang/native/test_unreal.py
+index 5cb2bfe853..65e39ac548 100644
+--- a/tests/sentry/lang/native/test_unreal.py
++++ b/tests/sentry/lang/native/test_unreal.py
+@@ -8,15 +8,18 @@ from django.core.files.uploadedfile import SimpleUploadedFile
+ 
+ from sentry.testutils import TestCase
+ from sentry.lang.native.minidump import MINIDUMP_ATTACHMENT_TYPE
+-from sentry.lang.native.unreal import process_unreal_crash, unreal_attachment_type
++from sentry.lang.native.unreal import process_unreal_crash, unreal_attachment_type, merge_unreal_context_event
+ from sentry.models import Event, EventAttachment
+ 
+ 
++def get_unreal_crash_file():
++    return os.path.join(os.path.dirname(__file__), 'fixtures', 'unreal_crash')
++
++
+ def test_process_minidump():
+-    minidump = os.path.join(os.path.dirname(__file__), 'fixtures', 'unreal_crash')
+-    with open(minidump, 'rb') as f:
+-        minidump = process_unreal_crash(f.read())
+-        process_state = minidump.process_minidump()
++    with open(get_unreal_crash_file(), 'rb') as f:
++        unreal_crash = process_unreal_crash(f.read())
++        process_state = unreal_crash.process_minidump()
+         assert 115 == process_state.module_count
+         assert 54 == process_state.thread_count
+ 
+@@ -37,6 +40,20 @@ class MockFile(TestCase):
+ 
+ 
+ class UnrealIntegrationTest(TestCase):
++    def test_merge_unreal_context_event(self):
++        with open(get_unreal_crash_file(), 'rb') as f:
++            unreal_crash = process_unreal_crash(f.read())
++            event = {}
++            merge_unreal_context_event(unreal_crash.get_context(), event, self.project)
++            assert event['message'] == 'Access violation - code c0000005 (first/second chance not available)'
++            assert event['user']['username'] == 'bruno'
++            assert event['contexts']['device']['memory_size'] == 6896832512
++            assert event['contexts']['os']['name'] == 'Windows 10'
++            assert event['contexts']['gpu']['name'] == 'Parallels Display Adapter (WDDM)'
++            assert len(event['stacktrace']['frames']) == 20
++            assert 'ntdll' == event['stacktrace']['frames'][0]['package']
++            assert 'YetAnother' == event['stacktrace']['frames'][2]['package']
++            assert 'YetAnother' == event['stacktrace']['frames'][2]['package']
+ 
+     def upload_symbols(self):
+         url = reverse(
+@@ -82,7 +99,7 @@ class UnrealIntegrationTest(TestCase):
+         main = frames[-1]
+         assert main.function == 'AActor::IsPendingKillPending()'
+         assert main.errors is None
+-        assert main.instruction_addr == '0x7ff754be3394'
++        assert main.instruction_addr == '0x54be3394'
+ 
+         attachments = sorted(
+             EventAttachment.objects.filter(

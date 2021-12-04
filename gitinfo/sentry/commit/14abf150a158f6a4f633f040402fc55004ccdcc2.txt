@@ -1,0 +1,161 @@
+commit 14abf150a158f6a4f633f040402fc55004ccdcc2
+Author: Dan Fuller <dfuller@sentry.io>
+Date:   Tue Jul 7 13:50:32 2020 -0700
+
+    fix(metric_alerts): Fix bug where start bucket can be missing on a very new alert. (#19619)
+    
+    This fixes a bug where the start bucket can be missing on a new alert. This typically happens on an
+    alert with a large time window such as an hour. Basically if the start date is after the last bucket
+    on the graph, it ends up filtered out by the zerofill code.
+    
+    An example:
+    We have an alert rule with a time window of 1 hour.
+    An alert starts at 11:34pm.
+    We fetch the data, and only fetch up to bucket 11pm since 12am hasn't happened yet.
+    We have code that fetches the 11:34pm bucket as well, so that is included. However, the end date of
+    our result ends up being 11pm still, and so when we do zerofill it excludes that bucket.
+    
+    This fixes the code to include the max of the stat range or the incident start date. It also
+    modifies the zerofill code to include any leftover buckets. This is necessary because if the start
+    date bucket is the last bucket, it'll end up filtered off since we round the end date down to
+    nearest rollup below it.
+
+diff --git a/src/sentry/api/serializers/snuba.py b/src/sentry/api/serializers/snuba.py
+index aaaff27b42..46e88feecb 100644
+--- a/src/sentry/api/serializers/snuba.py
++++ b/src/sentry/api/serializers/snuba.py
+@@ -126,10 +126,11 @@ def value_from_row(row, tagkey):
+ 
+ def zerofill(data, start, end, rollup):
+     rv = []
+-    start = (int(to_timestamp(start)) // rollup) * rollup
+-    end = (int(to_timestamp(end)) // rollup) * rollup
++    end = int(to_timestamp(end))
++    rollup_start = (int(to_timestamp(start)) // rollup) * rollup
++    rollup_end = (end // rollup) * rollup
+     i = 0
+-    for key in six.moves.xrange(start, end, rollup):
++    for key in six.moves.xrange(rollup_start, rollup_end, rollup):
+         try:
+             while data[i][0] < key:
+                 rv.append(data[i])
+@@ -142,6 +143,11 @@ def zerofill(data, start, end, rollup):
+             pass
+ 
+         rv.append((key, []))
++    # Add any remaining rows that are not aligned to the rollup and are lower than the
++    # end date.
++    if i < len(data):
++        rv.extend(row for row in data[i:] if row[0] < rollup_end)
++
+     return rv
+ 
+ 
+diff --git a/src/sentry/incidents/logic.py b/src/sentry/incidents/logic.py
+index 05217fcbc8..477fb85220 100644
+--- a/src/sentry/incidents/logic.py
++++ b/src/sentry/incidents/logic.py
+@@ -406,29 +406,34 @@ def get_incident_event_stats(incident, start=None, end=None, windowed_stats=Fals
+         )
+     ]
+ 
++    # We make extra queries to fetch these buckets
++    def build_extra_query_params(bucket_start):
++        extra_bucket_query_params = build_incident_query_params(
++            incident, start=bucket_start, end=bucket_start + timedelta(seconds=time_window)
++        )
++        aggregations = extra_bucket_query_params.pop("aggregations")[0]
++        return SnubaQueryParams(
++            aggregations=[(aggregations[0], aggregations[1], "count")],
++            limit=1,
++            **extra_bucket_query_params
++        )
++
+     # We want to include the specific buckets for the incident start and closed times,
+     # so that there's no need to interpolate to show them on the frontend. If they're
+     # cleanly divisible by the `time_window` then there's no need to fetch, since
+     # they'll be included in the standard results anyway.
++    start_query_params = None
+     extra_buckets = []
+     if int(to_timestamp(incident.date_started)) % time_window:
++        start_query_params = build_extra_query_params(incident.date_started)
++        snuba_params.append(start_query_params)
+         extra_buckets.append(incident.date_started)
+-    if incident.date_closed and int(to_timestamp(incident.date_closed)) % time_window:
+-        extra_buckets.append(incident.date_closed.replace(second=0, microsecond=0))
+ 
+-    # We make extra queries to fetch these buckets
+-    for bucket_start in extra_buckets:
+-        extra_bucket_query_params = build_incident_query_params(
+-            incident, start=bucket_start, end=bucket_start + timedelta(seconds=time_window)
+-        )
+-        aggregations = extra_bucket_query_params.pop("aggregations")[0]
+-        snuba_params.append(
+-            SnubaQueryParams(
+-                aggregations=[(aggregations[0], aggregations[1], "count")],
+-                limit=1,
+-                **extra_bucket_query_params
+-            )
+-        )
++    if incident.date_closed:
++        date_closed = incident.date_closed.replace(second=0, microsecond=0)
++        if int(to_timestamp(date_closed)) % time_window:
++            snuba_params.append(build_extra_query_params(date_closed))
++            extra_buckets.append(date_closed)
+ 
+     results = bulk_raw_query(snuba_params, referrer="incidents.get_incident_event_stats")
+     # Once we receive the results, if we requested extra buckets we now need to label
+@@ -438,10 +443,14 @@ def get_incident_event_stats(incident, start=None, end=None, windowed_stats=Fals
+     merged_data = list(chain(*[r["data"] for r in results]))
+     merged_data.sort(key=lambda row: row["time"])
+     results[0]["data"] = merged_data
+-
+-    return SnubaTSResult(
+-        results[0], snuba_params[0].start, snuba_params[0].end, snuba_params[0].rollup
+-    )
++    # When an incident has just been created it's possible for the actual incident start
++    # date to be greater than the latest bucket for the query. Get the actual end date
++    # here.
++    end_date = snuba_params[0].end
++    if start_query_params:
++        end_date = max(end_date, start_query_params.end)
++
++    return SnubaTSResult(results[0], snuba_params[0].start, end_date, snuba_params[0].rollup)
+ 
+ 
+ def get_incident_aggregates(
+diff --git a/tests/sentry/incidents/endpoints/test_organization_incident_stats.py b/tests/sentry/incidents/endpoints/test_organization_incident_stats.py
+index 7965f1e4ee..02b0e1f361 100644
+--- a/tests/sentry/incidents/endpoints/test_organization_incident_stats.py
++++ b/tests/sentry/incidents/endpoints/test_organization_incident_stats.py
+@@ -96,3 +96,30 @@ class OrganizationIncidentDetailsTest(SnubaTestCase, APITestCase):
+             [{"count": 2}],
+             [{"count": 2}],
+         ]
++
++    def test_start_bucket_outside_range(self):
++        now = self.now - timedelta(minutes=1)
++        with freeze_time(now):
++            incident_start = now - timedelta(minutes=2)
++            self.create_event(incident_start - timedelta(minutes=1))
++            self.create_event(incident_start - timedelta(minutes=6))
++            self.create_event(incident_start + timedelta(minutes=1))
++            alert_rule = self.create_alert_rule(time_window=30)
++            incident = self.create_incident(
++                date_started=incident_start, query="", alert_rule=alert_rule
++            )
++
++            with self.feature("organizations:incidents"):
++                resp = self.get_valid_response(incident.organization.slug, incident.identifier)
++
++            assert resp.data["totalEvents"] == 3
++            assert resp.data["uniqueUsers"] == 0
++            for i, data in enumerate(resp.data["eventStats"]["data"]):
++                if data[1]:
++                    break
++            # We don't care about the empty rows, we just want to find this block of rows
++            # with counts somewhere in the data
++            assert [data[1] for data in resp.data["eventStats"]["data"][i : i + 3]] == [
++                [{"count": 3}],
++                [{"count": 1}],
++            ]

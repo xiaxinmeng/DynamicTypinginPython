@@ -1,0 +1,472 @@
+commit bed3f4bd71d89db3ac60f1c2cdbc7706ab188569
+Author: David Cramer <dcramer@gmail.com>
+Date:   Mon Jan 8 11:21:27 2018 -0800
+
+    feat(api): Allow organizations to be restored via the API
+    
+    This exposes 'cancelDeletion' on the PUT /organizations/:id/ endpoint and moves the restore organization server-rendered view to use the endpoint.
+    
+    Additionally it:
+    
+    - changes OrganizationStatus to use IntEnum
+    - adds OrganizationStatus.ACTIVE to supercede VISIBLE
+    - allows restoration even after a deletion has begun (accept the consequences).
+    - exposes 'status' in the organization details API
+    - allows fetching data for organizations which are in deletion phases
+
+diff --git a/src/sentry/api/bases/organization.py b/src/sentry/api/bases/organization.py
+index 9d34970f21..2d1da8bc77 100644
+--- a/src/sentry/api/bases/organization.py
++++ b/src/sentry/api/bases/organization.py
+@@ -9,7 +9,7 @@ from sentry.app import raven
+ from sentry.auth import access
+ from sentry.auth.superuser import is_active_superuser
+ from sentry.models import (
+-    ApiKey, Organization, OrganizationMemberTeam, OrganizationStatus, Project, ReleaseProject, Team
++    ApiKey, Organization, OrganizationMemberTeam, Project, ReleaseProject, Team
+ )
+ from sentry.utils import auth
+ 
+@@ -122,9 +122,6 @@ class OrganizationEndpoint(Endpoint):
+         except Organization.DoesNotExist:
+             raise ResourceDoesNotExist
+ 
+-        if organization.status != OrganizationStatus.VISIBLE:
+-            raise ResourceDoesNotExist
+-
+         self.check_object_permissions(request, organization)
+ 
+         raven.tags_context({
+diff --git a/src/sentry/api/endpoints/organization_details.py b/src/sentry/api/endpoints/organization_details.py
+index 8db19c60ec..d53a8c4279 100644
+--- a/src/sentry/api/endpoints/organization_details.py
++++ b/src/sentry/api/endpoints/organization_details.py
+@@ -35,6 +35,8 @@ ORG_OPTIONS = (
+ 
+ delete_logger = logging.getLogger('sentry.deletions.api')
+ 
++DELETION_STATUSES = frozenset([OrganizationStatus.PENDING_DELETION, OrganizationStatus.DELETION_IN_PROGRESS])
++
+ 
+ @scenario('RetrieveOrganization')
+ def retrieve_organization_scenario(runner):
+@@ -158,11 +160,15 @@ class OrganizationSerializer(serializers.Serializer):
+ 
+ class OwnerOrganizationSerializer(OrganizationSerializer):
+     defaultRole = serializers.ChoiceField(choices=roles.get_choices())
++    cancelDeletion = serializers.BooleanField(required=False)
+ 
+     def save(self, *args, **kwargs):
+         org = self.context['organization']
++        cancel_deletion = 'cancelDeletion' in self.init_data and org.status in DELETION_STATUSES
+         if 'defaultRole' in self.init_data:
+             org.default_role = self.init_data['defaultRole']
++        if cancel_deletion:
++            org.status = OrganizationStatus.VISIBLE
+         return super(OwnerOrganizationSerializer, self).save(*args, **kwargs)
+ 
+ 
+@@ -210,6 +216,8 @@ class OrganizationDetailsEndpoint(OrganizationEndpoint):
+         else:
+             serializer_cls = OrganizationSerializer
+ 
++        was_pending_deletion = organization.status in DELETION_STATUSES
++
+         serializer = serializer_cls(
+             data=request.DATA,
+             partial=True,
+@@ -218,6 +226,22 @@ class OrganizationDetailsEndpoint(OrganizationEndpoint):
+         if serializer.is_valid():
+             organization = serializer.save()
+ 
++            if was_pending_deletion and organization.status == OrganizationStatus.VISIBLE:
++                self.create_audit_entry(
++                    request=request,
++                    organization=organization,
++                    target_object=organization.id,
++                    event=AuditLogEntryEvent.ORG_RESTORE,
++                    data=organization.get_audit_log_data(),
++                )
++                delete_logger.info(
++                    'object.delete.canceled',
++                    extra={
++                        'object_id': organization.id,
++                        'model': Organization.__name__,
++                    }
++                )
++
+             self.create_audit_entry(
+                 request=request,
+                 organization=organization,
+diff --git a/src/sentry/api/endpoints/organization_index.py b/src/sentry/api/endpoints/organization_index.py
+index fd3e5922a4..1a0af2936c 100644
+--- a/src/sentry/api/endpoints/organization_index.py
++++ b/src/sentry/api/endpoints/organization_index.py
+@@ -56,9 +56,7 @@ class OrganizationIndexEndpoint(Endpoint):
+         """
+         member_only = request.GET.get('member') in ('1', 'true')
+ 
+-        queryset = Organization.objects.filter(
+-            status=OrganizationStatus.VISIBLE,
+-        )
++        queryset = Organization.objects.all()
+ 
+         if request.auth and not request.user.is_authenticated():
+             if hasattr(request.auth, 'project'):
+@@ -94,6 +92,15 @@ class OrganizationIndexEndpoint(Endpoint):
+                     )
+                 elif key == 'id':
+                     queryset = queryset.filter(id__in=value)
++                elif key == 'status':
++                    try:
++                        queryset = queryset.filter(status__in=[
++                            OrganizationStatus[v.upper()] for v in value
++                        ])
++                    except KeyError:
++                        queryset = queryset.none()
++                else:
++                    queryset = queryset.none()
+ 
+         sort_by = request.GET.get('sortBy')
+         if sort_by == 'members':
+diff --git a/src/sentry/api/serializers/models/organization.py b/src/sentry/api/serializers/models/organization.py
+index 621d23b1a9..6d9a863e2c 100644
+--- a/src/sentry/api/serializers/models/organization.py
++++ b/src/sentry/api/serializers/models/organization.py
+@@ -8,7 +8,7 @@ from sentry.api.serializers import Serializer, register, serialize
+ from sentry.auth import access
+ from sentry.models import (
+     ApiKey, Organization, OrganizationAccessRequest, OrganizationAvatar, OrganizationOnboardingTask,
+-    OrganizationOption, Team, TeamStatus
++    OrganizationOption, OrganizationStatus, Team, TeamStatus
+ )
+ 
+ 
+@@ -38,9 +38,15 @@ class OrganizationSerializer(Serializer):
+                 'avatarUuid': None,
+             }
+ 
++        status = OrganizationStatus(obj.status)
++
+         return {
+             'id': six.text_type(obj.id),
+             'slug': obj.slug,
++            'status': {
++                'id': status.name,
++                'name': status.label,
++            },
+             'name': obj.name or obj.slug,
+             'dateCreated': obj.date_added,
+             'isEarlyAdopter': bool(obj.flags.early_adopter),
+@@ -104,20 +110,16 @@ class DetailedOrganizationSerializer(OrganizationSerializer):
+         context = super(DetailedOrganizationSerializer, self).serialize(obj, attrs, user)
+         max_rate = quotas.get_maximum_quota(obj)
+         context['quota'] = {
+-            'maxRate':
+-            max_rate[0],
+-            'maxRateInterval':
+-            max_rate[1],
+-            'accountLimit':
+-            int(
++            'maxRate': max_rate[0],
++            'maxRateInterval': max_rate[1],
++            'accountLimit': int(
+                 OrganizationOption.objects.get_value(
+                     organization=obj,
+                     key='sentry:account-rate-limit',
+                     default=0,
+                 )
+             ),
+-            'projectLimit':
+-            int(
++            'projectLimit': int(
+                 OrganizationOption.objects.get_value(
+                     organization=obj,
+                     key='sentry:project-rate-limit',
+@@ -125,26 +127,24 @@ class DetailedOrganizationSerializer(OrganizationSerializer):
+                 )
+             ),
+         }
+-        context.update(
+-            {
+-                'isDefault': obj.is_default,
+-                'defaultRole': obj.default_role,
+-                'availableRoles': [{
+-                    'id': r.id,
+-                    'name': r.name,
+-                } for r in roles.get_all()],
+-                'openMembership': bool(obj.flags.allow_joinleave),
+-                'require2FA': bool(obj.flags.require_2fa),
+-                'allowSharedIssues': not obj.flags.disable_shared_issues,
+-                'enhancedPrivacy': bool(obj.flags.enhanced_privacy),
+-                'dataScrubber': bool(obj.get_option('sentry:require_scrub_data', False)),
+-                'dataScrubberDefaults':
+-                bool(obj.get_option('sentry:require_scrub_defaults', False)),
+-                'sensitiveFields': obj.get_option('sentry:sensitive_fields', None) or [],
+-                'safeFields': obj.get_option('sentry:safe_fields', None) or [],
+-                'scrubIPAddresses': bool(obj.get_option('sentry:require_scrub_ip_address', False)),
+-            }
+-        )
++
++        context.update({
++            'isDefault': obj.is_default,
++            'defaultRole': obj.default_role,
++            'availableRoles': [{
++                'id': r.id,
++                'name': r.name,
++            } for r in roles.get_all()],
++            'openMembership': bool(obj.flags.allow_joinleave),
++            'require2FA': bool(obj.flags.require_2fa),
++            'allowSharedIssues': not obj.flags.disable_shared_issues,
++            'enhancedPrivacy': bool(obj.flags.enhanced_privacy),
++            'dataScrubber': bool(obj.get_option('sentry:require_scrub_data', False)),
++            'dataScrubberDefaults': bool(obj.get_option('sentry:require_scrub_defaults', False)),
++            'sensitiveFields': obj.get_option('sentry:sensitive_fields', None) or [],
++            'safeFields': obj.get_option('sentry:safe_fields', None) or [],
++            'scrubIPAddresses': bool(obj.get_option('sentry:require_scrub_ip_address', False)),
++        })
+         context['teams'] = serialize(team_list, user, TeamWithProjectsSerializer())
+         if env.request:
+             context['access'] = access.from_request(env.request, obj).scopes
+diff --git a/src/sentry/models/organization.py b/src/sentry/models/organization.py
+index 9454b4ad9f..6483d3e510 100644
+--- a/src/sentry/models/organization.py
++++ b/src/sentry/models/organization.py
+@@ -7,7 +7,10 @@ sentry.models.organization
+ """
+ from __future__ import absolute_import, print_function
+ 
++import six
++
+ from datetime import timedelta
++from enum import IntEnum
+ 
+ from bitfield import BitField
+ from django.conf import settings
+@@ -15,7 +18,6 @@ from django.core.urlresolvers import reverse
+ from django.db import IntegrityError, models, transaction
+ from django.utils import timezone
+ from django.utils.functional import cached_property
+-from django.utils.translation import ugettext_lazy as _
+ 
+ from sentry import roles
+ from sentry.app import locks
+@@ -26,12 +28,41 @@ from sentry.utils.http import absolute_uri
+ from sentry.utils.retries import TimedRetryPolicy
+ 
+ 
+-# TODO(dcramer): pull in enum library
+-class OrganizationStatus(object):
+-    VISIBLE = 0
++class OrganizationStatus(IntEnum):
++    ACTIVE = 0
+     PENDING_DELETION = 1
+     DELETION_IN_PROGRESS = 2
+ 
++    # alias
++    VISIBLE = 0
++
++    def __str__(self):
++        return self.name
++
++    @property
++    def label(self):
++        return OrganizationStatus._labels[self]
++
++    @classmethod
++    def as_choices(cls):
++        result = []
++        for name, member in six.iteritems(cls.__members__):
++            # an alias
++            if name != member.name:
++                continue
++            # realistically Enum shouldn't even creating these, but alas
++            if name.startswith('_'):
++                continue
++            result.append((member, member.label))
++        return tuple(result)
++
++
++OrganizationStatus._labels = {
++    OrganizationStatus.ACTIVE: 'active',
++    OrganizationStatus.PENDING_DELETION: 'pending deletion',
++    OrganizationStatus.DELETION_IN_PROGRESS: 'deletion in progress',
++}
++
+ 
+ class OrganizationManager(BaseManager):
+     # def get_by_natural_key(self, slug):
+@@ -48,13 +79,13 @@ class OrganizationManager(BaseManager):
+ 
+         if settings.SENTRY_PUBLIC and scope is None:
+             if only_visible:
+-                return list(self.filter(status=OrganizationStatus.VISIBLE))
++                return list(self.filter(status=OrganizationStatus.ACTIVE))
+             else:
+                 return list(self.filter())
+ 
+         qs = OrganizationMember.objects.filter(user=user).select_related('organization')
+         if only_visible:
+-            qs = qs.filter(organization__status=OrganizationStatus.VISIBLE)
++            qs = qs.filter(organization__status=OrganizationStatus.ACTIVE)
+ 
+         results = list(qs)
+ 
+@@ -72,12 +103,8 @@ class Organization(Model):
+     name = models.CharField(max_length=64)
+     slug = models.SlugField(unique=True)
+     status = BoundedPositiveIntegerField(
+-        choices=(
+-            (OrganizationStatus.VISIBLE,
+-             _('Visible')), (OrganizationStatus.PENDING_DELETION, _('Pending Deletion')),
+-            (OrganizationStatus.DELETION_IN_PROGRESS, _('Deletion in Progress')),
+-        ),
+-        default=OrganizationStatus.VISIBLE
++        choices=OrganizationStatus.as_choices(),
++        default=OrganizationStatus.ACTIVE
+     )
+     date_added = models.DateTimeField(default=timezone.now)
+     members = models.ManyToManyField(
+@@ -127,7 +154,7 @@ class Organization(Model):
+         Return the organization used in single organization mode.
+         """
+         return cls.objects.filter(
+-            status=OrganizationStatus.VISIBLE,
++            status=OrganizationStatus.ACTIVE,
+         )[0]
+ 
+     def __unicode__(self):
+diff --git a/src/sentry/web/frontend/restore_organization.py b/src/sentry/web/frontend/restore_organization.py
+index 5413f987be..f4dda0723a 100644
+--- a/src/sentry/web/frontend/restore_organization.py
++++ b/src/sentry/web/frontend/restore_organization.py
+@@ -7,7 +7,8 @@ from django.contrib import messages
+ from django.core.urlresolvers import reverse
+ from django.utils.translation import ugettext_lazy as _
+ 
+-from sentry.models import Organization, OrganizationStatus, AuditLogEntryEvent
++from sentry.api import client
++from sentry.models import Organization, OrganizationStatus
+ from sentry.web.frontend.base import OrganizationView
+ from sentry.web.helpers import render_to_response
+ 
+@@ -54,29 +55,21 @@ class RestoreOrganizationView(OrganizationView):
+         return render_to_response('sentry/restore-organization.html', context, self.request)
+ 
+     def post(self, request, organization):
+-        if organization.status != OrganizationStatus.PENDING_DELETION:
++        deletion_statuses = [
++            OrganizationStatus.PENDING_DELETION,
++            OrganizationStatus.DELETION_IN_PROGRESS]
++
++        if organization.status not in deletion_statuses:
+             messages.add_message(request, messages.ERROR, ERR_MESSAGES[organization.status])
+             return self.redirect(reverse('sentry'))
+ 
+         updated = Organization.objects.filter(
+             id=organization.id,
+-            status=OrganizationStatus.PENDING_DELETION,
++            status__in=deletion_statuses,
+         ).update(status=OrganizationStatus.VISIBLE)
+         if updated:
+-            self.create_audit_entry(
+-                request=request,
+-                organization=organization,
+-                target_object=organization.id,
+-                event=AuditLogEntryEvent.ORG_RESTORE,
+-                data=organization.get_audit_log_data(),
+-            )
+-            delete_logger.info(
+-                'object.delete.canceled',
+-                extra={
+-                    'object_id': organization.id,
+-                    'model': Organization.__name__,
+-                }
+-            )
++            client.put('/organizations/{}/'.format(organization.slug), data={
++                'cancelDeletion': True,
++            }, request=request)
+             messages.add_message(request, messages.SUCCESS, MSG_RESTORE_SUCCESS)
+-
+         return self.redirect(reverse('sentry-organization-home', args=[organization.slug]))
+diff --git a/tests/sentry/api/endpoints/test_organization_details.py b/tests/sentry/api/endpoints/test_organization_details.py
+index cb474d7789..1a07c3991e 100644
+--- a/tests/sentry/api/endpoints/test_organization_details.py
++++ b/tests/sentry/api/endpoints/test_organization_details.py
+@@ -284,6 +284,23 @@ class OrganizationUpdateTest(APITestCase):
+ 
+         assert not options.get('sentry:sensitive_fields')
+ 
++    def test_cancel_delete(self):
++        org = self.create_organization(owner=self.user, status=OrganizationStatus.PENDING_DELETION)
++        self.login_as(user=self.user)
++        url = reverse(
++            'sentry-api-0-organization-details', kwargs={
++                'organization_slug': org.slug,
++            }
++        )
++        response = self.client.put(
++            url, data={
++                'cancelDeletion': True,
++            }
++        )
++        assert response.status_code == 200, (response.status_code, response.content)
++        org = Organization.objects.get(id=org.id)
++        assert org.status == OrganizationStatus.VISIBLE
++
+ 
+ class OrganizationDeleteTest(APITestCase):
+     @patch('sentry.api.endpoints.organization_details.uuid4')
+diff --git a/tests/sentry/api/endpoints/test_organization_index.py b/tests/sentry/api/endpoints/test_organization_index.py
+index 12702eec5b..ccb411c844 100644
+--- a/tests/sentry/api/endpoints/test_organization_index.py
++++ b/tests/sentry/api/endpoints/test_organization_index.py
+@@ -5,7 +5,7 @@ import six
+ from django.core.urlresolvers import reverse
+ from exam import fixture
+ 
+-from sentry.models import Organization
++from sentry.models import Organization, OrganizationStatus
+ from sentry.testutils import APITestCase
+ 
+ 
+@@ -22,6 +22,20 @@ class OrganizationsListTest(APITestCase):
+         assert len(response.data) == 1
+         assert response.data[0]['id'] == six.text_type(org.id)
+ 
++    def test_status_query(self):
++        org = self.create_organization(owner=self.user, status=OrganizationStatus.PENDING_DELETION)
++        self.login_as(user=self.user)
++        response = self.client.get('{}?query=status:pending_deletion'.format(self.path))
++        assert response.status_code == 200
++        assert len(response.data) == 1
++        assert response.data[0]['id'] == six.text_type(org.id)
++        response = self.client.get('{}?query=status:deletion_in_progress'.format(self.path))
++        assert response.status_code == 200
++        assert len(response.data) == 0
++        response = self.client.get('{}?query=status:invalid_status'.format(self.path))
++        assert response.status_code == 200
++        assert len(response.data) == 0
++
+ 
+ class OrganizationsCreateTest(APITestCase):
+     @fixture
+diff --git a/tests/sentry/web/frontend/test_restore_organization.py b/tests/sentry/web/frontend/test_restore_organization.py
+index a9fb875a2e..8c18858377 100644
+--- a/tests/sentry/web/frontend/test_restore_organization.py
++++ b/tests/sentry/web/frontend/test_restore_organization.py
+@@ -66,7 +66,7 @@ class RemoveOrganizationTest(TestCase):
+ 
+         assert org.status == OrganizationStatus.VISIBLE
+ 
+-    def test_too_late(self):
++    def test_too_late_still_restores(self):
+         Organization.objects.filter(
+             id=self.organization.id,
+         ).update(status=OrganizationStatus.DELETION_IN_PROGRESS)
+@@ -77,4 +77,4 @@ class RemoveOrganizationTest(TestCase):
+ 
+         org = Organization.objects.get(id=self.organization.id)
+ 
+-        assert org.status == OrganizationStatus.DELETION_IN_PROGRESS
++        assert org.status == OrganizationStatus.VISIBLE

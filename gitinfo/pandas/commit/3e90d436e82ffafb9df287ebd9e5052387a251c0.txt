@@ -1,0 +1,356 @@
+commit 3e90d436e82ffafb9df287ebd9e5052387a251c0
+Author: Vasily Litvinov <45396231+vnlitvin@users.noreply.github.com>
+Date:   Sat Apr 20 19:52:24 2019 +0300
+
+    PERF: Parse certain dates in Cython instead of falling back to dateutil.parse (#25922)
+
+diff --git a/asv_bench/benchmarks/io/csv.py b/asv_bench/benchmarks/io/csv.py
+index 88c2a6f99..260c1c390 100644
+--- a/asv_bench/benchmarks/io/csv.py
++++ b/asv_bench/benchmarks/io/csv.py
+@@ -251,4 +251,22 @@ class ReadCSVMemoryGrowth(BaseIO):
+             pass
+ 
+ 
++class ReadCSVParseSpecialDate(StringIORewind):
++    params = (['mY', 'mdY'],)
++    params_name = ['value']
++    objects = {
++        'mY': '01-2019\n10-2019\n02/2000\n',
++        'mdY': '12/02/2010\n'
++    }
++
++    def setup(self, value):
++        count_elem = 10000
++        data = self.objects[value] * count_elem
++        self.StringIO_input = StringIO(data)
++
++    def time_read_special_date(self, value):
++        read_csv(self.data(self.StringIO_input), sep=',', header=None,
++                 names=['Date'], parse_dates=['Date'])
++
++
+ from ..pandas_vb_common import setup  # noqa: F401
+diff --git a/doc/source/whatsnew/v0.25.0.rst b/doc/source/whatsnew/v0.25.0.rst
+index 1dff35433..7d4450279 100644
+--- a/doc/source/whatsnew/v0.25.0.rst
++++ b/doc/source/whatsnew/v0.25.0.rst
+@@ -250,6 +250,7 @@ Performance Improvements
+ - Improved performance of :meth:`read_csv` by faster tokenizing and faster parsing of small float numbers (:issue:`25784`)
+ - Improved performance of :meth:`read_csv` by faster parsing of N/A and boolean values (:issue:`25804`)
+ - Improved performance of :meth:DataFrame.`to_csv` when write datetime dtype data (:issue:`25708`)
++- Improved performance of :meth:`read_csv` by much faster parsing of MM/YYYY and DD/MM/YYYY datetime formats (:issue:`25922`)
+ 
+ .. _whatsnew_0250.bug_fixes:
+ 
+diff --git a/pandas/_libs/src/headers/portable.h b/pandas/_libs/src/headers/portable.h
+index 1976addac..cb8e5ba81 100644
+--- a/pandas/_libs/src/headers/portable.h
++++ b/pandas/_libs/src/headers/portable.h
+@@ -8,6 +8,7 @@
+ // GH-23516 - works around locale perf issues
+ // from MUSL libc, MIT Licensed - see LICENSES
+ #define isdigit_ascii(c) (((unsigned)(c) - '0') < 10u)
++#define getdigit_ascii(c, default) (isdigit_ascii(c) ? ((int)((c) - '0')) : default)
+ #define isspace_ascii(c) (((c) == ' ') || (((unsigned)(c) - '\t') < 5))
+ #define toupper_ascii(c) ((((unsigned)(c) - 'a') < 26) ? ((c) & 0x5f) : (c))
+ #define tolower_ascii(c) ((((unsigned)(c) - 'A') < 26) ? ((c) | 0x20) : (c))
+diff --git a/pandas/_libs/tslibs/parsing.pyx b/pandas/_libs/tslibs/parsing.pyx
+index 6fd4379d9..4fc695d3a 100644
+--- a/pandas/_libs/tslibs/parsing.pyx
++++ b/pandas/_libs/tslibs/parsing.pyx
+@@ -6,8 +6,11 @@ import re
+ import time
+ from io import StringIO
+ 
+-from cpython.datetime cimport datetime
++from libc.string cimport strchr
+ 
++from cpython.datetime cimport datetime, datetime_new, import_datetime
++from cpython.version cimport PY_VERSION_HEX
++import_datetime()
+ 
+ import numpy as np
+ 
+@@ -24,6 +27,10 @@ from pandas._config import get_option
+ 
+ from pandas._libs.tslibs.ccalendar import MONTH_NUMBERS
+ from pandas._libs.tslibs.nattype import nat_strings, NaT
++from pandas._libs.tslibs.util cimport get_c_string_buf_and_size
++
++cdef extern from "../src/headers/portable.h":
++    int getdigit_ascii(char c, int default) nogil
+ 
+ # ----------------------------------------------------------------------
+ # Constants
+@@ -42,6 +49,99 @@ cdef:
+     set _not_datelike_strings = {'a', 'A', 'm', 'M', 'p', 'P', 't', 'T'}
+ 
+ # ----------------------------------------------------------------------
++cdef:
++    const char* delimiters = " /-."
++    int MAX_DAYS_IN_MONTH = 31, MAX_MONTH = 12
++
++
++cdef inline bint _is_not_delimiter(const char ch):
++    return strchr(delimiters, ch) == NULL
++
++
++cdef inline int _parse_2digit(const char* s):
++    cdef int result = 0
++    result += getdigit_ascii(s[0], -10) * 10
++    result += getdigit_ascii(s[1], -100) * 1
++    return result
++
++
++cdef inline int _parse_4digit(const char* s):
++    cdef int result = 0
++    result += getdigit_ascii(s[0], -10) * 1000
++    result += getdigit_ascii(s[1], -100) * 100
++    result += getdigit_ascii(s[2], -1000) * 10
++    result += getdigit_ascii(s[3], -10000) * 1
++    return result
++
++
++cdef inline object _parse_delimited_date(object date_string, bint dayfirst):
++    """
++    Parse special cases of dates: MM/DD/YYYY, DD/MM/YYYY, MM/YYYY.
++    At the beginning function tries to parse date in MM/DD/YYYY format, but
++    if month > 12 - in DD/MM/YYYY (`dayfirst == False`).
++    With `dayfirst == True` function makes an attempt to parse date in
++    DD/MM/YYYY, if an attemp is wrong - in DD/MM/YYYY
++
++    Note
++    ----
++    For MM/DD/YYYY, DD/MM/YYYY: delimiter can be a space or one of /-.
++    For MM/YYYY: delimiter can be a space or one of /-
++    If `date_string` can't be converted to date, then function returns
++    None, None
++
++    Parameters
++    ----------
++    date_string : str
++    dayfirst : bint
++
++    Returns:
++    --------
++    datetime, resolution
++    """
++    cdef:
++        const char* buf
++        Py_ssize_t length
++        int day = 1, month = 1, year
++        bint can_swap = 0
++
++    buf = get_c_string_buf_and_size(date_string, &length)
++    if length == 10:
++        # parsing MM?DD?YYYY and DD?MM?YYYY dates
++        if _is_not_delimiter(buf[2]) or _is_not_delimiter(buf[5]):
++            return None, None
++        month = _parse_2digit(buf)
++        day = _parse_2digit(buf + 3)
++        year = _parse_4digit(buf + 6)
++        reso = 'day'
++        can_swap = 1
++    elif length == 7:
++        # parsing MM?YYYY dates
++        if buf[2] == b'.' or _is_not_delimiter(buf[2]):
++            # we cannot reliably tell whether e.g. 10.2010 is a float
++            # or a date, thus we refuse to parse it here
++            return None, None
++        month = _parse_2digit(buf)
++        year = _parse_4digit(buf + 3)
++        reso = 'month'
++    else:
++        return None, None
++
++    if month < 0 or day < 0 or year < 1000:
++        # some part is not an integer, so
++        # date_string can't be converted to date, above format
++        return None, None
++
++    if 1 <= month <= MAX_DAYS_IN_MONTH and 1 <= day <= MAX_DAYS_IN_MONTH \
++            and (month <= MAX_MONTH or day <= MAX_MONTH):
++        if (month > MAX_MONTH or (day <= MAX_MONTH and dayfirst)) and can_swap:
++            day, month = month, day
++        if PY_VERSION_HEX >= 0x03060100:
++            # In Python <= 3.6.0 there is no range checking for invalid dates
++            # in C api, thus we call faster C version for 3.6.1 or newer
++            return datetime_new(year, month, day, 0, 0, 0, 0, None), reso
++        return datetime(year, month, day, 0, 0, 0, 0, None), reso
++
++    raise DateParseError("Invalid date specified ({}/{})".format(month, day))
+ 
+ 
+ def parse_datetime_string(date_string, freq=None, dayfirst=False,
+@@ -66,6 +166,10 @@ def parse_datetime_string(date_string, freq=None, dayfirst=False,
+                       yearfirst=yearfirst, **kwargs)
+         return dt
+ 
++    dt, _ = _parse_delimited_date(date_string, dayfirst)
++    if dt is not None:
++        return dt
++
+     try:
+         dt, _, _ = _parse_dateabbr_string(date_string, _DEFAULT_DATETIME, freq)
+         return dt
+@@ -146,6 +250,10 @@ cdef parse_datetime_string_with_reso(date_string, freq=None, dayfirst=False,
+     if not _does_string_look_like_datetime(date_string):
+         raise ValueError('Given date string not likely a datetime.')
+ 
++    parsed, reso = _parse_delimited_date(date_string, dayfirst)
++    if parsed is not None:
++        return parsed, parsed, reso
++
+     try:
+         return _parse_dateabbr_string(date_string, _DEFAULT_DATETIME, freq)
+     except DateParseError:
+@@ -279,7 +387,7 @@ cdef inline object _parse_dateabbr_string(object date_string, object default,
+         except ValueError:
+             pass
+ 
+-    for pat in ['%Y-%m', '%m-%Y', '%b %Y', '%b-%Y']:
++    for pat in ['%Y-%m', '%b %Y', '%b-%Y']:
+         try:
+             ret = datetime.strptime(date_string, pat)
+             return ret, ret, 'month'
+diff --git a/pandas/tests/io/parser/test_parse_dates.py b/pandas/tests/io/parser/test_parse_dates.py
+index 1da0b60fc..f523b2910 100644
+--- a/pandas/tests/io/parser/test_parse_dates.py
++++ b/pandas/tests/io/parser/test_parse_dates.py
+@@ -8,14 +8,16 @@ parsers defined in parsers.py
+ from datetime import date, datetime
+ from io import StringIO
+ 
+-from dateutil.parser import parse
++from dateutil.parser import parse as du_parse
++from hypothesis import given, settings, strategies as st
+ import numpy as np
+ import pytest
+ import pytz
+ 
+ from pandas._libs.tslib import Timestamp
+ from pandas._libs.tslibs import parsing
+-from pandas.compat import lrange
++from pandas._libs.tslibs.parsing import parse_datetime_string
++from pandas.compat import is_platform_windows, lrange
+ from pandas.compat.numpy import np_array_datetime64_compat
+ 
+ import pandas as pd
+@@ -26,6 +28,15 @@ import pandas.util.testing as tm
+ import pandas.io.date_converters as conv
+ import pandas.io.parsers as parsers
+ 
++# constant
++_DEFAULT_DATETIME = datetime(1, 1, 1)
++
++# Strategy for hypothesis
++if is_platform_windows():
++    date_strategy = st.datetimes(min_value=datetime(1900, 1, 1))
++else:
++    date_strategy = st.datetimes()
++
+ 
+ def test_separator_date_conflict(all_parsers):
+     # Regression test for gh-4678
+@@ -439,7 +450,7 @@ def test_parse_dates_custom_euro_format(all_parsers, kwargs):
+ """
+     if "dayfirst" in kwargs:
+         df = parser.read_csv(StringIO(data), names=["time", "Q", "NTU"],
+-                             date_parser=lambda d: parse(d, **kwargs),
++                             date_parser=lambda d: du_parse(d, **kwargs),
+                              header=0, index_col=0, parse_dates=True,
+                              na_values=["NA"])
+         exp_index = Index([datetime(2010, 1, 31), datetime(2010, 2, 1),
+@@ -451,7 +462,7 @@ def test_parse_dates_custom_euro_format(all_parsers, kwargs):
+         msg = "got an unexpected keyword argument 'day_first'"
+         with pytest.raises(TypeError, match=msg):
+             parser.read_csv(StringIO(data), names=["time", "Q", "NTU"],
+-                            date_parser=lambda d: parse(d, **kwargs),
++                            date_parser=lambda d: du_parse(d, **kwargs),
+                             skiprows=[0], index_col=0, parse_dates=True,
+                             na_values=["NA"])
+ 
+@@ -849,3 +860,82 @@ def test_parse_timezone(all_parsers):
+ 
+     expected = DataFrame(expected_data)
+     tm.assert_frame_equal(result, expected)
++
++
++@pytest.mark.parametrize("date_string", [
++    "32/32/2019",
++    "02/30/2019",
++    "13/13/2019",
++    "13/2019",
++    "a3/11/2018",
++    "10/11/2o17"
++])
++def test_invalid_parse_delimited_date(all_parsers, date_string):
++    parser = all_parsers
++    expected = DataFrame({0: [date_string]}, dtype="object")
++    result = parser.read_csv(StringIO(date_string),
++                             header=None, parse_dates=[0])
++    tm.assert_frame_equal(result, expected)
++
++
++@pytest.mark.parametrize("date_string,dayfirst,expected", [
++    # %d/%m/%Y; month > 12 thus replacement
++    ("13/02/2019", False, datetime(2019, 2, 13)),
++    ("13/02/2019", True, datetime(2019, 2, 13)),
++    # %m/%d/%Y; day > 12 thus there will be no replacement
++    ("02/13/2019", False, datetime(2019, 2, 13)),
++    ("02/13/2019", True, datetime(2019, 2, 13)),
++    # %d/%m/%Y; dayfirst==True thus replacement
++    ("04/02/2019", True, datetime(2019, 2, 4))
++])
++def test_parse_delimited_date_swap(all_parsers, date_string,
++                                   dayfirst, expected):
++    parser = all_parsers
++    expected = DataFrame({0: [expected]}, dtype="datetime64[ns]")
++    result = parser.read_csv(StringIO(date_string), header=None,
++                             dayfirst=dayfirst, parse_dates=[0])
++    tm.assert_frame_equal(result, expected)
++
++
++def _helper_hypothesis_delimited_date(call, date_string, **kwargs):
++    msg, result = None, None
++    try:
++        result = call(date_string, **kwargs)
++    except ValueError as er:
++        msg = str(er)
++        pass
++    return msg, result
++
++
++@given(date_strategy)
++@settings(deadline=None)
++@pytest.mark.parametrize("delimiter", list(" -./"))
++@pytest.mark.parametrize("dayfirst", [True, False])
++@pytest.mark.parametrize("date_format", [
++    "%d %m %Y",
++    "%m %d %Y",
++    "%m %Y",
++    "%Y %m %d",
++    "%y %m %d",
++    "%Y%m%d",
++    "%y%m%d",
++])
++def test_hypothesis_delimited_date(date_format, dayfirst,
++                                   delimiter, test_datetime):
++    if date_format == "%m %Y" and delimiter == ".":
++        pytest.skip("parse_datetime_string cannot reliably tell whether \
++        e.g. %m.%Y is a float or a date, thus we skip it")
++    result, expected = None, None
++    except_in_dateutil, except_out_dateutil = None, None
++    date_string = test_datetime.strftime(date_format.replace(' ', delimiter))
++
++    except_out_dateutil, result = _helper_hypothesis_delimited_date(
++        parse_datetime_string, date_string,
++        dayfirst=dayfirst)
++    except_in_dateutil, expected = _helper_hypothesis_delimited_date(
++        du_parse, date_string,
++        default=_DEFAULT_DATETIME,
++        dayfirst=dayfirst, yearfirst=False)
++
++    assert except_out_dateutil == except_in_dateutil
++    assert result == expected

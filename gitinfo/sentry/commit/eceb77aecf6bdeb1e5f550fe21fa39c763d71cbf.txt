@@ -1,0 +1,379 @@
+commit eceb77aecf6bdeb1e5f550fe21fa39c763d71cbf
+Author: Mark Story <mark@sentry.io>
+Date:   Tue Aug 20 10:13:20 2019 -0400
+
+    feat(discover2) Enable events-stats to be fetched for any aggregate  (#14414)
+    
+    In the near future we want to be able to generate timeseries data for
+    any user provided aggregate. This enables that without breaking
+    compatibility with the eventsv1 field names.
+    
+    Use transform_aliases in event stats endpoint.  We're
+    working towards having raw_query() in fewer places so that
+    column translation is done in fewer places, and internals can be more
+    consistent.
+    
+    Refs SEN-805
+
+diff --git a/src/sentry/api/endpoints/organization_events_stats.py b/src/sentry/api/endpoints/organization_events_stats.py
+index 0e9ae8ca4d..c424e6b6a4 100644
+--- a/src/sentry/api/endpoints/organization_events_stats.py
++++ b/src/sentry/api/endpoints/organization_events_stats.py
+@@ -1,40 +1,41 @@
+ from __future__ import absolute_import
+ 
++import six
++
+ from datetime import timedelta
+ from rest_framework.response import Response
++from rest_framework.exceptions import ParseError
+ 
++from sentry import features
+ from sentry.api.bases import OrganizationEventsEndpointBase, OrganizationEventsError, NoProjects
++from sentry.api.event_search import resolve_field_list, InvalidSearchQuery
+ from sentry.api.serializers.snuba import SnubaTSResultSerializer
+ from sentry.utils.dates import parse_stats_period
+-from sentry.utils.snuba import raw_query, SnubaTSResult
++from sentry.utils import snuba
+ 
+ 
+ class OrganizationEventsStatsEndpoint(OrganizationEventsEndpointBase):
+     def get(self, request, organization):
+         try:
+-            snuba_args = self.get_snuba_query_args_legacy(request, organization)
++            if features.has("organizations:events-v2", organization, actor=request.user):
++                params = self.get_filter_params(request, organization)
++                snuba_args = self.get_snuba_query_args(request, organization, params)
++            else:
++                snuba_args = self.get_snuba_query_args_legacy(request, organization)
+         except OrganizationEventsError as exc:
+-            return Response({"detail": exc.message}, status=400)
++            raise ParseError(detail=six.text_type(exc))
+         except NoProjects:
+             return Response({"data": []})
+ 
+         interval = parse_stats_period(request.GET.get("interval", "1h"))
+         if interval is None:
+             interval = timedelta(hours=1)
+-
+         rollup = int(interval.total_seconds())
+ 
+-        y_axis = request.GET.get("yAxis", None)
+-        if not y_axis or y_axis == "event_count":
+-            aggregations = [("count()", "", "count")]
+-        elif y_axis == "user_count":
+-            aggregations = [("uniq", "tags[sentry:user]", "count")]
+-            snuba_args["filter_keys"]["tags_key"] = ["sentry:user"]
+-        else:
+-            return Response({"detail": "Param yAxis value %s not recognized." % y_axis}, status=400)
++        snuba_args = self.get_field(request, snuba_args)
+ 
+-        result = raw_query(
+-            aggregations=aggregations,
++        result = snuba.transform_aliases_and_query(
++            skip_conditions=True,
+             orderby="time",
+             groupby=["time"],
+             rollup=rollup,
+@@ -42,11 +43,28 @@ class OrganizationEventsStatsEndpoint(OrganizationEventsEndpointBase):
+             limit=10000,
+             **snuba_args
+         )
+-
+         serializer = SnubaTSResultSerializer(organization, None, request.user)
+         return Response(
+             serializer.serialize(
+-                SnubaTSResult(result, snuba_args["start"], snuba_args["end"], rollup)
++                snuba.SnubaTSResult(result, snuba_args["start"], snuba_args["end"], rollup)
+             ),
+             status=200,
+         )
++
++    def get_field(self, request, snuba_args):
++        y_axis = request.GET.get("yAxis", None)
++        # These aliases are used by v1 of events.
++        if not y_axis or y_axis == "event_count":
++            y_axis = "count()"
++        elif y_axis == "user_count":
++            y_axis = "count_unique(user)"
++
++        try:
++            resolved = resolve_field_list([y_axis], {})
++        except InvalidSearchQuery as err:
++            raise ParseError(detail=six.text_type(err))
++        aggregate = resolved["aggregations"][0]
++        aggregate[2] = "count"
++        snuba_args["aggregations"] = [aggregate]
++
++        return snuba_args
+diff --git a/src/sentry/api/event_search.py b/src/sentry/api/event_search.py
+index 8237215217..91f75b81c3 100644
+--- a/src/sentry/api/event_search.py
++++ b/src/sentry/api/event_search.py
+@@ -667,11 +667,11 @@ FIELD_ALIASES = {
+ VALID_AGGREGATES = {
+     "count_unique": {"snuba_name": "uniq", "fields": "*"},
+     "count": {"snuba_name": "count", "fields": "*"},
+-    "avg": {"snuba_name": "avg", "fields": ["duration"]},
+     "min": {"snuba_name": "min", "fields": ["timestamp", "duration"]},
+     "max": {"snuba_name": "max", "fields": ["timestamp", "duration"]},
+     "sum": {"snuba_name": "sum", "fields": ["duration"]},
+-    # This doesn't work yet, but is an illustration of how it could work
++    # These don't entirely work yet but are intended to be illustrative
++    "avg": {"snuba_name": "avg", "fields": ["duration"]},
+     "p75": {"snuba_name": "quantileTiming(0.75)", "fields": ["duration"]},
+ }
+ 
+@@ -719,7 +719,8 @@ def resolve_orderby(orderby, fields, aggregations):
+ 
+ 
+ def get_aggregate_alias(match):
+-    return u"{}_{}".format(match.group("function"), match.group("column")).rstrip("_")
++    column = match.group("column").replace(".", "_")
++    return u"{}_{}".format(match.group("function"), column).rstrip("_")
+ 
+ 
+ def resolve_field_list(fields, snuba_args):
+diff --git a/src/sentry/api/serializers/snuba.py b/src/sentry/api/serializers/snuba.py
+index 7e0ace54f6..f314f3df8f 100644
+--- a/src/sentry/api/serializers/snuba.py
++++ b/src/sentry/api/serializers/snuba.py
+@@ -303,7 +303,7 @@ class SnubaTSResultSerializer(BaseSnubaSerializer):
+         for k, v in data:
+             row = []
+             for r in v:
+-                item = {"count": r["count"]}
++                item = {"count": r.get("count", 0)}
+                 if self.lookup:
+                     value = value_from_row(r, self.lookup.columns)
+                     item[self.lookup.name] = (attrs.get(value),)
+diff --git a/src/sentry/utils/snuba.py b/src/sentry/utils/snuba.py
+index 340028b0f3..d062182796 100644
+--- a/src/sentry/utils/snuba.py
++++ b/src/sentry/utils/snuba.py
+@@ -452,9 +452,10 @@ def transform_aliases_and_query(skip_conditions=False, **kwargs):
+         derived_columns.add(aggregation[2])
+         aggregation[1] = get_snuba_column_name(aggregation[1])
+ 
+-    for (col, _value) in six.iteritems(filter_keys):
+-        name = get_snuba_column_name(col)
+-        filter_keys[name] = filter_keys.pop(col)
++    if not skip_conditions:
++        for (col, _value) in six.iteritems(filter_keys):
++            name = get_snuba_column_name(col)
++            filter_keys[name] = filter_keys.pop(col)
+ 
+     def handle_condition(cond):
+         if isinstance(cond, (list, tuple)) and len(cond):
+diff --git a/tests/sentry/api/test_event_search.py b/tests/sentry/api/test_event_search.py
+index 18df877ce3..c58c9c1914 100644
+--- a/tests/sentry/api/test_event_search.py
++++ b/tests/sentry/api/test_event_search.py
+@@ -1128,19 +1128,28 @@ class ResolveFieldListTest(unittest.TestCase):
+         ]
+ 
+     def test_aggregate_function_expansion(self):
+-        fields = ["count_unique(user)", "count(id)", "avg(duration)"]
++        fields = ["count_unique(user)", "count(id)", "min(timestamp)"]
+         result = resolve_field_list(fields, {})
+         # Automatic fields should be inserted
+         assert result["selected_columns"] == []
+         assert result["aggregations"] == [
+             ["uniq", "user", "count_unique_user"],
+             ["count", "id", "count_id"],
+-            ["avg", "duration", "avg_duration"],
++            ["min", "timestamp", "min_timestamp"],
+             ["argMax(event_id, timestamp)", "", "latest_event"],
+             ["argMax(project_id, timestamp)", "", "projectid"],
+         ]
+         assert result["groupby"] == []
+ 
++    def test_aggregate_function_dotted_argument(self):
++        fields = ["count_unique(user.id)"]
++        result = resolve_field_list(fields, {})
++        assert result["aggregations"] == [
++            ["uniq", "user.id", "count_unique_user_id"],
++            ["argMax(event_id, timestamp)", "", "latest_event"],
++            ["argMax(project_id, timestamp)", "", "projectid"],
++        ]
++
+     def test_aggregate_function_invalid_name(self):
+         with pytest.raises(InvalidSearchQuery) as err:
+             fields = ["derp(user)"]
+diff --git a/tests/sentry/utils/test_snuba.py b/tests/sentry/utils/test_snuba.py
+index 5ef0f80184..b18126da90 100644
+--- a/tests/sentry/utils/test_snuba.py
++++ b/tests/sentry/utils/test_snuba.py
+@@ -5,7 +5,7 @@ import pytz
+ 
+ from sentry.models import GroupRelease, Release
+ from sentry.testutils import TestCase
+-from sentry.utils.snuba import get_snuba_translators, zerofill, get_json_type
++from sentry.utils.snuba import get_snuba_translators, zerofill, get_json_type, get_snuba_column_name
+ 
+ 
+ class SnubaUtilsTest(TestCase):
+@@ -158,3 +158,13 @@ class SnubaUtilsTest(TestCase):
+         assert get_json_type("Char") == "string"
+         assert get_json_type("unknown") == "string"
+         assert get_json_type("") == "string"
++
++    def test_get_snuba_column_name(self):
++        assert get_snuba_column_name("project_id") == "project_id"
++        assert get_snuba_column_name("start") == "start"
++        assert get_snuba_column_name("'thing'") == "'thing'"
++        assert get_snuba_column_name("id") == "event_id"
++        assert get_snuba_column_name("geo.region") == "geo_region"
++        # This is odd behavior but captures what we do currently.
++        assert get_snuba_column_name("tags[sentry:user]") == "tags[tags[sentry:user]]"
++        assert get_snuba_column_name("organization") == "tags[organization]"
+diff --git a/tests/snuba/api/endpoints/test_organization_events_stats.py b/tests/snuba/api/endpoints/test_organization_events_stats.py
+index 152e165486..a027f6dca6 100644
+--- a/tests/snuba/api/endpoints/test_organization_events_stats.py
++++ b/tests/snuba/api/endpoints/test_organization_events_stats.py
+@@ -45,16 +45,16 @@ class OrganizationEventsStatsEndpointTest(APITestCase, SnubaTestCase):
+             datetime=self.day_ago + timedelta(hours=1, minutes=2),
+             tags={"sentry:user": self.user2.email},
+         )
+-
+-    def test_simple(self):
+-        url = reverse(
++        self.url = reverse(
+             "sentry-api-0-organization-events-stats",
+             kwargs={"organization_slug": self.project.organization.slug},
+         )
++
++    def test_simple(self):
+         response = self.client.get(
+             "%s?%s"
+             % (
+-                url,
++                self.url,
+                 urlencode(
+                     {
+                         "start": self.day_ago.isoformat()[:19],
+@@ -86,12 +86,8 @@ class OrganizationEventsStatsEndpointTest(APITestCase, SnubaTestCase):
+         assert len(response.data["data"]) == 0
+ 
+     def test_groupid_filter(self):
+-        url = reverse(
+-            "sentry-api-0-organization-events-stats",
+-            kwargs={"organization_slug": self.organization.slug},
+-        )
+         url = "%s?%s" % (
+-            url,
++            self.url,
+             urlencode(
+                 {
+                     "start": self.day_ago.isoformat()[:19],
+@@ -107,11 +103,7 @@ class OrganizationEventsStatsEndpointTest(APITestCase, SnubaTestCase):
+         assert len(response.data["data"])
+ 
+     def test_groupid_filter_invalid_value(self):
+-        url = reverse(
+-            "sentry-api-0-organization-events-stats",
+-            kwargs={"organization_slug": self.organization.slug},
+-        )
+-        url = "%s?group=not-a-number" % (url,)
++        url = "%s?group=not-a-number" % (self.url,)
+         response = self.client.get(url, format="json")
+ 
+         assert response.status_code == 400, response.content
+@@ -123,14 +115,10 @@ class OrganizationEventsStatsEndpointTest(APITestCase, SnubaTestCase):
+             datetime=self.day_ago + timedelta(minutes=2),
+             tags={"sentry:user": self.user2.email},
+         )
+-        url = reverse(
+-            "sentry-api-0-organization-events-stats",
+-            kwargs={"organization_slug": self.project.organization.slug},
+-        )
+         response = self.client.get(
+             "%s?%s"
+             % (
+-                url,
++                self.url,
+                 urlencode(
+                     {
+                         "start": self.day_ago.isoformat()[:19],
+@@ -142,9 +130,7 @@ class OrganizationEventsStatsEndpointTest(APITestCase, SnubaTestCase):
+             ),
+             format="json",
+         )
+-
+         assert response.status_code == 200, response.content
+-
+         assert [attrs for time, attrs in response.data["data"]] == [
+             [],
+             [{"count": 2}],
+@@ -152,14 +138,10 @@ class OrganizationEventsStatsEndpointTest(APITestCase, SnubaTestCase):
+         ]
+ 
+     def test_with_event_count_flag(self):
+-        url = reverse(
+-            "sentry-api-0-organization-events-stats",
+-            kwargs={"organization_slug": self.project.organization.slug},
+-        )
+         response = self.client.get(
+             "%s?%s"
+             % (
+-                url,
++                self.url,
+                 urlencode(
+                     {
+                         "start": self.day_ago.isoformat()[:19],
+@@ -178,3 +160,55 @@ class OrganizationEventsStatsEndpointTest(APITestCase, SnubaTestCase):
+             [{"count": 1}],
+             [{"count": 2}],
+         ]
++
++    def test_aggregate_function_count(self):
++        with self.feature("organizations:events-v2"):
++            response = self.client.get(
++                self.url,
++                format="json",
++                data={
++                    "start": self.day_ago.isoformat()[:19],
++                    "end": (self.day_ago + timedelta(hours=1, minutes=59)).isoformat()[:19],
++                    "interval": "1h",
++                    "yAxis": "count()",
++                },
++            )
++        assert response.status_code == 200, response.content
++        assert [attrs for time, attrs in response.data["data"]] == [
++            [],
++            [{"count": 1}],
++            [{"count": 2}],
++        ]
++
++    def test_aggregate_function_user_count(self):
++        with self.feature("organizations:events-v2"):
++            response = self.client.get(
++                self.url,
++                format="json",
++                data={
++                    "start": self.day_ago.isoformat()[:19],
++                    "end": (self.day_ago + timedelta(hours=1, minutes=59)).isoformat()[:19],
++                    "interval": "1h",
++                    "yAxis": "count_unique(user)",
++                },
++            )
++        assert response.status_code == 200, response.content
++        assert [attrs for time, attrs in response.data["data"]] == [
++            [],
++            [{"count": 1}],
++            [{"count": 1}],
++        ]
++
++    def test_aggregate_invalid(self):
++        with self.feature("organizations:events-v2"):
++            response = self.client.get(
++                self.url,
++                format="json",
++                data={
++                    "start": self.day_ago.isoformat()[:19],
++                    "end": (self.day_ago + timedelta(hours=1, minutes=59)).isoformat()[:19],
++                    "interval": "1h",
++                    "yAxis": "nope(lol)",
++                },
++            )
++        assert response.status_code == 400, response.content

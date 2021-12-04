@@ -1,0 +1,759 @@
+commit 023c5167fd601dc3873295688d04958b026beffe
+Author: Sam Doran <sdoran@redhat.com>
+Date:   Thu Mar 28 13:19:49 2019 -0400
+
+    Revert "Use locking for concurrent file access (#52567)" (#54547)
+    
+    This reverts commit e152b277cfc055a3b7bfdaa41db024168ca7a2a8.
+
+diff --git a/changelogs/fragments/30413-lineinfile-concurrence_issue.yaml b/changelogs/fragments/30413-lineinfile-concurrence_issue.yaml
+deleted file mode 100644
+index 8982aa51bc..0000000000
+--- a/changelogs/fragments/30413-lineinfile-concurrence_issue.yaml
++++ /dev/null
+@@ -1,3 +0,0 @@
+-bugfixes:
+-- change file locking implementation from a class to context manager to allow easy and safe concurrent file access by modules
+-- lineinfile - lock on concurrent file access (https://github.com/ansible/ansible/issues/30413)
+diff --git a/lib/ansible/module_utils/common/file.py b/lib/ansible/module_utils/common/file.py
+index 3acd632faa..9703ea782e 100644
+--- a/lib/ansible/module_utils/common/file.py
++++ b/lib/ansible/module_utils/common/file.py
+@@ -1,21 +1,24 @@
+-# -*- coding: utf-8 -*-
+-
+-# Copyright: (c) 2018, Ansible Project
++# Copyright (c) 2018, Ansible Project
+ # Simplified BSD License (see licenses/simplified_bsd.txt or https://opensource.org/licenses/BSD-2-Clause)
+ 
+ from __future__ import (absolute_import, division, print_function)
+ __metaclass__ = type
+ 
+-import fcntl
++import errno
+ import os
+-import re
+ import stat
+-import sys
++import re
++import pwd
++import grp
+ import time
++import shutil
++import traceback
++import fcntl
++import sys
+ 
+ from contextlib import contextmanager
+-from ansible.module_utils._text import to_bytes
+-from ansible.module_utils.six import PY3
++from ansible.module_utils._text import to_bytes, to_native, to_text
++from ansible.module_utils.six import b, binary_type
+ 
+ try:
+     import selinux
+@@ -59,13 +62,6 @@ _EXEC_PERM_BITS = 0o0111     # execute permission bits
+ _DEFAULT_PERM = 0o0666       # default file permission bits
+ 
+ 
+-# Ensure we use flock on e.g. FreeBSD, MacOSX and Solaris
+-if sys.platform.startswith('linux'):
+-    filelock = fcntl.lockf
+-else:
+-    filelock = fcntl.flock
+-
+-
+ def is_executable(path):
+     # This function's signature needs to be repeated
+     # as the first line of its docstring.
+@@ -118,88 +114,89 @@ class LockTimeout(Exception):
+     pass
+ 
+ 
+-# NOTE: Using the open_locked() context manager it is absolutely mandatory
+-#       to not open or close the same file within the existing context.
+-#       It is essential to reuse the returned file descriptor only.
+-@contextmanager
+-def open_locked(path, check_mode=False, lock_timeout=15):
+-    '''
+-    Context managed for opening files with lock acquisition
+-
+-    :kw path: Path (file) to lock
+-    :kw lock_timeout:
+-        Wait n seconds for lock acquisition, fail if timeout is reached.
+-        0 = Do not wait, fail if lock cannot be acquired immediately,
+-        Less than 0 or None = wait indefinitely until lock is released
+-        Default is wait 15s.
+-    :returns: file descriptor
+-    '''
+-    if check_mode:
+-        b_path = to_bytes(path, errors='surrogate_or_strict')
+-        fd = open(b_path, 'ab+')
+-        fd.seek(0)  # Due to a difference in behavior between PY2 and PY3 we need to seek(0) on PY3
+-    else:
+-        fd = lock(path, check_mode, lock_timeout)
+-    yield fd
+-    fd.close()
+-
+-
+-def lock(path, check_mode=False, lock_timeout=15):
+-    '''
+-    Set lock on given path via fcntl.flock(), note that using
+-    locks does not guarantee exclusiveness unless all accessing
+-    processes honor locks.
+-
+-    :kw path: Path (file) to lock
+-    :kw lock_timeout:
+-        Wait n seconds for lock acquisition, fail if timeout is reached.
+-        0 = Do not wait, fail if lock cannot be acquired immediately,
+-        Less than 0 or None = wait indefinitely until lock is released
+-        Default is wait 15s.
+-    :returns: file descriptor
++class FileLock:
+     '''
+-    b_path = to_bytes(path, errors='surrogate_or_strict')
+-    wait = 0.1
+-
+-    lock_exception = IOError
+-    if PY3:
+-        lock_exception = OSError
+-
+-    if not os.path.exists(b_path):
+-        raise IOError('{0} does not exist'.format(path))
+-
+-    if lock_timeout is None or lock_timeout < 0:
+-        fd = open(b_path, 'ab+')
+-        fd.seek(0)  # Due to a difference in behavior between PY2 and PY3 we need to seek(0) on PY3
+-        filelock(fd, fcntl.LOCK_EX)
+-        return fd
+-
+-    if lock_timeout >= 0:
+-        total_wait = 0
+-        while total_wait <= lock_timeout:
+-            fd = open(b_path, 'ab+')
+-            fd.seek(0)  # Due to a difference in behavior between PY2 and PY3 we need to seek(0) on PY3
+-            try:
+-                filelock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+-                return fd
+-            except lock_exception:
+-                fd.close()
+-                time.sleep(wait)
+-                total_wait += wait
+-                continue
+-
+-        fd.close()
+-        raise LockTimeout('Waited {0} seconds for lock on {1}'.format(total_wait, path))
+-
+-
+-def unlock(fd):
+-    '''
+-    Make sure lock file is available for everyone and Unlock the file descriptor
+-    locked by set_lock
+-
+-    :kw fd: File descriptor of file to unlock
++    Currently FileLock is implemented via fcntl.flock on a lock file, however this
++    behaviour may change in the future. Avoid mixing lock types fcntl.flock,
++    fcntl.lockf and module_utils.common.file.FileLock as it will certainly cause
++    unwanted and/or unexpected behaviour
+     '''
+-    try:
+-        filelock(fd, fcntl.LOCK_UN)
+-    except ValueError:  # File was not opened, let context manager fail gracefully
+-        pass
++    def __init__(self):
++        self.lockfd = None
++
++    @contextmanager
++    def lock_file(self, path, tmpdir, lock_timeout=None):
++        '''
++        Context for lock acquisition
++        '''
++        try:
++            self.set_lock(path, tmpdir, lock_timeout)
++            yield
++        finally:
++            self.unlock()
++
++    def set_lock(self, path, tmpdir, lock_timeout=None):
++        '''
++        Create a lock file based on path with flock to prevent other processes
++        using given path.
++        Please note that currently file locking only works when it's executed by
++        the same user, I.E single user scenarios
++
++        :kw path: Path (file) to lock
++        :kw tmpdir: Path where to place the temporary .lock file
++        :kw lock_timeout:
++            Wait n seconds for lock acquisition, fail if timeout is reached.
++            0 = Do not wait, fail if lock cannot be acquired immediately,
++            Default is None, wait indefinitely until lock is released.
++        :returns: True
++        '''
++        lock_path = os.path.join(tmpdir, 'ansible-{0}.lock'.format(os.path.basename(path)))
++        l_wait = 0.1
++        r_exception = IOError
++        if sys.version_info[0] == 3:
++            r_exception = BlockingIOError
++
++        self.lockfd = open(lock_path, 'w')
++
++        if lock_timeout <= 0:
++            fcntl.flock(self.lockfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
++            os.chmod(lock_path, stat.S_IWRITE | stat.S_IREAD)
++            return True
++
++        if lock_timeout:
++            e_secs = 0
++            while e_secs < lock_timeout:
++                try:
++                    fcntl.flock(self.lockfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
++                    os.chmod(lock_path, stat.S_IWRITE | stat.S_IREAD)
++                    return True
++                except r_exception:
++                    time.sleep(l_wait)
++                    e_secs += l_wait
++                    continue
++
++            self.lockfd.close()
++            raise LockTimeout('{0} sec'.format(lock_timeout))
++
++        fcntl.flock(self.lockfd, fcntl.LOCK_EX)
++        os.chmod(lock_path, stat.S_IWRITE | stat.S_IREAD)
++
++        return True
++
++    def unlock(self):
++        '''
++        Make sure lock file is available for everyone and Unlock the file descriptor
++        locked by set_lock
++
++        :returns: True
++        '''
++        if not self.lockfd:
++            return True
++
++        try:
++            fcntl.flock(self.lockfd, fcntl.LOCK_UN)
++            self.lockfd.close()
++        except ValueError:  # file wasn't opened, let context manager fail gracefully
++            pass
++
++        return True
+diff --git a/lib/ansible/modules/files/lineinfile.py b/lib/ansible/modules/files/lineinfile.py
+index a4f43e0a29..1283d33e5d 100644
+--- a/lib/ansible/modules/files/lineinfile.py
++++ b/lib/ansible/modules/files/lineinfile.py
+@@ -184,13 +184,6 @@ EXAMPLES = r'''
+     line: 192.168.1.99 foo.lab.net foo
+     create: yes
+ 
+-# Fully quoted because of the ': ' on the line. See the Gotchas in the YAML docs.
+-- lineinfile:
+-    path: /etc/sudoers
+-    state: present
+-    regexp: '^%wheel\s'
+-    line: '%wheel ALL=(ALL) NOPASSWD: ALL'
+-
+ # NOTE: Yaml requires escaping backslashes in double quotes but not in single quotes
+ - name: Ensure the JBoss memory settings are exactly as needed
+   lineinfile:
+@@ -215,7 +208,6 @@ import tempfile
+ 
+ # import module snippets
+ from ansible.module_utils.basic import AnsibleModule
+-from ansible.module_utils.common.file import open_locked
+ from ansible.module_utils.six import b
+ from ansible.module_utils._text import to_bytes, to_native
+ 
+@@ -273,148 +265,141 @@ def present(module, dest, regexp, line, insertafter, insertbefore, create,
+                 os.makedirs(b_destpath)
+             except Exception as e:
+                 module.fail_json(msg='Error creating %s Error code: %s Error description: %s' % (b_destpath, e[0], e[1]))
+-        # destination must exist to be able to lock it
+-        if not module.check_mode:
+-            open(b_dest, 'ab').close()
+ 
+         b_lines = []
+     else:
+-        b_lines = None
++        with open(b_dest, 'rb') as f:
++            b_lines = f.readlines()
+ 
+-    # NOTE: Avoid opening the same file in this context !
+-    with open_locked(dest, module.check_mode) as fd:
+-        if b_lines is None:
+-            b_lines = fd.readlines()
++    if module._diff:
++        diff['before'] = to_native(b('').join(b_lines))
+ 
+-        if module._diff:
+-            diff['before'] = to_native(b('').join(b_lines))
++    if regexp is not None:
++        bre_m = re.compile(to_bytes(regexp, errors='surrogate_or_strict'))
+ 
++    if insertafter not in (None, 'BOF', 'EOF'):
++        bre_ins = re.compile(to_bytes(insertafter, errors='surrogate_or_strict'))
++    elif insertbefore not in (None, 'BOF'):
++        bre_ins = re.compile(to_bytes(insertbefore, errors='surrogate_or_strict'))
++    else:
++        bre_ins = None
++
++    # index[0] is the line num where regexp has been found
++    # index[1] is the line num where insertafter/inserbefore has been found
++    index = [-1, -1]
++    m = None
++    b_line = to_bytes(line, errors='surrogate_or_strict')
++    for lineno, b_cur_line in enumerate(b_lines):
+         if regexp is not None:
+-            bre_m = re.compile(to_bytes(regexp, errors='surrogate_or_strict'))
++            match_found = bre_m.search(b_cur_line)
++        else:
++            match_found = b_line == b_cur_line.rstrip(b('\r\n'))
++        if match_found:
++            index[0] = lineno
++            m = match_found
++        elif bre_ins is not None and bre_ins.search(b_cur_line):
++            if insertafter:
++                # + 1 for the next line
++                index[1] = lineno + 1
++                if firstmatch:
++                    break
++            if insertbefore:
++                # index[1] for the previous line
++                index[1] = lineno
++                if firstmatch:
++                    break
+ 
+-        if insertafter not in (None, 'BOF', 'EOF'):
+-            bre_ins = re.compile(to_bytes(insertafter, errors='surrogate_or_strict'))
+-        elif insertbefore not in (None, 'BOF'):
+-            bre_ins = re.compile(to_bytes(insertbefore, errors='surrogate_or_strict'))
++    msg = ''
++    changed = False
++    b_linesep = to_bytes(os.linesep, errors='surrogate_or_strict')
++    # Exact line or Regexp matched a line in the file
++    if index[0] != -1:
++        if backrefs:
++            b_new_line = m.expand(b_line)
+         else:
+-            bre_ins = None
+-
+-        # index[0] is the line num where regexp has been found
+-        # index[1] is the line num where insertafter/inserbefore has been found
+-        index = [-1, -1]
+-        m = None
+-        b_line = to_bytes(line, errors='surrogate_or_strict')
+-        for lineno, b_cur_line in enumerate(b_lines):
+-            if regexp is not None:
+-                match_found = bre_m.search(b_cur_line)
+-            else:
+-                match_found = b_line == b_cur_line.rstrip(b('\r\n'))
+-            if match_found:
+-                index[0] = lineno
+-                m = match_found
+-            elif bre_ins is not None and bre_ins.search(b_cur_line):
+-                if insertafter:
+-                    # + 1 for the next line
+-                    index[1] = lineno + 1
+-                    if firstmatch:
+-                        break
+-                if insertbefore:
+-                    # index[1] for the previous line
+-                    index[1] = lineno
+-                    if firstmatch:
+-                        break
+-
+-        msg = ''
+-        changed = False
+-        b_linesep = to_bytes(os.linesep, errors='surrogate_or_strict')
+-        # Exact line or Regexp matched a line in the file
+-        if index[0] != -1:
+-            if backrefs:
+-                b_new_line = m.expand(b_line)
+-            else:
+-                # Don't do backref expansion if not asked.
+-                b_new_line = b_line
+-
+-            if not b_new_line.endswith(b_linesep):
+-                b_new_line += b_linesep
+-
+-            # If no regexp was given and no line match is found anywhere in the file,
+-            # insert the line appropriately if using insertbefore or insertafter
+-            if regexp is None and m is None:
+-
+-                # Insert lines
+-                if insertafter and insertafter != 'EOF':
+-                    # Ensure there is a line separator after the found string
+-                    # at the end of the file.
+-                    if b_lines and not b_lines[-1][-1:] in (b('\n'), b('\r')):
+-                        b_lines[-1] = b_lines[-1] + b_linesep
+-
+-                    # If the line to insert after is at the end of the file
+-                    # use the appropriate index value.
+-                    if len(b_lines) == index[1]:
+-                        if b_lines[index[1] - 1].rstrip(b('\r\n')) != b_line:
+-                            b_lines.append(b_line + b_linesep)
+-                            msg = 'line added'
+-                            changed = True
+-                    elif b_lines[index[1]].rstrip(b('\r\n')) != b_line:
+-                        b_lines.insert(index[1], b_line + b_linesep)
++            # Don't do backref expansion if not asked.
++            b_new_line = b_line
++
++        if not b_new_line.endswith(b_linesep):
++            b_new_line += b_linesep
++
++        # If no regexp was given and no line match is found anywhere in the file,
++        # insert the line appropriately if using insertbefore or insertafter
++        if regexp is None and m is None:
++
++            # Insert lines
++            if insertafter and insertafter != 'EOF':
++                # Ensure there is a line separator after the found string
++                # at the end of the file.
++                if b_lines and not b_lines[-1][-1:] in (b('\n'), b('\r')):
++                    b_lines[-1] = b_lines[-1] + b_linesep
++
++                # If the line to insert after is at the end of the file
++                # use the appropriate index value.
++                if len(b_lines) == index[1]:
++                    if b_lines[index[1] - 1].rstrip(b('\r\n')) != b_line:
++                        b_lines.append(b_line + b_linesep)
+                         msg = 'line added'
+                         changed = True
+-
+-                elif insertbefore and insertbefore != 'BOF':
+-                    # If the line to insert before is at the beginning of the file
+-                    # use the appropriate index value.
+-                    if index[1] <= 0:
+-                        if b_lines[index[1]].rstrip(b('\r\n')) != b_line:
+-                            b_lines.insert(index[1], b_line + b_linesep)
+-                            msg = 'line added'
+-                            changed = True
+-
+-                    elif b_lines[index[1] - 1].rstrip(b('\r\n')) != b_line:
++                elif b_lines[index[1]].rstrip(b('\r\n')) != b_line:
++                    b_lines.insert(index[1], b_line + b_linesep)
++                    msg = 'line added'
++                    changed = True
++
++            elif insertbefore and insertbefore != 'BOF':
++                # If the line to insert before is at the beginning of the file
++                # use the appropriate index value.
++                if index[1] <= 0:
++                    if b_lines[index[1]].rstrip(b('\r\n')) != b_line:
+                         b_lines.insert(index[1], b_line + b_linesep)
+                         msg = 'line added'
+                         changed = True
+ 
+-            elif b_lines[index[0]] != b_new_line:
+-                b_lines[index[0]] = b_new_line
+-                msg = 'line replaced'
+-                changed = True
+-
+-        elif backrefs:
+-            # Do absolutely nothing, since it's not safe generating the line
+-            # without the regexp matching to populate the backrefs.
+-            pass
+-        # Add it to the beginning of the file
+-        elif insertbefore == 'BOF' or insertafter == 'BOF':
+-            b_lines.insert(0, b_line + b_linesep)
+-            msg = 'line added'
++                elif b_lines[index[1] - 1].rstrip(b('\r\n')) != b_line:
++                    b_lines.insert(index[1], b_line + b_linesep)
++                    msg = 'line added'
++                    changed = True
++
++        elif b_lines[index[0]] != b_new_line:
++            b_lines[index[0]] = b_new_line
++            msg = 'line replaced'
+             changed = True
+-        # Add it to the end of the file if requested or
+-        # if insertafter/insertbefore didn't match anything
+-        # (so default behaviour is to add at the end)
+-        elif insertafter == 'EOF' or index[1] == -1:
+ 
+-            # If the file is not empty then ensure there's a newline before the added line
+-            if b_lines and not b_lines[-1][-1:] in (b('\n'), b('\r')):
+-                b_lines.append(b_linesep)
++    elif backrefs:
++        # Do absolutely nothing, since it's not safe generating the line
++        # without the regexp matching to populate the backrefs.
++        pass
++    # Add it to the beginning of the file
++    elif insertbefore == 'BOF' or insertafter == 'BOF':
++        b_lines.insert(0, b_line + b_linesep)
++        msg = 'line added'
++        changed = True
++    # Add it to the end of the file if requested or
++    # if insertafter/insertbefore didn't match anything
++    # (so default behaviour is to add at the end)
++    elif insertafter == 'EOF' or index[1] == -1:
+ 
+-            b_lines.append(b_line + b_linesep)
+-            msg = 'line added'
+-            changed = True
+-        # insert matched, but not the regexp
+-        else:
+-            b_lines.insert(index[1], b_line + b_linesep)
+-            msg = 'line added'
+-            changed = True
++        # If the file is not empty then ensure there's a newline before the added line
++        if b_lines and not b_lines[-1][-1:] in (b('\n'), b('\r')):
++            b_lines.append(b_linesep)
++
++        b_lines.append(b_line + b_linesep)
++        msg = 'line added'
++        changed = True
++    # insert matched, but not the regexp
++    else:
++        b_lines.insert(index[1], b_line + b_linesep)
++        msg = 'line added'
++        changed = True
+ 
+-        if module._diff:
+-            diff['after'] = to_native(b('').join(b_lines))
++    if module._diff:
++        diff['after'] = to_native(b('').join(b_lines))
+ 
+-        backupdest = ""
+-        if changed and not module.check_mode:
+-            if backup and os.path.exists(b_dest):
+-                backupdest = module.backup_local(dest)
+-            write_changes(module, b_lines, dest)
++    backupdest = ""
++    if changed and not module.check_mode:
++        if backup and os.path.exists(b_dest):
++            backupdest = module.backup_local(dest)
++        write_changes(module, b_lines, dest)
+ 
+     if module.check_mode and not os.path.exists(b_dest):
+         module.exit_json(changed=changed, msg=msg, backup=backupdest, diff=diff)
+@@ -441,39 +426,38 @@ def absent(module, dest, regexp, line, backup):
+             'before_header': '%s (content)' % dest,
+             'after_header': '%s (content)' % dest}
+ 
+-    # NOTE: Avoid opening the same file in this context !
+-    with open_locked(dest, module.check_mode) as fd:
+-        b_lines = fd.readlines()
++    with open(b_dest, 'rb') as f:
++        b_lines = f.readlines()
++
++    if module._diff:
++        diff['before'] = to_native(b('').join(b_lines))
+ 
+-        if module._diff:
+-            diff['before'] = to_native(b('').join(b_lines))
++    if regexp is not None:
++        bre_c = re.compile(to_bytes(regexp, errors='surrogate_or_strict'))
++    found = []
+ 
++    b_line = to_bytes(line, errors='surrogate_or_strict')
++
++    def matcher(b_cur_line):
+         if regexp is not None:
+-            bre_c = re.compile(to_bytes(regexp, errors='surrogate_or_strict'))
+-        found = []
+-
+-        b_line = to_bytes(line, errors='surrogate_or_strict')
+-
+-        def matcher(b_cur_line):
+-            if regexp is not None:
+-                match_found = bre_c.search(b_cur_line)
+-            else:
+-                match_found = b_line == b_cur_line.rstrip(b('\r\n'))
+-            if match_found:
+-                found.append(b_cur_line)
+-            return not match_found
+-
+-        b_lines = [l for l in b_lines if matcher(l)]
+-        changed = len(found) > 0
+-
+-        if module._diff:
+-            diff['after'] = to_native(b('').join(b_lines))
+-
+-        backupdest = ""
+-        if changed and not module.check_mode:
+-            if backup:
+-                backupdest = module.backup_local(dest)
+-            write_changes(module, b_lines, dest)
++            match_found = bre_c.search(b_cur_line)
++        else:
++            match_found = b_line == b_cur_line.rstrip(b('\r\n'))
++        if match_found:
++            found.append(b_cur_line)
++        return not match_found
++
++    b_lines = [l for l in b_lines if matcher(l)]
++    changed = len(found) > 0
++
++    if module._diff:
++        diff['after'] = to_native(b('').join(b_lines))
++
++    backupdest = ""
++    if changed and not module.check_mode:
++        if backup:
++            backupdest = module.backup_local(dest)
++        write_changes(module, b_lines, dest)
+ 
+     if changed:
+         msg = "%s line(s) removed" % len(found)
+diff --git a/lib/ansible/modules/system/known_hosts.py b/lib/ansible/modules/system/known_hosts.py
+index 5816a2cfd4..094fa48015 100644
+--- a/lib/ansible/modules/system/known_hosts.py
++++ b/lib/ansible/modules/system/known_hosts.py
+@@ -84,6 +84,7 @@ import re
+ import tempfile
+ 
+ from ansible.module_utils.basic import AnsibleModule
++from ansible.module_utils.common.file import FileLock
+ from ansible.module_utils._text import to_bytes, to_native
+ 
+ 
+diff --git a/test/integration/targets/file_lock/aliases b/test/integration/targets/file_lock/aliases
+deleted file mode 100644
+index 765b70da79..0000000000
+--- a/test/integration/targets/file_lock/aliases
++++ /dev/null
+@@ -1 +0,0 @@
+-shippable/posix/group2
+diff --git a/test/integration/targets/file_lock/inventory b/test/integration/targets/file_lock/inventory
+deleted file mode 100644
+index 7af5285404..0000000000
+--- a/test/integration/targets/file_lock/inventory
++++ /dev/null
+@@ -1,2 +0,0 @@
+-[lockhosts]
+-lockhost[00:99] ansible_connection=local ansible_python_interpreter="{{ ansible_playbook_python }}"
+diff --git a/test/integration/targets/file_lock/runme.sh b/test/integration/targets/file_lock/runme.sh
+deleted file mode 100755
+index e182da99f9..0000000000
+--- a/test/integration/targets/file_lock/runme.sh
++++ /dev/null
+@@ -1,6 +0,0 @@
+-#!/usr/bin/env bash
+-
+-set -eux
+-
+-ansible-playbook test_filelock.yml -i inventory --forks 10 --diff -v "$@"
+-ansible-playbook test_filelock_timeout.yml -i inventory --diff  -v "$@"
+diff --git a/test/integration/targets/file_lock/test_filelock.yml b/test/integration/targets/file_lock/test_filelock.yml
+deleted file mode 100644
+index 2de44234e4..0000000000
+--- a/test/integration/targets/file_lock/test_filelock.yml
++++ /dev/null
+@@ -1,45 +0,0 @@
+----
+-- hosts: lockhosts
+-  gather_facts: no
+-  vars:
+-    lockfile: ~/ansible_testing/lock.test
+-  tasks:
+-  - name: Remove lockfile
+-    file:
+-      path: '{{ lockfile }}'
+-      state: absent
+-    run_once: yes
+-
+-  - name: Write inventory_hostname to lockfile concurrently
+-    lineinfile:
+-      path: '{{ lockfile }}'
+-      line: '{{ inventory_hostname }}'
+-      create: yes
+-      state: present
+-
+-  - debug:
+-      msg: File {{ lockfile }} has {{ lines|length }} lines for {{ ansible_play_batch|length }} instances
+-    vars:
+-      lines: "{{ lookup('file', lockfile).split('\n') }}"
+-    run_once: yes
+-
+-  - name: Assert we get the expected number of lines
+-    assert:
+-      that:
+-      - lines|length == ansible_play_batch|length
+-    vars:
+-      lines: "{{ lookup('file', lockfile).split('\n') }}"
+-    run_once: yes
+-
+-  - name: Check lockfile for inventory_hostname entries
+-    lineinfile:
+-      path: '{{ lockfile }}'
+-      line: '{{ inventory_hostname }}'
+-      state: present
+-    register: check_lockfile
+-
+-  - name: Assert locking results
+-    assert:
+-      that:
+-      - check_lockfile is not changed
+-      - check_lockfile is not failed
+diff --git a/test/integration/targets/file_lock/test_filelock_timeout.yml b/test/integration/targets/file_lock/test_filelock_timeout.yml
+deleted file mode 100644
+index 101ea133cf..0000000000
+--- a/test/integration/targets/file_lock/test_filelock_timeout.yml
++++ /dev/null
+@@ -1,63 +0,0 @@
+----
+-- hosts: lockhost00
+-  vars:
+-    lockfile: ~/ansible_testing/lock_timeout.test
+-  gather_facts: no
+-  tasks:
+-  - name: Remove lockfile
+-    file:
+-      path: '{{ lockfile }}'
+-      state: absent
+-    run_once: yes
+-
+-  - name: Create lockfile
+-    lineinfile:
+-      line: '{{ inventory_hostname }}'
+-      path: '{{ lockfile }}'
+-      state: present
+-      create: yes
+-
+-  - name: Lock lockfile with lockf and sleep 20s
+-    command: python
+-    args:
+-      stdin: |
+-        import time
+-        from ansible.module_utils.common.file import open_locked
+-        with open_locked('{{ lockfile | expanduser }}') as fd:
+-            time.sleep(20)
+-    async: 60
+-    poll: 0
+-    register: flock_waiter
+-
+-  - name: Remove inventory_hostname line from lockfile
+-    lineinfile:
+-      path: '{{ lockfile }}'
+-      line: '{{ inventory_hostname }}'
+-      state: absent
+-    ignore_errors: yes
+-    register: rm_line
+-
+-  - name: Assert that removal of inventory_hostname from lockfile failed
+-    assert:
+-      that:
+-        - rm_line is failed
+-
+-  - name: Wait for flock job to finish
+-    async_status:
+-      jid: '{{ flock_waiter.ansible_job_id }}'
+-    register: job_result
+-    until: job_result.finished
+-    retries: 30
+-
+-  - name: Inventory_hostname in lockfile
+-    lineinfile:
+-      path: '{{ lockfile }}'
+-      line: '{{ inventory_hostname }}'
+-      state: present
+-    register: check_line
+-
+-  - name: Assert that lockfile is unchanged
+-    assert:
+-      that:
+-        - check_line is not changed
+-        - check_line is not failed

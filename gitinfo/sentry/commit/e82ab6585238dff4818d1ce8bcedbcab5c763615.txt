@@ -1,0 +1,406 @@
+commit e82ab6585238dff4818d1ce8bcedbcab5c763615
+Author: Markus Unterwaditzer <markus@unterwaditzer.net>
+Date:   Thu Dec 19 13:40:50 2019 +0100
+
+    feat: Ability to ingest user_report items. (#16160)
+    
+    While we have no immediate plans to ingest all user reports through Relay, we need some sort of user report ingestion for the unreal endpoint. While the unreal endpoint really only needs the raw model persisted we attempt to reuse the logic of the old endpoint anyway to avoid code duplication and to prepare for an eventual endpoint in Relay.
+
+diff --git a/src/sentry/api/endpoints/project_user_reports.py b/src/sentry/api/endpoints/project_user_reports.py
+index c27f9be5b1..a0abeb8cf1 100644
+--- a/src/sentry/api/endpoints/project_user_reports.py
++++ b/src/sentry/api/endpoints/project_user_reports.py
+@@ -1,20 +1,16 @@
+ from __future__ import absolute_import
+ 
+-from datetime import timedelta
+-from django.db import IntegrityError, transaction
+-from django.utils import timezone
+ from rest_framework import serializers
+ from uuid import uuid4
+ 
+-from sentry import eventstore
+ from sentry.api.authentication import DSNAuthentication
+ from sentry.api.base import DocSection, EnvironmentMixin
+ from sentry.api.bases.project import ProjectEndpoint
+ from sentry.api.serializers import serialize, UserReportWithGroupSerializer
+ from sentry.api.paginator import DateTimePaginator
+-from sentry.models import Environment, EventUser, GroupStatus, ProjectKey, UserReport
+-from sentry.signals import user_feedback_received
++from sentry.models import Environment, GroupStatus, ProjectKey, UserReport
+ from sentry.utils.apidocs import scenario, attach_scenarios
++from sentry.ingest.userreport import save_userreport, Conflict
+ 
+ 
+ @scenario("CreateUserFeedback")
+@@ -121,69 +117,10 @@ class ProjectUserReportsEndpoint(ProjectEndpoint, EnvironmentMixin):
+             return self.respond(serializer.errors, status=400)
+ 
+         report = serializer.validated_data
+-
+-        # XXX(dcramer): enforce case insensitivity by coercing this to a lowercase string
+-        report["event_id"] = report["event_id"].lower()
+-        report["project"] = project
+-
+-        event = eventstore.get_event_by_id(project.id, report["event_id"])
+-
+-        # TODO(dcramer): we should probably create the user if they dont
+-        # exist, and ideally we'd also associate that with the event
+-        euser = self.find_event_user(report, event)
+-        if euser and not euser.name and report["name"]:
+-            euser.update(name=report["name"])
+-        if euser:
+-            report["event_user_id"] = euser.id
+-
+-        if event:
+-            # if the event is more than 30 minutes old, we dont allow updates
+-            # as it might be abusive
+-            if event.datetime < timezone.now() - timedelta(minutes=30):
+-                return self.respond(
+-                    {"detail": "Feedback for this event cannot be modified."}, status=409
+-                )
+-
+-            report["environment"] = event.get_environment()
+-            report["group"] = event.group
+-
+         try:
+-            with transaction.atomic():
+-                report_instance = UserReport.objects.create(**report)
+-        except IntegrityError:
+-            # There was a duplicate, so just overwrite the existing
+-            # row with the new one. The only way this ever happens is
+-            # if someone is messing around with the API, or doing
+-            # something wrong with the SDK, but this behavior is
+-            # more reasonable than just hard erroring and is more
+-            # expected.
+-            existing_report = UserReport.objects.get(
+-                project=report["project"], event_id=report["event_id"]
+-            )
+-
+-            # if the existing report was submitted more than 5 minutes ago, we dont
+-            # allow updates as it might be abusive (replay attacks)
+-            if existing_report.date_added < timezone.now() - timedelta(minutes=5):
+-                return self.respond(
+-                    {"detail": "Feedback for this event cannot be modified."}, status=409
+-                )
+-
+-            existing_report.update(
+-                name=report["name"],
+-                email=report["email"],
+-                comments=report["comments"],
+-                date_added=timezone.now(),
+-                event_user_id=euser.id if euser else None,
+-            )
+-            report_instance = existing_report
+-
+-        else:
+-            if report_instance.group:
+-                report_instance.notify()
+-
+-        user_feedback_received.send(
+-            project=report_instance.project, group=report_instance.group, sender=self
+-        )
++            report_instance = save_userreport(project, report)
++        except Conflict as e:
++            return self.respond({"detail": e.message}, status=409)
+ 
+         return self.respond(
+             serialize(
+@@ -194,23 +131,3 @@ class ProjectUserReportsEndpoint(ProjectEndpoint, EnvironmentMixin):
+                 ),
+             )
+         )
+-
+-    def find_event_user(self, report_data, event):
+-        if not event:
+-            if not report_data.get("email"):
+-                return None
+-            try:
+-                return EventUser.objects.filter(
+-                    project_id=report_data["project"].id, email=report_data["email"]
+-                )[0]
+-            except IndexError:
+-                return None
+-
+-        tag = event.get_tag("sentry:user")
+-        if not tag:
+-            return None
+-
+-        try:
+-            return EventUser.for_tags(project_id=report_data["project"].id, values=[tag])[tag]
+-        except KeyError:
+-            pass
+diff --git a/src/sentry/ingest/ingest_consumer.py b/src/sentry/ingest/ingest_consumer.py
+index 3671c512ca..6eb6ee000c 100644
+--- a/src/sentry/ingest/ingest_consumer.py
++++ b/src/sentry/ingest/ingest_consumer.py
+@@ -14,10 +14,12 @@ from sentry.models import Project, File, EventAttachment
+ from sentry.signals import event_accepted
+ from sentry.tasks.store import preprocess_event
+ from sentry.utils import json
++from sentry.utils.dates import to_datetime
+ from sentry.utils.cache import cache_key_for_event
+ from sentry.utils.kafka import create_batching_kafka_consumer
+ from sentry.utils.batching_kafka_consumer import AbstractBatchWorker
+ from sentry.attachments import CachedAttachment, attachment_cache
++from sentry.ingest.userreport import Conflict, save_userreport
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -56,6 +58,8 @@ class IngestConsumerWorker(AbstractBatchWorker):
+             process_attachment_chunk(message)
+         elif message_type == "attachment":
+             process_individual_attachment(message)
++        elif message_type == "user_report":
++            process_userreport(message)
+         else:
+             raise ValueError("Unknown message type: {}".format(message_type))
+ 
+@@ -173,6 +177,25 @@ def process_individual_attachment(message):
+     attachment.delete()
+ 
+ 
++def process_userreport(message):
++    project_id = message["project_id"]
++    start_time = to_datetime(message["start_time"])
++    feedback = json.loads(message["payload"])
++
++    try:
++        project = Project.objects.get_from_cache(id=project_id)
++    except Project.DoesNotExist:
++        logger.error("Project for ingested event does not exist: %s", project_id)
++        return False
++
++    try:
++        save_userreport(project, feedback, start_time=start_time)
++        return True
++    except Conflict as e:
++        logger.info("Invalid userreport: %s", e)
++        return False
++
++
+ def get_ingest_consumer(consumer_type, once=False, **options):
+     """
+     Handles events coming via a kafka queue.
+diff --git a/src/sentry/ingest/userreport.py b/src/sentry/ingest/userreport.py
+new file mode 100644
+index 0000000000..f842b984f4
+--- /dev/null
++++ b/src/sentry/ingest/userreport.py
+@@ -0,0 +1,103 @@
++from __future__ import absolute_import
++
++from datetime import timedelta
++from django.db import IntegrityError, transaction
++from django.utils import timezone
++
++from sentry import eventstore
++from sentry.models import EventUser, UserReport
++from sentry.signals import user_feedback_received
++
++
++class Conflict(Exception):
++    pass
++
++
++def save_userreport(project, report, start_time=None):
++    if start_time is None:
++        start_time = timezone.now()
++
++    # XXX(dcramer): enforce case insensitivity by coercing this to a lowercase string
++    report["event_id"] = report["event_id"].lower()
++    report["project"] = project
++
++    event = eventstore.get_event_by_id(project.id, report["event_id"])
++
++    # TODO(dcramer): we should probably create the user if they dont
++    # exist, and ideally we'd also associate that with the event
++    euser = find_event_user(report, event)
++
++    if euser and not euser.name and report["name"]:
++        euser.update(name=report["name"])
++    if euser:
++        report["event_user_id"] = euser.id
++
++    if event:
++        # if the event is more than 30 minutes old, we dont allow updates
++        # as it might be abusive
++        if event.datetime < start_time - timedelta(minutes=30):
++            raise Conflict("Feedback for this event cannot be modified.")
++
++        report["environment"] = event.get_environment()
++        report["group"] = event.group
++
++    try:
++        with transaction.atomic():
++            report_instance = UserReport.objects.create(**report)
++
++    except IntegrityError:
++        # There was a duplicate, so just overwrite the existing
++        # row with the new one. The only way this ever happens is
++        # if someone is messing around with the API, or doing
++        # something wrong with the SDK, but this behavior is
++        # more reasonable than just hard erroring and is more
++        # expected.
++
++        existing_report = UserReport.objects.get(
++            project=report["project"], event_id=report["event_id"]
++        )
++
++        # if the existing report was submitted more than 5 minutes ago, we dont
++        # allow updates as it might be abusive (replay attacks)
++        if existing_report.date_added < timezone.now() - timedelta(minutes=5):
++            raise Conflict("Feedback for this event cannot be modified.")
++
++        existing_report.update(
++            name=report["name"],
++            email=report["email"],
++            comments=report["comments"],
++            date_added=timezone.now(),
++            event_user_id=euser.id if euser else None,
++        )
++        report_instance = existing_report
++
++    else:
++        if report_instance.group:
++            report_instance.notify()
++
++    user_feedback_received.send(
++        project=report_instance.project, group=report_instance.group, sender=save_userreport
++    )
++
++    return report_instance
++
++
++def find_event_user(report_data, event):
++    if not event:
++        if not report_data.get("email"):
++            return None
++        try:
++            return EventUser.objects.filter(
++                project_id=report_data["project"].id, email=report_data["email"]
++            )[0]
++        except IndexError:
++            return None
++
++    tag = event.get_tag("sentry:user")
++    if not tag:
++        return None
++
++    try:
++        return EventUser.for_tags(project_id=report_data["project"].id, values=[tag])[tag]
++    except KeyError:
++        pass
+diff --git a/tests/sentry/ingest/ingest_consumer/test_ingest_processing.py b/tests/sentry/ingest/ingest_consumer/test_ingest_processing.py
+index ba5492864d..9971eb96fe 100644
+--- a/tests/sentry/ingest/ingest_consumer/test_ingest_processing.py
++++ b/tests/sentry/ingest/ingest_consumer/test_ingest_processing.py
+@@ -1,5 +1,6 @@
+ from __future__ import absolute_import
+ 
++import uuid
+ import pytest
+ import time
+ 
+@@ -8,10 +9,11 @@ from sentry.ingest.ingest_consumer import (
+     process_event,
+     process_attachment_chunk,
+     process_individual_attachment,
++    process_userreport,
+ )
+ from sentry.attachments import attachment_cache
+ from sentry.event_manager import EventManager
+-from sentry.models import EventAttachment
++from sentry.models import Event, EventAttachment, UserReport, EventUser
+ 
+ 
+ def get_normalized_event(data, project):
+@@ -183,3 +185,88 @@ def test_individual_attachments(default_project, monkeypatch, event_attachments)
+         f = att1.file.getfile()
+         assert f.read() == b"Hello World!"
+         assert f.name == "foo.txt"
++
++
++@pytest.mark.django_db
++def test_userreport(default_project, monkeypatch):
++    """
++    Test that user_report-type kafka messages end up in a user report being
++    persisted. We additionally test some logic around upserting data in
++    eventuser which is also present in the legacy endpoint.
++    """
++    event_id = uuid.uuid4().hex
++    start_time = time.time() - 3600
++
++    mgr = EventManager(data={"event_id": event_id, "user": {"email": "markus+dontatme@sentry.io"}})
++
++    mgr.normalize()
++    mgr.save(default_project.id)
++
++    evtuser, = EventUser.objects.all()
++    assert not evtuser.name
++
++    assert not UserReport.objects.all()
++
++    assert process_userreport(
++        {
++            "type": "user_report",
++            "start_time": start_time,
++            "payload": json.dumps(
++                {
++                    "name": "Hans Gans",
++                    "event_id": event_id,
++                    "comments": "hello world",
++                    "email": "markus+dontatme@sentry.io",
++                }
++            ),
++            "project_id": default_project.id,
++        }
++    )
++
++    report, = UserReport.objects.all()
++    assert report.comments == "hello world"
++
++    evtuser, = EventUser.objects.all()
++    assert evtuser.name == "Hans Gans"
++
++
++@pytest.mark.django_db
++def test_userreport_reverse_order(default_project, monkeypatch):
++    """
++    Test that ingesting a userreport before the event works. This is relevant
++    for unreal crashes where the userreport is processed immediately in the
++    ingest consumer while the rest of the event goes to processing tasks.
++    """
++    event_id = uuid.uuid4().hex
++    start_time = time.time() - 3600
++
++    assert not Event.objects.all()
++
++    assert process_userreport(
++        {
++            "type": "user_report",
++            "start_time": start_time,
++            "payload": json.dumps(
++                {
++                    "name": "Hans Gans",
++                    "event_id": event_id,
++                    "comments": "hello world",
++                    "email": "markus+dontatme@sentry.io",
++                }
++            ),
++            "project_id": default_project.id,
++        }
++    )
++
++    mgr = EventManager(data={"event_id": event_id, "user": {"email": "markus+dontatme@sentry.io"}})
++
++    mgr.normalize()
++    mgr.save(default_project.id)
++
++    report, = UserReport.objects.all()
++    assert report.comments == "hello world"
++
++    evtuser, = EventUser.objects.all()
++    # Event got saved after user report, and the sync only works in the
++    # opposite direction. That's fine, we just accept it.
++    assert evtuser.name is None

@@ -1,0 +1,225 @@
+commit 8040c0dcc66113a0510df137f1a646fdd9259914
+Author: ted kaemming <ted@kaemming.com>
+Date:   Tue May 16 14:09:49 2017 -0700
+
+    Track the last seen non-sampled event ID for `GroupHash` records. (#5372)
+    
+    * Track relevant hashes during `EventManager._save_aggregate`.
+    
+    * Add last processed event helpers to `GroupHash`.
+    
+    * Change return type of `EventManager._find_hashes`.
+    
+    * Update event manager hash logic to deal with instances.
+    
+    * Make sure fetch/record work
+
+diff --git a/src/sentry/event_manager.py b/src/sentry/event_manager.py
+index 2766aa7a1a..bad64443a9 100644
+--- a/src/sentry/event_manager.py
++++ b/src/sentry/event_manager.py
+@@ -761,21 +761,19 @@ class EventManager(object):
+         return euser
+ 
+     def _find_hashes(self, project, hash_list):
+-        matches = []
+-        for hash in hash_list:
+-            ghash, _ = GroupHash.objects.get_or_create(
++        return map(
++            lambda hash: GroupHash.objects.get_or_create(
+                 project=project,
+                 hash=hash,
+-            )
+-            matches.append((ghash.group_id, ghash.hash))
+-        return matches
++            )[0],
++            hash_list,
++        )
+ 
+     def _ensure_hashes_merged(self, group, hash_list):
+         # TODO(dcramer): there is a race condition with selecting/updating
+         # in that another group could take ownership of the hash
+         bad_hashes = GroupHash.objects.filter(
+-            project=group.project,
+-            hash__in=hash_list,
++            id__in=[h.id for h in hash_list],
+         ).exclude(
+             group=group,
+         )
+@@ -804,7 +802,7 @@ class EventManager(object):
+         all_hashes = self._find_hashes(project, hashes)
+ 
+         try:
+-            existing_group_id = six.next(h[0] for h in all_hashes if h[0])
++            existing_group_id = six.next(h.group_id for h in all_hashes if h.group_id is not None)
+         except StopIteration:
+             existing_group_id = None
+ 
+@@ -825,42 +823,39 @@ class EventManager(object):
+ 
+             group_is_new = False
+ 
++        # Keep a set of all of the hashes that are relevant for this event and
++        # belong to the destination group so that we can record this as the
++        # last processed event for each. (We can't just update every
++        # ``GroupHash`` instance, since we only want to record this for events
++        # that not only include the hash but were also placed into the
++        # associated group.)
++        relevant_group_hashes = set([instance for instance in all_hashes if instance.group_id == group.id])
++
+         # If all hashes are brand new we treat this event as new
+         is_new = False
+-        new_hashes = [h[1] for h in all_hashes if h[0] is None]
++        new_hashes = [h for h in all_hashes if h.group_id is None]
+         if new_hashes:
+-            # This is an attempt at optimizing the lookup against GroupHash
+-            # Previously this was doing something like:
+-            # UPDATE "sentry_grouphash" SET "group_id" = x WHERE ("sentry_grouphash"."project_id" = x AND "sentry_grouphash"."hash" IN ('x') AND "sentry_grouphash"."group_id" IS NULL)
+-            # This query is causing the query planner to choose the sentry_grouphash_group_id index
+-            # rather than the expected sentry_grouphash_project_id_4a293f96a363c9a2_uniq index.
+-            # So this change to a SELECT/UPDATE instead forces us to hit the expected index.
+-            # We then filter in python to check if we need to update, and we update back explicitly
+-            # on the primary keys.
+-            affected = map(
+-                # Extract just the id
+-                lambda x: x[0],
+-                filter(
+-                    # find the rows that have no group id
+-                    lambda x: x[1] is None, list(
+-                        GroupHash.objects.filter(
+-                            project=project,
+-                            hash__in=new_hashes,
+-                        ).values_list('id', 'group_id')
+-                    )
+-                )
+-            )
+-
+-            if affected:
+-                GroupHash.objects.filter(
+-                    id__in=affected,
+-                ).update(group=group)
+-
+-            if len(affected) != len(new_hashes):
+-                self._ensure_hashes_merged(group, new_hashes)
+-            elif group_is_new and len(new_hashes) == len(all_hashes):
++            # XXX: There is a race condition here wherein another process could
++            # create a new group that is associated with one of the new hashes,
++            # add some event(s) to it, and then subsequently have the hash
++            # "stolen" by this process. This then "orphans" those events from
++            # their "siblings" in the group we've created here. We don't have a
++            # way to fix this, since we can't call `_ensure_hashes_merged`
++            # without filtering on `group_id` (which we can't do due to query
++            # planner weirdness.) For more context, see 84c6f75a and d0e22787,
++            # as well as GH-5085.
++            GroupHash.objects.filter(
++                id__in=[h.id for h in new_hashes],
++            ).update(group=group)
++
++            if group_is_new and len(new_hashes) == len(all_hashes):
+                 is_new = True
+ 
++            # XXX: This can lead to invalid results due to a race condition and
++            # lack of referential integrity enforcement, see above comment(s)
++            # about "hash stealing".
++            relevant_group_hashes.update(new_hashes)
++
+         # XXX(dcramer): it's important this gets called **before** the aggregate
+         # is processed as otherwise values like last_seen will get mutated
+         can_sample = (
+@@ -888,6 +883,13 @@ class EventManager(object):
+         else:
+             is_sample = can_sample
+ 
++        if not is_sample:
++            GroupHash.record_last_processed_event_id(
++                project.id,
++                [h.id for h in relevant_group_hashes],
++                event.event_id,
++            )
++
+         return group, is_new, is_regression, is_sample
+ 
+     def _handle_regression(self, group, event, release):
+diff --git a/src/sentry/models/grouphash.py b/src/sentry/models/grouphash.py
+index d3e9d0b967..57c200f58d 100644
+--- a/src/sentry/models/grouphash.py
++++ b/src/sentry/models/grouphash.py
+@@ -10,6 +10,7 @@ from __future__ import absolute_import
+ from django.db import models
+ 
+ from sentry.db.models import FlexibleForeignKey, Model
++from sentry.utils import redis
+ 
+ 
+ class GroupHash(Model):
+@@ -23,3 +24,38 @@ class GroupHash(Model):
+         app_label = 'sentry'
+         db_table = 'sentry_grouphash'
+         unique_together = (('project', 'hash'),)
++
++    @staticmethod
++    def fetch_last_processed_event_id(project_id, group_hash_ids):
++        prefix = 'last-processed-event:{}'.format(project_id)
++        with redis.clusters.get('default').map() as client:
++            results = map(
++                lambda group_hash_id: client.hget(
++                    '{}:{}'.format(prefix, group_hash_id % 16),
++                    group_hash_id,
++                ),
++                group_hash_ids,
++            )
++
++        return map(
++            lambda result: result.value,
++            results,
++        )
++
++    @staticmethod
++    def record_last_processed_event_id(project_id, group_hash_ids, event_id):
++        prefix = 'last-processed-event:{}'.format(project_id)
++        with redis.clusters.get('default').map() as client:
++            results = map(
++                lambda group_hash_id: client.hset(
++                    '{}:{}'.format(prefix, group_hash_id % 16),
++                    group_hash_id,
++                    event_id,
++                ),
++                group_hash_ids,
++            )
++
++        return map(
++            lambda result: result.value,
++            results,
++        )
+diff --git a/tests/sentry/models/test_grouphash.py b/tests/sentry/models/test_grouphash.py
+new file mode 100644
+index 0000000000..e9265d2120
+--- /dev/null
++++ b/tests/sentry/models/test_grouphash.py
+@@ -0,0 +1,26 @@
++from __future__ import absolute_import
++
++from sentry.models import GroupHash
++from sentry.testutils import TestCase
++
++
++class GroupTest(TestCase):
++    def test_fetch_and_record_last_processed_event_id(self):
++        group = self.group
++
++        grouphash = GroupHash.objects.create(
++            project=group.project,
++            group=group,
++            hash='xyz',
++        )
++
++        GroupHash.record_last_processed_event_id(
++            grouphash.project_id,
++            [grouphash.id],
++            'event',
++        )
++
++        assert GroupHash.fetch_last_processed_event_id(
++            grouphash.project_id,
++            [grouphash.id, -1],
++        ) == ['event', None]

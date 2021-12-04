@@ -1,0 +1,662 @@
+commit d6b8b55d580af001229c19b2627b945faeb97ee9
+Author: Megan Heskett <meg.heskett@gmail.com>
+Date:   Mon Aug 27 10:32:53 2018 -0700
+
+    feat(require-2fa): Remove 2FA noncompliant users from organization (#9447)
+
+diff --git a/src/sentry/api/endpoints/organization_details.py b/src/sentry/api/endpoints/organization_details.py
+index 1ab2d91e01..7c8fd11f86 100644
+--- a/src/sentry/api/endpoints/organization_details.py
++++ b/src/sentry/api/endpoints/organization_details.py
+@@ -247,7 +247,7 @@ class OrganizationSerializer(serializers.Serializer):
+                 filename='{}.png'.format(org.slug),
+             )
+         if 'require2FA' in self.init_data and self.init_data['require2FA'] is True:
+-            org.send_setup_2fa_emails()
++            org.handle_2fa_required(self.context['request'])
+         return org, changed_data
+ 
+ 
+@@ -314,7 +314,11 @@ class OrganizationDetailsEndpoint(OrganizationEndpoint):
+         serializer = serializer_cls(
+             data=request.DATA,
+             partial=True,
+-            context={'organization': organization, 'user': request.user},
++            context={
++                'organization': organization,
++                'user': request.user,
++                'request': request,
++            },
+         )
+         if serializer.is_valid():
+             organization, changed_data = serializer.save()
+diff --git a/src/sentry/models/auditlogentry.py b/src/sentry/models/auditlogentry.py
+index 6461b38cda..b3387159ef 100644
+--- a/src/sentry/models/auditlogentry.py
++++ b/src/sentry/models/auditlogentry.py
+@@ -25,6 +25,7 @@ class AuditLogEntryEvent(object):
+     MEMBER_REMOVE = 5
+     MEMBER_JOIN_TEAM = 6
+     MEMBER_LEAVE_TEAM = 7
++    MEMBER_PENDING = 8
+ 
+     ORG_ADD = 10
+     ORG_EDIT = 11
+@@ -103,6 +104,7 @@ class AuditLogEntry(Model):
+             (AuditLogEntryEvent.MEMBER_EDIT, 'member.edit'),
+             (AuditLogEntryEvent.MEMBER_JOIN_TEAM, 'member.join-team'),
+             (AuditLogEntryEvent.MEMBER_LEAVE_TEAM, 'member.leave-team'),
++            (AuditLogEntryEvent.MEMBER_PENDING, 'member.pending'),
+             (AuditLogEntryEvent.TEAM_ADD, 'team.create'),
+             (AuditLogEntryEvent.TEAM_EDIT, 'team.edit'),
+             (AuditLogEntryEvent.TEAM_REMOVE, 'team.remove'),
+@@ -209,6 +211,10 @@ class AuditLogEntry(Model):
+                 self.data.get('email') or self.target_user.get_display_name(),
+                 self.data['team_slug'],
+             )
++        elif self.event == AuditLogEntryEvent.MEMBER_PENDING:
++            return 'required member %s to setup 2FA' % (
++                self.data.get('email') or self.target_user.get_display_name(),
++            )
+ 
+         elif self.event == AuditLogEntryEvent.ORG_ADD:
+             return 'created the organization'
+diff --git a/src/sentry/models/organization.py b/src/sentry/models/organization.py
+index f563bf4074..bf1ee51c1e 100644
+--- a/src/sentry/models/organization.py
++++ b/src/sentry/models/organization.py
+@@ -26,7 +26,6 @@ from sentry.db.models import (BaseManager, BoundedPositiveIntegerField, Model, s
+ from sentry.db.models.utils import slugify_instance
+ from sentry.utils.http import absolute_uri
+ from sentry.utils.retries import TimedRetryPolicy
+-from sentry.models import Authenticator
+ 
+ 
+ class OrganizationStatus(IntEnum):
+@@ -363,27 +362,19 @@ class Organization(Model):
+         "Returns ``True`` if ``flag`` has changed since initialization."
+         return getattr(self.old_value('flags'), flag_name, None) != getattr(self.flags, flag_name)
+ 
+-    def send_setup_2fa_emails(self):
+-        from sentry import options
+-        from sentry.utils.email import MessageBuilder
+-        from sentry.models import User
+-
+-        for user in User.objects.filter(
+-            is_active=True,
+-            sentry_orgmember_set__organization=self,
+-        ):
+-            if not Authenticator.objects.user_has_2fa(user):
+-                context = {
+-                    'user': user,
+-                    'url': absolute_uri(reverse('sentry-account-settings-security')),
+-                    'organization': self
+-                }
+-                message = MessageBuilder(
+-                    subject='%s %s Mandatory: Enable Two-Factor Authentication' % (
+-                        options.get('mail.subject-prefix'), self.name),
+-                    template='sentry/emails/setup_2fa.txt',
+-                    html_template='sentry/emails/setup_2fa.html',
+-                    type='user.setup_2fa',
+-                    context=context,
+-                )
+-                message.send_async([user.email])
++    def handle_2fa_required(self, request):
++        from sentry.models import ApiKey
++        from sentry.tasks.auth import remove_2fa_non_compliant_members
++
++        actor_id = request.user.id if request.user and request.user.is_authenticated() else None
++        api_key_id = request.auth.id if hasattr(
++            request, 'auth') and isinstance(
++            request.auth, ApiKey) else None
++        ip_address = request.META['REMOTE_ADDR']
++
++        remove_2fa_non_compliant_members.delay(
++            self.id,
++            actor_id=actor_id,
++            actor_key_id=api_key_id,
++            ip_address=ip_address
++        )
+diff --git a/src/sentry/models/organizationmember.py b/src/sentry/models/organizationmember.py
+index 770ec62529..11e745a2fa 100644
+--- a/src/sentry/models/organizationmember.py
++++ b/src/sentry/models/organizationmember.py
+@@ -224,7 +224,7 @@ class OrganizationMember(Model):
+         return self.email or self.id
+ 
+     def get_email(self):
+-        if self.user_id:
++        if self.user_id and self.user.email:
+             return self.user.email
+         return self.email
+ 
+@@ -245,7 +245,7 @@ class OrganizationMember(Model):
+ 
+         return {
+             'email':
+-            self.email,
++            self.get_email(),
+             'user':
+             self.user_id,
+             'teams': [t['id'] for t in teams],
+diff --git a/src/sentry/static/sentry/app/data/forms/organizationGeneralSettings.jsx b/src/sentry/static/sentry/app/data/forms/organizationGeneralSettings.jsx
+index 7932faa4af..9d297e39f8 100644
+--- a/src/sentry/static/sentry/app/data/forms/organizationGeneralSettings.jsx
++++ b/src/sentry/static/sentry/app/data/forms/organizationGeneralSettings.jsx
+@@ -83,8 +83,9 @@ const formGroups = [
+         help: t('Require two-factor authentication for all members'),
+         confirm: {
+           true: t(
+-            'This will immediately force all users to enable two-factor authentication.' +
+-              ' It will also send an email reminder to setup two-factor authentication. Do you want to continue?'
++            'This will remove all members without two-factor authentication' +
++              ' from your organization. It will also send them an email to setup 2FA' +
++              ' and reinstate their access and settings. Do you want to continue?'
+           ),
+           false: t(
+             'Are you sure you want to allow users to access your organization without having two-factor authentication enabled?'
+diff --git a/src/sentry/static/sentry/app/views/settings/organizationAuditLog/index.jsx b/src/sentry/static/sentry/app/views/settings/organizationAuditLog/index.jsx
+index ff8330473f..efbdd10437 100644
+--- a/src/sentry/static/sentry/app/views/settings/organizationAuditLog/index.jsx
++++ b/src/sentry/static/sentry/app/views/settings/organizationAuditLog/index.jsx
+@@ -15,6 +15,7 @@ const EVENT_TYPES = [
+   'member.edit',
+   'member.join-team',
+   'member.leave-team',
++  'member.pending',
+   'team.create',
+   'team.edit',
+   'team.remove',
+diff --git a/src/sentry/tasks/auth.py b/src/sentry/tasks/auth.py
+index 6d43f5878b..f46e45c20b 100644
+--- a/src/sentry/tasks/auth.py
++++ b/src/sentry/tasks/auth.py
+@@ -2,10 +2,17 @@ from __future__ import absolute_import, print_function
+ 
+ import logging
+ 
+-from sentry.models import Organization, OrganizationMember, User
++from django.db import IntegrityError
++
++from sentry import options
++from sentry.models import (
++    ApiKey, AuditLogEntryEvent, AuditLogEntry, Authenticator,
++    Organization, OrganizationMember, User
++)
+ from sentry.tasks.base import instrumented_task
+ from sentry.auth import manager
+ from sentry.auth.exceptions import ProviderNotRegistered
++from sentry.utils.email import MessageBuilder
+ 
+ logger = logging.getLogger('sentry.auth')
+ 
+@@ -45,3 +52,80 @@ def email_unlink_notifications(org_id, actor_id, provider_key):
+ 
+     for member in member_list:
+         member.send_sso_unlink_email(actor, provider)
++
++
++@instrumented_task(
++    name='sentry.tasks.remove_2fa_non_compliant_members',
++    queue='auth',
++    default_retry_delay=60 * 5,
++    max_retries=5
++)
++def remove_2fa_non_compliant_members(org_id, actor_id=None, actor_key_id=None, ip_address=None):
++    org = Organization.objects.get(id=org_id)
++    actor = User.objects.get(id=actor_id) if actor_id else None
++    actor_key = ApiKey.objects.get(id=actor_key_id) if actor_key_id else None
++
++    for member in OrganizationMember.objects.select_related('user').filter(
++        organization=org,
++        user__isnull=False
++    ):
++        if not Authenticator.objects.user_has_2fa(member.user):
++            _remove_2fa_non_compliant_member(
++                member,
++                org,
++                actor=actor,
++                actor_key=actor_key,
++                ip_address=ip_address
++            )
++
++
++def _remove_2fa_non_compliant_member(member, org, actor=None, actor_key=None, ip_address=None):
++    user = member.user
++    logging_data = {
++        'organization_id': org.id,
++        'user_id': user.id,
++        'member_id': member.id
++    }
++
++    try:
++        member.email = member.get_email()
++        member.user = None
++        member.save()
++    except (AssertionError, IntegrityError):
++        logger.warning(
++            'Could not remove 2FA noncompliant user from org',
++            extra=logging_data
++        )
++    else:
++        logger.info(
++            '2FA noncompliant user removed from org',
++            extra=logging_data
++        )
++        AuditLogEntry.objects.create(
++            actor=actor,
++            actor_key=actor_key,
++            ip_address=ip_address,
++            event=AuditLogEntryEvent.MEMBER_PENDING,
++            data=member.get_audit_log_data(),
++            organization=org,
++            target_object=org.id,
++            target_user=user,
++        )
++
++        # send invite to setup 2fa
++        email_context = {
++            'url': member.get_invite_link(),
++            'organization': org
++        }
++        subject = '{} {} Mandatory: Enable Two-Factor Authentication'.format(
++            options.get('mail.subject-prefix'),
++            org.name.capitalize(),
++        )
++        message = MessageBuilder(
++            subject=subject,
++            template='sentry/emails/setup_2fa.txt',
++            html_template='sentry/emails/setup_2fa.html',
++            type='user.setup_2fa',
++            context=email_context,
++        )
++        message.send_async([member.email])
+diff --git a/src/sentry/templates/sentry/emails/setup_2fa.html b/src/sentry/templates/sentry/emails/setup_2fa.html
+index d3fe46ecd8..fe657d0cfc 100644
+--- a/src/sentry/templates/sentry/emails/setup_2fa.html
++++ b/src/sentry/templates/sentry/emails/setup_2fa.html
+@@ -4,15 +4,14 @@
+ 
+ {% block main %}
+     <h3>Setup Two-Factor Authentication</h3>
+-    <p>Hello {{ user.name }},</p>
+     <p>
+-        The {{ organization.name }} organization now requires that all members enable
++        The {{ organization.name|title }} organization now requires all members to enable
+         two-factor authentication. Effective immediately, you will be unable to access
+-        projects under the {{ organization.name }} organization unless you enable at
+-        least one form of two-factor authentication.
++        this organization or recieve its notifications until you enable at least
++        one form of 2FA.
+     </p>
+     <p>
+-            Click the button below to enable two-factor authentication.
++        Click the button below to enable 2FA and reinstate your access and settings.
+     </p>
+     <a href="{{ url }}" class="btn">Enable Two-Factor Authentication</a>
+ {% endblock %}
+diff --git a/src/sentry/templates/sentry/emails/setup_2fa.txt b/src/sentry/templates/sentry/emails/setup_2fa.txt
+index 5aa7cbf9fd..d8348a1fba 100644
+--- a/src/sentry/templates/sentry/emails/setup_2fa.txt
++++ b/src/sentry/templates/sentry/emails/setup_2fa.txt
+@@ -1,10 +1,9 @@
+ Setup Two-Factor Authentication
+ 
+-Hello {{ user.name }},
+-
+-The {{ organization.name }} organization now requires that all members enable
++The {{ organization.name|title }} organization now requires all members to enable
+ two-factor authentication. Effective immediately, you will be unable to access
+-projects under the {{ organization.name }} organization unless you enable at
+-least one form of two-factor authentication.
++this organization or recieve its notifications until you enable at least
++one form of 2FA.
+ 
+-Enable two-factor authentication: {{ url }}
++Enable 2FA to reinstate your access and settings:
++{{ url }}
+diff --git a/src/sentry/testutils/fixtures.py b/src/sentry/testutils/fixtures.py
+index abab9fa176..f0c6809770 100644
+--- a/src/sentry/testutils/fixtures.py
++++ b/src/sentry/testutils/fixtures.py
+@@ -421,7 +421,7 @@ class Fixtures(object):
+         return commit_file_change
+ 
+     def create_user(self, email=None, **kwargs):
+-        if not email:
++        if email is None:
+             email = uuid4().hex + '@example.com'
+ 
+         kwargs.setdefault('username', email)
+diff --git a/src/sentry/web/frontend/debug/debug_setup_2fa_email.py b/src/sentry/web/frontend/debug/debug_setup_2fa_email.py
+index 996bd339ab..7db6c2c29a 100644
+--- a/src/sentry/web/frontend/debug/debug_setup_2fa_email.py
++++ b/src/sentry/web/frontend/debug/debug_setup_2fa_email.py
+@@ -1,24 +1,26 @@
+ from __future__ import absolute_import
+ 
+-from django.core.urlresolvers import reverse
+-from sentry.utils.http import absolute_uri
+ from django.views.generic import View
+ 
+ from .mail import MailPreview
+ 
+-from sentry.models import Organization
++from sentry.models import Organization, OrganizationMember
+ 
+ 
+ class DebugSetup2faEmailView(View):
+     def get(self, request):
++        org = Organization(
++            id=1,
++            slug='organization',
++            name='sentry corp',
++        )
++        member = OrganizationMember(
++            id=1,
++            organization=org,
++            email='test@gmail.com')
+         context = {
+-            'user': request.user,
+-            'url': absolute_uri(reverse('sentry-account-settings-security')),
+-            'organization': Organization(
+-                id=1,
+-                slug='organization',
+-                name='Sentry Corp',
+-            )
++            'url': member.get_invite_link(),
++            'organization': org
+         }
+         return MailPreview(
+             html_template='sentry/emails/setup_2fa.html',
+diff --git a/tests/js/spec/views/settings/__snapshots__/auditLogView.spec.jsx.snap b/tests/js/spec/views/settings/__snapshots__/auditLogView.spec.jsx.snap
+index c5c9e32e4d..b0cdb870ce 100644
+--- a/tests/js/spec/views/settings/__snapshots__/auditLogView.spec.jsx.snap
++++ b/tests/js/spec/views/settings/__snapshots__/auditLogView.spec.jsx.snap
+@@ -184,6 +184,7 @@ exports[`OrganizationAuditLog renders 1`] = `
+         "member.invite",
+         "member.join-team",
+         "member.leave-team",
++        "member.pending",
+         "member.remove",
+         "org.create",
+         "org.edit",
+diff --git a/tests/sentry/models/test_organization.py b/tests/sentry/models/test_organization.py
+index cfbdcfcffa..6359058227 100644
+--- a/tests/sentry/models/test_organization.py
++++ b/tests/sentry/models/test_organization.py
+@@ -1,10 +1,16 @@
+ from __future__ import absolute_import
+ 
++import copy
++import mock
++
+ from sentry.models import (
+-    Commit, File, OrganizationMember, OrganizationMemberTeam, OrganizationOption, Project, Release, ReleaseCommit, ReleaseEnvironment, ReleaseFile, Team, TotpInterface
++    ApiKey, AuditLogEntry, AuditLogEntryEvent, Commit, File, OrganizationMember,
++    OrganizationMemberTeam, OrganizationOption, Project, Release, ReleaseCommit,
++    ReleaseEnvironment, ReleaseFile, Team, TotpInterface, User,
+ )
+ from sentry.testutils import TestCase
+ from django.core import mail
++from uuid import uuid4
+ 
+ 
+ class OrganizationTest(TestCase):
+@@ -136,40 +142,6 @@ class OrganizationTest(TestCase):
+         assert org.flag_has_changed('allow_joinleave') is False
+         assert org.flag_has_changed('require_2fa') is True
+ 
+-    def test_send_setup_2fa_emails(self):
+-        owner = self.create_user('foo@example.com')
+-        TotpInterface().enroll(owner)
+-        org = self.create_organization(owner=owner)
+-        non_compliant_members = []
+-        for num in range(0, 10):
+-            user = self.create_user('foo_%s@example.com' % num)
+-            self.create_member(organization=org, user=user)
+-            if num % 2:
+-                TotpInterface().enroll(user)
+-            else:
+-                non_compliant_members.append(user.email)
+-
+-        with self.options({'system.url-prefix': 'http://example.com'}), self.tasks():
+-            org.send_setup_2fa_emails()
+-
+-        assert len(mail.outbox) == len(non_compliant_members)
+-        assert sorted([email.to[0] for email in mail.outbox]) == sorted(non_compliant_members)
+-
+-    def test_send_setup_2fa_emails_no_non_compliant_members(self):
+-        owner = self.create_user('foo@example.com')
+-        TotpInterface().enroll(owner)
+-        org = self.create_organization(owner=owner)
+-
+-        for num in range(0, 10):
+-            user = self.create_user('foo_%s@example.com' % num)
+-            self.create_member(organization=org, user=user)
+-            TotpInterface().enroll(user)
+-
+-        with self.options({'system.url-prefix': 'http://example.com'}), self.tasks():
+-            org.send_setup_2fa_emails()
+-
+-        assert len(mail.outbox) == 0
+-
+     def test_has_changed(self):
+         org = self.create_organization()
+ 
+@@ -241,3 +213,215 @@ class OrganizationTest(TestCase):
+             key='sentry:store_crash_reports')
+         p.value = True
+         assert p.has_changed('value') is True
++
++
++class Require2fa(TestCase):
++
++    def setUp(self):
++        self.owner = self.create_user('foo@example.com')
++        TotpInterface().enroll(self.owner)
++        self.org = self.create_organization(owner=self.owner)
++        self.request = self.make_request(user=self.owner)
++
++    def _create_user(self, has_email=True):
++        if not has_email:
++            return self.create_user('')
++        return self.create_user()
++
++    def _create_user_and_member(self, has_2fa=False, has_user_email=True, has_member_email=False):
++        user = self._create_user(has_email=has_user_email)
++        if has_2fa:
++            TotpInterface().enroll(user)
++        if has_member_email:
++            email = uuid4().hex
++            member = self.create_member(organization=self.org, user=user, email=email)
++        else:
++            member = self.create_member(organization=self.org, user=user)
++        return user, member
++
++    def is_organization_member(self, user_id, member_id):
++        member = OrganizationMember.objects.get(id=member_id)
++        user = User.objects.get(id=user_id)
++        assert not member.is_pending
++        assert not member.email
++        assert member.user == user
++
++    def is_pending_organization_member(self, user_id, member_id):
++        member = OrganizationMember.objects.get(id=member_id)
++        assert User.objects.filter(id=user_id).exists()
++        assert member.is_pending
++        assert member.email
++
++    @mock.patch('sentry.utils.email.logger')
++    def test_handle_2fa_required__compliant_and_non_compliant_members(self, email_log):
++        compliant_user, compliant_member = self._create_user_and_member(has_2fa=True)
++        non_compliant_user, non_compliant_member = self._create_user_and_member()
++
++        with self.options({'system.url-prefix': 'http://example.com'}), self.tasks():
++            self.org.handle_2fa_required(self.request)
++
++        self.is_organization_member(compliant_user.id, compliant_member.id)
++        self.is_pending_organization_member(non_compliant_user.id, non_compliant_member.id)
++
++        assert len(mail.outbox) == 1
++        assert mail.outbox[0].to == [non_compliant_user.email]
++        assert email_log.info.call_count == 2  # mail.queued, mail.sent
++
++        audit_logs = AuditLogEntry.objects.filter(
++            event=AuditLogEntryEvent.MEMBER_PENDING,
++            organization=self.org,
++            actor=self.owner
++        )
++        assert audit_logs.count() == 1
++        assert audit_logs[0].data['email'] == non_compliant_user.email
++        assert audit_logs[0].target_user_id == non_compliant_user.id
++
++    @mock.patch('sentry.utils.email.logger')
++    def test_handle_2fa_required__compliant_members(self, email_log):
++        compliant = []
++        for num in range(0, 4):
++            user, member = self._create_user_and_member(has_2fa=True)
++            compliant.append((user, member))
++
++        with self.options({'system.url-prefix': 'http://example.com'}), self.tasks():
++            self.org.handle_2fa_required(self.request)
++
++        for user, member in compliant:
++            self.is_organization_member(user.id, member.id)
++
++        assert len(mail.outbox) == email_log.info.call_count == 0
++        assert not AuditLogEntry.objects.filter(
++            event=AuditLogEntryEvent.MEMBER_PENDING,
++            organization=self.org,
++            actor=self.owner
++        ).exists()
++
++    @mock.patch('sentry.utils.email.logger')
++    def test_handle_2fa_required__non_compliant_members(self, email_log):
++        non_compliant = []
++        for num in range(0, 4):
++            user, member = self._create_user_and_member()
++            non_compliant.append((user, member))
++
++        with self.options({'system.url-prefix': 'http://example.com'}), self.tasks():
++            self.org.handle_2fa_required(self.request)
++
++        for user, member in non_compliant:
++            self.is_pending_organization_member(user.id, member.id)
++
++        assert len(mail.outbox) == len(non_compliant)
++        assert email_log.info.call_count == len(non_compliant) * 2  # mail.queued, mail.sent
++        assert AuditLogEntry.objects.filter(
++            event=AuditLogEntryEvent.MEMBER_PENDING,
++            organization=self.org,
++            actor=self.owner
++        ).count() == len(non_compliant)
++
++    @mock.patch('sentry.utils.email.logger')
++    def test_handle_2fa_required__pending_member__ok(self, email_log):
++        user, member = self._create_user_and_member(has_member_email=True)
++        member.user = None
++        member.save()
++
++        with self.options({'system.url-prefix': 'http://example.com'}), self.tasks():
++            self.org.handle_2fa_required(self.request)
++        self.is_pending_organization_member(user.id, member.id)
++
++        assert len(mail.outbox) == email_log.info.call_count == 0
++        assert not AuditLogEntry.objects.filter(
++            event=AuditLogEntryEvent.MEMBER_PENDING,
++            organization=self.org,
++            actor=self.owner
++        ).exists()
++
++    @mock.patch('sentry.tasks.auth.logger')
++    @mock.patch('sentry.utils.email.logger')
++    def test_handle_2fa_required__no_user_email__ok(self, email_log, auth_log):
++        user, member = self._create_user_and_member(has_user_email=False, has_member_email=True)
++        assert not user.email
++        assert member.email
++
++        with self.options({'system.url-prefix': 'http://example.com'}), self.tasks():
++            self.org.handle_2fa_required(self.request)
++
++        self.is_pending_organization_member(user.id, member.id)
++
++        assert email_log.info.call_count == 2  # mail.queued, mail.sent
++        assert len(mail.outbox) == 1
++        assert mail.outbox[0].to == [member.email]
++
++        assert not auth_log.warning.called
++        auth_log.info.assert_called_with(
++            '2FA noncompliant user removed from org',
++            extra={
++                'organization_id': self.org.id,
++                'user_id': user.id,
++                'member_id': member.id
++            }
++        )
++
++    @mock.patch('sentry.tasks.auth.logger')
++    @mock.patch('sentry.utils.email.logger')
++    def test_handle_2fa_required__no_email__warning(self, email_log, auth_log):
++        user, member = self._create_user_and_member(has_user_email=False)
++        assert not user.email
++        assert not member.email
++
++        with self.options({'system.url-prefix': 'http://example.com'}), self.tasks():
++            self.org.handle_2fa_required(self.request)
++        self.is_organization_member(user.id, member.id)
++
++        auth_log.warning.assert_called_with(
++            'Could not remove 2FA noncompliant user from org',
++            extra={
++                'organization_id': self.org.id,
++                'user_id': user.id,
++                'member_id': member.id
++            }
++        )
++
++    @mock.patch('sentry.tasks.auth.logger')
++    @mock.patch('sentry.utils.email.logger')
++    def test_handle_2fa_required__no_actor_and_api_key__ok(self, email_log, auth_log):
++        user, member = self._create_user_and_member()
++
++        with self.options({'system.url-prefix': 'http://example.com'}), self.tasks():
++            api_key = ApiKey.objects.create(
++                organization=self.org,
++                scope_list=['org:read', 'org:write', 'member:read', 'member:write']
++            )
++            request = copy.deepcopy(self.request)
++            request.user = None
++            request.auth = api_key
++            self.org.handle_2fa_required(request)
++        self.is_pending_organization_member(user.id, member.id)
++
++        assert len(mail.outbox) == 1
++        assert email_log.info.call_count == 2  # mail.queued, mail.sent
++        assert AuditLogEntry.objects.filter(
++            event=AuditLogEntryEvent.MEMBER_PENDING,
++            organization=self.org,
++            actor=None,
++            actor_key=api_key
++        ).count() == 1
++
++    @mock.patch('sentry.tasks.auth.logger')
++    @mock.patch('sentry.utils.email.logger')
++    def test_handle_2fa_required__no_ip_address__ok(self, email_log, auth_log):
++        user, member = self._create_user_and_member()
++
++        with self.options({'system.url-prefix': 'http://example.com'}), self.tasks():
++            request = copy.deepcopy(self.request)
++            request.META['REMOTE_ADDR'] = None
++            self.org.handle_2fa_required(request)
++        self.is_pending_organization_member(user.id, member.id)
++
++        assert len(mail.outbox) == 1
++        assert email_log.info.call_count == 2  # mail.queued, mail.sent
++        assert AuditLogEntry.objects.filter(
++            event=AuditLogEntryEvent.MEMBER_PENDING,
++            organization=self.org,
++            actor=self.owner,
++            actor_key=None,
++            ip_address=None,
++        ).count() == 1

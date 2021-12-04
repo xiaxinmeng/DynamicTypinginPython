@@ -1,0 +1,300 @@
+commit 5a3a9ccea3abf52888db368a18b3fe4c527d68fc
+Author: Chris Fuller <cfuller@sentry.io>
+Date:   Sun Apr 12 00:27:15 2020 -0400
+
+    feat(workflow): Snapshot AlertRule on delete if attached alert exists (#18122)
+
+diff --git a/src/sentry/incidents/logic.py b/src/sentry/incidents/logic.py
+index af2fbab97a..ffceedf500 100644
+--- a/src/sentry/incidents/logic.py
++++ b/src/sentry/incidents/logic.py
+@@ -2,7 +2,6 @@ from __future__ import absolute_import
+ 
+ from collections import defaultdict
+ from datetime import timedelta
+-from uuid import uuid4
+ 
+ import six
+ from django.db import transaction
+@@ -743,21 +742,18 @@ def delete_alert_rule(alert_rule):
+     Marks an alert rule as deleted and fires off a task to actually delete it.
+     :param alert_rule:
+     """
+-    if alert_rule.status in (
+-        AlertRuleStatus.PENDING_DELETION.value,
+-        AlertRuleStatus.DELETION_IN_PROGRESS.value,
+-    ):
++    if alert_rule.status == AlertRuleStatus.SNAPSHOT.value:
+         raise AlreadyDeletedError()
+ 
+     with transaction.atomic():
+-        alert_rule.update(
+-            # Randomize the name here so that we don't get unique constraint issues
+-            # while waiting for the deletion to process
+-            name=uuid4().hex,
+-            status=AlertRuleStatus.PENDING_DELETION.value,
+-        )
++        incidents = Incident.objects.filter(alert_rule=alert_rule)
+         bulk_delete_snuba_subscriptions(list(alert_rule.query_subscriptions.all()))
+-    tasks.delete_alert_rule.apply_async(kwargs={"alert_rule_id": alert_rule.id})
++        if incidents:
++            alert_rule.update(status=AlertRuleStatus.SNAPSHOT.value)
++            for incident in incidents:
++                incident.update(status=IncidentStatus.CLOSED.value)
++        else:
++            alert_rule.delete()
+ 
+ 
+ def validate_alert_rule_query(query):
+diff --git a/src/sentry/incidents/models.py b/src/sentry/incidents/models.py
+index 8af2cedf66..c20a562002 100644
+--- a/src/sentry/incidents/models.py
++++ b/src/sentry/incidents/models.py
+@@ -271,10 +271,7 @@ class IncidentSubscription(Model):
+ 
+ class AlertRuleStatus(Enum):
+     PENDING = 0
+-    TRIGGERED = 1
+-    PENDING_DELETION = 2
+-    DELETION_IN_PROGRESS = 3
+-    ARCHIVED = 4
++    SNAPSHOT = 4
+ 
+ 
+ class AlertRuleThresholdType(Enum):
+@@ -284,7 +281,7 @@ class AlertRuleThresholdType(Enum):
+ 
+ class AlertRuleManager(BaseManager):
+     """
+-    A manager that excludes all rows that are pending deletion.
++    A manager that excludes all rows that are snapshots.
+     """
+ 
+     CACHE_SUBSCRIPTION_KEY = "alert_rule:subscription:%s"
+@@ -293,13 +290,7 @@ class AlertRuleManager(BaseManager):
+         return (
+             super(AlertRuleManager, self)
+             .get_queryset()
+-            .exclude(
+-                status__in=(
+-                    AlertRuleStatus.PENDING_DELETION.value,
+-                    AlertRuleStatus.DELETION_IN_PROGRESS.value,
+-                    AlertRuleStatus.ARCHIVED.value,
+-                )
+-            )
++            .exclude(status=AlertRuleStatus.SNAPSHOT.value)
+         )
+ 
+     def fetch_for_organization(self, organization):
+@@ -380,7 +371,7 @@ class AlertRule(Model):
+     __core__ = True
+ 
+     objects = AlertRuleManager()
+-    objects_with_deleted = BaseManager()
++    objects_with_snapshots = BaseManager()
+ 
+     organization = FlexibleForeignKey("sentry.Organization", null=True)
+     query_subscriptions = models.ManyToManyField(
+diff --git a/src/sentry/incidents/tasks.py b/src/sentry/incidents/tasks.py
+index e9028c77a9..74c62ff071 100644
+--- a/src/sentry/incidents/tasks.py
++++ b/src/sentry/incidents/tasks.py
+@@ -1,16 +1,10 @@
+ from __future__ import absolute_import
+ 
+-from uuid import uuid4
+-
+ from django.core.urlresolvers import reverse
+ from six.moves.urllib.parse import urlencode
+ 
+-from sentry import deletions
+ from sentry.auth.access import from_user
+-from sentry.exceptions import DeleteAborted
+ from sentry.incidents.models import (
+-    AlertRule,
+-    AlertRuleStatus,
+     AlertRuleTriggerAction,
+     Incident,
+     IncidentActivity,
+@@ -20,7 +14,7 @@ from sentry.incidents.models import (
+ )
+ from sentry.models import Project
+ from sentry.snuba.query_subscription_consumer import register_subscriber
+-from sentry.tasks.base import instrumented_task, retry
++from sentry.tasks.base import instrumented_task
+ from sentry.utils.email import MessageBuilder
+ from sentry.utils.http import absolute_uri
+ from sentry.utils import metrics
+@@ -100,44 +94,6 @@ def build_activity_context(activity, user):
+     }
+ 
+ 
+-@instrumented_task(
+-    name="sentry.incidents.tasks.delete_alert_rule",
+-    queue="cleanup",
+-    default_retry_delay=60 * 5,
+-    max_retries=1,
+-)
+-@retry(exclude=(DeleteAborted,))
+-def delete_alert_rule(alert_rule_id, transaction_id=None, **kwargs):
+-    from sentry.incidents.models import AlertRule
+-
+-    try:
+-        instance = AlertRule.objects_with_deleted.get(id=alert_rule_id)
+-    except AlertRule.DoesNotExist:
+-        return
+-
+-    if instance.status not in (
+-        AlertRuleStatus.DELETION_IN_PROGRESS.value,
+-        AlertRuleStatus.PENDING_DELETION.value,
+-    ):
+-        raise DeleteAborted
+-
+-    task = deletions.get(
+-        model=AlertRule, query={"id": alert_rule_id}, transaction_id=transaction_id or uuid4().hex
+-    )
+-    has_more = task.chunk()
+-    if has_more:
+-        delete_alert_rule.apply_async(
+-            kwargs={"alert_rule_id": alert_rule_id, "transaction_id": transaction_id}, countdown=15
+-        )
+-
+-
+-class AlertRuleDeletionTask(deletions.ModelDeletionTask):
+-    manager_name = "objects_with_deleted"
+-
+-
+-deletions.default_manager.register(AlertRule, AlertRuleDeletionTask)
+-
+-
+ @register_subscriber(INCIDENTS_SNUBA_SUBSCRIPTION_TYPE)
+ def handle_snuba_query_update(subscription_update, subscription):
+     """
+diff --git a/tests/sentry/incidents/endpoints/test_organization_alert_rule_details.py b/tests/sentry/incidents/endpoints/test_organization_alert_rule_details.py
+index e973acac83..0f4ca83b2d 100644
+--- a/tests/sentry/incidents/endpoints/test_organization_alert_rule_details.py
++++ b/tests/sentry/incidents/endpoints/test_organization_alert_rule_details.py
+@@ -11,7 +11,7 @@ from sentry.api.serializers import serialize
+ from sentry.api.serializers.models.alert_rule import DetailedAlertRuleSerializer
+ from sentry.auth.access import OrganizationGlobalAccess
+ from sentry.incidents.endpoints.serializers import AlertRuleSerializer
+-from sentry.incidents.models import AlertRule
++from sentry.incidents.models import AlertRule, AlertRuleStatus, Incident, IncidentStatus
+ from sentry.testutils import APITestCase
+ 
+ 
+@@ -389,5 +389,27 @@ class AlertRuleDetailsDeleteEndpointTest(AlertRuleDetailsBase, APITestCase):
+             self.get_valid_response(self.organization.slug, self.alert_rule.id, status_code=204)
+ 
+         assert not AlertRule.objects.filter(id=self.alert_rule.id).exists()
+-        assert not AlertRule.objects_with_deleted.filter(name=self.alert_rule.name)
+-        assert AlertRule.objects_with_deleted.filter(id=self.alert_rule.id).exists()
++        assert not AlertRule.objects_with_snapshots.filter(name=self.alert_rule.name).exists()
++        assert not AlertRule.objects_with_snapshots.filter(id=self.alert_rule.id).exists()
++
++    def test_snapshot_and_create_new_with_same_name(self):
++
++        self.create_member(
++            user=self.user, organization=self.organization, role="owner", teams=[self.team]
++        )
++        self.login_as(self.user)
++
++        # We attach the rule to an incident so the rule is snapshotted instead of deleted.
++        incident = self.create_incident(alert_rule=self.alert_rule)
++
++        with self.feature("organizations:incidents"):
++            self.get_valid_response(self.organization.slug, self.alert_rule.id, status_code=204)
++
++        alert_rule = AlertRule.objects_with_snapshots.get(id=self.alert_rule.id)
++
++        assert not AlertRule.objects.filter(id=alert_rule.id).exists()
++        assert AlertRule.objects_with_snapshots.filter(id=alert_rule.id).exists()
++        assert alert_rule.status == AlertRuleStatus.SNAPSHOT.value
++
++        # We also confirm that the incident is automatically resolved.
++        assert Incident.objects.get(id=incident.id).status == IncidentStatus.CLOSED.value
+diff --git a/tests/sentry/incidents/endpoints/test_project_alert_rule_details.py b/tests/sentry/incidents/endpoints/test_project_alert_rule_details.py
+index 9c6c68eb0f..6ed5a3eae8 100644
+--- a/tests/sentry/incidents/endpoints/test_project_alert_rule_details.py
++++ b/tests/sentry/incidents/endpoints/test_project_alert_rule_details.py
+@@ -4,7 +4,7 @@ from exam import fixture
+ 
+ from sentry.api.serializers import serialize
+ from sentry.incidents.logic import create_alert_rule
+-from sentry.incidents.models import AlertRule
++from sentry.incidents.models import AlertRule, AlertRuleStatus, Incident, IncidentStatus
+ from sentry.snuba.models import QueryAggregations
+ from sentry.testutils import APITestCase
+ 
+@@ -169,5 +169,29 @@ class AlertRuleDetailsDeleteEndpointTest(AlertRuleDetailsBase, APITestCase):
+             )
+ 
+         assert not AlertRule.objects.filter(id=self.alert_rule.id).exists()
+-        assert not AlertRule.objects_with_deleted.filter(name=self.alert_rule.name)
+-        assert AlertRule.objects_with_deleted.filter(id=self.alert_rule.id).exists()
++        assert not AlertRule.objects_with_snapshots.filter(name=self.alert_rule.id).exists()
++        assert not AlertRule.objects_with_snapshots.filter(id=self.alert_rule.id).exists()
++
++    def test_snapshot_and_create_new_with_same_name(self):
++
++        self.create_member(
++            user=self.user, organization=self.organization, role="owner", teams=[self.team]
++        )
++        self.login_as(self.user)
++
++        # We attach the rule to an incident so the rule is snapshotted instead of deleted.
++        incident = self.create_incident(alert_rule=self.alert_rule)
++
++        with self.feature("organizations:incidents"):
++            self.get_valid_response(
++                self.organization.slug, self.project.slug, self.alert_rule.id, status_code=204
++            )
++
++        alert_rule = AlertRule.objects_with_snapshots.get(id=self.alert_rule.id)
++
++        assert not AlertRule.objects.filter(id=alert_rule.id).exists()
++        assert AlertRule.objects_with_snapshots.filter(id=alert_rule.id).exists()
++        assert alert_rule.status == AlertRuleStatus.SNAPSHOT.value
++
++        # We also confirm that the incident is automatically resolved.
++        assert Incident.objects.get(id=incident.id).status == IncidentStatus.CLOSED.value
+diff --git a/tests/sentry/incidents/test_logic.py b/tests/sentry/incidents/test_logic.py
+index a7bc755e59..0116580537 100644
+--- a/tests/sentry/incidents/test_logic.py
++++ b/tests/sentry/incidents/test_logic.py
+@@ -892,7 +892,8 @@ class DeleteAlertRuleTest(TestCase, BaseIncidentsTest):
+         with self.tasks():
+             delete_alert_rule(self.alert_rule)
+ 
+-        assert not AlertRule.objects_with_deleted.filter(id=alert_rule_id).exists()
++        assert not AlertRule.objects.filter(id=alert_rule_id).exists()
++        assert not AlertRule.objects_with_snapshots.filter(id=alert_rule_id).exists()
+ 
+     def test_with_incident(self):
+         incident = self.create_incident()
+@@ -901,9 +902,10 @@ class DeleteAlertRuleTest(TestCase, BaseIncidentsTest):
+         with self.tasks():
+             delete_alert_rule(self.alert_rule)
+ 
+-        assert not AlertRule.objects_with_deleted.filter(id=alert_rule_id).exists()
++        assert AlertRule.objects_with_snapshots.filter(id=alert_rule_id).exists()
++        assert not AlertRule.objects.filter(id=alert_rule_id).exists()
+         incident = Incident.objects.get(id=incident.id)
+-        assert Incident.objects.filter(id=incident.id, alert_rule_id__isnull=True).exists()
++        assert Incident.objects.filter(id=incident.id, alert_rule=self.alert_rule).exists()
+ 
+ 
+ class TestGetExcludedProjectsForAlertRule(TestCase):
+diff --git a/tests/sentry/incidents/test_models.py b/tests/sentry/incidents/test_models.py
+index 4a29798fc9..0bd226fd3b 100644
+--- a/tests/sentry/incidents/test_models.py
++++ b/tests/sentry/incidents/test_models.py
+@@ -361,7 +361,7 @@ class IncidentAlertRuleRelationTest(TestCase):
+         all_alert_rules = list(AlertRule.objects.all())
+         assert self.alert_rule in all_alert_rules
+ 
+-        self.alert_rule.status = AlertRuleStatus.ARCHIVED.value
++        self.alert_rule.status = AlertRuleStatus.SNAPSHOT.value
+         self.alert_rule.save()
+ 
+         all_alert_rules = list(AlertRule.objects.all())

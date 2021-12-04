@@ -1,0 +1,889 @@
+commit 8f67713e975d3b33b2005f7daaea92212868d45f
+Author: MeredithAnya <meredith.a.heller@gmail.com>
+Date:   Mon Oct 28 09:26:12 2019 -0700
+
+    feat(integrations): PagerDuty Integration Part I (#14860)
+
+diff --git a/src/sentry/api/endpoints/organization_config_integrations.py b/src/sentry/api/endpoints/organization_config_integrations.py
+index 8a2830bec2..7e57b4a16e 100644
+--- a/src/sentry/api/endpoints/organization_config_integrations.py
++++ b/src/sentry/api/endpoints/organization_config_integrations.py
+@@ -2,14 +2,26 @@ from __future__ import absolute_import
+ 
+ from rest_framework.response import Response
+ 
+-from sentry import integrations
++from django.conf import settings
++
++from sentry import integrations, features
+ from sentry.api.bases.organization import OrganizationEndpoint
+ from sentry.api.serializers import serialize, IntegrationProviderSerializer
+ 
+ 
+ class OrganizationConfigIntegrationsEndpoint(OrganizationEndpoint):
+     def get(self, request, organization):
+-        providers = list(integrations.all())
++        has_catchall = features.has(
++            "organizations:internal-catchall", organization, actor=request.user
++        )
++
++        providers = []
++        for provider in integrations.all():
++            if not has_catchall and provider.key in settings.SENTRY_INTERNAL_INTEGRATIONS:
++                continue
++
++            providers.append(provider)
++
+         providers.sort(key=lambda i: i.key)
+ 
+         serialized = serialize(
+diff --git a/src/sentry/conf/server.py b/src/sentry/conf/server.py
+index 09d091dc55..efe975b83f 100644
+--- a/src/sentry/conf/server.py
++++ b/src/sentry/conf/server.py
+@@ -1410,9 +1410,13 @@ SENTRY_DEFAULT_INTEGRATIONS = (
+     "sentry.integrations.jira_server.JiraServerIntegrationProvider",
+     "sentry.integrations.vsts.VstsIntegrationProvider",
+     "sentry.integrations.vsts_extension.VstsExtensionIntegrationProvider",
++    "sentry.integrations.pagerduty.integration.PagerDutyIntegrationProvider",
+ )
+ 
+ 
++SENTRY_INTERNAL_INTEGRATIONS = ["pagerduty"]
++
++
+ def get_sentry_sdk_config():
+     return {
+         "release": sentry.__build__,
+diff --git a/src/sentry/integrations/pagerduty/__init__.py b/src/sentry/integrations/pagerduty/__init__.py
+new file mode 100644
+index 0000000000..2cfe72bbf9
+--- /dev/null
++++ b/src/sentry/integrations/pagerduty/__init__.py
+@@ -0,0 +1,7 @@
++from __future__ import absolute_import
++
++from sentry.rules import rules
++
++from .notify_action import PagerDutyNotifyServiceAction
++
++rules.add(PagerDutyNotifyServiceAction)
+diff --git a/src/sentry/integrations/pagerduty/client.py b/src/sentry/integrations/pagerduty/client.py
+new file mode 100644
+index 0000000000..dd253be911
+--- /dev/null
++++ b/src/sentry/integrations/pagerduty/client.py
+@@ -0,0 +1,58 @@
++from __future__ import absolute_import
++
++from sentry.utils import json
++from sentry.integrations.client import ApiClient
++from sentry.models import EventCommon
++
++
++class PagerDutyClient(ApiClient):
++    allow_redirects = False
++    integration_name = "pagerduty"
++    base_url = "https://events.pagerduty.com/v2/enqueue"
++
++    def __init__(self, integration_key):
++        self.integration_key = integration_key
++        super(PagerDutyClient, self).__init__()
++
++    def request(self, method, path, headers=None, data=None, params=None):
++        if not headers:
++            headers = {"Content-Type": "application/json"}
++
++        # (XXX) Meredith: We stringify the data ahead of time in send_trigger (because reasons)
++        # so we have to pass json=False since True is the default.
++        return self._request(method, path, headers=headers, data=data, params=params, json=False)
++
++    def send_trigger(self, data):
++        # not sure if this will only been events for now
++        if isinstance(data, EventCommon):
++            source = data.transaction or data.culprit or "<unknown>"
++            group = data.group
++            payload = {
++                "routing_key": self.integration_key,
++                "event_action": "trigger",
++                "dedup_key": group.qualified_short_id,
++                "payload": {
++                    "summary": data.message or data.title,
++                    "severity": "error",
++                    "source": source,
++                    "component": group.project.slug,
++                    "custom_details": data.as_dict(),
++                },
++                "links": [
++                    {
++                        "href": group.get_absolute_url(
++                            params={"referrer": "pagerduty_integration"}
++                        ),
++                        "text": "Issue Details",
++                    }
++                ],
++            }
++        # (XXX) Meredith: The 'datetime' property that is included in as_dict doesn't
++        # get properly serializied in the requests library so we stringify it here instead.
++        return self.post("/", data=json.dumps(payload))
++
++    def send_acknowledge(self, data):
++        pass
++
++    def send_resolve(self, data):
++        pass
+diff --git a/src/sentry/integrations/pagerduty/integration.py b/src/sentry/integrations/pagerduty/integration.py
+new file mode 100644
+index 0000000000..3d044fbc38
+--- /dev/null
++++ b/src/sentry/integrations/pagerduty/integration.py
+@@ -0,0 +1,180 @@
++from __future__ import absolute_import
++
++from django.utils.translation import ugettext_lazy as _
++from django.db import transaction
++
++from sentry import options
++
++from sentry.utils import json
++from sentry.utils.http import absolute_uri
++from sentry.integrations.base import (
++    IntegrationInstallation,
++    IntegrationFeatures,
++    IntegrationMetadata,
++    IntegrationProvider,
++    FeatureDescription,
++)
++from sentry.models import (
++    OrganizationIntegration,
++    PagerDutyServiceProject,
++    PagerDutyService,
++    Project,
++)
++from sentry.pipeline import PipelineView
++from .client import PagerDutyClient
++
++DESCRIPTION = """
++PagerDuty Description
++"""
++
++FEATURES = [
++    FeatureDescription(
++        """
++        Configure rule based PagerDuty notifications!!
++        """,
++        IntegrationFeatures.ALERT_RULE,
++    )
++]
++
++metadata = IntegrationMetadata(
++    description=_(DESCRIPTION.strip()),
++    features=FEATURES,
++    author="The Sentry Team",
++    noun=_("Installation"),
++    issue_url="https://github.com/getsentry/sentry/issues/new?title=PagerDuty%20Integration:%20&labels=Component%3A%20Integrations",
++    source_url="https://github.com/getsentry/sentry/tree/master/src/sentry/integrations/pagerduty",
++    aspects={},
++)
++
++
++class PagerDutyIntegration(IntegrationInstallation):
++    def get_client(self, integration_key):
++        return PagerDutyClient(integration_key=integration_key)
++
++    def get_organization_config(self):
++        from sentry.models import Project
++
++        projects = Project.objects.filter(organization_id=self.org_integration.organization_id)
++        items = []
++        for p in projects:
++            items.append({"value": p.id, "label": p.name})
++
++        service_options = [(s.id, s.service_name) for s in self.services]
++
++        fields = [
++            {
++                "name": "project_mapping",
++                "type": "choice_mapper",
++                "label": "Map projects in Sentry to services in PagerDuty",
++                "help": "When an alert rule is triggered in a project, this mapping will let us know what service to create the incident in PagerDuty.",
++                "addButtonText": "Add Sentry Project",
++                "addDropdown": {
++                    "emptyMessage": "All projects configured",
++                    "noResultsMessage": "Could not find project",
++                    "items": items,
++                },
++                "mappedSelectors": {
++                    "service": {"choices": service_options, "placeholder": "Select a service"}
++                },
++                "columnLabels": {"service": "Service"},
++                "mappedColumnLabel": "Sentry Project",
++            }
++        ]
++
++        return fields
++
++    def update_organization_config(self, data):
++
++        if "project_mapping" in data:
++            project_ids_and_services = data.pop("project_mapping")
++
++            with transaction.atomic():
++                PagerDutyServiceProject.objects.filter(pagerduty_service__in=self.services).delete()
++
++                for p_id, s in project_ids_and_services.items():
++                    # create the record in the table
++                    project = Project.objects.get(pk=p_id)
++                    service = PagerDutyService.objects.get(id=s["service"])
++                    PagerDutyServiceProject.objects.create(
++                        project=project, pagerduty_service=service
++                    )
++
++    def get_config_data(self):
++        config = self.org_integration.config
++        project_mappings = PagerDutyServiceProject.objects.filter(
++            pagerduty_service__in=self.services
++        )
++        data = {}
++        for pm in project_mappings:
++            data[pm.project_id] = {"service": pm.pagerduty_service_id}
++        config = {}
++        config["project_mapping"] = data
++        return config
++
++    @property
++    def services(self):
++        services = PagerDutyService.objects.filter(organization_integration=self.org_integration)
++
++        return services
++
++
++class PagerDutyIntegrationProvider(IntegrationProvider):
++    key = "pagerduty"
++    name = "PagerDuty"
++    metadata = metadata
++    features = frozenset([IntegrationFeatures.ALERT_RULE])
++    integration_cls = PagerDutyIntegration
++
++    setup_dialog_config = {"width": 600, "height": 900}
++
++    def get_pipeline_views(self):
++        return [PagerDutyInstallationRedirect()]
++
++    def post_install(self, integration, organization):
++        services = integration.metadata["services"]
++        try:
++            org_integration = OrganizationIntegration.objects.get(
++                integration=integration, organization=organization
++            )
++        except OrganizationIntegration.DoesNotExist:
++            return
++
++        with transaction.atomic():
++            for service in services:
++                PagerDutyService.objects.create_or_update(
++                    organization_integration=org_integration,
++                    integration_key=service["integration_key"],
++                    service_id=service["id"],
++                    service_name=service["name"],
++                )
++
++    def build_integration(self, state):
++        config = json.loads(state.get("config"))
++        account = config["account"]
++        # PagerDuty gives us integration keys for various things, some of which
++        # are not services. For now we only care about services.
++        services = filter(lambda x: x["type"] == "service", config["integration_keys"])
++
++        return {
++            "name": account["name"],
++            "external_id": account["subdomain"],
++            "metadata": {"services": services},
++        }
++
++
++class PagerDutyInstallationRedirect(PipelineView):
++    def get_app_url(self):
++        app_id = options.get("pagerduty.app-id")
++        setup_url = absolute_uri("/extensions/pagerduty/setup/")
++
++        return (
++            u"https://app.pagerduty.com/install/integration?app_id=%s&redirect_url=%s&version=1"
++            % (app_id, setup_url)
++        )
++
++    def dispatch(self, request, pipeline):
++        if "config" in request.GET:
++            pipeline.bind_state("config", request.GET["config"])
++            return pipeline.next_step()
++
++        return self.redirect(self.get_app_url())
+diff --git a/src/sentry/integrations/pagerduty/notify_action.py b/src/sentry/integrations/pagerduty/notify_action.py
+new file mode 100644
+index 0000000000..398e140151
+--- /dev/null
++++ b/src/sentry/integrations/pagerduty/notify_action.py
+@@ -0,0 +1,168 @@
++"""
++Used for notifying a *specific* plugin
++"""
++from __future__ import absolute_import
++
++from django import forms
++from django.utils.translation import ugettext_lazy as _
++from sentry.constants import ObjectStatus
++
++from sentry.rules.actions.base import EventAction
++from sentry.models import Integration, PagerDutyService, PagerDutyServiceProject
++from sentry.integrations.exceptions import ApiError
++from .client import PagerDutyClient
++
++
++class PagerDutyNotifyServiceForm(forms.Form):
++    account = forms.ChoiceField(choices=(), widget=forms.Select())
++    service = forms.ChoiceField(required=False, choices=(), widget=forms.Select())
++
++    def __init__(self, *args, **kwargs):
++        integrations = [(i.id, i.name) for i in kwargs.pop("integrations")]
++        services = kwargs.pop("services")
++
++        super(PagerDutyNotifyServiceForm, self).__init__(*args, **kwargs)
++        if integrations:
++            self.fields["account"].initial = integrations[0][0]
++
++        self.fields["account"].choices = integrations
++        self.fields["account"].widget.choices = self.fields["account"].choices
++
++        if services:
++            self.fields["service"].initial = services[0][0]
++
++        self.fields["service"].choices = services
++        self.fields["service"].widget.choices = self.fields["service"].choices
++
++    def clean(self):
++        cleaned_data = super(PagerDutyNotifyServiceForm, self).clean()
++
++        integration_id = cleaned_data.get("account")
++        service_id = cleaned_data.get("service")
++
++        service = PagerDutyService.objects.get(id=service_id)
++
++        # need to make sure that the service actually belongs to that integration - meaning
++        # that it belongs under the appropriate account in PagerDuty
++        if not service.organization_integration.integration_id == int(integration_id):
++            params = {
++                "account": dict(self.fields["account"].choices).get(int(integration_id)),
++                "service": dict(self.fields["service"].choices).get(int(service_id)),
++            }
++
++            raise forms.ValidationError(
++                _(
++                    'The service "%(service)s" does not exist or has not been granted access in the %(account)s Pagerduty account.'
++                ),
++                code="invalid",
++                params=params,
++            )
++
++        return cleaned_data
++
++
++class PagerDutyNotifyServiceAction(EventAction):
++    form_cls = PagerDutyNotifyServiceForm
++    label = "Send a notification to PagerDuty account {account} and service {service}"
++
++    def __init__(self, *args, **kwargs):
++        super(PagerDutyNotifyServiceAction, self).__init__(*args, **kwargs)
++        self.form_fields = {
++            "account": {
++                "type": "choice",
++                "choices": [(i.id, i.name) for i in self.get_integrations()],
++            },
++            "service": {"type": "choice", "choices": self.get_services()},
++        }
++        initial_service = self.get_initial_service()
++        if initial_service:
++            self.form_fields["service"]["initial"] = initial_service
++
++    def get_initial_service(self):
++        try:
++            # service_id here is the id of the PagerDutyService record, not the
++            # service_id that is generated by pagerduty
++            service_id = PagerDutyServiceProject.objects.get(
++                project=self.project
++            ).pagerduty_service_id
++        except PagerDutyServiceProject.DoesNotExist:
++            service_id = None
++
++        return service_id
++
++    def after(self, event, state):
++        if event.group.is_ignored():
++            return
++
++        try:
++            integration = Integration.objects.get(
++                provider="pagerduty",
++                organizations=self.project.organization,
++                status=ObjectStatus.VISIBLE,
++            )
++        except Integration.DoesNotExist:
++            # integration removed but rule still exists
++            return
++
++        try:
++            service = PagerDutyService.objects.get(pk=self.get_option("service"))
++        except PagerDutyService.DoesNotExist:
++            return
++
++        def send_notification(event, futures):
++            client = PagerDutyClient(integration_key=service.integration_key)
++            try:
++                client.send_trigger(event)
++            except ApiError as e:
++                self.logger.info(
++                    "rule.fail.pagerduty_trigger",
++                    extra={"error": e.message, "service": service.service_name},
++                )
++
++        key = u"pagerduty:{}".format(integration.id)
++        yield self.future(send_notification, key=key)
++
++    def get_integrations(self):
++        integrations = Integration.objects.filter(
++            provider="pagerduty",
++            organizations=self.project.organization,
++            status=ObjectStatus.VISIBLE,
++        )
++
++        return integrations
++
++    def get_services(self):
++        integrations = Integration.objects.filter(
++            provider="pagerduty",
++            organizations=self.project.organization,
++            status=ObjectStatus.VISIBLE,
++        )
++        services = []
++        for integration in integrations:
++            service_list = PagerDutyService.objects.filter(
++                organization_integration_id__in=integration.organizationintegration_set.all()
++            ).values_list("id", "service_name")
++            services += service_list
++        return services
++
++    def render_label(self):
++        try:
++            integration_name = Integration.objects.get(
++                provider="pagerduty",
++                organizations=self.project.organization,
++                id=self.get_option("account"),
++            ).name
++        except Integration.DoesNotExist:
++            integration_name = "[removed]"
++
++        try:
++            service_name = PagerDutyService.objects.get(id=self.get_option("service")).service_name
++        except PagerDutyService.DoesNotExist:
++            service_name = "[removed]"
++
++        return self.label.format(account=integration_name, service=service_name)
++
++    def get_form_instance(self):
++        return self.form_cls(
++            self.data, integrations=self.get_integrations(), services=self.get_services()
++        )
+diff --git a/src/sentry/integrations/pipeline.py b/src/sentry/integrations/pipeline.py
+index f365954b17..d29c8eca35 100644
+--- a/src/sentry/integrations/pipeline.py
++++ b/src/sentry/integrations/pipeline.py
+@@ -147,7 +147,6 @@ class IntegrationPipeline(Pipeline):
+         org_integration = self.integration.add_organization(
+             self.organization, self.request.user, default_auth_id=default_auth_id
+         )
+-
+         return self._dialog_response(serialize(org_integration, self.request.user), True)
+ 
+     def _dialog_response(self, data, success):
+diff --git a/src/sentry/options/defaults.py b/src/sentry/options/defaults.py
+index 33a74ba32c..c4d11502ad 100644
+--- a/src/sentry/options/defaults.py
++++ b/src/sentry/options/defaults.py
+@@ -127,6 +127,9 @@ register("github-app.client-secret", flags=FLAG_PRIORITIZE_DISK)
+ register("vsts.client-id", flags=FLAG_PRIORITIZE_DISK)
+ register("vsts.client-secret", flags=FLAG_PRIORITIZE_DISK)
+ 
++# PagerDuty Integration
++register("pagerduty.app-id", default="")
++
+ # Snuba
+ register("snuba.search.pre-snuba-candidates-optimizer", type=Bool, default=False)
+ register("snuba.search.pre-snuba-candidates-percentage", default=0.2)
+diff --git a/src/sentry/static/sentry/app/views/settings/projectAlerts/ruleEditor/ruleNode.jsx b/src/sentry/static/sentry/app/views/settings/projectAlerts/ruleEditor/ruleNode.jsx
+index 592e9cf698..7f37b3fd2a 100644
+--- a/src/sentry/static/sentry/app/views/settings/projectAlerts/ruleEditor/ruleNode.jsx
++++ b/src/sentry/static/sentry/app/views/settings/projectAlerts/ruleEditor/ruleNode.jsx
+@@ -23,7 +23,11 @@ class RuleNode extends React.Component {
+ 
+     let initialVal;
+     if (this.props.data[name] === undefined && !!data.choices.length) {
+-      initialVal = data.choices[0][0];
++      if (data.initial) {
++        initialVal = data.initial;
++      } else {
++        initialVal = data.choices[0][0];
++      }
+       this.props.handlePropertyChange(name, initialVal);
+     } else {
+       initialVal = this.props.data[name];
+diff --git a/src/sentry/utils/pytest/sentry.py b/src/sentry/utils/pytest/sentry.py
+index 816c564b10..52ff8c3d93 100644
+--- a/src/sentry/utils/pytest/sentry.py
++++ b/src/sentry/utils/pytest/sentry.py
+@@ -194,6 +194,7 @@ def register_extensions():
+     from sentry.integrations.slack import SlackIntegrationProvider
+     from sentry.integrations.vsts import VstsIntegrationProvider
+     from sentry.integrations.vsts_extension import VstsExtensionIntegrationProvider
++    from sentry.integrations.pagerduty.integration import PagerDutyIntegrationProvider
+ 
+     integrations.register(BitbucketIntegrationProvider)
+     integrations.register(ExampleIntegrationProvider)
+@@ -206,6 +207,7 @@ def register_extensions():
+     integrations.register(SlackIntegrationProvider)
+     integrations.register(VstsIntegrationProvider)
+     integrations.register(VstsExtensionIntegrationProvider)
++    integrations.register(PagerDutyIntegrationProvider)
+ 
+     from sentry.plugins.base import bindings
+     from sentry.plugins.providers.dummy import DummyRepositoryProvider
+diff --git a/tests/sentry/api/endpoints/test_project_rules_configuration.py b/tests/sentry/api/endpoints/test_project_rules_configuration.py
+index 4a5a79c24f..6c673de2db 100644
+--- a/tests/sentry/api/endpoints/test_project_rules_configuration.py
++++ b/tests/sentry/api/endpoints/test_project_rules_configuration.py
+@@ -20,5 +20,5 @@ class ProjectRuleConfigurationTest(APITestCase):
+         response = self.client.get(url, format="json")
+ 
+         assert response.status_code == 200, response.content
+-        assert len(response.data["actions"]) == 3
++        assert len(response.data["actions"]) == 4
+         assert len(response.data["conditions"]) == 9
+diff --git a/tests/sentry/integrations/pagerduty/__init__.py b/tests/sentry/integrations/pagerduty/__init__.py
+new file mode 100644
+index 0000000000..c3961685ab
+--- /dev/null
++++ b/tests/sentry/integrations/pagerduty/__init__.py
+@@ -0,0 +1 @@
++from __future__ import absolute_import
+diff --git a/tests/sentry/integrations/pagerduty/test_client.py b/tests/sentry/integrations/pagerduty/test_client.py
+new file mode 100644
+index 0000000000..1168cc3a5e
+--- /dev/null
++++ b/tests/sentry/integrations/pagerduty/test_client.py
+@@ -0,0 +1,81 @@
++from __future__ import absolute_import
++
++import copy
++
++from sentry.utils import json
++from mock import patch
++
++from sentry.testutils import APITestCase
++from sentry.testutils.helpers.datetime import iso_format, before_now
++from sentry.models import Integration, PagerDutyService
++from sentry.testutils.factories import DEFAULT_EVENT_DATA
++
++# external_id is the account name in pagerduty
++EXTERNAL_ID = "example-pagerduty"
++SERVICES = [
++    {
++        "type": "service",
++        "integration_key": "PND4F9",
++        "service_id": "123",
++        "service_name": "Critical",
++    }
++]
++
++
++class PagerDutyClientTest(APITestCase):
++    provider = "pagerduty"
++
++    def setUp(self):
++        self.login_as(self.user)
++        self.integration = Integration.objects.create(
++            provider=self.provider,
++            name="Example PagerDuty",
++            external_id=EXTERNAL_ID,
++            metadata={"services": SERVICES},
++        )
++        self.integration.add_organization(self.organization, self.user)
++        self.service = PagerDutyService.objects.create(
++            service_id=SERVICES[0]["service_id"],
++            service_name=SERVICES[0]["service_name"],
++            integration_key=SERVICES[0]["integration_key"],
++            organization_integration=self.integration.organizationintegration_set.first(),
++        )
++        self.installation = self.integration.get_installation(self.organization.id)
++        self.min_ago = iso_format(before_now(minutes=1))
++
++    @patch("sentry.integrations.pagerduty.client.PagerDutyClient.request")
++    def test_send_trigger(self, mock_request):
++        event = self.store_event(
++            data={
++                "event_id": "a" * 32,
++                "message": "message",
++                "timestamp": self.min_ago,
++                "stacktrace": copy.deepcopy(DEFAULT_EVENT_DATA["stacktrace"]),
++            },
++            project_id=self.project.id,
++        )
++        group = event.group
++
++        integration_key = self.service.integration_key
++        client = self.installation.get_client(integration_key=integration_key)
++
++        client.send_trigger(event)
++        data = {
++            "routing_key": integration_key,
++            "event_action": "trigger",
++            "dedup_key": group.qualified_short_id,
++            "payload": {
++                "summary": event.message,
++                "severity": "error",
++                "source": event.transaction or event.culprit,
++                "component": self.project.slug,
++                "custom_details": event.as_dict(),
++            },
++            "links": [
++                {
++                    "href": group.get_absolute_url(params={"referrer": "pagerduty_integration"}),
++                    "text": "Issue Details",
++                }
++            ],
++        }
++        mock_request.assert_called_once_with("POST", "/", data=json.dumps(data))
+diff --git a/tests/sentry/integrations/pagerduty/test_integration.py b/tests/sentry/integrations/pagerduty/test_integration.py
+new file mode 100644
+index 0000000000..fedabfe2f2
+--- /dev/null
++++ b/tests/sentry/integrations/pagerduty/test_integration.py
+@@ -0,0 +1,88 @@
++from __future__ import absolute_import
++
++import responses
++
++from sentry import options
++from sentry.utils import json
++
++from six.moves.urllib.parse import urlencode, urlparse
++from sentry.models import Integration, OrganizationIntegration
++from sentry.testutils import IntegrationTestCase
++from sentry.integrations.pagerduty.integration import PagerDutyIntegrationProvider
++
++
++class PagerDutyIntegrationTest(IntegrationTestCase):
++    provider = PagerDutyIntegrationProvider
++    base_url = "https://app.pagerduty.com"
++
++    def setUp(self):
++        super(PagerDutyIntegrationTest, self).setUp()
++        self.app_id = "app_1"
++        self.account_slug = "test-app"
++        self._stub_pagerduty()
++
++    def _stub_pagerduty(self):
++        options.set("pagerduty.app-id", self.app_id)
++        responses.reset()
++
++        responses.add(
++            responses.GET,
++            self.base_url
++            + "/install/integration?app_id=%sredirect_url=%s&version=1"
++            % (self.app_id, self.setup_path),
++        )
++
++    def assert_setup_flow(self):
++        resp = self.client.get(self.init_path)
++        assert resp.status_code == 302
++        redirect = urlparse(resp["Location"])
++        assert redirect.scheme == "https"
++        assert redirect.netloc == "app.pagerduty.com"
++        assert redirect.path == "/install/integration"
++
++        config = {
++            "integration_keys": [
++                {
++                    "integration_key": "key1",
++                    "name": "Super Cool Service",
++                    "id": "PD12345",
++                    "type": "service",
++                },
++                {
++                    "integration_key": "key3",
++                    "name": "B Team's Rules",
++                    "id": "PDBCDEF",
++                    "type": "team_rule_set",
++                },
++            ],
++            "account": {"subdomain": "test-app", "name": "Test App"},
++        }
++
++        resp = self.client.get(
++            u"{}?{}".format(self.setup_path, urlencode({"config": json.dumps(config)}))
++        )
++
++        self.assertDialogSuccess(resp)
++        return resp
++
++    @responses.activate
++    def test_basic_flow(self):
++        with self.tasks():
++            self.assert_setup_flow()
++
++        integration = Integration.objects.get(provider=self.provider.key)
++
++        assert integration.external_id == self.account_slug
++        assert integration.name == "Test App"
++        assert integration.metadata["services"] == [
++            {
++                "integration_key": "key1",
++                "name": "Super Cool Service",
++                "id": "PD12345",
++                "type": "service",
++            }
++        ]
++        oi = OrganizationIntegration.objects.get(
++            integration=integration, organization=self.organization
++        )
++        assert oi.config == {}
+diff --git a/tests/sentry/integrations/pagerduty/test_notify_action.py b/tests/sentry/integrations/pagerduty/test_notify_action.py
+new file mode 100644
+index 0000000000..054633589b
+--- /dev/null
++++ b/tests/sentry/integrations/pagerduty/test_notify_action.py
+@@ -0,0 +1,127 @@
++from __future__ import absolute_import
++
++import responses
++
++from sentry.utils import json
++from sentry.models import Integration, PagerDutyService, GroupStatus
++from sentry.testutils.cases import RuleTestCase
++from sentry.integrations.pagerduty.notify_action import PagerDutyNotifyServiceAction
++
++# external_id is the account name in pagerduty
++EXTERNAL_ID = "example-pagerduty"
++SERVICES = [
++    {
++        "type": "service",
++        "integration_key": "PND4F9",
++        "service_id": "123",
++        "service_name": "Critical",
++    }
++]
++
++
++class PagerDutyNotifyActionTest(RuleTestCase):
++    rule_cls = PagerDutyNotifyServiceAction
++
++    def setUp(self):
++        self.get_event()
++
++        self.integration = Integration.objects.create(
++            provider="pagerduty",
++            name="Example",
++            external_id=EXTERNAL_ID,
++            metadata={"services": SERVICES},
++        )
++        self.integration.add_organization(self.organization, self.user)
++        self.service = PagerDutyService.objects.create(
++            service_id=SERVICES[0]["service_id"],
++            service_name=SERVICES[0]["service_name"],
++            integration_key=SERVICES[0]["integration_key"],
++            organization_integration=self.integration.organizationintegration_set.first(),
++        )
++        self.installation = self.integration.get_installation(self.organization.id)
++
++    @responses.activate
++    def test_applies_correctly(self):
++        event = self.get_event()
++
++        rule = self.get_rule(data={"account": self.integration.id, "service": self.service.id})
++
++        results = list(rule.after(event=event, state=self.get_state()))
++        assert len(results) == 1
++
++        responses.add(
++            method=responses.POST,
++            url="https://events.pagerduty.com/v2/enqueue/",
++            body={},
++            status=202,
++            content_type="application/json",
++        )
++
++        # Trigger rule callback
++        results[0].callback(event, futures=[])
++        data = json.loads(responses.calls[0].request.body)
++
++        assert data["event_action"] == "trigger"
++
++    def test_render_label(self):
++        rule = self.get_rule(data={"account": self.integration.id, "service": self.service.id})
++
++        assert (
++            rule.render_label()
++            == "Send a notification to PagerDuty account Example and service Critical"
++        )
++
++    def test_render_label_without_integration(self):
++        self.integration.delete()
++
++        rule = self.get_rule(data={"account": self.integration.id, "service": self.service.id})
++
++        label = rule.render_label()
++        assert label == "Send a notification to PagerDuty account [removed] and service [removed]"
++
++    @responses.activate
++    def test_valid_service_selected(self):
++        rule = self.get_rule(data={"account": self.integration.id, "service": self.service.id})
++
++        form = rule.get_form_instance()
++        assert form.is_valid()
++
++    @responses.activate
++    def test_invalid_service_selected(self):
++        # make a service associated with a different pagerduty account
++        service_info = {
++            "type": "service",
++            "integration_key": "PND351",
++            "service_id": "345",
++            "service_name": "Informational",
++        }
++        integration = Integration.objects.create(
++            provider="pagerduty",
++            name="Example 2",
++            external_id="example-2",
++            metadata={"services": [service_info]},
++        )
++        integration.add_organization(self.organization, self.user)
++        service = PagerDutyService.objects.create(
++            service_id=service_info["service_id"],
++            service_name=service_info["service_name"],
++            integration_key=service_info["integration_key"],
++            organization_integration=integration.organizationintegration_set.first(),
++        )
++        self.installation = integration.get_installation(self.organization.id)
++
++        rule = self.get_rule(data={"account": self.integration.id, "service": service.id})
++
++        form = rule.get_form_instance()
++        assert not form.is_valid()
++        assert len(form.errors) == 1
++
++    def test_dont_notify_ignored(self):
++        event = self.get_event()
++        event.group.status = GroupStatus.IGNORED
++        event.group.save()
++
++        rule = self.get_rule(data={"account": self.integration.id, "service": self.service.id})
++
++        results = list(rule.after(event=event, state=self.get_state()))
++        assert len(results) == 0

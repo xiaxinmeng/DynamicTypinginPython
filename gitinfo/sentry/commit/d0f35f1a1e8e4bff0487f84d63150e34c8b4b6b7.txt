@@ -1,0 +1,1670 @@
+commit d0f35f1a1e8e4bff0487f84d63150e34c8b4b6b7
+Author: David Cramer <dcramer@gmail.com>
+Date:   Thu Nov 19 14:14:22 2015 -0800
+
+    Support for release resolution
+    
+    This implements a new pending resolution computed state. You can mark an issue as 'resolved in next release', which will change the state of the issue to be Resolved, with a slightly tweaked activity item. It will also snooze the issue for the current release(s).
+    
+    When the next release happens it will update the activity notification to suggest the version which resolved the event, and if it happens again it will be marked as a regression.
+    
+    Fixes GH-2155
+
+diff --git a/src/sentry/api/endpoints/project_group_index.py b/src/sentry/api/endpoints/project_group_index.py
+index 63353480e1..8a02422238 100644
+--- a/src/sentry/api/endpoints/project_group_index.py
++++ b/src/sentry/api/endpoints/project_group_index.py
+@@ -1,6 +1,7 @@
+ from __future__ import absolute_import, division, print_function
+ 
+ from datetime import datetime, timedelta
++from django.db import IntegrityError, transaction
+ from django.db.models import Q
+ from django.utils import timezone
+ from rest_framework import serializers
+@@ -11,13 +12,11 @@ from sentry.api.base import DocSection
+ from sentry.api.bases.project import ProjectEndpoint, ProjectEventPermission
+ from sentry.api.serializers import serialize
+ from sentry.api.serializers.models.group import StreamGroupSerializer
+-from sentry.constants import (
+-    DEFAULT_SORT_OPTION, STATUS_CHOICES
+-)
++from sentry.constants import DEFAULT_SORT_OPTION
+ from sentry.db.models.query import create_or_update
+ from sentry.models import (
+-    Activity, EventMapping, Group, GroupBookmark, GroupSeen, GroupSnooze,
+-    GroupStatus, TagKey
++    Activity, EventMapping, Group, GroupBookmark, GroupResolution, GroupSeen,
++    GroupSnooze, GroupStatus, Release, TagKey
+ )
+ from sentry.search.utils import parse_query
+ from sentry.tasks.deletion import delete_group
+@@ -61,6 +60,14 @@ def list_project_aggregates_scenario(runner):
+     )
+ 
+ 
++STATUS_CHOICES = {
++    'resolved': GroupStatus.RESOLVED,
++    'unresolved': GroupStatus.UNRESOLVED,
++    'muted': GroupStatus.MUTED,
++    'resolvedInNextRelease': GroupStatus.UNRESOLVED,
++}
++
++
+ class GroupSerializer(serializers.Serializer):
+     status = serializers.ChoiceField(choices=zip(
+         STATUS_CHOICES.keys(), STATUS_CHOICES.keys()
+@@ -315,7 +322,51 @@ class ProjectGroupIndexEndpoint(ProjectEndpoint):
+                 return Response('{"detail": "Invalid status"}', status=400)
+             filters.append(Q(status=status_filter))
+ 
+-        if result.get('status') == 'resolved':
++        if result.get('status') == 'resolvedInNextRelease':
++            release = Release.objects.filter(
++                project=project,
++            ).order_by('-date_added')[0]
++
++            now = timezone.now()
++
++            for group in group_list:
++                try:
++                    with transaction.atomic():
++                        GroupResolution.objects.create(
++                            group=group,
++                            release=release,
++                        )
++                except IntegrityError:
++                    pass
++
++                happened = Group.objects.filter(
++                    id=group.id,
++                ).update(
++                    status=GroupStatus.RESOLVED,
++                    resolved_at=now,
++                )
++
++                if happened:
++                    activity = Activity.objects.create(
++                        project=group.project,
++                        group=group,
++                        type=Activity.SET_RESOLVED_IN_RELEASE,
++                        user=acting_user,
++                        data={
++                            # no version yet
++                            'version': '',
++                        }
++                    )
++                    activity.send_notification()
++
++            result.update({
++                'status': 'resolved',
++                'statusDetails': {
++                    'inNextRelease': True,
++                },
++            })
++
++        elif result.get('status') == 'resolved':
+             now = timezone.now()
+ 
+             happened = Group.objects.filter(*filters).exclude(
+@@ -325,6 +376,10 @@ class ProjectGroupIndexEndpoint(ProjectEndpoint):
+                 resolved_at=now,
+             )
+ 
++            GroupResolution.objects.filter(
++                group__in=Group.objects.filter(*filters),
++            ).delete()
++
+             if group_list and happened:
+                 for group in group_list:
+                     group.status = GroupStatus.RESOLVED
+@@ -337,6 +392,8 @@ class ProjectGroupIndexEndpoint(ProjectEndpoint):
+                     )
+                     activity.send_notification()
+ 
++            result['statusDetails'] = {}
++
+         elif result.get('status'):
+             new_status = STATUS_CHOICES[result['status']]
+ 
+@@ -346,10 +403,15 @@ class ProjectGroupIndexEndpoint(ProjectEndpoint):
+                 status=new_status,
+             )
+ 
++            GroupResolution.objects.filter(
++                group__in=Group.objects.filter(*filters),
++            ).delete()
++
+             if new_status == GroupStatus.MUTED:
+-                if result.get('snoozeDuration'):
++                snooze_duration = result.pop('snoozeDuration', None)
++                if snooze_duration:
+                     snooze_until = timezone.now() + timedelta(
+-                        minutes=int(result['snoozeDuration']),
++                        minutes=snooze_duration,
+                     )
+                     for group in group_list:
+                         GroupSnooze.objects.create_or_update(
+@@ -358,12 +420,17 @@ class ProjectGroupIndexEndpoint(ProjectEndpoint):
+                                 'until': snooze_until,
+                             }
+                         )
+-                        result['snoozeUntil'] = snooze_until
++                        result['statusDetails'] = {
++                            'snoozeUntil': snooze_until,
++                        }
+                 else:
+                     GroupSnooze.objects.filter(
+                         group__in=group_list,
+                     ).delete()
+-                    result['snoozeUntil'] = None
++                    snooze_until = None
++                    result['statusDetails'] = {}
++            else:
++                result['statusDetails'] = {}
+ 
+             if group_list and happened:
+                 if new_status == GroupStatus.UNRESOLVED:
+@@ -372,8 +439,8 @@ class ProjectGroupIndexEndpoint(ProjectEndpoint):
+                 elif new_status == GroupStatus.MUTED:
+                     activity_type = Activity.SET_MUTED
+                     activity_data = {
+-                        'snoozeUntil': result['snoozeUntil'],
+-                        'snoozeDuration': result['snoozeDuration'],
++                        'snoozeUntil': snooze_until,
++                        'snoozeDuration': snooze_duration,
+                     }
+ 
+                 for group in group_list:
+diff --git a/src/sentry/api/serializers/models/group.py b/src/sentry/api/serializers/models/group.py
+index 3349629d20..11647589f6 100644
+--- a/src/sentry/api/serializers/models/group.py
++++ b/src/sentry/api/serializers/models/group.py
+@@ -8,8 +8,8 @@ from sentry.api.serializers import Serializer, register, serialize
+ from sentry.app import tsdb
+ from sentry.constants import LOG_LEVELS
+ from sentry.models import (
+-    Group, GroupAssignee, GroupBookmark, GroupMeta, GroupSeen, GroupSnooze,
+-    GroupStatus, GroupTagKey
++    Group, GroupAssignee, GroupBookmark, GroupMeta, GroupResolution, GroupSeen,
++    GroupSnooze, GroupStatus, GroupTagKey
+ )
+ from sentry.utils.db import attach_foreignkey
+ from sentry.utils.http import absolute_uri
+@@ -58,6 +58,12 @@ class GroupSerializer(Serializer):
+             ).values_list('group', 'until')
+         )
+ 
++        resolutions = dict(
++            GroupResolution.objects.filter(
++                group__in=item_list,
++            ).values_list('group', 'release')
++        )
++
+         result = {}
+         for item in item_list:
+             active_date = item.active_at or item.last_seen
+@@ -75,6 +81,7 @@ class GroupSerializer(Serializer):
+                 'annotations': annotations,
+                 'user_count': user_counts.get(item.id, 0),
+                 'snooze': snoozes.get(item.id),
++                'resolution': resolutions.get(item.id),
+             }
+         return result
+ 
+@@ -97,6 +104,18 @@ class GroupSerializer(Serializer):
+         else:
+             status_label = 'unresolved'
+ 
++        # TODO(dcramer): these are pretty arbitrary and not defined anywhere
++        if status_label == 'resolved' and attrs['resolution']:
++            status_details = {
++                'inNextRelease': True,
++            }
++        elif status_label == 'muted' and attrs['snooze']:
++            status_details = {
++                'snoozeUntil': attrs['snooze'],
++            }
++        else:
++            status_details = {}
++
+         if obj.team:
+             permalink = absolute_uri(reverse('sentry-group', args=[
+                 obj.organization.slug, obj.project.slug, obj.id]))
+@@ -117,7 +136,7 @@ class GroupSerializer(Serializer):
+             'logger': obj.logger or None,
+             'level': LOG_LEVELS.get(obj.level, 'unknown'),
+             'status': status_label,
+-            'snoozeUntil': attrs['snooze'],
++            'statusDetails': status_details,
+             'isPublic': obj.is_public,
+             'project': {
+                 'name': obj.project.name,
+diff --git a/src/sentry/event_manager.py b/src/sentry/event_manager.py
+index 0068324459..e656103e14 100644
+--- a/src/sentry/event_manager.py
++++ b/src/sentry/event_manager.py
+@@ -13,7 +13,8 @@ import six
+ 
+ from datetime import datetime, timedelta
+ from django.conf import settings
+-from django.db import IntegrityError, transaction
++from django.db import connection, IntegrityError, transaction
++from django.db.models import Q
+ from django.utils import timezone
+ from django.utils.encoding import force_bytes
+ from hashlib import md5
+@@ -25,8 +26,8 @@ from sentry.constants import (
+ )
+ from sentry.interfaces.base import get_interface
+ from sentry.models import (
+-    Activity, Event, EventMapping, EventUser, Group, GroupHash, GroupStatus,
+-    Project, Release, TagKey, UserReport
++    Activity, Event, EventMapping, EventUser, Group, GroupHash, GroupResolution,
++    GroupStatus, Project, Release, TagKey, UserReport
+ )
+ from sentry.plugins import plugins
+ from sentry.signals import regression_signal
+@@ -426,6 +427,7 @@ class EventManager(object):
+         group, is_new, is_regression, is_sample = self._save_aggregate(
+             event=event,
+             hashes=hashes,
++            release=release,
+             **group_kwargs
+         )
+ 
+@@ -550,7 +552,7 @@ class EventManager(object):
+             group=group,
+         )
+ 
+-    def _save_aggregate(self, event, hashes, **kwargs):
++    def _save_aggregate(self, event, hashes, release, **kwargs):
+         project = event.project
+ 
+         # attempt to find a matching hash
+@@ -597,7 +599,12 @@ class EventManager(object):
+         can_sample = should_sample(event.datetime, group.last_seen, group.times_seen)
+ 
+         if not is_new:
+-            is_regression = self._process_existing_aggregate(group, event, kwargs)
++            is_regression = self._process_existing_aggregate(
++                group=group,
++                event=event,
++                data=kwargs,
++                release=release,
++            )
+         else:
+             is_regression = False
+ 
+@@ -614,7 +621,80 @@ class EventManager(object):
+ 
+         return group, is_new, is_regression, is_sample
+ 
+-    def _process_existing_aggregate(self, group, event, data):
++    def _handle_regression(self, group, event, release):
++        if not group.is_resolved():
++            return
++
++        elif release:
++            # we only mark it as a regression if the event's release is newer than
++            # the release which we originally marked this as resolved
++            has_resolution = GroupResolution.objects.filter(
++                Q(release__date_added__gt=release.date_added) | Q(release=release),
++                group=group,
++            ).exists()
++            if has_resolution:
++                return
++
++        if not plugin_is_regression(group, event):
++            return
++
++        # we now think its a regression, rely on the database to validate that
++        # no one beat us to this
++        date = max(event.datetime, group.last_seen)
++        is_regression = bool(Group.objects.filter(
++            id=group.id,
++            # ensure we cant update things if the status has been set to
++            # muted
++            status__in=[GroupStatus.RESOLVED, GroupStatus.UNRESOLVED],
++        ).exclude(
++            # add to the regression window to account for races here
++            active_at__gte=date - timedelta(seconds=5),
++        ).update(
++            active_at=date,
++            # explicitly set last_seen here as ``is_resolved()`` looks
++            # at the value
++            last_seen=date,
++            status=GroupStatus.UNRESOLVED
++        ))
++
++        group.active_at = date
++        group.status = GroupStatus.UNRESOLVED
++
++        # this technically could be missing a release, but
++        # really we wouldn't want to take this path if it was. It's a bit odd
++        # that it wouldn't be taken care of it, but the only case this should
++        # be possible is if you usually send a Release and then you stopped.
++        if is_regression and release:
++            # delete() API does not return affected rows
++            cursor = connection.cursor()
++            # TODO(dcramer): this could be more precise by including the filters
++            # present in the ``has_resolution`` check above
++            cursor.execute("DELETE FROM sentry_groupresolution WHERE group_id = %s", [group.id])
++            affected = cursor.rowcount > 0
++
++            if affected:
++                # if we had to remove the GroupResolution (i.e. we beat the
++                # the queue to handling this) then we need to also record
++                # the corresponding event
++                activity = Activity.objects.filter(
++                    group=group,
++                    type=Activity.SET_RESOLVED_IN_RELEASE,
++                ).order_by('-datetime')[0]
++
++                activity.update(data={
++                    'version': release.version,
++                })
++
++        if is_regression:
++            Activity.objects.create(
++                project=group.project,
++                group=group,
++                type=Activity.SET_REGRESSION,
++            )
++
++        return is_regression
++
++    def _process_existing_aggregate(self, group, event, data, release):
+         date = max(event.datetime, group.last_seen)
+         extra = {
+             'last_seen': date,
+@@ -627,25 +707,7 @@ class EventManager(object):
+         if group.culprit != data['culprit']:
+             extra['culprit'] = data['culprit']
+ 
+-        is_regression = False
+-        if group.is_resolved() and plugin_is_regression(group, event):
+-            is_regression = bool(Group.objects.filter(
+-                id=group.id,
+-                # ensure we cant update things if the status has been set to
+-                # muted
+-                status__in=[GroupStatus.RESOLVED, GroupStatus.UNRESOLVED],
+-            ).exclude(
+-                # add to the regression window to account for races here
+-                active_at__gte=date - timedelta(seconds=5),
+-            ).update(
+-                active_at=date,
+-                # explicitly set last_seen here as ``is_resolved()`` looks
+-                # at the value
+-                last_seen=date,
+-                status=GroupStatus.UNRESOLVED
+-            ))
+-            group.active_at = date
+-            group.status = GroupStatus.UNRESOLVED
++        is_regression = self._handle_regression(group, event, release)
+ 
+         group.last_seen = extra['last_seen']
+ 
+diff --git a/src/sentry/migrations/0217_auto__add_groupresolution.py b/src/sentry/migrations/0217_auto__add_groupresolution.py
+new file mode 100644
+index 0000000000..a6163d6ac3
+--- /dev/null
++++ b/src/sentry/migrations/0217_auto__add_groupresolution.py
+@@ -0,0 +1,477 @@
++# -*- coding: utf-8 -*-
++from south.utils import datetime_utils as datetime
++from south.db import db
++from south.v2 import SchemaMigration
++from django.db import models
++
++
++class Migration(SchemaMigration):
++
++    def forwards(self, orm):
++        # Adding model 'GroupResolution'
++        db.create_table('sentry_groupresolution', (
++            ('id', self.gf('sentry.db.models.fields.bounded.BoundedBigAutoField')(primary_key=True)),
++            ('group', self.gf('sentry.db.models.fields.foreignkey.FlexibleForeignKey')(to=orm['sentry.Group'], unique=True)),
++            ('release', self.gf('sentry.db.models.fields.foreignkey.FlexibleForeignKey')(to=orm['sentry.Release'])),
++            ('datetime', self.gf('django.db.models.fields.DateTimeField')(default=datetime.datetime.now, db_index=True)),
++        ))
++        db.send_create_signal('sentry', ['GroupResolution'])
++
++
++    def backwards(self, orm):
++        # Deleting model 'GroupResolution'
++        db.delete_table('sentry_groupresolution')
++
++
++    models = {
++        'sentry.activity': {
++            'Meta': {'object_name': 'Activity'},
++            'data': ('sentry.db.models.fields.gzippeddict.GzippedDictField', [], {'null': 'True'}),
++            'datetime': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'event': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Event']", 'null': 'True'}),
++            'group': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Group']", 'null': 'True'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'ident': ('django.db.models.fields.CharField', [], {'max_length': '64', 'null': 'True'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Project']"}),
++            'type': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {}),
++            'user': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.User']", 'null': 'True'})
++        },
++        'sentry.apikey': {
++            'Meta': {'object_name': 'ApiKey'},
++            'allowed_origins': ('django.db.models.fields.TextField', [], {'null': 'True', 'blank': 'True'}),
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'key': ('django.db.models.fields.CharField', [], {'unique': 'True', 'max_length': '32'}),
++            'label': ('django.db.models.fields.CharField', [], {'default': "'Default'", 'max_length': '64', 'blank': 'True'}),
++            'organization': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'related_name': "'key_set'", 'to': "orm['sentry.Organization']"}),
++            'scopes': ('django.db.models.fields.BigIntegerField', [], {'default': 'None'}),
++            'status': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'default': '0', 'db_index': 'True'})
++        },
++        'sentry.auditlogentry': {
++            'Meta': {'object_name': 'AuditLogEntry'},
++            'actor': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'blank': 'True', 'related_name': "'audit_actors'", 'null': 'True', 'to': "orm['sentry.User']"}),
++            'actor_key': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.ApiKey']", 'null': 'True', 'blank': 'True'}),
++            'actor_label': ('django.db.models.fields.CharField', [], {'max_length': '64', 'null': 'True', 'blank': 'True'}),
++            'data': ('sentry.db.models.fields.gzippeddict.GzippedDictField', [], {}),
++            'datetime': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'event': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'ip_address': ('django.db.models.fields.GenericIPAddressField', [], {'max_length': '39', 'null': 'True'}),
++            'organization': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Organization']"}),
++            'target_object': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'null': 'True'}),
++            'target_user': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'blank': 'True', 'related_name': "'audit_targets'", 'null': 'True', 'to': "orm['sentry.User']"})
++        },
++        'sentry.authidentity': {
++            'Meta': {'unique_together': "(('auth_provider', 'ident'), ('auth_provider', 'user'))", 'object_name': 'AuthIdentity'},
++            'auth_provider': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.AuthProvider']"}),
++            'data': ('jsonfield.fields.JSONField', [], {'default': '{}'}),
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'ident': ('django.db.models.fields.CharField', [], {'max_length': '128'}),
++            'last_synced': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'last_verified': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'user': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.User']"})
++        },
++        'sentry.authprovider': {
++            'Meta': {'object_name': 'AuthProvider'},
++            'config': ('jsonfield.fields.JSONField', [], {'default': '{}'}),
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'default_global_access': ('django.db.models.fields.BooleanField', [], {'default': 'True'}),
++            'default_role': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'default': '50'}),
++            'default_teams': ('django.db.models.fields.related.ManyToManyField', [], {'to': "orm['sentry.Team']", 'symmetrical': 'False', 'blank': 'True'}),
++            'flags': ('django.db.models.fields.BigIntegerField', [], {'default': '0'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'last_sync': ('django.db.models.fields.DateTimeField', [], {'null': 'True'}),
++            'organization': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Organization']", 'unique': 'True'}),
++            'provider': ('django.db.models.fields.CharField', [], {'max_length': '128'}),
++            'sync_time': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'null': 'True'})
++        },
++        'sentry.broadcast': {
++            'Meta': {'object_name': 'Broadcast'},
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'date_expires': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime(2015, 12, 1, 0, 0)', 'null': 'True', 'blank': 'True'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'is_active': ('django.db.models.fields.BooleanField', [], {'default': 'True', 'db_index': 'True'}),
++            'link': ('django.db.models.fields.URLField', [], {'max_length': '200', 'null': 'True', 'blank': 'True'}),
++            'message': ('django.db.models.fields.CharField', [], {'max_length': '256'}),
++            'title': ('django.db.models.fields.CharField', [], {'max_length': '32'}),
++            'upstream_id': ('django.db.models.fields.CharField', [], {'max_length': '32', 'null': 'True', 'blank': 'True'})
++        },
++        'sentry.broadcastseen': {
++            'Meta': {'unique_together': "(('broadcast', 'user'),)", 'object_name': 'BroadcastSeen'},
++            'broadcast': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Broadcast']"}),
++            'date_seen': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'user': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.User']"})
++        },
++        'sentry.event': {
++            'Meta': {'unique_together': "(('project', 'event_id'),)", 'object_name': 'Event', 'db_table': "'sentry_message'", 'index_together': "(('group', 'datetime'),)"},
++            'data': ('sentry.db.models.fields.node.NodeField', [], {'null': 'True', 'blank': 'True'}),
++            'datetime': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now', 'db_index': 'True'}),
++            'event_id': ('django.db.models.fields.CharField', [], {'max_length': '32', 'null': 'True', 'db_column': "'message_id'"}),
++            'group': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'blank': 'True', 'related_name': "'event_set'", 'null': 'True', 'to': "orm['sentry.Group']"}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'message': ('django.db.models.fields.TextField', [], {}),
++            'num_comments': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'default': '0', 'null': 'True'}),
++            'platform': ('django.db.models.fields.CharField', [], {'max_length': '64', 'null': 'True'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Project']", 'null': 'True'}),
++            'time_spent': ('sentry.db.models.fields.bounded.BoundedIntegerField', [], {'null': 'True'})
++        },
++        'sentry.eventmapping': {
++            'Meta': {'unique_together': "(('project', 'event_id'),)", 'object_name': 'EventMapping'},
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'event_id': ('django.db.models.fields.CharField', [], {'max_length': '32'}),
++            'group': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Group']"}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Project']"})
++        },
++        'sentry.eventuser': {
++            'Meta': {'unique_together': "(('project', 'ident'), ('project', 'hash'))", 'object_name': 'EventUser', 'index_together': "(('project', 'email'), ('project', 'username'), ('project', 'ip_address'))"},
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now', 'db_index': 'True'}),
++            'email': ('django.db.models.fields.EmailField', [], {'max_length': '75', 'null': 'True'}),
++            'hash': ('django.db.models.fields.CharField', [], {'max_length': '32'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'ident': ('django.db.models.fields.CharField', [], {'max_length': '128', 'null': 'True'}),
++            'ip_address': ('django.db.models.fields.GenericIPAddressField', [], {'max_length': '39', 'null': 'True'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Project']"}),
++            'username': ('django.db.models.fields.CharField', [], {'max_length': '128', 'null': 'True'})
++        },
++        'sentry.file': {
++            'Meta': {'object_name': 'File'},
++            'blob': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.FileBlob']", 'null': 'True'}),
++            'checksum': ('django.db.models.fields.CharField', [], {'max_length': '40', 'null': 'True'}),
++            'headers': ('jsonfield.fields.JSONField', [], {'default': '{}'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'name': ('django.db.models.fields.CharField', [], {'max_length': '128'}),
++            'path': ('django.db.models.fields.TextField', [], {'null': 'True'}),
++            'size': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'null': 'True'}),
++            'storage': ('django.db.models.fields.CharField', [], {'max_length': '128', 'null': 'True'}),
++            'storage_options': ('jsonfield.fields.JSONField', [], {'default': '{}'}),
++            'timestamp': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now', 'db_index': 'True'}),
++            'type': ('django.db.models.fields.CharField', [], {'max_length': '64'})
++        },
++        'sentry.fileblob': {
++            'Meta': {'object_name': 'FileBlob'},
++            'checksum': ('django.db.models.fields.CharField', [], {'unique': 'True', 'max_length': '40'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'path': ('django.db.models.fields.TextField', [], {'null': 'True'}),
++            'size': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'null': 'True'}),
++            'storage': ('django.db.models.fields.CharField', [], {'max_length': '128'}),
++            'storage_options': ('jsonfield.fields.JSONField', [], {'default': '{}'}),
++            'timestamp': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now', 'db_index': 'True'})
++        },
++        'sentry.group': {
++            'Meta': {'object_name': 'Group', 'db_table': "'sentry_groupedmessage'", 'index_together': "(('project', 'first_release'),)"},
++            'active_at': ('django.db.models.fields.DateTimeField', [], {'null': 'True', 'db_index': 'True'}),
++            'culprit': ('django.db.models.fields.CharField', [], {'max_length': '200', 'null': 'True', 'db_column': "'view'", 'blank': 'True'}),
++            'data': ('sentry.db.models.fields.gzippeddict.GzippedDictField', [], {'null': 'True', 'blank': 'True'}),
++            'first_release': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Release']", 'null': 'True'}),
++            'first_seen': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now', 'db_index': 'True'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'is_public': ('django.db.models.fields.NullBooleanField', [], {'default': 'False', 'null': 'True', 'blank': 'True'}),
++            'last_seen': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now', 'db_index': 'True'}),
++            'level': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'default': '40', 'db_index': 'True', 'blank': 'True'}),
++            'logger': ('django.db.models.fields.CharField', [], {'default': "''", 'max_length': '64', 'db_index': 'True', 'blank': 'True'}),
++            'message': ('django.db.models.fields.TextField', [], {}),
++            'num_comments': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'default': '0', 'null': 'True'}),
++            'platform': ('django.db.models.fields.CharField', [], {'max_length': '64', 'null': 'True'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Project']", 'null': 'True'}),
++            'resolved_at': ('django.db.models.fields.DateTimeField', [], {'null': 'True', 'db_index': 'True'}),
++            'score': ('sentry.db.models.fields.bounded.BoundedIntegerField', [], {'default': '0'}),
++            'status': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'default': '0', 'db_index': 'True'}),
++            'time_spent_count': ('sentry.db.models.fields.bounded.BoundedIntegerField', [], {'default': '0'}),
++            'time_spent_total': ('sentry.db.models.fields.bounded.BoundedIntegerField', [], {'default': '0'}),
++            'times_seen': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'default': '1', 'db_index': 'True'})
++        },
++        'sentry.groupassignee': {
++            'Meta': {'object_name': 'GroupAssignee', 'db_table': "'sentry_groupasignee'"},
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'group': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'related_name': "'assignee_set'", 'unique': 'True', 'to': "orm['sentry.Group']"}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'related_name': "'assignee_set'", 'to': "orm['sentry.Project']"}),
++            'user': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'related_name': "'sentry_assignee_set'", 'to': "orm['sentry.User']"})
++        },
++        'sentry.groupbookmark': {
++            'Meta': {'unique_together': "(('project', 'user', 'group'),)", 'object_name': 'GroupBookmark'},
++            'group': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'related_name': "'bookmark_set'", 'to': "orm['sentry.Group']"}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'related_name': "'bookmark_set'", 'to': "orm['sentry.Project']"}),
++            'user': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'related_name': "'sentry_bookmark_set'", 'to': "orm['sentry.User']"})
++        },
++        'sentry.groupemailthread': {
++            'Meta': {'unique_together': "(('email', 'group'), ('email', 'msgid'))", 'object_name': 'GroupEmailThread'},
++            'date': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now', 'db_index': 'True'}),
++            'email': ('django.db.models.fields.EmailField', [], {'max_length': '75'}),
++            'group': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'related_name': "'groupemail_set'", 'to': "orm['sentry.Group']"}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'msgid': ('django.db.models.fields.CharField', [], {'max_length': '100'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'related_name': "'groupemail_set'", 'to': "orm['sentry.Project']"})
++        },
++        'sentry.grouphash': {
++            'Meta': {'unique_together': "(('project', 'hash'),)", 'object_name': 'GroupHash'},
++            'group': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Group']", 'null': 'True'}),
++            'hash': ('django.db.models.fields.CharField', [], {'max_length': '32'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Project']", 'null': 'True'})
++        },
++        'sentry.groupmeta': {
++            'Meta': {'unique_together': "(('group', 'key'),)", 'object_name': 'GroupMeta'},
++            'group': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Group']"}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'key': ('django.db.models.fields.CharField', [], {'max_length': '64'}),
++            'value': ('django.db.models.fields.TextField', [], {})
++        },
++        'sentry.groupresolution': {
++            'Meta': {'object_name': 'GroupResolution'},
++            'datetime': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now', 'db_index': 'True'}),
++            'group': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Group']", 'unique': 'True'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'release': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Release']"})
++        },
++        'sentry.grouprulestatus': {
++            'Meta': {'unique_together': "(('rule', 'group'),)", 'object_name': 'GroupRuleStatus'},
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'group': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Group']"}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'last_active': ('django.db.models.fields.DateTimeField', [], {'null': 'True'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Project']"}),
++            'rule': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Rule']"}),
++            'status': ('django.db.models.fields.PositiveSmallIntegerField', [], {'default': '0'})
++        },
++        'sentry.groupseen': {
++            'Meta': {'unique_together': "(('user', 'group'),)", 'object_name': 'GroupSeen'},
++            'group': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Group']"}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'last_seen': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Project']"}),
++            'user': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.User']", 'db_index': 'False'})
++        },
++        'sentry.groupsnooze': {
++            'Meta': {'object_name': 'GroupSnooze'},
++            'group': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Group']", 'unique': 'True'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'until': ('django.db.models.fields.DateTimeField', [], {})
++        },
++        'sentry.grouptagkey': {
++            'Meta': {'unique_together': "(('project', 'group', 'key'),)", 'object_name': 'GroupTagKey'},
++            'group': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Group']"}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'key': ('django.db.models.fields.CharField', [], {'max_length': '32'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Project']", 'null': 'True'}),
++            'values_seen': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'default': '0'})
++        },
++        'sentry.grouptagvalue': {
++            'Meta': {'unique_together': "(('project', 'key', 'value', 'group'),)", 'object_name': 'GroupTagValue', 'db_table': "'sentry_messagefiltervalue'"},
++            'first_seen': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now', 'null': 'True', 'db_index': 'True'}),
++            'group': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'related_name': "'grouptag'", 'to': "orm['sentry.Group']"}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'key': ('django.db.models.fields.CharField', [], {'max_length': '32'}),
++            'last_seen': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now', 'null': 'True', 'db_index': 'True'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'related_name': "'grouptag'", 'null': 'True', 'to': "orm['sentry.Project']"}),
++            'times_seen': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'default': '0'}),
++            'value': ('django.db.models.fields.CharField', [], {'max_length': '200'})
++        },
++        'sentry.helppage': {
++            'Meta': {'object_name': 'HelpPage'},
++            'content': ('django.db.models.fields.TextField', [], {}),
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'is_visible': ('django.db.models.fields.BooleanField', [], {'default': 'True'}),
++            'key': ('django.db.models.fields.CharField', [], {'max_length': '64', 'unique': 'True', 'null': 'True'}),
++            'priority': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'default': '50'}),
++            'title': ('django.db.models.fields.CharField', [], {'max_length': '64'})
++        },
++        'sentry.lostpasswordhash': {
++            'Meta': {'object_name': 'LostPasswordHash'},
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'hash': ('django.db.models.fields.CharField', [], {'max_length': '32'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'user': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.User']", 'unique': 'True'})
++        },
++        'sentry.option': {
++            'Meta': {'object_name': 'Option'},
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'key': ('django.db.models.fields.CharField', [], {'unique': 'True', 'max_length': '64'}),
++            'last_updated': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'value': ('sentry.db.models.fields.pickle.UnicodePickledObjectField', [], {})
++        },
++        'sentry.organization': {
++            'Meta': {'object_name': 'Organization'},
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'default_role': ('django.db.models.fields.CharField', [], {'default': "'member'", 'max_length': '32'}),
++            'flags': ('django.db.models.fields.BigIntegerField', [], {'default': '1'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'members': ('django.db.models.fields.related.ManyToManyField', [], {'related_name': "'org_memberships'", 'symmetrical': 'False', 'through': "orm['sentry.OrganizationMember']", 'to': "orm['sentry.User']"}),
++            'name': ('django.db.models.fields.CharField', [], {'max_length': '64'}),
++            'slug': ('django.db.models.fields.SlugField', [], {'unique': 'True', 'max_length': '50'}),
++            'status': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'default': '0'})
++        },
++        'sentry.organizationaccessrequest': {
++            'Meta': {'unique_together': "(('team', 'member'),)", 'object_name': 'OrganizationAccessRequest'},
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'member': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.OrganizationMember']"}),
++            'team': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Team']"})
++        },
++        'sentry.organizationmember': {
++            'Meta': {'unique_together': "(('organization', 'user'), ('organization', 'email'))", 'object_name': 'OrganizationMember'},
++            'counter': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'null': 'True', 'blank': 'True'}),
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'email': ('django.db.models.fields.EmailField', [], {'max_length': '75', 'null': 'True', 'blank': 'True'}),
++            'flags': ('django.db.models.fields.BigIntegerField', [], {'default': '0'}),
++            'has_global_access': ('django.db.models.fields.BooleanField', [], {'default': 'True'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'organization': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'related_name': "'member_set'", 'to': "orm['sentry.Organization']"}),
++            'role': ('django.db.models.fields.CharField', [], {'default': "'member'", 'max_length': '32'}),
++            'teams': ('django.db.models.fields.related.ManyToManyField', [], {'to': "orm['sentry.Team']", 'symmetrical': 'False', 'through': "orm['sentry.OrganizationMemberTeam']", 'blank': 'True'}),
++            'type': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'default': '50', 'blank': 'True'}),
++            'user': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'blank': 'True', 'related_name': "'sentry_orgmember_set'", 'null': 'True', 'to': "orm['sentry.User']"})
++        },
++        'sentry.organizationmemberteam': {
++            'Meta': {'unique_together': "(('team', 'organizationmember'),)", 'object_name': 'OrganizationMemberTeam', 'db_table': "'sentry_organizationmember_teams'"},
++            'id': ('sentry.db.models.fields.bounded.BoundedAutoField', [], {'primary_key': 'True'}),
++            'is_active': ('django.db.models.fields.BooleanField', [], {'default': 'True'}),
++            'organizationmember': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.OrganizationMember']"}),
++            'team': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Team']"})
++        },
++        'sentry.organizationoption': {
++            'Meta': {'unique_together': "(('organization', 'key'),)", 'object_name': 'OrganizationOption', 'db_table': "'sentry_organizationoptions'"},
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'key': ('django.db.models.fields.CharField', [], {'max_length': '64'}),
++            'organization': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Organization']"}),
++            'value': ('sentry.db.models.fields.pickle.UnicodePickledObjectField', [], {})
++        },
++        'sentry.project': {
++            'Meta': {'unique_together': "(('team', 'slug'), ('organization', 'slug'))", 'object_name': 'Project'},
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'first_event': ('django.db.models.fields.DateTimeField', [], {'null': 'True'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'name': ('django.db.models.fields.CharField', [], {'max_length': '200'}),
++            'organization': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Organization']"}),
++            'public': ('django.db.models.fields.BooleanField', [], {'default': 'False'}),
++            'slug': ('django.db.models.fields.SlugField', [], {'max_length': '50', 'null': 'True'}),
++            'status': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'default': '0', 'db_index': 'True'}),
++            'team': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Team']"})
++        },
++        'sentry.projectkey': {
++            'Meta': {'object_name': 'ProjectKey'},
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now', 'null': 'True'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'label': ('django.db.models.fields.CharField', [], {'max_length': '64', 'null': 'True', 'blank': 'True'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'related_name': "'key_set'", 'to': "orm['sentry.Project']"}),
++            'public_key': ('django.db.models.fields.CharField', [], {'max_length': '32', 'unique': 'True', 'null': 'True'}),
++            'roles': ('django.db.models.fields.BigIntegerField', [], {'default': '1'}),
++            'secret_key': ('django.db.models.fields.CharField', [], {'max_length': '32', 'unique': 'True', 'null': 'True'}),
++            'status': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'default': '0', 'db_index': 'True'})
++        },
++        'sentry.projectoption': {
++            'Meta': {'unique_together': "(('project', 'key'),)", 'object_name': 'ProjectOption', 'db_table': "'sentry_projectoptions'"},
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'key': ('django.db.models.fields.CharField', [], {'max_length': '64'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Project']"}),
++            'value': ('sentry.db.models.fields.pickle.UnicodePickledObjectField', [], {})
++        },
++        'sentry.release': {
++            'Meta': {'unique_together': "(('project', 'version'),)", 'object_name': 'Release'},
++            'data': ('jsonfield.fields.JSONField', [], {'default': '{}'}),
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'date_released': ('django.db.models.fields.DateTimeField', [], {'null': 'True', 'blank': 'True'}),
++            'date_started': ('django.db.models.fields.DateTimeField', [], {'null': 'True', 'blank': 'True'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'new_groups': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'default': '0'}),
++            'owner': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.User']", 'null': 'True', 'blank': 'True'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Project']"}),
++            'ref': ('django.db.models.fields.CharField', [], {'max_length': '64', 'null': 'True', 'blank': 'True'}),
++            'url': ('django.db.models.fields.URLField', [], {'max_length': '200', 'null': 'True', 'blank': 'True'}),
++            'version': ('django.db.models.fields.CharField', [], {'max_length': '64'})
++        },
++        'sentry.releasefile': {
++            'Meta': {'unique_together': "(('release', 'ident'),)", 'object_name': 'ReleaseFile'},
++            'file': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.File']"}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'ident': ('django.db.models.fields.CharField', [], {'max_length': '40'}),
++            'name': ('django.db.models.fields.TextField', [], {}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Project']"}),
++            'release': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Release']"})
++        },
++        'sentry.rule': {
++            'Meta': {'object_name': 'Rule'},
++            'data': ('sentry.db.models.fields.gzippeddict.GzippedDictField', [], {}),
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'label': ('django.db.models.fields.CharField', [], {'max_length': '64'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Project']"})
++        },
++        'sentry.savedsearch': {
++            'Meta': {'unique_together': "(('project', 'name'),)", 'object_name': 'SavedSearch'},
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'name': ('django.db.models.fields.CharField', [], {'max_length': '128'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Project']"}),
++            'query': ('django.db.models.fields.TextField', [], {})
++        },
++        'sentry.tagkey': {
++            'Meta': {'unique_together': "(('project', 'key'),)", 'object_name': 'TagKey', 'db_table': "'sentry_filterkey'"},
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'key': ('django.db.models.fields.CharField', [], {'max_length': '32'}),
++            'label': ('django.db.models.fields.CharField', [], {'max_length': '64', 'null': 'True'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Project']"}),
++            'status': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'default': '0'}),
++            'values_seen': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'default': '0'})
++        },
++        'sentry.tagvalue': {
++            'Meta': {'unique_together': "(('project', 'key', 'value'),)", 'object_name': 'TagValue', 'db_table': "'sentry_filtervalue'"},
++            'data': ('sentry.db.models.fields.gzippeddict.GzippedDictField', [], {'null': 'True', 'blank': 'True'}),
++            'first_seen': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now', 'null': 'True', 'db_index': 'True'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'key': ('django.db.models.fields.CharField', [], {'max_length': '32'}),
++            'last_seen': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now', 'null': 'True', 'db_index': 'True'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Project']", 'null': 'True'}),
++            'times_seen': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'default': '0'}),
++            'value': ('django.db.models.fields.CharField', [], {'max_length': '200'})
++        },
++        'sentry.team': {
++            'Meta': {'unique_together': "(('organization', 'slug'),)", 'object_name': 'Team'},
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now', 'null': 'True'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'name': ('django.db.models.fields.CharField', [], {'max_length': '64'}),
++            'organization': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Organization']"}),
++            'slug': ('django.db.models.fields.SlugField', [], {'max_length': '50'}),
++            'status': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'default': '0'})
++        },
++        'sentry.user': {
++            'Meta': {'object_name': 'User', 'db_table': "'auth_user'"},
++            'date_joined': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'email': ('django.db.models.fields.EmailField', [], {'max_length': '75', 'blank': 'True'}),
++            'first_name': ('django.db.models.fields.CharField', [], {'max_length': '30', 'blank': 'True'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedAutoField', [], {'primary_key': 'True'}),
++            'is_active': ('django.db.models.fields.BooleanField', [], {'default': 'True'}),
++            'is_managed': ('django.db.models.fields.BooleanField', [], {'default': 'False'}),
++            'is_staff': ('django.db.models.fields.BooleanField', [], {'default': 'False'}),
++            'is_superuser': ('django.db.models.fields.BooleanField', [], {'default': 'False'}),
++            'last_login': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'last_name': ('django.db.models.fields.CharField', [], {'max_length': '30', 'blank': 'True'}),
++            'password': ('django.db.models.fields.CharField', [], {'max_length': '128'}),
++            'username': ('django.db.models.fields.CharField', [], {'unique': 'True', 'max_length': '128'})
++        },
++        'sentry.useroption': {
++            'Meta': {'unique_together': "(('user', 'project', 'key'),)", 'object_name': 'UserOption'},
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'key': ('django.db.models.fields.CharField', [], {'max_length': '64'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Project']", 'null': 'True'}),
++            'user': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.User']"}),
++            'value': ('sentry.db.models.fields.pickle.UnicodePickledObjectField', [], {})
++        },
++        'sentry.userreport': {
++            'Meta': {'object_name': 'UserReport', 'index_together': "(('project', 'event_id'),)"},
++            'comments': ('django.db.models.fields.TextField', [], {}),
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'email': ('django.db.models.fields.EmailField', [], {'max_length': '75'}),
++            'event_id': ('django.db.models.fields.CharField', [], {'max_length': '32'}),
++            'group': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Group']", 'null': 'True'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'name': ('django.db.models.fields.CharField', [], {'max_length': '128'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Project']"})
++        }
++    }
++
++    complete_apps = ['sentry']
+\ No newline at end of file
+diff --git a/src/sentry/models/activity.py b/src/sentry/models/activity.py
+index a1831c9768..5de39fe57d 100644
+--- a/src/sentry/models/activity.py
++++ b/src/sentry/models/activity.py
+@@ -34,10 +34,12 @@ class Activity(Model):
+     RELEASE = 10
+     ASSIGNED = 11
+     UNASSIGNED = 12
++    SET_RESOLVED_IN_RELEASE = 13
+ 
+     TYPE = (
+         # (TYPE, verb-slug)
+         (SET_RESOLVED, 'set_resolved'),
++        (SET_RESOLVED_IN_RELEASE, 'set_resolved_in_release'),
+         (SET_UNRESOLVED, 'set_unresolved'),
+         (SET_MUTED, 'set_muted'),
+         (SET_PUBLIC, 'set_public'),
+diff --git a/src/sentry/models/group.py b/src/sentry/models/group.py
+index 7ab5a98dba..78cd4856c5 100644
+--- a/src/sentry/models/group.py
++++ b/src/sentry/models/group.py
+@@ -177,7 +177,7 @@ class Group(Model):
+         return self.get_status() == GroupStatus.RESOLVED
+ 
+     def get_status(self):
+-        # XXX(dcramer): GroupSerializer reimplements this logic)
++        # XXX(dcramer): GroupSerializer reimplements this logic
+         from sentry.models import GroupSnooze
+ 
+         if self.status == GroupStatus.MUTED:
+diff --git a/src/sentry/models/groupresolution.py b/src/sentry/models/groupresolution.py
+new file mode 100644
+index 0000000000..c602677e1c
+--- /dev/null
++++ b/src/sentry/models/groupresolution.py
+@@ -0,0 +1,30 @@
++from __future__ import absolute_import
++
++from django.db import models
++from django.utils import timezone
++from sentry.db.models import Model, FlexibleForeignKey, sane_repr
++
++
++class GroupResolution(Model):
++    """
++    Describes in which release a group was marked as resolved.
++
++    This is used to power the concept of "Ive fixed this in code, but its not
++    fixed in the current release".
++
++    In the future this will likely expand to have full commit references, and
++    possibly remove the tight association with a release.
++    """
++    __core__ = False
++
++    group = FlexibleForeignKey('sentry.Group', unique=True)
++    # the release in which its suggested this was resolved
++    # which allows us to indicate if it still happens in newer versions
++    release = FlexibleForeignKey('sentry.Release')
++    datetime = models.DateTimeField(default=timezone.now, db_index=True)
++
++    class Meta:
++        db_table = 'sentry_groupresolution'
++        app_label = 'sentry'
++
++    __repr__ = sane_repr('group_id', 'release_id')
+diff --git a/src/sentry/receivers/core.py b/src/sentry/receivers/core.py
+index bafab21b54..7630cec242 100644
+--- a/src/sentry/receivers/core.py
++++ b/src/sentry/receivers/core.py
+@@ -12,9 +12,9 @@ from pkg_resources import parse_version as Version
+ from sentry import options
+ from sentry.models import (
+     Organization, OrganizationMember, Project, User,
+-    Team, ProjectKey, TagKey, TagValue, GroupTagValue, GroupTagKey, Activity
++    Team, ProjectKey, TagKey, TagValue, GroupTagValue, GroupTagKey
+ )
+-from sentry.signals import buffer_incr_complete, regression_signal
++from sentry.signals import buffer_incr_complete
+ from sentry.utils import db
+ 
+ PROJECT_SEQUENCE_FIX = """
+@@ -183,18 +183,6 @@ def record_group_tag_count(filters, created, **kwargs):
+     })
+ 
+ 
+-@regression_signal.connect(weak=False)
+-def create_regression_activity(instance, **kwargs):
+-    if instance.times_seen == 1:
+-        # this event is new
+-        return
+-    Activity.objects.create(
+-        project=instance.project,
+-        group=instance,
+-        type=Activity.SET_REGRESSION,
+-    )
+-
+-
+ # Anything that relies on default objects that may not exist with default
+ # fields should be wrapped in handle_db_failure
+ post_syncdb.connect(
+diff --git a/src/sentry/receivers/releases.py b/src/sentry/receivers/releases.py
+index f0a61fb045..f4583b5009 100644
+--- a/src/sentry/receivers/releases.py
++++ b/src/sentry/receivers/releases.py
+@@ -4,6 +4,7 @@ from django.db import IntegrityError, transaction
+ from django.db.models.signals import post_save
+ 
+ from sentry.models import Release, TagValue
++from sentry.tasks.clear_expired_resolutions import clear_expired_resolutions
+ 
+ 
+ def ensure_release_exists(instance, created, **kwargs):
+@@ -26,6 +27,21 @@ def ensure_release_exists(instance, created, **kwargs):
+         instance.update(data={'release_id': release.id})
+ 
+ 
++def resolve_group_resolutions(instance, created, **kwargs):
++    if not created:
++        return
++
++    clear_expired_resolutions.delay(release_id=instance.id)
++
++
++post_save.connect(
++    resolve_group_resolutions,
++    sender=Release,
++    dispatch_uid="resolve_group_resolutions",
++    weak=False
++)
++
++
+ post_save.connect(
+     ensure_release_exists,
+     sender=TagValue,
+diff --git a/src/sentry/static/sentry/app/components/mutedBox.jsx b/src/sentry/static/sentry/app/components/mutedBox.jsx
+index aea03ce3f2..19af0cde2a 100644
+--- a/src/sentry/static/sentry/app/components/mutedBox.jsx
++++ b/src/sentry/static/sentry/app/components/mutedBox.jsx
+@@ -7,15 +7,13 @@ const MutedBox = React.createClass({
+   mixins: [PureRenderMixin],
+ 
+   render() {
+-    if (this.props.status !== 'muted') {
+-      return null;
+-    }
++    let statusDetails = this.props.statusDetails;
+     return (
+       <div className="alert alert-info alert-block">
+-        {this.props.snoozeUntil ?
+-          <span>This event has been snoozed until <strong><DateTime date={this.props.snoozeUntil} /></strong> &mdash; </span>
++        {statusDetails.snoozeUntil ?
++          <span>This issue has been snoozed until <strong><DateTime date={statusDetails.snoozeUntil} /></strong> &mdash; </span>
+         :
+-          <span>This event has been muted &mdash; </span>
++          <span>This issue has been muted &mdash; </span>
+         }
+         You will not be notified of any changes and it will not show up by
+         default in feeds.
+diff --git a/src/sentry/static/sentry/app/stores/groupStore.jsx b/src/sentry/static/sentry/app/stores/groupStore.jsx
+index aef0293cf9..ee6df2d8e9 100644
+--- a/src/sentry/static/sentry/app/stores/groupStore.jsx
++++ b/src/sentry/static/sentry/app/stores/groupStore.jsx
+@@ -54,6 +54,10 @@ const GroupStore = Reflux.createStore({
+     items.forEach((item, idx) => {
+       if (itemsById[item.id]) {
+         this.items[idx] = jQuery.extend(true, {}, item, itemsById[item.id]);
++        // HACK(dcramer): work around statusDetails not being consistent
++        if (typeof itemsById[item.id].statusDetails !== undefined) {
++          this.items[idx].statusDetails = itemsById[item.id].statusDetails;
++        }
+         delete itemsById[item.id];
+       }
+     });
+diff --git a/src/sentry/static/sentry/app/views/groupActivity/index.jsx b/src/sentry/static/sentry/app/views/groupActivity/index.jsx
+index 2affae06ea..8805791689 100644
+--- a/src/sentry/static/sentry/app/views/groupActivity/index.jsx
++++ b/src/sentry/static/sentry/app/views/groupActivity/index.jsx
+@@ -18,6 +18,12 @@ let formatActivity = function(item) {
+       return 'left a comment';
+     case 'set_resolved':
+       return 'marked this issue as resolved';
++    case 'set_resolved_in_release':
++      return (data.version ?
++        `marked this issue as resolved in ${data.version}`
++      :
++        'marked this issue as resolved in the upcoming release'
++      );
+     case 'set_unresolved':
+       return 'marked this issue as unresolved';
+     case 'set_muted':
+diff --git a/src/sentry/static/sentry/app/views/groupDetails/actions.jsx b/src/sentry/static/sentry/app/views/groupDetails/actions.jsx
+index 83f7c79405..737c44c8bd 100644
+--- a/src/sentry/static/sentry/app/views/groupDetails/actions.jsx
++++ b/src/sentry/static/sentry/app/views/groupDetails/actions.jsx
+@@ -12,7 +12,6 @@ const Snooze = {
+   '30MINUTES': 30,
+   '2HOURS': 60 * 2,
+   '24HOURS': 60 * 24,
+-  'FOREVER': null,
+ };
+ 
+ const GroupActions = React.createClass({
+@@ -40,7 +39,7 @@ const GroupActions = React.createClass({
+     this.history.pushState(null, `/${org.slug}/${project.slug}/`);
+   },
+ 
+-  onToggleResolve() {
++  onUpdate(data) {
+     let group = this.getGroup();
+     let project = this.getProject();
+     let org = this.getOrganization();
+@@ -50,9 +49,7 @@ const GroupActions = React.createClass({
+       orgId: org.slug,
+       projectId: project.slug,
+       itemIds: [group.id],
+-      data: {
+-        status: group.status === 'resolved' ? 'unresolved' : 'resolved'
+-      }
++      data: data,
+     }, {
+       complete: () => {
+         IndicatorStore.remove(loadingIndicator);
+@@ -61,63 +58,13 @@ const GroupActions = React.createClass({
+   },
+ 
+   onToggleBookmark() {
+-    let group = this.getGroup();
+-    let project = this.getProject();
+-    let org = this.getOrganization();
+-    let loadingIndicator = IndicatorStore.add('Saving changes..');
+-
+-    api.bulkUpdate({
+-      orgId: org.slug,
+-      projectId: project.slug,
+-      itemIds: [group.id],
+-      data: {
+-        isBookmarked: !group.isBookmarked
+-      }
+-    }, {
+-      complete: () => {
+-        IndicatorStore.remove(loadingIndicator);
+-      }
+-    });
+-  },
+-
+-  onRemoveSnooze() {
+-    let group = this.getGroup();
+-    let project = this.getProject();
+-    let org = this.getOrganization();
+-    let loadingIndicator = IndicatorStore.add('Saving changes..');
+-
+-    api.bulkUpdate({
+-      orgId: org.slug,
+-      projectId: project.slug,
+-      itemIds: [group.id],
+-      data: {
+-        status: 'unresolved'
+-      }
+-    }, {
+-      complete: () => {
+-        IndicatorStore.remove(loadingIndicator);
+-      }
+-    });
++    this.onUpdate({isBookmarked: !this.getGroup().isBookmarked});
+   },
+ 
+   onSnooze(duration) {
+-    let group = this.getGroup();
+-    let project = this.getProject();
+-    let org = this.getOrganization();
+-    let loadingIndicator = IndicatorStore.add('Saving changes..');
+-
+-    api.bulkUpdate({
+-      orgId: org.slug,
+-      projectId: project.slug,
+-      itemIds: [group.id],
+-      data: {
+-        status: 'muted',
+-        snoozeDuration: duration,
+-      }
+-    }, {
+-      complete: () => {
+-        IndicatorStore.remove(loadingIndicator);
+-      }
++    this.onUpdate({
++      status: 'muted',
++      snoozeDuration: duration,
+     });
+   },
+ 
+@@ -142,22 +89,43 @@ const GroupActions = React.createClass({
+     return (
+       <div className="group-actions">
+         <div className="btn-group">
+-          <a className={resolveClassName}
+-             title="Resolve"
+-             onClick={this.onToggleResolve}>
+-            <span className="icon-checkmark"></span>
+-          </a>
++          {group.status === 'resolved' ?
++            <a className={resolveClassName}
++               title="Unresolve"
++               onClick={this.onUpdate.bind(this, {status: 'unresolved'})}>
++              <span className="icon-checkmark" />
++            </a>
++          :
++            [<a className={resolveClassName}
++               title="Resolve"
++               onClick={this.onUpdate.bind(this, {status: 'resolved'})}>
++              Resolve
++            </a>,
++            <DropdownLink
++              caret={true}
++              className={resolveClassName}
++              title="">
++              <MenuItem noAnchor={true}>
++                <a onClick={this.onUpdate.bind(this, {status: 'resolvedInNextRelease'})}>
++                  <strong>Resolve after Next Release</strong>
++                  <div className="help-text">Snooze this notification until the next release which then marks this as resolved.</div>
++                </a>
++              </MenuItem>
++            </DropdownLink>]
++          }
++        </div>
++        <div className="btn-group">
+           <a className={bookmarkClassName}
+              title="Bookmark"
+              onClick={this.onToggleBookmark}>
+-            <span className="icon-bookmark"></span>
++            <span className="icon-bookmark" />
+           </a>
+         </div>
+         <div className="btn-group">
+           {group.status === 'muted' ?
+             <a className={snoozeClassName}
+                title="Remove Snooze"
+-               onClick={this.onRemoveSnooze}>
++               onClick={this.onUpdate.bind(this, {status: 'unresolved'})}>
+               Snooze
+             </a>
+           :
+@@ -175,7 +143,7 @@ const GroupActions = React.createClass({
+                 <a onClick={this.onSnooze.bind(this, Snooze['24HOURS'])}>for 24 hours</a>
+               </MenuItem>
+               <MenuItem noAnchor={true}>
+-                <a onClick={this.onSnooze.bind(this, Snooze.FOREVER)}>forever</a>
++                <a onClick={this.onUpdate.bind(this, {status: 'muted'})}>forever</a>
+               </MenuItem>
+             </DropdownLink>
+           }
+diff --git a/src/sentry/static/sentry/app/views/groupEventDetails.jsx b/src/sentry/static/sentry/app/views/groupEventDetails.jsx
+index 41f1249157..4020ef1a87 100644
+--- a/src/sentry/static/sentry/app/views/groupEventDetails.jsx
++++ b/src/sentry/static/sentry/app/views/groupEventDetails.jsx
+@@ -88,7 +88,16 @@ const GroupEventDetails = React.createClass({
+                   orgId={params.orgId}
+                   projectId={params.projectId} />
+             }
+-            <MutedBox status={group.status} snoozeUntil={group.snoozeUntil} />
++            {group.status === 'muted' &&
++              <MutedBox statusDetails={group.statusDetails} />
++            }
++            {group.status === 'resolved' && group.statusDetails.inNextRelease  &&
++              <div className="alert alert-info alert-block">
++                <span>This issue has been marked as being resolved in the next
++                  release. Until then, you will not get notified about new
++                  occurances.</span>
++              </div>
++            }
+             {this.state.loading ?
+               <LoadingIndicator />
+             : (this.state.error ?
+diff --git a/src/sentry/tasks/clear_expired_resolutions.py b/src/sentry/tasks/clear_expired_resolutions.py
+new file mode 100644
+index 0000000000..2bc55c7eac
+--- /dev/null
++++ b/src/sentry/tasks/clear_expired_resolutions.py
+@@ -0,0 +1,63 @@
++from __future__ import absolute_import, print_function
++
++from django.db import connection
++from django.db.models import Q
++
++from sentry.models import (
++    Activity, Group, GroupResolution, GroupStatus, Project, Release
++)
++from sentry.tasks.base import instrumented_task
++
++
++@instrumented_task(name='sentry.tasks.clear_expired_resolutions',
++                   time_limit=15,
++                   soft_time_limit=10)
++def clear_expired_resolutions(release_id):
++    """
++    This should be fired when ``release_id`` is created, and will indicate to
++    the system that any pending resolutions older than the given release can now
++    be safely transitioned to resolved.
++    """
++    try:
++        release = Release.objects.get_from_cache(
++            id=release_id,
++        )
++    except Release.DoesNotExist:
++        return
++
++    project = Project.objects.get_from_cache(
++        id=release.project_id,
++    )
++
++    resolution_list = GroupResolution.objects.filter(
++        release__project=project,
++        release__date_added__lt=release.date_added,
++    ).exclude(
++        release=release,
++    )
++
++    for resolution in resolution_list:
++        cursor = connection.cursor()
++        cursor.execute("DELETE FROM sentry_groupresolution WHERE id = %s", [resolution.id])
++        affected = cursor.rowcount > 0
++
++        if not affected:
++            continue
++
++        Group.objects.filter(
++            Q(active_at__lte=release.date_added) | Q(active_at__isnull=True),
++            id=resolution.group_id,
++            status=GroupStatus.UNRESOLVED,
++        ).update(
++            status=GroupStatus.RESOLVED,
++        )
++
++        if affected:
++            activity = Activity.objects.filter(
++                group=resolution.group_id,
++                type=Activity.SET_RESOLVED_IN_RELEASE,
++            ).order_by('-datetime')[0]
++
++            activity.update(data={
++                'version': release.version,
++            })
+diff --git a/tests/sentry/api/endpoints/test_group_details.py b/tests/sentry/api/endpoints/test_group_details.py
+index e375e7c0c5..c27c8c1ce3 100644
+--- a/tests/sentry/api/endpoints/test_group_details.py
++++ b/tests/sentry/api/endpoints/test_group_details.py
+@@ -92,7 +92,7 @@ class GroupUpdateTest(APITestCase):
+         assert snooze.until > timezone.now() + timedelta(minutes=29)
+         assert snooze.until < timezone.now() + timedelta(minutes=31)
+ 
+-        assert response.data['snoozeUntil'] == snooze.until
++        assert response.data['statusDetails']['snoozeUntil'] == snooze.until
+ 
+         group = Group.objects.get(id=group.id)
+         assert group.get_status() == GroupStatus.MUTED
+diff --git a/tests/sentry/api/endpoints/test_project_group_index.py b/tests/sentry/api/endpoints/test_project_group_index.py
+index 3890499a02..269a0866d5 100644
+--- a/tests/sentry/api/endpoints/test_project_group_index.py
++++ b/tests/sentry/api/endpoints/test_project_group_index.py
+@@ -6,7 +6,8 @@ from django.utils import timezone
+ from mock import patch
+ 
+ from sentry.models import (
+-    EventMapping, Group, GroupBookmark, GroupSeen, GroupSnooze, GroupStatus
++    Activity, EventMapping, Group, GroupBookmark, GroupResolution, GroupSeen,
++    GroupSnooze, GroupStatus, Release
+ )
+ from sentry.testutils import APITestCase
+ from sentry.testutils.helpers import parse_link_header
+@@ -222,6 +223,7 @@ class GroupUpdateTest(APITestCase):
+         assert response.status_code == 200, response.data
+         assert response.data == {
+             'status': 'resolved',
++            'statusDetails': {},
+         }
+ 
+         # the previously resolved entry should not be included
+@@ -266,6 +268,7 @@ class GroupUpdateTest(APITestCase):
+         assert response.status_code == 200
+         assert response.data == {
+             'status': 'resolved',
++            'statusDetails': {},
+         }
+ 
+         new_group1 = Group.objects.get(id=group1.id)
+@@ -283,6 +286,48 @@ class GroupUpdateTest(APITestCase):
+         assert new_group4.resolved_at is None
+         assert new_group4.status == GroupStatus.UNRESOLVED
+ 
++    def test_set_resolved_in_next_release(self):
++        release = Release.objects.create(project=self.project, version='a')
++
++        group = self.create_group(
++            checksum='a' * 32,
++            status=GroupStatus.UNRESOLVED,
++        )
++
++        self.login_as(user=self.user)
++
++        url = '{url}?id={group.id}'.format(
++            url=reverse('sentry-api-0-project-group-index', kwargs={
++                'organization_slug': self.project.organization.slug,
++                'project_slug': self.project.slug,
++            }),
++            group=group,
++        )
++        response = self.client.put(url, data={
++            'status': 'resolvedInNextRelease',
++        }, format='json')
++        assert response.status_code == 200
++        assert response.data == {
++            'status': 'resolved',
++            'statusDetails': {
++                'inNextRelease': True,
++            },
++        }
++
++        group = Group.objects.get(id=group.id)
++        assert group.status == GroupStatus.RESOLVED
++
++        assert GroupResolution.objects.filter(
++            group=group,
++            release=release,
++        ).exists()
++
++        activity = Activity.objects.get(
++            group=group,
++            type=Activity.SET_RESOLVED_IN_RELEASE,
++        )
++        assert activity.data['version'] == ''
++
+     def test_set_unresolved(self):
+         group = self.create_group(checksum='a' * 32, status=GroupStatus.RESOLVED)
+ 
+@@ -301,6 +346,7 @@ class GroupUpdateTest(APITestCase):
+         assert response.status_code == 200
+         assert response.data == {
+             'status': 'unresolved',
++            'statusDetails': {},
+         }
+ 
+         group = Group.objects.get(id=group.id)
+@@ -329,6 +375,7 @@ class GroupUpdateTest(APITestCase):
+         assert response.status_code == 200
+         assert response.data == {
+             'status': 'unresolved',
++            'statusDetails': {},
+         }
+ 
+         group = Group.objects.get(id=group.id)
+@@ -360,8 +407,9 @@ class GroupUpdateTest(APITestCase):
+ 
+         assert response.data == {
+             'status': 'muted',
+-            'snoozeDuration': 30,
+-            'snoozeUntil': snooze.until,
++            'statusDetails': {
++                'snoozeUntil': snooze.until,
++            },
+         }
+ 
+         group = Group.objects.get(id=group.id)
+diff --git a/tests/sentry/receivers/test_releases.py b/tests/sentry/receivers/test_releases.py
+index eac8210583..939daafaa7 100644
+--- a/tests/sentry/receivers/test_releases.py
++++ b/tests/sentry/receivers/test_releases.py
+@@ -1,5 +1,7 @@
+ from __future__ import absolute_import
+ 
++from mock import patch
++
+ from sentry.models import Release, TagValue
+ from sentry.testutils import TestCase
+ 
+@@ -23,3 +25,16 @@ class EnsureReleaseExistsTest(TestCase):
+ 
+         # ensure we dont hit some kind of error saving it again
+         tv.save()
++
++
++class ResolveGroupResolutions(TestCase):
++    @patch('sentry.tasks.clear_expired_resolutions.clear_expired_resolutions.delay')
++    def test_simple(self, mock_delay):
++        release = Release.objects.create(
++            version='a',
++            project=self.project,
++        )
++
++        mock_delay.assert_called_once_with(
++            release_id=release.id,
++        )
+diff --git a/tests/sentry/tasks/test_clear_expired_resolutions.py b/tests/sentry/tasks/test_clear_expired_resolutions.py
+new file mode 100644
+index 0000000000..939fd9e7b2
+--- /dev/null
++++ b/tests/sentry/tasks/test_clear_expired_resolutions.py
+@@ -0,0 +1,74 @@
++from __future__ import absolute_import
++
++from datetime import timedelta
++from django.utils import timezone
++
++from sentry.models import Activity, Group, GroupResolution, GroupStatus, Release
++from sentry.tasks.clear_expired_resolutions import clear_expired_resolutions
++from sentry.testutils import TestCase
++
++
++class ClearExpiredResolutionsTest(TestCase):
++    def test_task_persistent_name(self):
++        assert clear_expired_resolutions.name == 'sentry.tasks.clear_expired_resolutions'
++
++    def test_simple(self):
++        project = self.create_project()
++
++        old_release = Release.objects.create(
++            project=project,
++            version='a',
++        )
++
++        group1 = self.create_group(
++            project=project,
++            status=GroupStatus.UNRESOLVED,
++            active_at=timezone.now(),
++        )
++        GroupResolution.objects.create(
++            group=group1,
++            release=old_release,
++        )
++        activity1 = Activity.objects.create(
++            group=group1,
++            project=project,
++            type=Activity.SET_RESOLVED_IN_RELEASE,
++            data={'version': ''},
++        )
++
++        new_release = Release.objects.create(
++            project=project,
++            version='b',
++            date_added=timezone.now() + timedelta(minutes=1),
++        )
++
++        group2 = self.create_group(
++            status=GroupStatus.UNRESOLVED,
++            active_at=timezone.now(),
++        )
++        GroupResolution.objects.create(
++            group=group2,
++            release=new_release,
++        )
++        activity2 = Activity.objects.create(
++            group=group2,
++            project=project,
++            type=Activity.SET_RESOLVED_IN_RELEASE,
++            data={'version': ''},
++        )
++
++        clear_expired_resolutions(new_release.id)
++
++        assert Group.objects.get(
++            id=group1.id,
++        ).status == GroupStatus.RESOLVED
++
++        assert Group.objects.get(
++            id=group2.id,
++        ).status == GroupStatus.UNRESOLVED
++
++        activity1 = Activity.objects.get(id=activity1.id)
++        assert activity1.data['version'] == new_release.version
++
++        activity2 = Activity.objects.get(id=activity2.id)
++        assert activity2.data['version'] == ''
+diff --git a/tests/sentry/test_event_manager.py b/tests/sentry/test_event_manager.py
+index 50eaec9b61..59c1501990 100644
+--- a/tests/sentry/test_event_manager.py
++++ b/tests/sentry/test_event_manager.py
+@@ -4,9 +4,11 @@ from __future__ import absolute_import, print_function
+ 
+ import logging
+ 
+-from mock import patch
+-
++from datetime import timedelta
+ from django.conf import settings
++from django.utils import timezone
++from mock import patch
++from time import time
+ 
+ from sentry.app import tsdb
+ from sentry.constants import MAX_CULPRIT_LENGTH, DEFAULT_LOGGER_NAME
+@@ -14,7 +16,9 @@ from sentry.event_manager import (
+     EventManager, EventUser, get_hashes_for_event, get_hashes_from_fingerprint,
+     generate_culprit,
+ )
+-from sentry.models import Event, Group, GroupStatus, EventMapping
++from sentry.models import (
++    Activity, Event, Group, GroupResolution, GroupStatus, EventMapping, Release
++)
+ from sentry.testutils import TestCase, TransactionTestCase
+ 
+ 
+@@ -243,6 +247,78 @@ class EventManagerTest(TransactionTestCase):
+         group = Group.objects.get(id=group.id)
+         assert group.is_resolved()
+ 
++    @patch('sentry.event_manager.plugin_is_regression')
++    def test_marks_as_unresolved_only_with_new_release(self, plugin_is_regression):
++        plugin_is_regression.return_value = True
++
++        old_release = Release.objects.create(
++            version='a',
++            project=self.project,
++            date_added=timezone.now() - timedelta(minutes=30),
++        )
++
++        manager = EventManager(self.make_event(
++            event_id='a' * 32,
++            checksum='a' * 32,
++            timestamp=time() - 50000,  # need to work around active_at
++            release=old_release.version,
++        ))
++        event = manager.save(1)
++
++        group = event.group
++
++        group.update(status=GroupStatus.RESOLVED)
++
++        GroupResolution.objects.create(
++            release=old_release,
++            group=group,
++        )
++        activity = Activity.objects.create(
++            group=group,
++            project=group.project,
++            type=Activity.SET_RESOLVED_IN_RELEASE,
++            data={'version': ''},
++        )
++
++        manager = EventManager(self.make_event(
++            event_id='b' * 32,
++            checksum='a' * 32,
++            timestamp=time(),
++            release=old_release.version,
++        ))
++        event = manager.save(1)
++        assert event.group_id == group.id
++
++        group = Group.objects.get(id=group.id)
++        assert group.status == GroupStatus.RESOLVED
++
++        activity = Activity.objects.get(id=activity.id)
++        assert activity.data['version'] == ''
++
++        assert GroupResolution.objects.filter(group=group).exists()
++
++        manager = EventManager(self.make_event(
++            event_id='c' * 32,
++            checksum='a' * 32,
++            timestamp=time(),
++            release='b',
++        ))
++        event = manager.save(1)
++        assert event.group_id == group.id
++
++        group = Group.objects.get(id=group.id)
++        assert group.status == GroupStatus.UNRESOLVED
++
++        activity = Activity.objects.get(id=activity.id)
++        assert activity.data['version'] == 'b'
++
++        assert not GroupResolution.objects.filter(group=group).exists()
++
++        assert Activity.objects.filter(
++            group=group,
++            type=Activity.SET_REGRESSION,
++        ).exists()
++
+     @patch('sentry.models.Group.is_resolved')
+     def test_unresolves_group_with_auto_resolve(self, mock_is_resolved):
+         mock_is_resolved.return_value = False

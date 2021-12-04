@@ -1,0 +1,663 @@
+commit c65b8b1f2f4fffd24b13acb4f663a4956e741e91
+Author: Matt Robenolt <matt@ydekproductions.com>
+Date:   Wed Sep 12 10:48:41 2018 -0700
+
+    feat: Initial round of Health APIs (#9622)
+
+diff --git a/src/sentry/api/endpoints/organization_health.py b/src/sentry/api/endpoints/organization_health.py
+new file mode 100644
+index 0000000000..b393c450d8
+--- /dev/null
++++ b/src/sentry/api/endpoints/organization_health.py
+@@ -0,0 +1,299 @@
++from __future__ import absolute_import
++
++import re
++from collections import namedtuple, defaultdict
++from datetime import timedelta
++
++from rest_framework.exceptions import PermissionDenied
++from rest_framework.response import Response
++from django.utils import timezone
++
++from sentry.api.bases import OrganizationEndpoint, EnvironmentMixin
++from sentry.api.exceptions import ResourceDoesNotExist
++from sentry.models import (
++    Project, ProjectStatus, OrganizationMemberTeam,
++    Environment,
++)
++from sentry.api.serializers.snuba import (
++    SnubaResultSerializer, SnubaTSResultSerializer, value_from_row,
++    SnubaLookup,
++)
++from sentry.utils import snuba
++
++
++SnubaResultSet = namedtuple('SnubaResultSet', ('current', 'previous'))
++SnubaTSResult = namedtuple('SnubaTSResult', ('data', 'start', 'end', 'rollup'))
++
++
++def parse_stats_period(period):
++    """
++    Convert a value such as 1h into a
++    proper timedelta.
++    """
++    m = re.match('^(\d+)([hdms]?)$', period)
++    if not m:
++        return None
++    value, unit = m.groups()
++    value = int(value)
++    if not unit:
++        unit = 's'
++    return timedelta(**{
++        {'h': 'hours', 'd': 'days', 'm': 'minutes', 's': 'seconds'}[unit]: value,
++    })
++
++
++def query(**kwargs):
++    kwargs['referrer'] = 'health'
++    kwargs['totals'] = True
++    return snuba.raw_query(**kwargs)
++
++
++class OrganizationHealthEndpointBase(OrganizationEndpoint, EnvironmentMixin):
++    def empty(self):
++        return Response({'data': []})
++
++    def get_project_ids(self, request, organization):
++        project_ids = set(map(int, request.GET.getlist('project')))
++
++        before = project_ids.copy()
++        if request.user.is_superuser:
++            # Superusers can query any projects within the organization
++            qs = Project.objects.filter(
++                organization=organization,
++                status=ProjectStatus.VISIBLE,
++            )
++        else:
++            # Anyone else needs membership of the project
++            qs = Project.objects.filter(
++                organization=organization,
++                teams__in=OrganizationMemberTeam.objects.filter(
++                    organizationmember__user=request.user,
++                    organizationmember__organization=organization,
++                ).values_list('team'),
++                status=ProjectStatus.VISIBLE,
++            )
++
++        # If no project's are passed through querystring, we want to
++        # return all projects, otherwise, limit to the passed in ones
++        if project_ids:
++            qs = qs.filter(id__in=project_ids)
++
++        project_ids = set(qs.values_list('id', flat=True))
++
++        if before and project_ids != before:
++            raise PermissionDenied
++
++        if not project_ids:
++            return
++
++        # Make sure project_ids is now a list, otherwise
++        # snuba isn't happy with it being a set
++        return list(project_ids)
++
++    def get_environment(self, request, organization):
++        try:
++            environment = self._get_environment_from_request(
++                request,
++                organization.id,
++            )
++        except Environment.DoesNotExist:
++            raise ResourceDoesNotExist
++
++        if environment is None:
++            return []
++        if environment.name == '':
++            return [['tags[environment]', 'IS NULL', None]]
++        return [['tags[environment]', '=', environment.name]]
++
++    def get_query_condition(self, request, organization):
++        qs = request.GET.getlist('q')
++        if not qs:
++            return [[]]
++
++        conditions = defaultdict(list)
++        for q in qs:
++            try:
++                tag, value = q.split(':', 1)
++            except ValueError:
++                # Malformed query
++                continue
++
++            try:
++                lookup = SnubaLookup.get(tag)
++            except KeyError:
++                # Not a valid lookup tag
++                continue
++
++            conditions[lookup.filter_key].append(value)
++
++        return [[k, 'IN', v] for k, v in conditions.items()]
++
++
++class OrganizationHealthTopEndpoint(OrganizationHealthEndpointBase):
++    MIN_STATS_PERIOD = timedelta(hours=1)
++    MAX_STATS_PERIOD = timedelta(days=45)
++    MAX_LIMIT = 50
++
++    def get(self, request, organization):
++        """
++        Returns a top-N view based on queryset over time period, as well as previous
++        period.
++        """
++        try:
++            lookup = SnubaLookup.get(request.GET['tag'])
++        except KeyError:
++            raise ResourceDoesNotExist
++
++        stats_period = parse_stats_period(request.GET.get('statsPeriod', '24h'))
++        if stats_period is None or stats_period < self.MIN_STATS_PERIOD or stats_period >= self.MAX_STATS_PERIOD:
++            return Response({'detail': 'Invalid statsPeriod'}, status=400)
++
++        try:
++            limit = int(request.GET.get('limit', '5'))
++        except ValueError:
++            return Response({'detail': 'Invalid limit'}, status=400)
++
++        if limit > self.MAX_LIMIT:
++            return Response({'detail': 'Invalid limit: max %d' % self.MAX_LIMIT}, status=400)
++        if limit <= 0:
++            return self.empty()
++
++        try:
++            project_ids = self.get_project_ids(request, organization)
++        except ValueError:
++            return Response({'detail': 'Invalid project ids'}, status=400)
++        if not project_ids:
++            return self.empty()
++
++        environment = self.get_environment(request, organization)
++        query_condition = self.get_query_condition(request, organization)
++
++        aggregations = [('count()', '', 'count')]
++
++        # If we pass `?topk` this means we also are
++        # layering on top_projects and total_projects for each value.
++        if 'topk' in request.GET:
++            try:
++                topk = int(request.GET['topk'])
++            except ValueError:
++                return Response({'detail': 'Invalid topk'}, status=400)
++            aggregations += [
++                ('topK(%d)' % topk, 'project_id', 'top_projects'),
++                ('uniq', 'project_id', 'total_projects'),
++            ]
++
++        now = timezone.now()
++
++        data = query(
++            end=now,
++            start=now - stats_period,
++            selected_columns=lookup.selected_columns,
++            aggregations=aggregations,
++            filter_keys={
++                'project_id': project_ids,
++            },
++            conditions=lookup.conditions + query_condition + environment,
++            groupby=lookup.columns,
++            orderby='-count',
++            limit=limit,
++        )
++
++        if not data['data']:
++            return self.empty()
++
++        # Convert our results from current period into a condition
++        # to be used in the next query for the previous period.
++        # This way our values overlap to be able to deduce a delta.
++        values = []
++        is_null = False
++        for row in data['data']:
++            value = lookup.encoder(value_from_row(row, lookup.columns))
++            if value is None:
++                is_null = True
++            else:
++                values.append(value)
++
++        previous = query(
++            end=now - stats_period,
++            start=now - (stats_period * 2),
++            selected_columns=lookup.selected_columns,
++            aggregations=[
++                ('count()', '', 'count'),
++            ],
++            filter_keys={
++                'project_id': project_ids,
++            },
++            conditions=lookup.conditions + query_condition + environment + [
++                [lookup.filter_key, 'IN', values] if values else [],
++                [lookup.tagkey, 'IS NULL', None] if is_null else [],
++            ],
++            groupby=lookup.columns,
++        )
++
++        serializer = SnubaResultSerializer(organization, lookup, request.user)
++        return Response(
++            serializer.serialize(
++                SnubaResultSet(data, previous),
++            ),
++            status=200,
++        )
++
++
++class OrganizationHealthGraphEndpoint(OrganizationHealthEndpointBase):
++    MIN_STATS_PERIOD = timedelta(hours=1)
++    MAX_STATS_PERIOD = timedelta(days=90)
++
++    def get(self, request, organization):
++        """
++        Returns a time series view over statsPeriod over interval.
++        """
++        try:
++            lookup = SnubaLookup.get(request.GET['tag'])
++        except KeyError:
++            raise ResourceDoesNotExist
++
++        stats_period = parse_stats_period(request.GET.get('statsPeriod', '24h'))
++        if stats_period is None or stats_period < self.MIN_STATS_PERIOD or stats_period >= self.MAX_STATS_PERIOD:
++            return Response({'detail': 'Invalid statsPeriod'}, status=400)
++
++        interval = parse_stats_period(request.GET.get('interval', '1h'))
++        if interval is None:
++            interval = timedelta(hours=1)
++
++        try:
++            project_ids = self.get_project_ids(request, organization)
++        except ValueError:
++            return Response({'detail': 'Invalid project ids'}, status=400)
++        if not project_ids:
++            return self.empty()
++
++        environment = self.get_environment(request, organization)
++        query_condition = self.get_query_condition(request, organization)
++
++        end = timezone.now()
++        start = end - stats_period
++        rollup = int(interval.total_seconds())
++
++        data = query(
++            end=end,
++            start=start,
++            rollup=rollup,
++            selected_columns=lookup.selected_columns,
++            aggregations=[
++                ('count()', '', 'count'),
++            ],
++            filter_keys={
++                'project_id': project_ids,
++            },
++            conditions=lookup.conditions + query_condition + environment,
++            groupby=['time'] + lookup.columns,
++            orderby='time',
++        )
++
++        serializer = SnubaTSResultSerializer(organization, lookup, request.user)
++        return Response(
++            serializer.serialize(
++                SnubaTSResult(data, start, end, rollup),
++            ),
++            status=200,
++        )
+diff --git a/src/sentry/api/serializers/snuba.py b/src/sentry/api/serializers/snuba.py
+new file mode 100644
+index 0000000000..51d586ea15
+--- /dev/null
++++ b/src/sentry/api/serializers/snuba.py
+@@ -0,0 +1,317 @@
++from __future__ import absolute_import
++
++import six
++import itertools
++from functools import reduce, partial
++from operator import or_
++
++from django.db.models import Q
++
++from sentry.models import Release, Project, ProjectStatus, EventUser
++from sentry.utils.dates import to_timestamp
++from sentry.utils.geo import geo_by_addr as _geo_by_addr
++
++HEALTH_ID_KEY = '_health_id'
++
++
++def make_health_id(lookup, value):
++    # Convert a lookup and value into
++    # a string that can be used back in a request query.
++    return '%s:%s' % (lookup.name, lookup.encoder(value))
++
++
++def serialize_releases(organization, item_list, user, lookup):
++    return {
++        (r.version,): {
++            HEALTH_ID_KEY: make_health_id(lookup, [r.version]),
++            'value': {
++                'id': r.id,
++                'version': r.version,
++                'shortVersion': r.short_version,
++            },
++        }
++        for r in Release.objects.filter(
++            organization=organization,
++            version__in={i[0] for i in item_list},
++        )
++    }
++
++
++def geo_by_addr(ip):
++    try:
++        geo = _geo_by_addr(ip)
++    except Exception:
++        geo = None
++
++    if not geo:
++        return
++
++    rv = {}
++    for k in 'country_code', 'city', 'region':
++        d = geo.get(k)
++        if isinstance(d, six.binary_type):
++            d = d.decode('ISO-8859-1')
++        rv[k] = d
++
++    return rv
++
++
++def serialize_eventusers(organization, item_list, user, lookup):
++    # We have no reliable way to map the tag value format
++    # back into real EventUser rows. EventUser is only unique
++    # per-project, and this is an organization aggregate.
++    # This means a single value maps to multiple rows.
++    filters = reduce(or_, [
++        Q(hash=EventUser.hash_from_tag(tag), project_id=project)
++        for tag, project in item_list
++    ])
++
++    eu_by_key = {
++        (eu.tag_value, eu.project_id): eu
++        for eu in EventUser.objects.filter(filters)
++    }
++
++    projects = serialize_projects(organization, {i[1] for i in item_list}, user)
++
++    rv = {}
++    for tag, project in item_list:
++        eu = eu_by_key.get((tag, project))
++        if eu is None:
++            attr, value = tag.split(':', 1)
++            eu = EventUser(project_id=project, **{EventUser.attr_from_keyword(attr): value})
++        rv[(tag, project)] = {
++            HEALTH_ID_KEY: make_health_id(lookup, [eu.tag_value, eu.project_id]),
++            'value': {
++                'id': six.text_type(eu.id) if eu.id else None,
++                'project': projects.get(eu.project_id),
++                'hash': eu.hash,
++                'tagValue': eu.tag_value,
++                'identifier': eu.ident,
++                'username': eu.username,
++                'email': eu.email,
++                'ipAddress': eu.ip_address,
++                'dateCreated': eu.date_added,
++                'label': eu.get_label(),
++                'name': eu.get_display_name(),
++                'geo': geo_by_addr(eu.ip_address),
++            },
++        }
++    return rv
++
++
++def encoder_eventuser(value):
++    # EventUser needs to be encoded as a
++    # project_id, value tuple.
++    tag_value, project_id = value
++    return '%d:%s' % (project_id, tag_value)
++
++
++def serialize_projects(organization, item_list, user):
++    return {
++        id: {
++            'id': id,
++            'slug': slug,
++        }
++        for id, slug in Project.objects.filter(
++            id__in=item_list,
++            organization=organization,
++            status=ProjectStatus.VISIBLE,
++        ).values_list('id', 'slug')
++    }
++
++
++def serialize_noop(organization, item_list, user, lookup):
++    return {
++        i: {
++            HEALTH_ID_KEY: make_health_id(lookup, [i[0]]),
++            'value': i[0],
++        }
++        for i in item_list
++    }
++
++
++def encoder_noop(row):
++    if not row:
++        return None
++    return row[0]
++
++
++def value_from_row(row, tagkey):
++    return tuple(row[k] for k in tagkey)
++
++
++def zerofill(data, start, end, rollup):
++    rv = []
++    start = ((int(to_timestamp(start)) / rollup) * rollup) - rollup
++    end = ((int(to_timestamp(end)) / rollup) * rollup) + rollup
++    i = 0
++    for key in xrange(start, end, rollup):
++        try:
++            if data[i][0] == key:
++                rv.append(data[i])
++                i += 1
++                continue
++        except IndexError:
++            pass
++
++        rv.append((key, []))
++    return rv
++
++
++class SnubaLookup(object):
++    """
++    A SnubaLookup consists of all of the attributes needed to facilitate making
++    a query for a column in Snuba. This covers which columns are selected, the extra conditions
++    that need to be applied, how values are serialized in/out of Snuba, etc.
++    """
++    __slots__ = 'name', 'tagkey', 'columns', 'selected_columns', 'conditions', 'serializer', 'encoder', 'filter_key'
++    __registry = {}
++
++    def __init__(self, name, tagkey=None, extra=None, selected_columns=None,
++                 conditions=None, serializer=serialize_noop, encoder=encoder_noop,
++                 filter_key=None):
++        cls = type(self)
++        assert name not in cls.__registry
++        self.name = name
++        self.tagkey = tagkey or name
++        self.columns = [self.tagkey] + list(extra or [])
++        self.serializer = partial(serializer, lookup=self)
++        self.encoder = encoder
++        self.conditions = conditions or [[self.tagkey, 'IS NOT NULL', None]]
++        self.selected_columns = selected_columns or []
++        self.filter_key = filter_key or self.tagkey
++        cls.__registry[name] = self
++
++    @classmethod
++    def get(cls, name):
++        return cls.__registry[name]
++
++
++SnubaLookup(
++    'user',
++    'tags[sentry:user]',
++    ['project_id'],
++    serializer=serialize_eventusers,
++    encoder=encoder_eventuser,
++    # User is a complex query and can't be treated as a single value.
++    # And EventUser is a tuple of project_id and the tag value. So we need
++    # to make sure we always keep them together and query them as a single unit.
++    filter_key=(
++        'concat', (('toString', ('project_id',)), "':'", 'tags[sentry:user]')
++    ),
++)
++SnubaLookup('release', 'tags[sentry:release]', serializer=serialize_releases)
++# error.type is special in that in ClickHouse, it's an array. But we need
++# to make sure that we don't do any queries across a NULL value or an empty array
++# so we must filter them out explicitly. We also are choosing to explicitly take the
++# first element of the exception_stacks array as the "primary" error type for the event.
++# This is slightly inaccurate due to the fact that a single error may have multiple
++# errors.
++SnubaLookup('error.type', 'error_type', selected_columns=[
++    ('ifNull', ('arrayElement', ('exception_stacks.type', 1), "''"), 'error_type'),
++], conditions=[
++    [('notEmpty', ('exception_stacks.type',)), '=', 1],
++    [('error_type', '!=', '')],
++])
++# Similar to error.type, we need to also guard against NULL types, but for this case,
++# the NULL type is actually significant for us, which means "unknown". So we want
++# to also retain and capture this.
++SnubaLookup('error.handled', 'error_handled', selected_columns=[
++    ('arrayElement', ('exception_stacks.mechanism_handled', 1), 'error_handled'),
++], conditions=[
++    [('notEmpty', ('exception_stacks.mechanism_handled',)), '=', 1],
++])
++
++# Simple tags don't need any special treatment
++for _tag in (
++    'transaction',
++    'os', 'os.name',
++    'browser', 'browser.name',
++    'device', 'device.family',
++):
++    SnubaLookup(_tag, 'tags[%s]' % _tag)
++
++
++class BaseSnubaSerializer(object):
++    def __init__(self, organization, lookup, user):
++        self.organization = organization
++        self.lookup = lookup
++        self.user = user
++
++    def get_attrs(self, item_list):
++        return self.lookup.serializer(
++            self.organization, item_list, self.user)
++
++
++class SnubaResultSerializer(BaseSnubaSerializer):
++    """
++    Serializer for the top values Snuba results.
++    """
++
++    def serialize(self, result):
++        counts_by_value = {
++            value_from_row(r, self.lookup.columns): r['count']
++            for r in result.previous['data']
++        }
++        projects = serialize_projects(
++            self.organization,
++            {p for r in result.current['data'] for p in r.get('top_projects', [])},
++            self.user,
++        )
++        attrs = self.get_attrs(
++            [value_from_row(r, self.lookup.columns) for r in result.current['data']],
++        )
++
++        data = []
++        for r in result.current['data']:
++            value = value_from_row(r, self.lookup.columns)
++            row = {
++                'count': r['count'],
++                'lastCount': counts_by_value.get(value, 0),
++                self.lookup.name: attrs.get(value),
++            }
++            if 'top_projects' in r:
++                row['topProjects'] = [projects[p] for p in r['top_projects']]
++            if 'total_projects' in r:
++                row['totalProjects'] = r['total_projects']
++
++            data.append(row)
++
++        return {
++            'data': data,
++            'totals': {
++                'count': result.current['totals']['count'],
++                'lastCount': result.previous['totals']['count'],
++            },
++        }
++
++
++class SnubaTSResultSerializer(BaseSnubaSerializer):
++    """
++    Serializer for time-series Snuba data.
++    """
++
++    def serialize(self, result):
++        data = [
++            (key, list(group))
++            for key, group in itertools.groupby(result.data['data'], key=lambda r: r['time'])
++        ]
++        attrs = self.get_attrs([
++            value_from_row(r, self.lookup.columns)
++            for _, v in data
++            for r in v
++        ])
++        rv = []
++        for k, v in data:
++            row = []
++            for r in v:
++                value = value_from_row(r, self.lookup.columns)
++                row.append({
++                    'count': r['count'],
++                    self.lookup.name: attrs.get(value),
++                })
++            rv.append((k, row))
++        return {
++            'data': zerofill(rv, result.start, result.end, result.rollup),
++            'totals': {'count': result.data['totals']['count']},
++        }
+diff --git a/src/sentry/api/urls.py b/src/sentry/api/urls.py
+index e813b85149..de8c8d628a 100644
+--- a/src/sentry/api/urls.py
++++ b/src/sentry/api/urls.py
+@@ -59,6 +59,7 @@ from .endpoints.organization_auth_provider_send_reminders import OrganizationAut
+ from .endpoints.organization_avatar import OrganizationAvatarEndpoint
+ from .endpoints.organization_details import OrganizationDetailsEndpoint
+ from .endpoints.organization_discover import OrganizationDiscoverEndpoint
++from .endpoints.organization_health import OrganizationHealthTopEndpoint, OrganizationHealthGraphEndpoint
+ from .endpoints.organization_shortid import ShortIdLookupEndpoint
+ from .endpoints.organization_environments import OrganizationEnvironmentsEndpoint
+ from .endpoints.organization_eventid import EventIdLookupEndpoint
+@@ -378,6 +379,16 @@ urlpatterns = patterns(
+         OrganizationDiscoverEndpoint.as_view(),
+         name='sentry-api-0-organization-discover'
+     ),
++    url(
++        r'^organizations/(?P<organization_slug>[^\/]+)/health/top/$',
++        OrganizationHealthTopEndpoint.as_view(),
++        name='sentry-api-0-organization-health-top',
++    ),
++    url(
++        r'^organizations/(?P<organization_slug>[^\/]+)/health/graph/$',
++        OrganizationHealthGraphEndpoint.as_view(),
++        name='sentry-api-0-organization-health-graph',
++    ),
+     url(
+         r'^organizations/(?P<organization_slug>[^\/]+)/shortids/(?P<short_id>[^\/]+)/$',
+         ShortIdLookupEndpoint.as_view(),

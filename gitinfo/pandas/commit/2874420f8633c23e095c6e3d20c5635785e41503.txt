@@ -1,0 +1,392 @@
+commit 2874420f8633c23e095c6e3d20c5635785e41503
+Author: Jeff Reback <jeff@reback.net>
+Date:   Fri Jun 5 11:33:23 2015 -0400
+
+    PERF: fix _get_level_indexer to accept an intermediate indexer result
+
+diff --git a/doc/source/whatsnew/v0.17.0.txt b/doc/source/whatsnew/v0.17.0.txt
+index 168fd803c..65b526638 100644
+--- a/doc/source/whatsnew/v0.17.0.txt
++++ b/doc/source/whatsnew/v0.17.0.txt
+@@ -63,6 +63,8 @@ Performance Improvements
+ 
+ - 4x improvement in ``timedelta`` string parsing (:issue:`6755`)
+ - 8x improvement in ``timedelta64`` and ``datetime64`` ops (:issue:`6755`)
++- Significantly improved performance of indexing ``MultiIndex`` with slicers (:issue:`10287`)
++- Improved performance of ``Series.isin`` for datetimelike/integer Series (:issue:`10287`)
+ 
+ .. _whatsnew_0170.bug_fixes:
+ 
+diff --git a/pandas/core/common.py b/pandas/core/common.py
+index 990eec08d..76deb773c 100644
+--- a/pandas/core/common.py
++++ b/pandas/core/common.py
+@@ -2497,6 +2497,10 @@ def is_integer_dtype(arr_or_dtype):
+     return (issubclass(tipo, np.integer) and
+             not issubclass(tipo, (np.datetime64, np.timedelta64)))
+ 
++def is_int64_dtype(arr_or_dtype):
++    tipo = _get_dtype_type(arr_or_dtype)
++    return issubclass(tipo, np.int64)
++
+ 
+ def is_int_or_datetime_dtype(arr_or_dtype):
+     tipo = _get_dtype_type(arr_or_dtype)
+diff --git a/pandas/core/index.py b/pandas/core/index.py
+index fad71c94c..35cf2c5ae 100644
+--- a/pandas/core/index.py
++++ b/pandas/core/index.py
+@@ -105,6 +105,7 @@ class Index(IndexOpsMixin, PandasObject):
+     _is_numeric_dtype = False
+ 
+     _engine_type = _index.ObjectEngine
++    _isin_type = lib.ismember
+ 
+     def __new__(cls, data=None, dtype=None, copy=False, name=None, fastpath=False,
+                 tupleize_cols=True, **kwargs):
+@@ -1838,7 +1839,7 @@ class Index(IndexOpsMixin, PandasObject):
+         value_set = set(values)
+         if level is not None:
+             self._validate_index_level(level)
+-        return lib.ismember(np.array(self), value_set)
++        return self._isin_type(np.array(self), value_set)
+ 
+     def _can_reindex(self, indexer):
+         """
+@@ -3381,6 +3382,7 @@ class Int64Index(NumericIndex):
+     _outer_indexer = _algos.outer_join_indexer_int64
+ 
+     _engine_type = _index.Int64Engine
++    _isin_type = lib.ismember_int64
+ 
+     def __new__(cls, data=None, dtype=None, copy=False, name=None, fastpath=False, **kwargs):
+ 
+@@ -5237,13 +5239,39 @@ class MultiIndex(Index):
+             indexer = self._get_level_indexer(key, level=level)
+             return indexer, maybe_droplevels(indexer, [level], drop_level)
+ 
+-    def _get_level_indexer(self, key, level=0):
+-        # return a boolean indexer or a slice showing where the key is
++    def _get_level_indexer(self, key, level=0, indexer=None):
++        # return an indexer, boolean array or a slice showing where the key is
+         # in the totality of values
++        # if the indexer is provided, then use this
+ 
+         level_index = self.levels[level]
+         labels = self.labels[level]
+ 
++        def convert_indexer(start, stop, step, indexer=indexer, labels=labels):
++            # given the inputs and the labels/indexer, compute an indexer set
++            # if we have a provided indexer, then this need not consider
++            # the entire labels set
++
++            r = np.arange(start,stop,step)
++            if indexer is not None and len(indexer) != len(labels):
++
++                # we have an indexer which maps the locations in the labels that we
++                # have already selected (and is not an indexer for the entire set)
++                # otherwise this is wasteful
++                # so we only need to examine locations that are in this set
++                # the only magic here is that the result are the mappings to the
++                # set that we have selected
++                from pandas import Series
++                mapper = Series(indexer)
++                result = Series(Index(labels.take(indexer)).isin(r).nonzero()[0])
++                m = result.map(mapper).values
++
++            else:
++                m = np.zeros(len(labels),dtype=bool)
++                m[np.in1d(labels,r,assume_unique=True)] = True
++
++            return m
++
+         if isinstance(key, slice):
+             # handle a slice, returnig a slice if we can
+             # otherwise a boolean indexer
+@@ -5269,17 +5297,13 @@ class MultiIndex(Index):
+                 # a partial date slicer on a DatetimeIndex generates a slice
+                 # note that the stop ALREADY includes the stopped point (if
+                 # it was a string sliced)
+-                m = np.zeros(len(labels),dtype=bool)
+-                m[np.in1d(labels,np.arange(start.start,stop.stop,step))] = True
+-                return m
++                return convert_indexer(start.start,stop.stop,step)
+ 
+             elif level > 0 or self.lexsort_depth == 0 or step is not None:
+                 # need to have like semantics here to right
+                 # searching as when we are using a slice
+                 # so include the stop+1 (so we include stop)
+-                m = np.zeros(len(labels),dtype=bool)
+-                m[np.in1d(labels,np.arange(start,stop+1,step))] = True
+-                return m
++                return convert_indexer(start,stop+1,step)
+             else:
+                 # sorted, so can return slice object -> view
+                 i = labels.searchsorted(start, side='left')
+@@ -5317,59 +5341,73 @@ class MultiIndex(Index):
+             raise KeyError('MultiIndex Slicing requires the index to be fully lexsorted'
+                            ' tuple len ({0}), lexsort depth ({1})'.format(len(tup), self.lexsort_depth))
+ 
+-        def _convert_indexer(r):
++        # indexer
++        # this is the list of all values that we want to select
++        n = len(self)
++        indexer = None
++
++        def _convert_to_indexer(r):
++            # return an indexer
+             if isinstance(r, slice):
+-                m = np.zeros(len(self),dtype=bool)
++                m = np.zeros(n,dtype=bool)
+                 m[r] = True
+-                return m
+-            return r
++                r = m.nonzero()[0]
++            elif is_bool_indexer(r):
++                if len(r) != n:
++                    raise ValueError("cannot index with a boolean indexer that is"
++                                     " not the same length as the index")
++                r = r.nonzero()[0]
++            return Int64Index(r)
++
++        def _update_indexer(idxr, indexer=indexer):
++            if indexer is None:
++                indexer = Index(np.arange(n))
++            if idxr is None:
++                return indexer
++            return indexer & idxr
+ 
+-        ranges = []
+         for i,k in enumerate(tup):
+ 
+             if is_bool_indexer(k):
+                 # a boolean indexer, must be the same length!
+                 k = np.asarray(k)
+-                if len(k) != len(self):
+-                    raise ValueError("cannot index with a boolean indexer that is"
+-                                     " not the same length as the index")
+-                ranges.append(k)
++                indexer = _update_indexer(_convert_to_indexer(k), indexer=indexer)
++
+             elif is_list_like(k):
+                 # a collection of labels to include from this level (these are or'd)
+-                indexers = []
++                indexers = None
+                 for x in k:
+                     try:
+-                        indexers.append(_convert_indexer(self._get_level_indexer(x, level=i)))
++                        idxrs = _convert_to_indexer(self._get_level_indexer(x, level=i, indexer=indexer))
++                        indexers = idxrs if indexers is None else indexers | idxrs
+                     except (KeyError):
+ 
+                         # ignore not founds
+                         continue
+-                if len(k):
+-                    ranges.append(reduce(np.logical_or, indexers))
++
++                if indexers is not None:
++                    indexer = _update_indexer(indexers, indexer=indexer)
+                 else:
+-                    ranges.append(np.zeros(self.labels[i].shape, dtype=bool))
++
++                    # no matches we are done
++                    return Int64Index([]).values
+ 
+             elif is_null_slice(k):
+                 # empty slice
+-                pass
++                indexer = _update_indexer(None, indexer=indexer)
+ 
+             elif isinstance(k,slice):
+ 
+                 # a slice, include BOTH of the labels
+-                ranges.append(self._get_level_indexer(k,level=i))
++                indexer = _update_indexer(_convert_to_indexer(self._get_level_indexer(k,level=i,indexer=indexer)), indexer=indexer)
+             else:
+                 # a single label
+-                ranges.append(self.get_loc_level(k,level=i,drop_level=False)[0])
+-
+-        # identity
+-        if len(ranges) == 0:
+-            return slice(0,len(self))
+-
+-        elif len(ranges) == 1:
+-            return ranges[0]
++                indexer = _update_indexer(_convert_to_indexer(self.get_loc_level(k,level=i,drop_level=False)[0]), indexer=indexer)
+ 
+-        # construct a boolean indexer if we have a slice or boolean indexer
+-        return reduce(np.logical_and,[ _convert_indexer(r) for r in ranges ])
++        # empty indexer
++        if indexer is None:
++            return Int64Index([]).values
++        return indexer.values
+ 
+     def truncate(self, before=None, after=None):
+         """
+diff --git a/pandas/core/indexing.py b/pandas/core/indexing.py
+index 02309e6e4..6bc505127 100644
+--- a/pandas/core/indexing.py
++++ b/pandas/core/indexing.py
+@@ -509,7 +509,7 @@ class _NDFrameIndexer(object):
+ 
+     def _align_series(self, indexer, ser):
+         # indexer to assign Series can be tuple, slice, scalar
+-        if isinstance(indexer, (slice, np.ndarray, list)):
++        if isinstance(indexer, (slice, np.ndarray, list, Index)):
+             indexer = tuple([indexer])
+ 
+         if isinstance(indexer, tuple):
+@@ -1719,7 +1719,7 @@ def maybe_convert_ix(*args):
+ 
+     ixify = True
+     for arg in args:
+-        if not isinstance(arg, (np.ndarray, list, ABCSeries)):
++        if not isinstance(arg, (np.ndarray, list, ABCSeries, Index)):
+             ixify = False
+ 
+     if ixify:
+diff --git a/pandas/core/series.py b/pandas/core/series.py
+index dfbc5dbf8..d1ddd086b 100644
+--- a/pandas/core/series.py
++++ b/pandas/core/series.py
+@@ -19,6 +19,7 @@ from pandas.core.common import (isnull, notnull, is_bool_indexer,
+                                 is_list_like, _values_from_object,
+                                 _possibly_cast_to_datetime, _possibly_castable,
+                                 _possibly_convert_platform, _try_sort,
++                                is_int64_dtype,
+                                 ABCSparseArray, _maybe_match_name,
+                                 _coerce_to_dtype, SettingWithCopyError,
+                                 _maybe_box_datetimelike, ABCDataFrame,
+@@ -2250,17 +2251,22 @@ class Series(base.IndexOpsMixin, generic.NDFrame):
+ 
+         # may need i8 conversion for proper membership testing
+         comps = _values_from_object(self)
++        f = lib.ismember
+         if com.is_datetime64_dtype(self):
+             from pandas.tseries.tools import to_datetime
+             values = Series(to_datetime(values)).values.view('i8')
+             comps = comps.view('i8')
++            f = lib.ismember_int64
+         elif com.is_timedelta64_dtype(self):
+             from pandas.tseries.timedeltas import to_timedelta
+             values = Series(to_timedelta(values)).values.view('i8')
+             comps = comps.view('i8')
++            f = lib.ismember_int64
++        elif is_int64_dtype(self):
++            f = lib.ismember_int64
+ 
+         value_set = set(values)
+-        result = lib.ismember(comps, value_set)
++        result = f(comps, value_set)
+         return self._constructor(result, index=self.index).__finalize__(self)
+ 
+     def between(self, left, right, inclusive=True):
+diff --git a/pandas/lib.pyx b/pandas/lib.pyx
+index cc4c43494..27ba6f953 100644
+--- a/pandas/lib.pyx
++++ b/pandas/lib.pyx
+@@ -156,6 +156,31 @@ def ismember(ndarray arr, set values):
+ 
+     return result.view(np.bool_)
+ 
++def ismember_int64(ndarray[int64_t] arr, set values):
++    '''
++    Checks whether
++
++    Parameters
++    ----------
++    arr : ndarray of int64
++    values : set
++
++    Returns
++    -------
++    ismember : ndarray (boolean dtype)
++    '''
++    cdef:
++        Py_ssize_t i, n
++        ndarray[uint8_t] result
++        int64_t v
++
++    n = len(arr)
++    result = np.empty(n, dtype=np.uint8)
++    for i in range(n):
++        result[i] = arr[i] in values
++
++    return result.view(np.bool_)
++
+ #----------------------------------------------------------------------
+ # datetime / io related
+ 
+diff --git a/pandas/tests/test_indexing.py b/pandas/tests/test_indexing.py
+index 710367bf0..94bb2c9f8 100644
+--- a/pandas/tests/test_indexing.py
++++ b/pandas/tests/test_indexing.py
+@@ -2293,6 +2293,7 @@ class TestIndexing(tm.TestCase):
+                              index=pd.MultiIndex.from_product([['A','B','C'],['foo']],
+                                                               names=['one','two'])
+                              ).sortlevel()
++
+         result = s.loc[idx[:,['foo']]]
+         assert_series_equal(result,expected)
+         result = s.loc[idx[:,['foo','bah']]]
+@@ -2304,9 +2305,9 @@ class TestIndexing(tm.TestCase):
+         df = DataFrame(np.random.randn(5, 6), index=range(5), columns=multi_index)
+         df = df.sortlevel(0, axis=1)
+ 
++        expected = DataFrame(index=range(5),columns=multi_index.reindex([])[0])
+         result1 = df.loc[:, ([], slice(None))]
+         result2 = df.loc[:, (['foo'], [])]
+-        expected = DataFrame(index=range(5),columns=multi_index.reindex([])[0])
+         assert_frame_equal(result1, expected)
+         assert_frame_equal(result2, expected)
+ 
+diff --git a/pandas/tseries/base.py b/pandas/tseries/base.py
+index 15f69b38f..ae869ce9b 100644
+--- a/pandas/tseries/base.py
++++ b/pandas/tseries/base.py
+@@ -449,7 +449,7 @@ class DatetimeIndexOpsMixin(object):
+                 return self.asobject.isin(values)
+ 
+         value_set = set(values.asi8)
+-        return lib.ismember(self.asi8, value_set)
++        return lib.ismember_int64(self.asi8, value_set)
+ 
+     def shift(self, n, freq=None):
+         """
+diff --git a/vb_suite/indexing.py b/vb_suite/indexing.py
+index 451c2de92..9fbc070ac 100644
+--- a/vb_suite/indexing.py
++++ b/vb_suite/indexing.py
+@@ -239,6 +239,7 @@ series_ix_array = Benchmark("s.ix[np.arange(10000)]", setup)
+ 
+ # multi-index slicing
+ setup = common_setup + """
++np.random.seed(1234)
+ idx=pd.IndexSlice
+ n=100000
+ mdt = pandas.DataFrame()
+diff --git a/vb_suite/series_methods.py b/vb_suite/series_methods.py
+index 1659340cf..d0c31cb04 100644
+--- a/vb_suite/series_methods.py
++++ b/vb_suite/series_methods.py
+@@ -7,6 +7,9 @@ common_setup = """from pandas_vb_common import *
+ setup = common_setup + """
+ s1 = Series(np.random.randn(10000))
+ s2 = Series(np.random.randint(1, 10, 10000))
++s3 = Series(np.random.randint(1, 10, 100000)).astype('int64')
++values = [1,2]
++s4 = s3.astype('object')
+ """
+ 
+ series_nlargest1 = Benchmark('s1.nlargest(3, take_last=True);'
+@@ -27,3 +30,10 @@ series_nsmallest2 = Benchmark('s2.nsmallest(3, take_last=True);'
+                               's2.nsmallest(3, take_last=False)',
+                               setup,
+                               start_date=datetime(2014, 1, 25))
++
++series_isin_int64 = Benchmark('s3.isin(values)',
++                              setup,
++                              start_date=datetime(2014, 1, 25))
++series_isin_object = Benchmark('s4.isin(values)',
++                               setup,
++                               start_date=datetime(2014, 1, 25))

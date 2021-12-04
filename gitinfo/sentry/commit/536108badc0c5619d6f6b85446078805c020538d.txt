@@ -1,0 +1,403 @@
+commit 536108badc0c5619d6f6b85446078805c020538d
+Author: Lyn Nagara <lyn.nagara@gmail.com>
+Date:   Mon Dec 16 16:04:57 2019 -0800
+
+    ref: Don't use Django event (#15593)
+    
+    This is intended to be the minimum set of changes required to be able to stop using Django Event in the saving and post processing of an event. The newly introduced class is supposed to be a drop in replacement for our previous Django event model.
+    
+    This change will allow us to remove the sentry_message table in production since using the Event model depends on the table being present
+    
+    This PR focuses on making the new Event class highly compatible with the previous one so that it can be easily toggled during rollout via an option. However the longer term plan around this would be for this new class to replace both Django Event as well as SnubaEvent everywhere.
+
+diff --git a/src/sentry/api/serializers/models/event.py b/src/sentry/api/serializers/models/event.py
+index f10e134dbd..cbd1ed14ef 100644
+--- a/src/sentry/api/serializers/models/event.py
++++ b/src/sentry/api/serializers/models/event.py
+@@ -8,10 +8,18 @@ from semaphore import meta_with_chunks
+ 
+ from sentry import eventstore
+ from sentry.api.serializers import Serializer, register, serialize
+-from sentry.models import Event, EventError, EventAttachment, Release, UserReport, SnubaEvent
++from sentry.models import (
++    Event as DjangoEvent,
++    EventAttachment,
++    EventError,
++    Release,
++    UserReport,
++    SnubaEvent,
++)
+ from sentry.search.utils import convert_user_tag_to_query
+ from sentry.utils.safe import get_path
+ from sentry.sdk_updates import get_suggested_updates, SdkSetupState
++from sentry.eventstore.models import Event
+ 
+ 
+ CRASH_FILE_TYPES = set(["event.minidump"])
+@@ -29,6 +37,7 @@ def get_crash_files(events):
+ 
+ 
+ @register(SnubaEvent)
++@register(DjangoEvent)
+ @register(Event)
+ class EventSerializer(Serializer):
+     _reserved_keys = frozenset(["user", "sdk", "device", "contexts"])
+diff --git a/src/sentry/digests/notifications.py b/src/sentry/digests/notifications.py
+index 8d79842827..caddad3b9c 100644
+--- a/src/sentry/digests/notifications.py
++++ b/src/sentry/digests/notifications.py
+@@ -8,6 +8,7 @@ import six
+ from collections import OrderedDict, defaultdict, namedtuple
+ from six.moves import reduce
+ 
++from sentry import options
+ from sentry.app import tsdb
+ from sentry.digests import Record
+ from sentry.models import Project, Group, GroupStatus, Rule
+@@ -38,9 +39,14 @@ def event_to_record(event, rules):
+     if not rules:
+         logger.warning("Creating record for %r that does not contain any rules!", event)
+ 
++    if options.get("store.use-django-event"):
++        event_data = strip_for_serialization(event)
++    else:
++        event_data = event
++
+     return Record(
+         event.event_id,
+-        Notification(strip_for_serialization(event), [rule.id for rule in rules]),
++        Notification(event_data, [rule.id for rule in rules]),
+         to_timestamp(event.datetime),
+     )
+ 
+diff --git a/src/sentry/event_manager.py b/src/sentry/event_manager.py
+index dbaf96393d..5ab9fec039 100644
+--- a/src/sentry/event_manager.py
++++ b/src/sentry/event_manager.py
+@@ -15,7 +15,7 @@ from django.db.models import Func
+ from django.utils import timezone
+ from django.utils.encoding import force_text
+ 
+-from sentry import buffer, eventtypes, eventstream, tsdb
++from sentry import buffer, eventstore, eventtypes, eventstream, options, tsdb
+ from sentry.constants import (
+     DEFAULT_STORE_NORMALIZER_ARGS,
+     LOG_LEVELS,
+@@ -379,25 +379,36 @@ class EventManager(object):
+         return self._data
+ 
+     def _get_event_instance(self, project_id=None):
+-        data = self._data
+-        event_id = data.get("event_id")
+-        platform = data.get("platform")
+-
+-        recorded_timestamp = data.get("timestamp")
+-        date = datetime.fromtimestamp(recorded_timestamp)
+-        date = date.replace(tzinfo=timezone.utc)
+-        time_spent = data.get("time_spent")
+-
+-        data["node_id"] = Event.generate_node_id(project_id, event_id)
+-
+-        return Event(
+-            project_id=project_id or self._project.id,
+-            event_id=event_id,
+-            data=EventDict(data, skip_renormalization=True),
+-            time_spent=time_spent,
+-            datetime=date,
+-            platform=platform,
+-        )
++        if options.get("store.use-django-event"):
++            data = self._data
++            event_id = data.get("event_id")
++            platform = data.get("platform")
++
++            recorded_timestamp = data.get("timestamp")
++            date = datetime.fromtimestamp(recorded_timestamp)
++            date = date.replace(tzinfo=timezone.utc)
++            time_spent = data.get("time_spent")
++
++            data["node_id"] = Event.generate_node_id(project_id, event_id)
++
++            return Event(
++                project_id=project_id or self._project.id,
++                event_id=event_id,
++                data=EventDict(data, skip_renormalization=True),
++                time_spent=time_spent,
++                datetime=date,
++                platform=platform,
++            )
++        else:
++            data = self._data
++            event_id = data.get("event_id")
++
++            return eventstore.create_event(
++                project_id=project_id or self._project.id,
++                event_id=event_id,
++                group_id=None,
++                data=EventDict(data, skip_renormalization=True),
++            )
+ 
+     def get_culprit(self):
+         """Helper to calculate the default culprit"""
+diff --git a/src/sentry/eventstore/base.py b/src/sentry/eventstore/base.py
+index 257c8b1e6e..2cd076da6c 100644
+--- a/src/sentry/eventstore/base.py
++++ b/src/sentry/eventstore/base.py
+@@ -5,6 +5,8 @@ from sentry import nodestore
+ from sentry.snuba.events import Columns
+ from sentry.utils.services import Service
+ 
++from .models import Event
++
+ 
+ class Filter(object):
+     """
+@@ -58,6 +60,7 @@ class EventStorage(Service):
+     __all__ = (
+         "minimal_columns",
+         "full_columns",
++        "create_event",
+         "get_event_by_id",
+         "get_events",
+         "get_prev_event_id",
+@@ -169,6 +172,12 @@ class EventStorage(Service):
+         """
+         raise NotImplementedError
+ 
++    def create_event(self, project_id, event_id, group_id, data):
++        """
++        Returns an Event from processed data
++        """
++        return Event(project_id=project_id, event_id=event_id, group_id=group_id, data=data)
++
+     def bind_nodes(self, object_list, node_name="data"):
+         """
+         For a list of Event objects, and a property name where we might find an
+diff --git a/src/sentry/eventstore/models.py b/src/sentry/eventstore/models.py
+new file mode 100644
+index 0000000000..5be4a2173c
+--- /dev/null
++++ b/src/sentry/eventstore/models.py
+@@ -0,0 +1,55 @@
++from __future__ import absolute_import
++
++from datetime import datetime
++from django.utils import timezone
++
++from sentry.models import EventCommon, EventDict
++from sentry.db.models import NodeData
++
++
++def ref_func(x):
++    return x.project_id or x.project.id
++
++
++class Event(EventCommon):
++    def __init__(self, project_id, event_id, group_id=None, data=None):
++        self.project_id = project_id
++        self.event_id = event_id
++        self.group_id = group_id
++        self.data = data
++        super(Event, self).__init__()
++
++    def __getstate__(self):
++        state = self.__dict__.copy()
++        # do not pickle cached info.  We want to fetch this on demand
++        # again.  In particular if we were to pickle interfaces we would
++        # pickle a CanonicalKeyView which old sentry workers do not know
++        # about
++        state.pop("_project_cache", None)
++        state.pop("_environment_cache", None)
++        state.pop("_group_cache", None)
++        state.pop("interfaces", None)
++
++        return state
++
++    @property
++    def data(self):
++        return self._data
++
++    @data.setter
++    def data(self, value):
++        node_id = Event.generate_node_id(self.project_id, self.event_id)
++        self._data = NodeData(
++            node_id, data=value, wrapper=EventDict, ref_version=2, ref_func=ref_func
++        )
++
++    @property
++    def platform(self):
++        return self.data.get("platform", None)
++
++    @property
++    def datetime(self):
++        recorded_timestamp = self.data.get("timestamp")
++        date = datetime.fromtimestamp(recorded_timestamp)
++        date = date.replace(tzinfo=timezone.utc)
++        return date
+diff --git a/src/sentry/web/frontend/debug/mail.py b/src/sentry/web/frontend/debug/mail.py
+index d10440533f..978fb18ea6 100644
+--- a/src/sentry/web/frontend/debug/mail.py
++++ b/src/sentry/web/frontend/debug/mail.py
+@@ -16,6 +16,7 @@ from django.views.generic import View
+ from loremipsum import Generator
+ from random import Random
+ 
++from sentry import options
+ from sentry.app import tsdb
+ from sentry.constants import LOG_LEVELS
+ from sentry.digests import Record
+@@ -245,7 +246,10 @@ def alert(request):
+     data = event_manager.get_data()
+     event = event_manager.save(project.id)
+     # Prevent Percy screenshot from constantly changing
+-    event.datetime = datetime(2017, 9, 6, 0, 0)
++    if options.get("store.use-django-event"):
++        event.datetime = datetime(2017, 9, 6, 0, 0)
++    else:
++        event.data["timestamp"] = 1504656000.0  # datetime(2017, 9, 6, 0, 0)
+     event_type = event_manager.get_event_type()
+ 
+     group.message = event_manager.get_search_message()
+diff --git a/tests/acceptance/test_issue_details_workflow.py b/tests/acceptance/test_issue_details_workflow.py
+index 293d07251b..97a43b1242 100644
+--- a/tests/acceptance/test_issue_details_workflow.py
++++ b/tests/acceptance/test_issue_details_workflow.py
+@@ -26,7 +26,6 @@ class IssueDetailsWorkflowTest(AcceptanceTestCase, SnubaTestCase):
+         event = self.store_event(
+             data=event_data, project_id=self.project.id, assert_no_errors=False
+         )
+-        event.datetime = datetime(2017, 9, 6, 0, 0)
+         event.group.update(
+             first_seen=datetime(2015, 8, 13, 3, 8, 25, tzinfo=timezone.utc),
+             last_seen=datetime(2016, 1, 13, 3, 8, 25, tzinfo=timezone.utc),
+diff --git a/tests/sentry/models/tests.py b/tests/sentry/models/tests.py
+index d97af884c3..5dd0c840e8 100644
+--- a/tests/sentry/models/tests.py
++++ b/tests/sentry/models/tests.py
+@@ -12,12 +12,12 @@ from django.http import HttpRequest
+ from django.utils import timezone
+ from exam import fixture
+ 
+-from sentry import nodestore
++from sentry import eventstore, nodestore
+ from sentry.db.models.fields.node import NodeIntegrityFailure
+-from sentry.models import ProjectKey, Event, LostPasswordHash
++from sentry.models import ProjectKey, LostPasswordHash
+ from sentry.testutils import TestCase
+-from sentry.utils.compat import pickle
+-from sentry.utils.strings import compress
++from sentry.eventstore.models import Event
++from sentry.testutils.helpers.datetime import iso_format, before_now
+ 
+ 
+ class ProjectKeyTest(TestCase):
+@@ -91,72 +91,45 @@ class EventNodeStoreTest(TestCase):
+     def test_event_node_id(self):
+         # Create an event without specifying node_id. A node_id should be generated
+         e1 = Event(project_id=1, event_id="abc", data={"foo": "bar"})
+-        e1.save()
+-        e1_node_id = e1.data.id
+         assert e1.data.id is not None, "We should have generated a node_id for this event"
+-        e1_body = nodestore.get(e1_node_id)
++        e1_node_id = e1.data.id
+         e1.data.save()
+         e1_body = nodestore.get(e1_node_id)
+         assert e1_body == {"foo": "bar"}, "The event body should be in nodestore"
+ 
+-        e1 = Event.objects.get(project_id=1, event_id="abc")
++        e1 = Event(project_id=1, event_id="abc")
++
+         assert e1.data.data == {"foo": "bar"}, "The event body should be loaded from nodestore"
+         assert e1.data.id == e1_node_id, "The event's node_id should be the same after load"
+ 
+-        # Create another event that references the same nodestore object as the first event.
+-        e2 = Event(project_id=1, event_id="def", data={"node_id": e1_node_id})
+-        assert e2.data.id == e1_node_id, "The event should use the provided node_id"
+-        e2_body = nodestore.get(e1_node_id)
+-        assert e2_body == {"foo": "bar"}, "The event body should be in nodestore already"
+-        e2.save()
+-        e2_body = nodestore.get(e1_node_id)
+-        assert e2_body == {"foo": "bar"}, "The event body should not be overwritten by save"
+-
+-        e2 = Event.objects.get(project_id=1, event_id="def")
+-        assert e2.data.data == {"foo": "bar"}, "The event body should be loaded from nodestore"
+-        assert e2.data.id == e1_node_id, "The event's node_id should be the same after load"
+-
+-        # Create an event with a new event body that specifies the node_id to use.
+-        e3 = Event(project_id=1, event_id="ghi", data={"baz": "quux", "node_id": "1:ghi"})
+-        assert e3.data.id == "1:ghi", "Event should have the specified node_id"
+-        assert e3.data.data == {
+-            "baz": "quux"
+-        }, "Event body should be the one provided (sans node_id)"
+-        e3.save()
+-        e3_body = nodestore.get("1:ghi")
+-        e3.data.save()
+-        e3_body = nodestore.get("1:ghi")
+-        assert e3_body == {"baz": "quux"}, "Event body should be saved to nodestore"
+-
+-        e3 = Event.objects.get(project_id=1, event_id="ghi")
+-        assert e3.data.data == {"baz": "quux"}, "Event body should be loaded from nodestore"
+-        assert e3.data.id == "1:ghi", "Loaded event should have the correct node_id"
+-
+-        # Try load it again, but using the pickled/compressed string we would expect to find
+-        # in the column
+-        e3_pickled_id = compress(pickle.dumps({"node_id": "1:ghi"}))
+-        e3 = Event(project_id=1, event_id="jkl", data=e3_pickled_id)
+-        assert e3.data.data == {"baz": "quux"}, "Event body should be loaded from nodestore"
+-
+-        # Event with no data should not be saved (or loaded) from nodestore
+-        e4 = Event(project_id=1, event_id="mno", data=None)
+-        e4.save()
+-        e4.data.save()
+-        assert nodestore.get("1:mno") is None, "We should not have saved anything to nodestore"
+-        e4 = Event.objects.get(project_id=1, event_id="mno")
+-        assert e4.data.id is None
+-        assert e4.data.data == {}  # NodeData returns {} by default
+-        e4.bind_node_data()
+-        assert e4.data.id is None
+-        assert e4.data.data == {}
++        # Event with no data should not be saved to nodestore
++        e2 = Event(project_id=1, event_id="mno", data=None)
++        e2_node_id = e2.data.id
++        assert e2.data.data == {}  # NodeData returns {} by default
++        eventstore.bind_nodes([e2], "data")
++        assert e2.data.data == {}
++        e2_body = nodestore.get(e2_node_id)
++        assert e2_body is None
+ 
+     def test_screams_bloody_murder_when_ref_fails(self):
+         project1 = self.create_project()
+         project2 = self.create_project()
+-        group1 = self.create_group(project1)
+-        invalid_event = self.create_event(group=group1)
+-        group2 = self.create_group(project2)
+-        event = self.create_event(group=group2)
++        invalid_event = self.store_event(
++            data={
++                "event_id": "a" * 32,
++                "timestamp": iso_format(before_now(minutes=1)),
++                "fingerprint": ["group-1"],
++            },
++            project_id=project1.id,
++        )
++        event = self.store_event(
++            data={
++                "event_id": "b" * 32,
++                "timestamp": iso_format(before_now(minutes=1)),
++                "fingerprint": ["group-2"],
++            },
++            project_id=project2.id,
++        )
+         event.data.bind_ref(invalid_event)
+         event.data.save()
+ 
+@@ -168,9 +141,7 @@ class EventNodeStoreTest(TestCase):
+     def test_accepts_valid_ref(self):
+         event = self.create_event()
+         event.data.bind_ref(event)
+-
+         event.bind_node_data()
+-
+         assert event.data.ref == event.project.id
+ 
+     def test_basic_ref_binding(self):

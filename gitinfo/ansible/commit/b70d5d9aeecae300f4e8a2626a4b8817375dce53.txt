@@ -1,0 +1,1122 @@
+commit b70d5d9aeecae300f4e8a2626a4b8817375dce53
+Author: Ed Costello <orthanc@users.noreply.github.com>
+Date:   Thu Nov 15 06:15:24 2018 +1300
+
+    [AWS] ses rule set module for inbound email processing (#42781)
+    
+    * Add module ses_rule_set for Amazon SES
+    
+    * Update behaviours and naming to be consistent with other aws_ses_ modules.
+    
+    * Add global lock around tests using active rule sets to prevent intermittent test failures.
+    
+    * Fix deletion of rule sets so that we don't inactivate the active rule set
+    when force deleting an inactive rule set.
+
+diff --git a/hacking/aws_config/testing_policies/compute-policy.json b/hacking/aws_config/testing_policies/compute-policy.json
+index 2bab151f13..3a18c17552 100644
+--- a/hacking/aws_config/testing_policies/compute-policy.json
++++ b/hacking/aws_config/testing_policies/compute-policy.json
+@@ -234,7 +234,14 @@
+             "ses:GetIdentityPolicies",
+             "ses:PutIdentityPolicy",
+             "ses:DeleteIdentityPolicy",
+-            "ses:ListIdentityPolicies"
++            "ses:ListIdentityPolicies",
++            "ses:SetIdentityFeedbackForwardingEnabled",
++            "ses:ListReceiptRuleSets",
++            "ses:DescribeReceiptRuleSet",
++            "ses:DescribeActiveReceiptRuleSet",
++            "ses:SetActiveReceiptRuleSet",
++            "ses:CreateReceiptRuleSet",
++            "ses:DeleteReceiptRuleSet"
+           ],
+           "Resource": [
+             "*"
+diff --git a/hacking/aws_config/testing_policies/security-policy.json b/hacking/aws_config/testing_policies/security-policy.json
+index 302b60b085..da25b72dc2 100644
+--- a/hacking/aws_config/testing_policies/security-policy.json
++++ b/hacking/aws_config/testing_policies/security-policy.json
+@@ -31,6 +31,28 @@
+             "Action": "waf:*",
+             "Effect": "Allow",
+             "Resource": "*"
++        },
++        {
++            "Sid": "AllowListingCloudwatchLogs",
++            "Effect": "Allow",
++            "Action": [
++                "logs:DescribeLogGroups"
++            ],
++            "Resource": [
++                "arn:aws:logs:{{aws_region}}:{{aws_account}}:log-group:*"
++            ]
++        },
++        {
++            "Sid": "AllowModifyingCloudwatchLogs",
++            "Effect": "Allow",
++            "Action": [
++                "logs:CreateLogGroup",
++                "logs:PutRetentionPolicy",
++                "logs:DeleteLogGroup"
++            ],
++            "Resource": [
++                "arn:aws:logs:{{aws_region}}:{{aws_account}}:log-group:ansible-testing*"
++            ]
+         }
+     ]
+ }
+diff --git a/lib/ansible/modules/cloud/amazon/aws_ses_rule_set.py b/lib/ansible/modules/cloud/amazon/aws_ses_rule_set.py
+new file mode 100644
+index 0000000000..ccb00942d6
+--- /dev/null
++++ b/lib/ansible/modules/cloud/amazon/aws_ses_rule_set.py
+@@ -0,0 +1,250 @@
++#!/usr/bin/python
++# Copyright (c) 2017, Ben Tomasik <ben@tomasik.io>
++# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
++
++
++ANSIBLE_METADATA = {'metadata_version': '1.1',
++                    'status': ['preview'],
++                    'supported_by': 'community'}
++
++
++DOCUMENTATION = """
++---
++module: aws_ses_rule_set
++short_description: Manages SES inbound receipt rule sets
++description:
++    - The M(aws_ses_rule_set) module allows you to create, delete, and manage SES receipt rule sets
++version_added: 2.8
++author:
++  - "Ben Tomasik (@tomislacker)"
++  - "Ed Costello (@orthanc)"
++requirements: [ boto3, botocore ]
++options:
++  name:
++    description:
++      - The name of the receipt rule set.
++    required: True
++  state:
++    description:
++      - Whether to create (or update) or destroy the receipt rule set.
++    required: False
++    default: present
++    choices: ["absent", "present"]
++  active:
++    description:
++      - Whether or not this rule set should be the active rule set. Only has an impact if I(state) is C(present).
++      - If omitted, the active rule set will not be changed.
++      - If C(True) then this rule set will be made active and all others inactive.
++      - if C(False) then this rule set will be deactivated. Be careful with this as you can end up with no active rule set.
++    type: bool
++    required: False
++  force:
++    description:
++      - When deleting a rule set, deactivate it first (AWS prevents deletion of the active rule set).
++    type: bool
++    required: False
++    default: False
++extends_documentation_fragment:
++    - aws
++    - ec2
++"""
++
++EXAMPLES = """
++# Note: None of these examples set aws_access_key, aws_secret_key, or region.
++# It is assumed that their matching environment variables are set.
++---
++- name: Create default rule set and activate it if not already
++  aws_ses_rule_set:
++    name: default-rule-set
++    state: present
++    active: yes
++
++- name: Create some arbitrary rule set but do not activate it
++  aws_ses_rule_set:
++    name: arbitrary-rule-set
++    state: present
++
++- name: Explicitly deactivate the default rule set leaving no active rule set
++  aws_ses_rule_set:
++    name: default-rule-set
++    state: present
++    active: no
++
++- name: Remove an arbitary inactive rule set
++  aws_ses_rule_set:
++    name: arbitrary-rule-set
++    state: absent
++
++- name: Remove an ruleset even if we have to first deactivate it to remove it
++  aws_ses_rule_set:
++    name: default-rule-set
++    state: absent
++    force: yes
++"""
++
++RETURN = """
++active:
++  description: if the SES rule set is active
++  returned: success if I(state) is C(present)
++  type: bool
++  sample: true
++rule_sets:
++  description: The list of SES receipt rule sets that exist after any changes.
++  returned: success
++  type: list
++  sample: [{
++      "created_timestamp": "2018-02-25T01:20:32.690000+00:00",
++      "name": "default-rule-set"
++    }]
++"""
++
++from ansible.module_utils.aws.core import AnsibleAWSModule
++from ansible.module_utils.ec2 import camel_dict_to_snake_dict, AWSRetry
++
++try:
++    from botocore.exceptions import BotoCoreError, ClientError
++except ImportError:
++    pass  # handled by AnsibleAWSModule
++
++
++def list_rule_sets(client, module):
++    try:
++        response = client.list_receipt_rule_sets(aws_retry=True)
++    except (BotoCoreError, ClientError) as e:
++        module.fail_json_aws(e, msg="Couldn't list rule sets.")
++    return response['RuleSets']
++
++
++def rule_set_in(name, rule_sets):
++    return any([s for s in rule_sets if s['Name'] == name])
++
++
++def ruleset_active(client, module, name):
++    try:
++        active_rule_set = client.describe_active_receipt_rule_set(aws_retry=True)
++    except (BotoCoreError, ClientError) as e:
++        module.fail_json_aws(e, msg="Couldn't get the active rule set.")
++    if active_rule_set is not None and 'Metadata' in active_rule_set:
++        return name == active_rule_set['Metadata']['Name']
++    else:
++        # Metadata was not set meaning there is no active rule set
++        return False
++
++
++def deactivate_rule_set(client, module):
++    try:
++        # No ruleset name deactivates all rulesets
++        client.set_active_receipt_rule_set(aws_retry=True)
++    except (BotoCoreError, ClientError) as e:
++        module.fail_json_aws(e, msg="Couldn't set active rule set to None.")
++
++
++def update_active_rule_set(client, module, name, desired_active):
++    check_mode = module.check_mode
++
++    active = ruleset_active(client, module, name)
++
++    changed = False
++    if desired_active is not None:
++        if desired_active and not active:
++            if not check_mode:
++                try:
++                    client.set_active_receipt_rule_set(RuleSetName=name, aws_retry=True)
++                except (BotoCoreError, ClientError) as e:
++                    module.fail_json_aws(e, msg="Couldn't set active rule set to {0}.".format(name))
++            changed = True
++            active = True
++        elif not desired_active and active:
++            if not check_mode:
++                deactivate_rule_set(client, module)
++            changed = True
++            active = False
++    return changed, active
++
++
++def create_or_update_rule_set(client, module):
++    name = module.params.get('name')
++    check_mode = module.check_mode
++    changed = False
++
++    rule_sets = list_rule_sets(client, module)
++    if not rule_set_in(name, rule_sets):
++        if not check_mode:
++            try:
++                client.create_receipt_rule_set(RuleSetName=name, aws_retry=True)
++            except (BotoCoreError, ClientError) as e:
++                module.fail_json_aws(e, msg="Couldn't create rule set {0}.".format(name))
++        changed = True
++        rule_sets = list(rule_sets)
++        rule_sets.append({
++            'Name': name,
++        })
++
++    (active_changed, active) = update_active_rule_set(client, module, name, module.params.get('active'))
++    changed |= active_changed
++
++    module.exit_json(
++        changed=changed,
++        active=active,
++        rule_sets=[camel_dict_to_snake_dict(x) for x in rule_sets],
++    )
++
++
++def remove_rule_set(client, module):
++    name = module.params.get('name')
++    check_mode = module.check_mode
++    changed = False
++
++    rule_sets = list_rule_sets(client, module)
++    if rule_set_in(name, rule_sets):
++        active = ruleset_active(client, module, name)
++        if active and not module.params.get('force'):
++            module.fail_json(
++                msg="Couldn't delete rule set {0} because it is currently active. Set force=true to delete an active ruleset.".format(name),
++                error={
++                    "code": "CannotDelete",
++                    "message": "Cannot delete active rule set: {0}".format(name),
++                }
++            )
++        if not check_mode:
++            if active and module.params.get('force'):
++                deactivate_rule_set(client, module)
++            try:
++                client.delete_receipt_rule_set(RuleSetName=name, aws_retry=True)
++            except (BotoCoreError, ClientError) as e:
++                module.fail_json_aws(e, msg="Couldn't delete rule set {0}.".format(name))
++        changed = True
++        rule_sets = [x for x in rule_sets if x['Name'] != name]
++
++    module.exit_json(
++        changed=changed,
++        rule_sets=[camel_dict_to_snake_dict(x) for x in rule_sets],
++    )
++
++
++def main():
++    argument_spec = dict(
++        name=dict(type='str', required=True),
++        state=dict(type='str', default='present', choices=['present', 'absent']),
++        active=dict(type='bool'),
++        force=dict(type='bool', default=False),
++    )
++
++    module = AnsibleAWSModule(argument_spec=argument_spec, supports_check_mode=True)
++
++    state = module.params.get('state')
++
++    # SES APIs seem to have a much lower throttling threshold than most of the rest of the AWS APIs.
++    # Docs say 1 call per second. This shouldn't actually be a big problem for normal usage, but
++    # the ansible build runs multiple instances of the test in parallel that's caused throttling
++    # failures so apply a jittered backoff to call SES calls.
++    client = module.client('ses', retry_decorator=AWSRetry.jittered_backoff())
++
++    if state == 'absent':
++        remove_rule_set(client, module)
++    else:
++        create_or_update_rule_set(client, module)
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/test/integration/targets/aws_ses_rule_set/aliases b/test/integration/targets/aws_ses_rule_set/aliases
+new file mode 100644
+index 0000000000..a112c3d1bb
+--- /dev/null
++++ b/test/integration/targets/aws_ses_rule_set/aliases
+@@ -0,0 +1,2 @@
++cloud/aws
++shippable/aws/group1
+diff --git a/test/integration/targets/aws_ses_rule_set/defaults/main.yaml b/test/integration/targets/aws_ses_rule_set/defaults/main.yaml
+new file mode 100644
+index 0000000000..f9fecf7bdf
+--- /dev/null
++++ b/test/integration/targets/aws_ses_rule_set/defaults/main.yaml
+@@ -0,0 +1,9 @@
++---
++default_rule_set: "{{ resource_prefix }}-default-rule-set"
++second_rule_set: "{{ resource_prefix }}-second-rule-set"
++
++# See comment in obtain-lock.yaml for definitions of these variables
++max_obtain_lock_attempts: 10
++obtain_lock_delay_seconds: 30
++lock_timeout_seconds: 900
++lock_log_group_prefix: "ansible-testing-locks/aws_ses_rule_set"
+diff --git a/test/integration/targets/aws_ses_rule_set/tasks/active-rule-set-tests.yaml b/test/integration/targets/aws_ses_rule_set/tasks/active-rule-set-tests.yaml
+new file mode 100644
+index 0000000000..99655e85d5
+--- /dev/null
++++ b/test/integration/targets/aws_ses_rule_set/tasks/active-rule-set-tests.yaml
+@@ -0,0 +1,349 @@
++---
++# ============================================================
++# These tests all rely on making rule sets active. There can only be
++# a single active rule set so multiple builds must not run these tests
++# in parallel or they will fail intermittently.
++# See the locking block in main.yaml for how this restriction is enforced
++# ============================================================
++
++- name: set up aws connection info
++  set_fact:
++    aws_connection_info: &aws_connection_info
++      aws_access_key: "{{ aws_access_key }}"
++      aws_secret_key: "{{ aws_secret_key }}"
++      security_token: "{{ security_token }}"
++      region: "{{ aws_region }}"
++  no_log: yes
++
++# ============================================================
++- name: mark rule set active
++  block:
++    - name: create rule set
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        <<: *aws_connection_info
++    - name: mark rule set active
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        active: True
++        <<: *aws_connection_info
++      register: result
++    - name: assert changed to active
++      assert:
++        that:
++          - result.changed == True
++          - result.active == True
++    - name: remark rule set active
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        active: True
++        <<: *aws_connection_info
++      register: result
++    - name: assert changed is False
++      assert:
++        that:
++          - result.changed == False
++  always:
++    - name: cleanup rule set
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        state: absent
++        force: True
++        <<: *aws_connection_info
++
++# ============================================================
++- name: create rule set active
++  block:
++    - name: create rule set
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        active: True
++        <<: *aws_connection_info
++      register: result
++    - name: assert changed to existing and active
++      assert:
++        that:
++          - result.changed == True
++          - result.active == True
++          - "default_rule_set in result.rule_sets|map(attribute='name')"
++    - name: remark rule set active
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        active: True
++        <<: *aws_connection_info
++      register: result
++    - name: assert changed is False
++      assert:
++        that:
++          - result.changed == False
++  always:
++    - name: cleanup rule set
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        state: absent
++        force: True
++        <<: *aws_connection_info
++
++# ============================================================
++- name: mark rule set inactive
++  block:
++    - name: create active rule set
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        active: True
++        <<: *aws_connection_info
++    - name: mark rule set inactive
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        active: False
++        <<: *aws_connection_info
++      register: result
++    - name: assert changed to inactive
++      assert:
++        that:
++          - result.changed == True
++          - result.active == False
++    - name: remark rule set inactive
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        active: False
++        <<: *aws_connection_info
++      register: result
++    - name: assert changed is False
++      assert:
++        that:
++          - result.changed == False
++  always:
++    - name: cleanup rule set
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        state: absent
++        force: True
++        <<: *aws_connection_info
++
++# ============================================================
++- name: Absent active flag does not change active status
++  block:
++    - name: create active rule set
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        active: True
++        <<: *aws_connection_info
++    - name: recreate rule set
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        <<: *aws_connection_info
++      register: result
++    - name: assert not changed and still active
++      assert:
++        that:
++          - result.changed == False
++          - result.active == True
++  always:
++    - name: cleanup rule set
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        state: absent
++        force: True
++        <<: *aws_connection_info
++
++# ============================================================
++- name: Cannot Remove Active Rule Set
++  block:
++    - name: create active rule set
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        active: True
++        <<: *aws_connection_info
++    - name: remove rule set
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        state: absent
++        <<: *aws_connection_info
++      register: result
++      failed_when: "result.error.code != 'CannotDelete'"
++    - name: assert error code is CannotDelete
++      assert:
++        that:
++          - "result.error.code == 'CannotDelete'"
++  always:
++    - name: cleanup rule set
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        state: absent
++        force: True
++        <<: *aws_connection_info
++
++# ============================================================
++- name: Remove Active Rule Set with Force
++  block:
++    - name: create active rule set
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        active: True
++        <<: *aws_connection_info
++    - name: force remove rule set
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        state: absent
++        force: True
++        <<: *aws_connection_info
++      register: result
++    - name: assert changed and absent
++      assert:
++        that:
++          - result.changed == True
++          - "default_rule_set not in result.rule_sets|map(attribute='name')"
++  always:
++    - name: cleanup rule set
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        state: absent
++        force: True
++        <<: *aws_connection_info
++
++# ============================================================
++- name: Force Remove of Inactive Rule Set does Not Affect Active Rule Set
++  block:
++    - name: create active rule set
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        active: True
++        <<: *aws_connection_info
++    - name: create inactive rule set
++      aws_ses_rule_set:
++        name: "{{ second_rule_set }}"
++        active: False
++        <<: *aws_connection_info
++    - name: force remove inactiave rule set
++      aws_ses_rule_set:
++        name: "{{ second_rule_set }}"
++        state: absent
++        force: True
++        <<: *aws_connection_info
++      register: result
++    - name: assert changed and absent
++      assert:
++        that:
++          - result.changed == True
++          - "second_rule_set not in result.rule_sets|map(attribute='name')"
++    - name: remark active rule set active
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        active: True
++        <<: *aws_connection_info
++      register: result
++    - name: assert no change
++      assert:
++        that:
++          - result.changed == False
++  always:
++    - name: cleanup rule set
++      aws_ses_rule_set:
++        name: "{{ item }}"
++        state: absent
++        force: True
++        <<: *aws_connection_info
++      loop:
++        - "{{ default_rule_set }}"
++        - "{{ second_rule_set }}"
++
++# ============================================================
++- name: mark rule set inactive in check mode
++  block:
++    - name: create rule set
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        active: True
++        <<: *aws_connection_info
++    - name: mark rule set inactive in check mode
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        active: False
++        <<: *aws_connection_info
++      register: result
++      check_mode: True
++    - name: assert changed to inactive
++      assert:
++        that:
++          - result.changed == True
++          - result.active == False
++    - name: remark rule set inactive
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        active: False
++        <<: *aws_connection_info
++      register: result
++    - name: assert changed is True since previous inactive was in check mode
++      assert:
++        that:
++          - result.changed == True
++  always:
++    - name: cleanup rule set
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        state: absent
++        force: True
++        <<: *aws_connection_info
++
++# ============================================================
++- name: Cannot Remove Active Rule Set in check mode
++  block:
++    - name: create active rule set
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        active: True
++        <<: *aws_connection_info
++    - name: remove rule set
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        state: absent
++        <<: *aws_connection_info
++      register: result
++      failed_when: "result.error.code != 'CannotDelete'"
++      check_mode: True
++    - name: assert error code is CannotDelete
++      assert:
++        that:
++          - "result.error.code == 'CannotDelete'"
++  always:
++    - name: cleanup rule set
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        state: absent
++        force: True
++        <<: *aws_connection_info
++
++# ============================================================
++- name: Remove Active Rule Set with Force in check mode
++  block:
++    - name: create active rule set
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        active: True
++        <<: *aws_connection_info
++    - name: force remove rule set
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        state: absent
++        force: True
++        <<: *aws_connection_info
++      register: result
++      check_mode: True
++    - name: assert changed and absent
++      assert:
++        that:
++          - result.changed == True
++          - "default_rule_set not in result.rule_sets|map(attribute='name')"
++  always:
++    - name: cleanup rule set
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        state: absent
++        force: True
++        <<: *aws_connection_info
++      register: result
++    - name: assert changed is True since previous removal was in check mode
++      assert:
++        that:
++          - result.changed == True
+diff --git a/test/integration/targets/aws_ses_rule_set/tasks/cleanup-lock.yaml b/test/integration/targets/aws_ses_rule_set/tasks/cleanup-lock.yaml
+new file mode 100644
+index 0000000000..155bf472e4
+--- /dev/null
++++ b/test/integration/targets/aws_ses_rule_set/tasks/cleanup-lock.yaml
+@@ -0,0 +1,15 @@
++---
++# ============================================================
++# Release a lock obtained using obtain-lock.yaml
++# This should be included in the always clause of a block to
++# ensure the lock is released. See obtain-lock.yaml for more
++# details of how the locking works.
++# ============================================================
++
++- cloudwatchlogs_log_group:
++    log_group_name: "{{ lock_attempt_log_group_name }}"
++    state: absent
++    aws_access_key: "{{ aws_access_key }}"
++    aws_secret_key: "{{ aws_secret_key }}"
++    security_token: "{{ security_token }}"
++    region: "{{ aws_region }}"
+diff --git a/test/integration/targets/aws_ses_rule_set/tasks/inactive-rule-set-tests.yaml b/test/integration/targets/aws_ses_rule_set/tasks/inactive-rule-set-tests.yaml
+new file mode 100644
+index 0000000000..4bd5250a73
+--- /dev/null
++++ b/test/integration/targets/aws_ses_rule_set/tasks/inactive-rule-set-tests.yaml
+@@ -0,0 +1,187 @@
++---
++# ============================================================
++# These tests work on rule sets without making them active.
++# so multiple builds can safely run these tests as is normal.
++#
++# DO NOT ADD TESTS THAT RELY ON ACTIVE RULE SETS TO THIS FILE
++#
++# Any test that make rule sets active must be added in
++# active-rule-set-tests.yaml or you will have intermittent failures
++# from multiple builds interacting
++# ============================================================
++
++- name: set up aws connection info
++  set_fact:
++    aws_connection_info: &aws_connection_info
++      aws_access_key: "{{ aws_access_key }}"
++      aws_secret_key: "{{ aws_secret_key }}"
++      security_token: "{{ security_token }}"
++      region: "{{ aws_region }}"
++  no_log: yes
++
++# ============================================================
++- name: test create rule sets
++  block:
++    - name: create rule set
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        <<: *aws_connection_info
++      register: result
++    - name: assert changed to exists inactive
++      assert:
++        that:
++          - result.changed == True
++          - result.active == False
++          - "default_rule_set in result.rule_sets|map(attribute='name')"
++    - name: recreate rule set
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        <<: *aws_connection_info
++      register: result
++    - name: assert changed is False
++      assert:
++        that:
++          - result.changed == False
++  always:
++    - name: cleanup rule set
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        state: absent
++        force: True
++        <<: *aws_connection_info
++# ============================================================
++- name: Remove No Such Rules Set
++  block:
++    - name: remove ruleset
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        state: absent
++        <<: *aws_connection_info
++      register: result
++    - name: assert not changed and absent
++      assert:
++        that:
++          - result.changed == False
++          - "default_rule_set not in result.rule_sets|map(attribute='name')"
++# ============================================================
++- name: Remove Inactive Rule Set
++  block:
++    - name: create rule set
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        <<: *aws_connection_info
++    - name: remove rule set
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        state: absent
++        <<: *aws_connection_info
++      register: result
++    - name: assert changed and removed
++      assert:
++        that:
++          - result.changed == True
++          - "default_rule_set not in result.rule_sets|map(attribute='name')"
++  always:
++    - name: cleanup rule set
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        state: absent
++        force: True
++        <<: *aws_connection_info
++# ============================================================
++- name: test create in check mode
++  block:
++    - name: create rule set in check mode
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        <<: *aws_connection_info
++      register: result
++      check_mode: True
++    - name: assert changed inactive and present
++      assert:
++        that:
++          - result.changed == True
++          - result.active == False
++          - "default_rule_set in result.rule_sets|map(attribute='name')"
++  always:
++    - name: cleanup rule set
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        state: absent
++        force: True
++        <<: *aws_connection_info
++      register: result
++    - name: assert nothing to clean up since create was in check mode
++      assert:
++        that:
++          - result.changed == False
++# ============================================================
++- name: mark rule set active in check mode
++  block:
++    - name: create rule set
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        <<: *aws_connection_info
++    - name: mark rule set active in check mode
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        active: True
++        <<: *aws_connection_info
++      register: result
++      check_mode: True
++    - name: assert changed and active
++      assert:
++        that:
++          - result.changed == True
++          - result.active == True
++    # We check the rule set is still inactive rather than making
++    # it active again as that way this test can be run in 
++    # parallel
++    - name: Ensure rule set is inactive
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        active: False
++        <<: *aws_connection_info
++      register: result
++    - name: assert unchanged since activation was in check mode
++      assert:
++        that:
++          - result.changed == False
++  always:
++    - name: cleanup rule set
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        state: absent
++        force: True
++        <<: *aws_connection_info
++# ============================================================
++- name: Remove Inactive Rule Set in check mode
++  block:
++    - name: create rule set
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        <<: *aws_connection_info
++    - name: remove rule set
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        state: absent
++        <<: *aws_connection_info
++      register: result
++      check_mode: True
++    - name: assert changed and removed
++      assert:
++        that:
++          - result.changed == True
++          - "default_rule_set not in result.rule_sets|map(attribute='name')"
++  always:
++    - name: cleanup rule set
++      aws_ses_rule_set:
++        name: "{{ default_rule_set }}"
++        state: absent
++        force: True
++        <<: *aws_connection_info
++      register: result
++    - name: assert changed is True since previous removal was in check mode
++      assert:
++        that:
++          - result.changed == True
+diff --git a/test/integration/targets/aws_ses_rule_set/tasks/main.yaml b/test/integration/targets/aws_ses_rule_set/tasks/main.yaml
+new file mode 100644
+index 0000000000..fe0e787797
+--- /dev/null
++++ b/test/integration/targets/aws_ses_rule_set/tasks/main.yaml
+@@ -0,0 +1,36 @@
++---
++- include_tasks: inactive-rule-set-tests.yaml
++
++# ============================================================
++# There can only be a single active rule set, tests that
++# relies on the active state of the rule cannot be run in
++# parallel.
++# To prevent failures due to parallel runs in the integration
++# builds, the below block creates a lock to ensure that only
++# one process will be running these tests in the same region
++# and same AWS account.
++# See obtain-lock.yaml for explanation of how the lock is
++# constructed.
++# ============================================================
++- name: Active Rule Set Tests
++  block:
++    - name: Obtain Lock
++      include_tasks: obtain-lock-wrapper.yaml
++      # Use of loop here is a workaround for lack of support for
++      # do-until loops on includes. See:
++      # https://github.com/ansible/ansible/issues/17098
++      loop: "{{ range(0, max_obtain_lock_attempts, 1)|list }}"
++      loop_control:
++        loop_var: obtain_lock_attempt
++
++      # Because of the above workaround we have to explicitly check
++      # that the lock was obtained
++    - name: Check Obtained Lock
++      assert:
++        msg: "Could not obtain lock after {{ max_obtain_lock_attempts }} attempts."
++        that: won_lock|bool
++
++    - include_tasks: active-rule-set-tests.yaml
++
++  always:
++    - include_tasks: cleanup-lock.yaml
+diff --git a/test/integration/targets/aws_ses_rule_set/tasks/obtain-lock-wrapper.yaml b/test/integration/targets/aws_ses_rule_set/tasks/obtain-lock-wrapper.yaml
+new file mode 100644
+index 0000000000..36969897cd
+--- /dev/null
++++ b/test/integration/targets/aws_ses_rule_set/tasks/obtain-lock-wrapper.yaml
+@@ -0,0 +1,26 @@
++# ============================================================
++# Do While loops cannot be used on task includes.
++# See: https://github.com/ansible/ansible/issues/17098
++#
++# So as a workaround we use a regular loop to repeatedly attempt
++# obtaining a lock.
++#
++# For this to work we need to skip the subsequent iterations
++# once we get a lock, and delay between iterations if we
++# did not obtain the lock.
++#
++# This file encapsulates this logic to reduce the spam from
++# skipped tasks in the ansible log.
++# ============================================================
++
++- include_tasks: obtain-lock.yaml
++  # Skip obtaining a lock if we've already succeeded in getting it
++  when: "not won_lock|default(False)|bool"
++
++- name: Lock Retry Delay
++  wait_for:
++    # Add some random jitter to the delay to reduce lock contention
++    timeout: "{{ obtain_lock_delay_seconds + 15|random }}"
++  # Only delay if we're retrying, so skip the delay if we're
++  # on the last attempt or have got the lock
++  when: "obtain_lock_attempt < (max_obtain_lock_attempts - 1) and not won_lock|bool"
+diff --git a/test/integration/targets/aws_ses_rule_set/tasks/obtain-lock.yaml b/test/integration/targets/aws_ses_rule_set/tasks/obtain-lock.yaml
+new file mode 100644
+index 0000000000..69ecaea333
+--- /dev/null
++++ b/test/integration/targets/aws_ses_rule_set/tasks/obtain-lock.yaml
+@@ -0,0 +1,126 @@
++# ============================================================
++# This file attempts to obtain a global lock (for a given
++# region / account combination.
++#
++# This makes one attempt to get the lock and will set the
++# won_lock variable to True or False to indicate whether
++# or not we got the lock.
++#
++# It's expected that this will be executed in a retry loop
++# so that if we don't get the lock we delay then try again.
++#
++# This should only be used in a block with cleanup-lock.yaml
++# included in the always clause to ensure the lock is released.
++#
++# There are several variables that control the locking behaviour:
++# * lock_timeout_seconds
++#     How old a lock must be before it's assumed to be an expired
++#     lock that was not cleaned up by the owner. Any locks older
++#     than this will not prevent a lock being obtained and will
++#     be deleted when a new process obtains the lock.
++# * lock_log_group_prefix
++#     The log_group prefix that represents the lock being obtained.
++#     This must be the same across all processes trying to obtain
++#     the lock.
++# * lock_process_id
++#     A unique identifier of this process. Each process that might
++#     attempt to lock the process must have a different identifier.
++#     This defaults to the resource_prefix which is generally
++#     appropriate.
++# * max_obtain_lock_attempts
++#     How many attempts to make to get the lock before giving up
++#     NB: This is actually done in main.yaml
++# * obtain_lock_delay_seconds:
++#     How long to delay after failing to get the lock before
++#     trying again.
++#     NB: This is actually done in obtain-lock-wrapper.yaml
++#
++# The locking here is based around creating cloudwatch log groups.
++# This resource was chosen because:
++#   A) it's free
++#   B) we have a built in grouping concept because of the hierarchy
++#      that allows us to easily group attempts for the same lock
++#   C) the creation time is tracked and returned which gives us
++#      a mechanism for deterministically picking a winner
++#
++# Each lock is represented by a log group prefix. Each attempt
++# to obtain the lock is a log group of the lock_process_id below
++# that prefix.
++#
++# The winning lock is the one with the earliest creation time.
++#
++# To prevent a hanging lock from permanently hanging the build
++# lock attempts older than the lock timeout are ignored and
++# cleaned up by the next process to win the lock.
++# ============================================================
++
++- name: set up aws connection info
++  set_fact:
++    aws_connection_info: &aws_connection_info
++      aws_access_key: "{{ aws_access_key }}"
++      aws_secret_key: "{{ aws_secret_key }}"
++      security_token: "{{ security_token }}"
++      region: "{{ aws_region }}"
++  no_log: yes
++
++- name: Set lock_attempt_log_group_name
++  set_fact:
++    lock_attempt_log_group_name: "{{ lock_log_group_prefix }}/{{ lock_process_id|default(resource_prefix) }}"
++
++  # Note the overwrite below to ensure that the creation time
++  # is upated. This is important as we calculate expiry relative
++  # the attempt creation.
++  #
++  # Because of this it's imporatnt that we delete the attempt
++  # if we don't get the lock. Otherwise we can get a deadlock
++  # where the stale atttempt from one process wins, but then
++  # because that process updates the creation date it doesn't
++  # consider its self to havewone.
++- name: Create Lock Attempt Log Group
++  cloudwatchlogs_log_group:
++    log_group_name: "{{ lock_attempt_log_group_name }}"
++    state: present
++    overwrite: True
++    <<: *aws_connection_info
++  register: lock_attempt_log_group_result
++
++- name: Get Lock Attempt Lock Groups
++  cloudwatchlogs_log_group_facts:
++    log_group_name: "{{ lock_log_group_prefix }}/"
++    <<: *aws_connection_info
++  register: lock_attempt_log_groups
++
++- name: Calculate Expired Lock Attempt Timestamp
++  set_fact:
++    expired_lock_timestamp: "{{ lock_attempt_log_group_result.creation_time - (lock_timeout_seconds * 1000) }}"
++
++- name: Get Expired and Active Lock Attempts
++  set_fact:
++    expired_lock_attempts: "{{ lock_attempt_log_groups.log_groups|selectattr('creation_time', 'lt', expired_lock_timestamp|int)|list }}"
++    active_lock_attempts: "{{ lock_attempt_log_groups.log_groups|selectattr('creation_time', 'ge', expired_lock_timestamp|int)|list }}"
++
++- name: Pick Winning Lock Attempt
++  set_fact:
++    winning_lock_attempt: "{{ active_lock_attempts|sort(attribute='creation_time')|first }}"
++
++- name: Determine if Won Lock
++  set_fact:
++    won_lock: "{{ winning_lock_attempt.log_group_name == lock_attempt_log_group_name }}"
++
++  # Remove the lock attempt if we didn't get the lock. This prevents
++  # our stale lock attempt blocking another process from getting the lock.
++  # See more detailed comment above Create Lock Attempt Log Group
++- name: Remove Failed Lock Attempt Log Group
++  cloudwatchlogs_log_group:
++    log_group_name: "{{ lock_attempt_log_group_name }}"
++    state: absent
++    <<: *aws_connection_info
++  when: "not won_lock|bool"
++
++- name: Delete Expired Lock Attempts
++  cloudwatchlogs_log_group:
++    log_group_name: "{{ item.log_group_name }}"
++    state: absent
++    <<: *aws_connection_info
++  when: "won_lock|bool"
++  loop: "{{ expired_lock_attempts }}"

@@ -1,0 +1,965 @@
+commit 1ef357332363719d085701af293303b4fa3e4eda
+Author: Dan Fuller <dfuller@sentry.io>
+Date:   Thu Oct 17 16:46:22 2019 -0700
+
+    feat(api): Modify alert rule processor to fire actions when triggers are fired (SEN-1140)
+    
+    This adds in the framework for performing actions when triggers are fired/resolved. There are no
+    concrete implementations for now, will follow up with them in a separate pr.
+    
+    I've put in work to make this partially plugable. The handlers for each type can now just be
+    registered, which should partially future proof us for adding additional integrations here. The
+    types are still a hardcoded enum, we'll change that when necessary.
+
+diff --git a/src/sentry/incidents/__init__.py b/src/sentry/incidents/__init__.py
+index 9418ba1d64..c3961685ab 100644
+--- a/src/sentry/incidents/__init__.py
++++ b/src/sentry/incidents/__init__.py
+@@ -1,2 +1 @@
+ from __future__ import absolute_import
+-from . import events  # NOQA
+diff --git a/src/sentry/incidents/action_handlers.py b/src/sentry/incidents/action_handlers.py
+new file mode 100644
+index 0000000000..47edfd0327
+--- /dev/null
++++ b/src/sentry/incidents/action_handlers.py
+@@ -0,0 +1,31 @@
++from __future__ import absolute_import
++
++import abc
++
++import six
++
++from sentry.incidents.models import AlertRuleTriggerAction
++
++
++@six.add_metaclass(abc.ABCMeta)
++class ActionHandler(object):
++    def __init__(self, action, incident):
++        self.action = action
++        self.incident = incident
++
++    @abc.abstractmethod
++    def fire(self):
++        pass
++
++    @abc.abstractmethod
++    def resolve(self):
++        pass
++
++
++@AlertRuleTriggerAction.register_type_handler(AlertRuleTriggerAction.Type.EMAIL)
++class EmailActionHandler(ActionHandler):
++    def fire(self):
++        pass
++
++    def resolve(self):
++        pass
+diff --git a/src/sentry/incidents/apps.py b/src/sentry/incidents/apps.py
+index 2908d09c75..db19297e6b 100644
+--- a/src/sentry/incidents/apps.py
++++ b/src/sentry/incidents/apps.py
+@@ -7,4 +7,6 @@ class Config(AppConfig):
+     name = "sentry.incidents"
+ 
+     def ready(self):
+-        from . import receivers  # noqa
++        from . import action_handlers  # NOQA
++        from . import events  # NOQA
++        from . import receivers  # NOQA
+diff --git a/src/sentry/incidents/models.py b/src/sentry/incidents/models.py
+index 641b7696ed..b5156fe0b5 100644
+--- a/src/sentry/incidents/models.py
++++ b/src/sentry/incidents/models.py
+@@ -8,7 +8,9 @@ from enum import Enum
+ from sentry.db.models import FlexibleForeignKey, Model, UUIDField
+ from sentry.db.models import ArrayField, sane_repr
+ from sentry.db.models.manager import BaseManager
++from sentry.models import Team, User
+ from sentry.snuba.models import QueryAggregations
++from sentry.utils import metrics
+ from sentry.utils.retries import TimedRetryPolicy
+ 
+ 
+@@ -378,6 +380,8 @@ class AlertRuleTriggerAction(Model):
+ 
+     __core__ = True
+ 
++    handlers = {}
++
+     # Which sort of action to take
+     class Type(Enum):
+         EMAIL = 0
+@@ -406,3 +410,55 @@ class AlertRuleTriggerAction(Model):
+     class Meta:
+         app_label = "sentry"
+         db_table = "sentry_alertruletriggeraction"
++
++    @property
++    def target(self):
++        if self.target_type == self.TargetType.USER.value:
++            try:
++                return User.objects.get(id=int(self.target_identifier))
++            except User.DoesNotExist:
++                pass
++        elif self.target_type == self.TargetType.TEAM.value:
++            try:
++                return Team.objects.get(id=int(self.target_identifier))
++            except Team.DoesNotExist:
++                pass
++        elif self.target_type == self.TargetType.SPECIFIC.value:
++            # TODO: This is only for email. We should have a way of validating that it's
++            # ok to contact this email.
++            return self.target_identifier
++
++    def build_handler(self, incident):
++        type = AlertRuleTriggerAction.Type(self.type)
++        if type in self.handlers:
++            return self.handlers[type](self, incident)
++        else:
++            metrics.incr("alert_rule_trigger.unhandled_type.{}".format(self.type))
++
++    def fire(self, incident):
++        handler = self.build_handler(incident)
++        if handler:
++            return handler.fire()
++
++    def resolve(self, incident):
++        handler = self.build_handler(incident)
++        if handler:
++            return handler.resolve()
++
++    @classmethod
++    def register_type_handler(cls, type):
++        """
++        Registers a handler for a given target_type.
++        :param type: The `Type` to handle.
++        :param handler: A subclass of `ActionHandler` that accepts the
++        `AlertRuleTriggerAction` and `Incident`.
++        """
++
++        def inner(handler):
++            if type not in cls.handlers:
++                cls.handlers[type] = handler
++            else:
++                raise Exception(u"Handler already registered for type %s" % type)
++            return handler
++
++        return inner
+diff --git a/src/sentry/incidents/subscription_processor.py b/src/sentry/incidents/subscription_processor.py
+index 15e536d031..f9bf0eee5d 100644
+--- a/src/sentry/incidents/subscription_processor.py
++++ b/src/sentry/incidents/subscription_processor.py
+@@ -20,6 +20,7 @@ from sentry.incidents.models import (
+     IncidentType,
+     TriggerStatus,
+ )
++from sentry.incidents.tasks import handle_trigger_action
+ from sentry.snuba.models import QueryAggregations
+ from sentry.utils import metrics, redis
+ from sentry.utils.dates import to_datetime
+@@ -192,6 +193,7 @@ class SubscriptionProcessor(object):
+                     alert_rule_trigger=trigger,
+                     status=TriggerStatus.ACTIVE.value,
+                 )
++            self.handle_trigger_actions(incident_trigger)
+             self.incident_triggers[trigger.id] = incident_trigger
+ 
+             # TODO: We should create an audit log, and maybe something that keeps
+@@ -225,14 +227,30 @@ class SubscriptionProcessor(object):
+         """
+         self.trigger_resolve_counts[trigger.id] += 1
+         if self.trigger_resolve_counts[trigger.id] >= self.alert_rule.threshold_period:
+-            self.incident_triggers[trigger.id].status = TriggerStatus.RESOLVED.value
+-            self.incident_triggers[trigger.id].save()
++            incident_trigger = self.incident_triggers[trigger.id]
++            incident_trigger.status = TriggerStatus.RESOLVED.value
++            incident_trigger.save()
++            self.handle_trigger_actions(incident_trigger)
++
+             if self.check_triggers_resolved():
+                 update_incident_status(self.active_incident, IncidentStatus.CLOSED)
+                 self.active_incident = None
+                 self.incident_triggers.clear()
+             self.trigger_resolve_counts[trigger.id] = 0
+ 
++    def handle_trigger_actions(self, incident_trigger):
++        method = "fire" if incident_trigger.status == TriggerStatus.ACTIVE.value else "resolve"
++
++        for action in incident_trigger.alert_rule_trigger.alertruletriggeraction_set.all():
++            handle_trigger_action.apply_async(
++                kwargs={
++                    "action_id": action.id,
++                    "incident_id": incident_trigger.incident_id,
++                    "method": method,
++                },
++                countdown=5,
++            )
++
+     def update_alert_rule_stats(self):
+         """
+         Updates stats about the alert rule, if they're changed.
+diff --git a/src/sentry/incidents/tasks.py b/src/sentry/incidents/tasks.py
+index 441017178e..3ca0ca2441 100644
+--- a/src/sentry/incidents/tasks.py
++++ b/src/sentry/incidents/tasks.py
+@@ -13,6 +13,7 @@ from sentry.exceptions import DeleteAborted
+ from sentry.incidents.models import (
+     AlertRule,
+     AlertRuleStatus,
++    AlertRuleTriggerAction,
+     Incident,
+     IncidentActivity,
+     IncidentActivityType,
+@@ -24,6 +25,7 @@ from sentry.tasks.base import instrumented_task, retry
+ from sentry.utils.email import MessageBuilder
+ from sentry.utils.http import absolute_uri
+ from sentry.utils.linksign import generate_signed_link
++from sentry.utils import metrics
+ from sentry.utils.retries import TimedRetryPolicy
+ 
+ INCIDENTS_SNUBA_SUBSCRIPTION_TYPE = "incidents"
+@@ -171,3 +173,24 @@ def handle_snuba_query_update(subscription_update, subscription):
+     from sentry.incidents.subscription_processor import SubscriptionProcessor
+ 
+     SubscriptionProcessor(subscription).process_update(subscription_update)
++
++
++@instrumented_task(
++    name="sentry.incidents.tasks.handle_trigger_action",
++    queue="incidents",
++    default_retry_delay=60,
++    max_retries=5,
++)
++def handle_trigger_action(action_id, incident_id, method):
++    try:
++        action = AlertRuleTriggerAction.objects.get(id=action_id)
++    except AlertRuleTriggerAction.DoesNotExist:
++        metrics.incr("incidents.alert_rules.skipping_missing_action")
++        return
++    try:
++        incident = Incident.objects.get(id=incident_id)
++    except Incident.DoesNotExist:
++        metrics.incr("incidents.alert_rules.skipping_missing_incident")
++        return
++
++    getattr(action, method)(incident)
+diff --git a/tests/sentry/incidents/test_models.py b/tests/sentry/incidents/test_models.py
+index 8057b729b1..b1aaab8139 100644
+--- a/tests/sentry/incidents/test_models.py
++++ b/tests/sentry/incidents/test_models.py
+@@ -3,13 +3,15 @@ from __future__ import absolute_import
+ import unittest
+ from datetime import timedelta
+ 
++import six
+ from django.db import IntegrityError, transaction
+ from django.utils import timezone
++from exam import patcher
+ from freezegun import freeze_time
+-from mock import patch
++from mock import Mock, patch
+ 
+ from sentry.db.models.manager import BaseManager
+-from sentry.incidents.models import Incident, IncidentStatus
++from sentry.incidents.models import AlertRuleTriggerAction, Incident, IncidentStatus
+ from sentry.testutils import TestCase
+ 
+ 
+@@ -124,3 +126,97 @@ class IncidentCurrentEndDateTest(unittest.TestCase):
+         assert incident.current_end_date == timezone.now()
+         incident.date_closed = timezone.now() - timedelta(minutes=10)
+         assert incident.current_end_date == timezone.now() - timedelta(minutes=10)
++
++
++class AlertRuleTriggerActionTargetTest(TestCase):
++    def test_user(self):
++        trigger = AlertRuleTriggerAction(
++            target_type=AlertRuleTriggerAction.TargetType.USER.value,
++            target_identifier=six.text_type(self.user.id),
++        )
++        assert trigger.target == self.user
++
++    def test_invalid_user(self):
++        trigger = AlertRuleTriggerAction(
++            target_type=AlertRuleTriggerAction.TargetType.USER.value, target_identifier="10000000"
++        )
++        assert trigger.target is None
++
++    def test_team(self):
++        trigger = AlertRuleTriggerAction(
++            target_type=AlertRuleTriggerAction.TargetType.TEAM.value,
++            target_identifier=six.text_type(self.team.id),
++        )
++        assert trigger.target == self.team
++
++    def test_invalid_team(self):
++        trigger = AlertRuleTriggerAction(
++            target_type=AlertRuleTriggerAction.TargetType.TEAM.value, target_identifier="10000000"
++        )
++        assert trigger.target is None
++
++    def test_specific(self):
++        email = "test@test.com"
++        trigger = AlertRuleTriggerAction(
++            target_type=AlertRuleTriggerAction.TargetType.SPECIFIC.value, target_identifier=email
++        )
++        assert trigger.target == email
++
++
++class AlertRuleTriggerActionActivateTest(object):
++    method = None
++
++    def setUp(self):
++        self.old_handlers = AlertRuleTriggerAction.handlers
++        AlertRuleTriggerAction.handlers = {}
++
++    def tearDown(self):
++        AlertRuleTriggerAction.handlers = self.old_handlers
++
++    def test_no_handler(self):
++        trigger = AlertRuleTriggerAction(type=AlertRuleTriggerAction.Type.EMAIL.value)
++        assert trigger.fire(Mock()) is None
++
++    def test_handler(self):
++        mock_handler = Mock()
++        mock_method = getattr(mock_handler.return_value, self.method)
++        mock_method.return_value = "test"
++        type = AlertRuleTriggerAction.Type.EMAIL
++        AlertRuleTriggerAction.register_type_handler(type)(mock_handler)
++        trigger = AlertRuleTriggerAction(type=type.value)
++        assert getattr(trigger, self.method)(Mock()) == mock_method.return_value
++
++
++class AlertRuleTriggerActionFireTest(AlertRuleTriggerActionActivateTest, unittest.TestCase):
++    method = "fire"
++
++
++class AlertRuleTriggerActionResolveTest(AlertRuleTriggerActionActivateTest, unittest.TestCase):
++    method = "resolve"
++
++
++class AlertRuleTriggerActionActivateTest(TestCase):
++    metrics = patcher("sentry.incidents.models.metrics")
++
++    def setUp(self):
++        self.old_handlers = AlertRuleTriggerAction.handlers
++        AlertRuleTriggerAction.handlers = {}
++
++    def tearDown(self):
++        AlertRuleTriggerAction.handlers = self.old_handlers
++
++    def test_unhandled(self):
++        trigger = AlertRuleTriggerAction(type=AlertRuleTriggerAction.Type.EMAIL.value)
++        trigger.build_handler(Mock())
++        self.metrics.incr.assert_called_once_with("alert_rule_trigger.unhandled_type.0")
++
++    def test_handled(self):
++        mock_handler = Mock()
++        type = AlertRuleTriggerAction.Type.EMAIL
++        AlertRuleTriggerAction.register_type_handler(type)(mock_handler)
++
++        trigger = AlertRuleTriggerAction(type=AlertRuleTriggerAction.Type.EMAIL.value)
++        incident = Mock()
++        trigger.build_handler(incident)
++        mock_handler.assert_called_once_with(trigger, incident)
++        assert not self.metrics.incr.called
+diff --git a/tests/sentry/incidents/test_subscription_processor.py b/tests/sentry/incidents/test_subscription_processor.py
+index ab8d087ecf..bb4797d441 100644
+--- a/tests/sentry/incidents/test_subscription_processor.py
++++ b/tests/sentry/incidents/test_subscription_processor.py
+@@ -6,16 +6,23 @@ from time import time
+ from random import randint
+ from uuid import uuid4
+ 
++import six
+ from django.utils import timezone
+ from exam import fixture, patcher
+ from freezegun import freeze_time
++from mock import call, Mock
+ 
+-from sentry.incidents.logic import create_alert_rule, create_alert_rule_trigger
++from sentry.incidents.logic import (
++    create_alert_rule,
++    create_alert_rule_trigger,
++    create_alert_rule_trigger_action,
++)
+ from sentry.snuba.subscriptions import query_aggregation_to_snuba
+ from sentry.incidents.models import (
+     AlertRule,
+     AlertRuleThresholdType,
+     AlertRuleTrigger,
++    AlertRuleTriggerAction,
+     Incident,
+     IncidentStatus,
+     IncidentTrigger,
+@@ -41,6 +48,22 @@ from sentry.utils.dates import to_timestamp
+ class ProcessUpdateTest(TestCase):
+     metrics = patcher("sentry.incidents.subscription_processor.metrics")
+ 
++    def setUp(self):
++        super(ProcessUpdateTest, self).setUp()
++        self.old_handlers = AlertRuleTriggerAction.handlers
++        AlertRuleTriggerAction.handlers = {}
++        self.email_action_handler = Mock()
++        AlertRuleTriggerAction.register_type_handler(AlertRuleTriggerAction.Type.EMAIL)(
++            self.email_action_handler
++        )
++        self._run_tasks = self.tasks()
++        self._run_tasks.__enter__()
++
++    def tearDown(self):
++        super(ProcessUpdateTest, self).tearDown()
++        AlertRuleTriggerAction.handlers = self.old_handlers
++        self._run_tasks.__exit__(None, None, None)
++
+     @fixture
+     def other_project(self):
+         return self.create_project()
+@@ -68,15 +91,25 @@ class ProcessUpdateTest(TestCase):
+             threshold_period=1,
+         )
+         # Make sure the trigger exists
+-        create_alert_rule_trigger(
++        trigger = create_alert_rule_trigger(
+             rule, "hi", AlertRuleThresholdType.ABOVE, 100, resolve_threshold=10
+         )
++        create_alert_rule_trigger_action(
++            trigger,
++            AlertRuleTriggerAction.Type.EMAIL,
++            AlertRuleTriggerAction.TargetType.USER,
++            six.text_type(self.user.id),
++        )
+         return rule
+ 
+     @fixture
+     def trigger(self):
+         return self.rule.alertruletrigger_set.get()
+ 
++    @fixture
++    def action(self):
++        return self.trigger.alertruletriggeraction_set.get()
++
+     def build_subscription_update(self, subscription, time_delta=None, value=None):
+         if time_delta is not None:
+             timestamp = int(to_timestamp(timezone.now() + time_delta))
+@@ -101,6 +134,7 @@ class ProcessUpdateTest(TestCase):
+         }
+ 
+     def send_update(self, rule, value, time_delta=None, subscription=None):
++        self.email_action_handler.reset_mock()
+         if time_delta is None:
+             time_delta = timedelta()
+         if subscription is None:
+@@ -129,6 +163,28 @@ class ProcessUpdateTest(TestCase):
+             .exists()
+         )
+ 
++    def assert_action_handler_called_with_actions(self, incident, actions):
++        if not actions:
++            if not incident:
++                assert not self.email_action_handler.called
++            else:
++                for call_args in self.email_action_handler.call_args_list:
++                    assert call_args[0][1] != incident
++        else:
++            self.email_action_handler.assert_has_calls(
++                [call(action, incident) for action in actions], any_order=True
++            )
++
++    def assert_actions_fired_for_incident(self, incident, actions=None):
++        actions = [] if actions is None else actions
++        self.assert_action_handler_called_with_actions(incident, actions)
++        assert len(actions) == len(self.email_action_handler.return_value.fire.call_args_list)
++
++    def assert_actions_resolved_for_incident(self, incident, actions=None):
++        actions = [] if actions is None else actions
++        self.assert_action_handler_called_with_actions(incident, actions)
++        assert len(actions) == len(self.email_action_handler.return_value.resolve.call_args_list)
++
+     def assert_no_active_incident(self, rule, subscription=None):
+         assert not self.active_incident_exists(rule, subscription=subscription)
+ 
+@@ -190,6 +246,7 @@ class ProcessUpdateTest(TestCase):
+         self.assert_trigger_counts(processor, self.trigger, 0, 0)
+         self.assert_no_active_incident(self.rule)
+         self.assert_trigger_does_not_exist(self.trigger)
++        self.assert_action_handler_called_with_actions(None, [])
+ 
+     def test_alert(self):
+         # Verify that an alert rule that only expects a single update to be over the
+@@ -200,6 +257,7 @@ class ProcessUpdateTest(TestCase):
+         self.assert_trigger_counts(processor, self.trigger, 0, 0)
+         incident = self.assert_active_incident(rule)
+         self.assert_trigger_exists_with_status(incident, self.trigger, TriggerStatus.ACTIVE)
++        self.assert_actions_fired_for_incident(incident, [self.action])
+ 
+     def test_alert_multiple_threshold_periods(self):
+         # Verify that a rule that expects two consecutive updates to be over the
+@@ -211,11 +269,13 @@ class ProcessUpdateTest(TestCase):
+         self.assert_trigger_counts(processor, self.trigger, 1, 0)
+         self.assert_no_active_incident(rule)
+         self.assert_trigger_does_not_exist(self.trigger)
++        self.assert_action_handler_called_with_actions(None, [])
+ 
+         processor = self.send_update(rule, trigger.alert_threshold + 1, timedelta(minutes=-1))
+         self.assert_trigger_counts(processor, self.trigger, 0, 0)
+         incident = self.assert_active_incident(rule)
+         self.assert_trigger_exists_with_status(incident, self.trigger, TriggerStatus.ACTIVE)
++        self.assert_actions_fired_for_incident(incident, [self.action])
+ 
+     def test_alert_multiple_triggers_non_consecutive(self):
+         # Verify that a rule that expects two consecutive updates to be over the
+@@ -228,16 +288,19 @@ class ProcessUpdateTest(TestCase):
+         self.assert_trigger_counts(processor, self.trigger, 1, 0)
+         self.assert_no_active_incident(rule)
+         self.assert_trigger_does_not_exist(self.trigger)
++        self.assert_action_handler_called_with_actions(None, [])
+ 
+         processor = self.send_update(rule, trigger.alert_threshold, timedelta(minutes=-2))
+         self.assert_trigger_counts(processor, self.trigger, 0, 0)
+         self.assert_no_active_incident(rule)
+         self.assert_trigger_does_not_exist(self.trigger)
++        self.assert_action_handler_called_with_actions(None, [])
+ 
+         processor = self.send_update(rule, trigger.alert_threshold + 1, timedelta(minutes=-1))
+         self.assert_trigger_counts(processor, self.trigger, 1, 0)
+         self.assert_no_active_incident(rule)
+         self.assert_trigger_does_not_exist(self.trigger)
++        self.assert_action_handler_called_with_actions(None, [])
+ 
+     def test_no_active_incident_resolve(self):
+         # Test that we don't track stats for resolving if there are no active incidents
+@@ -248,6 +311,7 @@ class ProcessUpdateTest(TestCase):
+         self.assert_trigger_counts(processor, self.trigger, 0, 0)
+         self.assert_no_active_incident(rule)
+         self.assert_trigger_does_not_exist(self.trigger)
++        self.assert_action_handler_called_with_actions(None, [])
+ 
+     def test_resolve(self):
+         # Verify that an alert rule that only expects a single update to be under the
+@@ -258,11 +322,13 @@ class ProcessUpdateTest(TestCase):
+         self.assert_trigger_counts(processor, self.trigger, 0, 0)
+         incident = self.assert_active_incident(rule)
+         self.assert_trigger_exists_with_status(incident, self.trigger, TriggerStatus.ACTIVE)
++        self.assert_actions_fired_for_incident(incident, [self.action])
+ 
+         processor = self.send_update(rule, trigger.resolve_threshold - 1, timedelta(minutes=-1))
+         self.assert_trigger_counts(processor, self.trigger, 0, 0)
+         self.assert_no_active_incident(rule)
+         self.assert_trigger_exists_with_status(incident, self.trigger, TriggerStatus.RESOLVED)
++        self.assert_actions_resolved_for_incident(incident, [self.action])
+ 
+     def test_resolve_multiple_threshold_periods(self):
+         # Verify that a rule that expects two consecutive updates to be under the
+@@ -274,17 +340,20 @@ class ProcessUpdateTest(TestCase):
+         self.assert_trigger_counts(processor, self.trigger, 0, 0)
+         incident = self.assert_active_incident(rule)
+         self.assert_trigger_exists_with_status(incident, self.trigger, TriggerStatus.ACTIVE)
++        self.assert_actions_fired_for_incident(incident, [self.action])
+ 
+         rule.update(threshold_period=2)
+         processor = self.send_update(rule, trigger.resolve_threshold - 1, timedelta(minutes=-2))
+         self.assert_trigger_counts(processor, self.trigger, 0, 1)
+         incident = self.assert_active_incident(rule)
+         self.assert_trigger_exists_with_status(incident, self.trigger, TriggerStatus.ACTIVE)
++        self.assert_action_handler_called_with_actions(incident, [])
+ 
+         processor = self.send_update(rule, trigger.resolve_threshold - 1, timedelta(minutes=-1))
+         self.assert_trigger_counts(processor, self.trigger, 0, 0)
+         self.assert_no_active_incident(rule)
+         self.assert_trigger_exists_with_status(incident, self.trigger, TriggerStatus.RESOLVED)
++        self.assert_actions_resolved_for_incident(incident, [self.action])
+ 
+     def test_resolve_multiple_threshold_periods_non_consecutive(self):
+         # Verify that a rule that expects two consecutive updates to be under the
+@@ -297,22 +366,26 @@ class ProcessUpdateTest(TestCase):
+         self.assert_trigger_counts(processor, self.trigger, 0, 0)
+         incident = self.assert_active_incident(rule)
+         self.assert_trigger_exists_with_status(incident, self.trigger, TriggerStatus.ACTIVE)
++        self.assert_actions_fired_for_incident(incident, [self.action])
+ 
+         rule.update(threshold_period=2)
+         processor = self.send_update(rule, trigger.resolve_threshold - 1, timedelta(minutes=-3))
+         self.assert_trigger_counts(processor, self.trigger, 0, 1)
+         self.assert_active_incident(rule)
+         self.assert_trigger_exists_with_status(incident, self.trigger, TriggerStatus.ACTIVE)
++        self.assert_action_handler_called_with_actions(incident, [])
+ 
+         processor = self.send_update(rule, trigger.resolve_threshold, timedelta(minutes=-2))
+         self.assert_trigger_counts(processor, self.trigger, 0, 0)
+         self.assert_active_incident(rule)
+         self.assert_trigger_exists_with_status(incident, self.trigger, TriggerStatus.ACTIVE)
++        self.assert_action_handler_called_with_actions(incident, [])
+ 
+         processor = self.send_update(rule, trigger.resolve_threshold - 1, timedelta(minutes=-1))
+         self.assert_trigger_counts(processor, self.trigger, 0, 1)
+         self.assert_active_incident(rule)
+         self.assert_trigger_exists_with_status(incident, self.trigger, TriggerStatus.ACTIVE)
++        self.assert_action_handler_called_with_actions(incident, [])
+ 
+     def test_reversed_threshold_alert(self):
+         # Test that inverting thresholds correctly alerts
+@@ -323,11 +396,13 @@ class ProcessUpdateTest(TestCase):
+         self.assert_trigger_counts(processor, self.trigger, 0, 0)
+         self.assert_no_active_incident(rule)
+         self.assert_trigger_does_not_exist(self.trigger)
++        self.assert_action_handler_called_with_actions(None, [])
+ 
+         processor = self.send_update(rule, trigger.alert_threshold - 1, timedelta(minutes=-1))
+         self.assert_trigger_counts(processor, self.trigger, 0, 0)
+         incident = self.assert_active_incident(rule)
+         self.assert_trigger_exists_with_status(incident, self.trigger, TriggerStatus.ACTIVE)
++        self.assert_actions_fired_for_incident(incident, [self.action])
+ 
+     def test_reversed_threshold_resolve(self):
+         # Test that inverting thresholds correctly resolves
+@@ -339,16 +414,19 @@ class ProcessUpdateTest(TestCase):
+         self.assert_trigger_counts(processor, self.trigger, 0, 0)
+         incident = self.assert_active_incident(rule)
+         self.assert_trigger_exists_with_status(incident, self.trigger, TriggerStatus.ACTIVE)
++        self.assert_actions_fired_for_incident(incident, [self.action])
+ 
+         processor = self.send_update(rule, trigger.resolve_threshold - 1, timedelta(minutes=-2))
+         self.assert_trigger_counts(processor, self.trigger, 0, 0)
+         incident = self.assert_active_incident(rule)
+         self.assert_trigger_exists_with_status(incident, self.trigger, TriggerStatus.ACTIVE)
++        self.assert_action_handler_called_with_actions(incident, [])
+ 
+         processor = self.send_update(rule, trigger.resolve_threshold + 1, timedelta(minutes=-1))
+         self.assert_trigger_counts(processor, self.trigger, 0, 0)
+         self.assert_no_active_incident(rule)
+         self.assert_trigger_exists_with_status(incident, self.trigger, TriggerStatus.RESOLVED)
++        self.assert_actions_resolved_for_incident(incident, [self.action])
+ 
+     def test_multiple_subscriptions_do_not_conflict(self):
+         # Verify that multiple subscriptions associated with a rule don't conflict with
+@@ -365,6 +443,7 @@ class ProcessUpdateTest(TestCase):
+         self.assert_trigger_counts(processor, self.trigger, 1, 0)
+         self.assert_no_active_incident(rule, self.sub)
+         self.assert_trigger_does_not_exist(self.trigger)
++        self.assert_action_handler_called_with_actions(None, [])
+ 
+         # Have an update come through for the other sub. This shouldn't influence the original
+         processor = self.send_update(
+@@ -375,6 +454,7 @@ class ProcessUpdateTest(TestCase):
+         self.assert_trigger_does_not_exist(self.trigger)
+         self.assert_no_active_incident(rule, self.other_sub)
+         self.assert_trigger_does_not_exist(self.trigger)
++        self.assert_action_handler_called_with_actions(None, [])
+ 
+         # Send another update through for the first subscription. This should trigger an
+         # incident for just this subscription.
+@@ -384,6 +464,7 @@ class ProcessUpdateTest(TestCase):
+         self.assert_trigger_counts(processor, self.trigger, 0, 0)
+         incident = self.assert_active_incident(rule, self.sub)
+         self.assert_trigger_exists_with_status(incident, self.trigger, TriggerStatus.ACTIVE)
++        self.assert_actions_fired_for_incident(incident, [self.action])
+         self.assert_no_active_incident(rule, self.other_sub)
+         self.assert_trigger_does_not_exist(self.trigger, [incident])
+ 
+@@ -395,8 +476,10 @@ class ProcessUpdateTest(TestCase):
+         self.assert_trigger_counts(processor, self.trigger, 0, 0)
+         incident = self.assert_active_incident(rule, self.sub)
+         self.assert_trigger_exists_with_status(incident, self.trigger, TriggerStatus.ACTIVE)
++        self.assert_action_handler_called_with_actions(incident, [])
+         other_incident = self.assert_active_incident(rule, self.other_sub)
+         self.assert_trigger_exists_with_status(other_incident, self.trigger, TriggerStatus.ACTIVE)
++        self.assert_actions_fired_for_incident(other_incident, [self.action])
+ 
+         # Now we want to test that resolving is isolated. Send another update through
+         # for the first subscription.
+@@ -406,8 +489,10 @@ class ProcessUpdateTest(TestCase):
+         self.assert_trigger_counts(processor, self.trigger, 0, 1)
+         incident = self.assert_active_incident(rule, self.sub)
+         self.assert_trigger_exists_with_status(incident, self.trigger, TriggerStatus.ACTIVE)
++        self.assert_action_handler_called_with_actions(incident, [])
+         other_incident = self.assert_active_incident(rule, self.other_sub)
+         self.assert_trigger_exists_with_status(other_incident, self.trigger, TriggerStatus.ACTIVE)
++        self.assert_action_handler_called_with_actions(other_incident, [])
+ 
+         processor = self.send_update(
+             rule, trigger.resolve_threshold - 1, timedelta(minutes=-7), subscription=self.other_sub
+@@ -415,8 +500,10 @@ class ProcessUpdateTest(TestCase):
+         self.assert_trigger_counts(processor, self.trigger, 0, 1)
+         incident = self.assert_active_incident(rule, self.sub)
+         self.assert_trigger_exists_with_status(incident, self.trigger, TriggerStatus.ACTIVE)
++        self.assert_action_handler_called_with_actions(incident, [])
+         other_incident = self.assert_active_incident(rule, self.other_sub)
+         self.assert_trigger_exists_with_status(other_incident, self.trigger, TriggerStatus.ACTIVE)
++        self.assert_action_handler_called_with_actions(other_incident, [])
+ 
+         # This second update for the second subscription should resolve its incident,
+         # but not the incident from the first subscription.
+@@ -428,6 +515,7 @@ class ProcessUpdateTest(TestCase):
+         self.assert_trigger_exists_with_status(incident, self.trigger, TriggerStatus.ACTIVE)
+         self.assert_no_active_incident(rule, self.other_sub)
+         self.assert_trigger_exists_with_status(other_incident, self.trigger, TriggerStatus.RESOLVED)
++        self.assert_actions_resolved_for_incident(other_incident, [self.action])
+ 
+         # This second update for the first subscription should resolve its incident now.
+         processor = self.send_update(
+@@ -436,8 +524,10 @@ class ProcessUpdateTest(TestCase):
+         self.assert_trigger_counts(processor, self.trigger, 0, 0)
+         self.assert_no_active_incident(rule, self.sub)
+         self.assert_trigger_exists_with_status(incident, self.trigger, TriggerStatus.RESOLVED)
++        self.assert_actions_resolved_for_incident(incident, [self.action])
+         self.assert_no_active_incident(rule, self.other_sub)
+         self.assert_trigger_exists_with_status(other_incident, self.trigger, TriggerStatus.RESOLVED)
++        self.assert_action_handler_called_with_actions(other_incident, [])
+ 
+     def test_multiple_triggers(self):
+         rule = self.rule
+@@ -446,6 +536,9 @@ class ProcessUpdateTest(TestCase):
+         other_trigger = create_alert_rule_trigger(
+             self.rule, "hello", AlertRuleThresholdType.ABOVE, 200, resolve_threshold=50
+         )
++        other_action = create_alert_rule_trigger_action(
++            other_trigger, AlertRuleTriggerAction.Type.EMAIL, AlertRuleTriggerAction.TargetType.USER
++        )
+         processor = self.send_update(
+             rule, trigger.alert_threshold + 1, timedelta(minutes=-10), subscription=self.sub
+         )
+@@ -454,6 +547,7 @@ class ProcessUpdateTest(TestCase):
+         self.assert_no_active_incident(rule, self.sub)
+         self.assert_trigger_does_not_exist(trigger)
+         self.assert_trigger_does_not_exist(other_trigger)
++        self.assert_action_handler_called_with_actions(None, [])
+ 
+         # This should cause both to increment, although only `trigger` should fire.
+         processor = self.send_update(
+@@ -464,6 +558,7 @@ class ProcessUpdateTest(TestCase):
+         incident = self.assert_active_incident(rule, self.sub)
+         self.assert_trigger_exists_with_status(incident, trigger, TriggerStatus.ACTIVE)
+         self.assert_trigger_does_not_exist(other_trigger)
++        self.assert_actions_fired_for_incident(incident, [self.action])
+ 
+         # Now only `other_trigger` should increment and fire.
+         processor = self.send_update(
+@@ -474,6 +569,7 @@ class ProcessUpdateTest(TestCase):
+         incident = self.assert_active_incident(rule, self.sub)
+         self.assert_trigger_exists_with_status(incident, trigger, TriggerStatus.ACTIVE)
+         self.assert_trigger_exists_with_status(incident, other_trigger, TriggerStatus.ACTIVE)
++        self.assert_actions_fired_for_incident(incident, [other_action])
+ 
+         # Now send through two updates where we're below threshold for `other_trigger`.
+         # The trigger should end up resolved, but the incident should still be active
+@@ -485,6 +581,7 @@ class ProcessUpdateTest(TestCase):
+         incident = self.assert_active_incident(rule, self.sub)
+         self.assert_trigger_exists_with_status(incident, trigger, TriggerStatus.ACTIVE)
+         self.assert_trigger_exists_with_status(incident, other_trigger, TriggerStatus.ACTIVE)
++        self.assert_action_handler_called_with_actions(incident, [])
+ 
+         processor = self.send_update(
+             rule, other_trigger.resolve_threshold - 1, timedelta(minutes=-6), subscription=self.sub
+@@ -494,6 +591,7 @@ class ProcessUpdateTest(TestCase):
+         incident = self.assert_active_incident(rule, self.sub)
+         self.assert_trigger_exists_with_status(incident, trigger, TriggerStatus.ACTIVE)
+         self.assert_trigger_exists_with_status(incident, other_trigger, TriggerStatus.RESOLVED)
++        self.assert_actions_resolved_for_incident(incident, [other_action])
+ 
+         # Now we push the other trigger below the resolve threshold twice. This should
+         # close the incident.
+@@ -505,6 +603,7 @@ class ProcessUpdateTest(TestCase):
+         incident = self.assert_active_incident(rule, self.sub)
+         self.assert_trigger_exists_with_status(incident, trigger, TriggerStatus.ACTIVE)
+         self.assert_trigger_exists_with_status(incident, other_trigger, TriggerStatus.RESOLVED)
++        self.assert_action_handler_called_with_actions(incident, [])
+ 
+         processor = self.send_update(
+             rule, trigger.resolve_threshold - 1, timedelta(minutes=-4), subscription=self.sub
+@@ -514,6 +613,7 @@ class ProcessUpdateTest(TestCase):
+         self.assert_no_active_incident(rule, self.sub)
+         self.assert_trigger_exists_with_status(incident, trigger, TriggerStatus.RESOLVED)
+         self.assert_trigger_exists_with_status(incident, other_trigger, TriggerStatus.RESOLVED)
++        self.assert_actions_resolved_for_incident(incident, [self.action])
+ 
+     def test_multiple_triggers_at_same_time(self):
+         # Check that both triggers fire if an update comes through that exceeds both of
+@@ -523,6 +623,9 @@ class ProcessUpdateTest(TestCase):
+         other_trigger = create_alert_rule_trigger(
+             self.rule, "hello", AlertRuleThresholdType.ABOVE, 200, resolve_threshold=50
+         )
++        other_action = create_alert_rule_trigger_action(
++            other_trigger, AlertRuleTriggerAction.Type.EMAIL, AlertRuleTriggerAction.TargetType.USER
++        )
+ 
+         processor = self.send_update(
+             rule, other_trigger.alert_threshold + 1, timedelta(minutes=-10), subscription=self.sub
+@@ -532,6 +635,7 @@ class ProcessUpdateTest(TestCase):
+         incident = self.assert_active_incident(rule, self.sub)
+         self.assert_trigger_exists_with_status(incident, trigger, TriggerStatus.ACTIVE)
+         self.assert_trigger_exists_with_status(incident, other_trigger, TriggerStatus.ACTIVE)
++        self.assert_actions_fired_for_incident(incident, [self.action, other_action])
+ 
+         processor = self.send_update(
+             rule, trigger.resolve_threshold - 1, timedelta(minutes=-9), subscription=self.sub
+@@ -541,6 +645,7 @@ class ProcessUpdateTest(TestCase):
+         self.assert_no_active_incident(rule, self.sub)
+         self.assert_trigger_exists_with_status(incident, trigger, TriggerStatus.RESOLVED)
+         self.assert_trigger_exists_with_status(incident, other_trigger, TriggerStatus.RESOLVED)
++        self.assert_actions_resolved_for_incident(incident, [self.action, other_action])
+ 
+     def test_multiple_triggers_one_with_no_resolve(self):
+         # Check that both triggers fire if an update comes through that exceeds both of
+@@ -550,6 +655,9 @@ class ProcessUpdateTest(TestCase):
+         other_trigger = create_alert_rule_trigger(
+             self.rule, "hello", AlertRuleThresholdType.ABOVE, 200
+         )
++        other_action = create_alert_rule_trigger_action(
++            other_trigger, AlertRuleTriggerAction.Type.EMAIL, AlertRuleTriggerAction.TargetType.USER
++        )
+ 
+         processor = self.send_update(
+             rule, other_trigger.alert_threshold + 1, timedelta(minutes=-10), subscription=self.sub
+@@ -559,6 +667,7 @@ class ProcessUpdateTest(TestCase):
+         incident = self.assert_active_incident(rule, self.sub)
+         self.assert_trigger_exists_with_status(incident, trigger, TriggerStatus.ACTIVE)
+         self.assert_trigger_exists_with_status(incident, other_trigger, TriggerStatus.ACTIVE)
++        self.assert_actions_fired_for_incident(incident, [self.action, other_action])
+ 
+         processor = self.send_update(
+             rule, trigger.resolve_threshold - 1, timedelta(minutes=-9), subscription=self.sub
+@@ -568,6 +677,7 @@ class ProcessUpdateTest(TestCase):
+         self.assert_no_active_incident(rule, self.sub)
+         self.assert_trigger_exists_with_status(incident, trigger, TriggerStatus.RESOLVED)
+         self.assert_trigger_exists_with_status(incident, other_trigger, TriggerStatus.ACTIVE)
++        self.assert_actions_resolved_for_incident(incident, [self.action])
+ 
+ 
+ class TestBuildAlertRuleStatKeys(unittest.TestCase):
+diff --git a/tests/sentry/incidents/test_tasks.py b/tests/sentry/incidents/test_tasks.py
+index f57a18c3b0..94d38fdf6f 100644
+--- a/tests/sentry/incidents/test_tasks.py
++++ b/tests/sentry/incidents/test_tasks.py
+@@ -2,11 +2,19 @@ from __future__ import absolute_import
+ 
+ import six
+ from django.core.urlresolvers import reverse
+-from exam import patcher
++from exam import fixture, patcher
+ from freezegun import freeze_time
++from mock import Mock, patch
+ 
+-from sentry.incidents.logic import create_incident_activity, subscribe_to_incident
++from sentry.incidents.logic import (
++    create_alert_rule_trigger,
++    create_alert_rule_trigger_action,
++    create_incident_activity,
++    subscribe_to_incident,
++)
+ from sentry.incidents.models import (
++    AlertRuleThresholdType,
++    AlertRuleTriggerAction,
+     IncidentActivityType,
+     IncidentStatus,
+     IncidentSubscription,
+@@ -16,6 +24,7 @@ from sentry.incidents.tasks import (
+     build_activity_context,
+     calculate_incident_suspects,
+     generate_incident_activity_email,
++    handle_trigger_action,
+     send_subscriber_notifications,
+ )
+ from sentry.models import Commit, Repository
+@@ -175,3 +184,43 @@ class CalculateIncidentSuspectsTest(TestCase):
+         incident = self.create_incident(self.organization, groups=[group])
+         calculate_incident_suspects(incident.id)
+         assert IncidentSuspectCommit.objects.filter(incident=incident, commit=commit).exists()
++
++
++class HandleTriggerActionTest(TestCase):
++    metrics = patcher("sentry.incidents.tasks.metrics")
++
++    @fixture
++    def alert_rule(self):
++        return self.create_alert_rule()
++
++    @fixture
++    def trigger(self):
++        return create_alert_rule_trigger(self.alert_rule, "", AlertRuleThresholdType.ABOVE, 100)
++
++    @fixture
++    def action(self):
++        return create_alert_rule_trigger_action(
++            self.trigger, AlertRuleTriggerAction.Type.EMAIL, AlertRuleTriggerAction.TargetType.USER
++        )
++
++    def test_missing_trigger_action(self):
++        with self.tasks():
++            handle_trigger_action.delay(1000, 1001, "hello")
++        self.metrics.incr.assert_called_once_with("incidents.alert_rules.skipping_missing_action")
++
++    def test_missing_incident(self):
++        with self.tasks():
++            handle_trigger_action.delay(self.action.id, 1001, "hello")
++        self.metrics.incr.assert_called_once_with("incidents.alert_rules.skipping_missing_incident")
++
++    def test(self):
++        with patch.object(AlertRuleTriggerAction, "handlers", new={}):
++            mock_handler = Mock()
++            AlertRuleTriggerAction.register_type_handler(AlertRuleTriggerAction.Type.EMAIL)(
++                mock_handler
++            )
++            incident = self.create_incident()
++            with self.tasks():
++                handle_trigger_action.delay(self.action.id, incident.id, "fire")
++            mock_handler.assert_called_once_with(self.action, incident)
++            mock_handler.return_value.fire.assert_called_once_with()
+diff --git a/tests/snuba/incidents/test_tasks.py b/tests/snuba/incidents/test_tasks.py
+index 621c057a0d..a61993d721 100644
+--- a/tests/snuba/incidents/test_tasks.py
++++ b/tests/snuba/incidents/test_tasks.py
+@@ -4,14 +4,25 @@ import json
+ from copy import deepcopy
+ from uuid import uuid4
+ 
++import six
+ from confluent_kafka import Producer
+ from django.conf import settings
+ from django.test.utils import override_settings
+ from exam import fixture
+ 
+-from sentry.incidents.logic import create_alert_rule, create_alert_rule_trigger
++from sentry.incidents.logic import (
++    create_alert_rule,
++    create_alert_rule_trigger,
++    create_alert_rule_trigger_action,
++)
+ from sentry.snuba.subscriptions import query_aggregation_to_snuba
+-from sentry.incidents.models import AlertRuleThresholdType, Incident, IncidentStatus, IncidentType
++from sentry.incidents.models import (
++    AlertRuleThresholdType,
++    AlertRuleTriggerAction,
++    Incident,
++    IncidentStatus,
++    IncidentType,
++)
+ from sentry.incidents.tasks import INCIDENTS_SNUBA_SUBSCRIPTION_TYPE
+ from sentry.snuba.models import QueryAggregations
+ from sentry.snuba.query_subscription_consumer import QuerySubscriptionConsumer, subscriber_registry
+@@ -52,9 +63,15 @@ class HandleSnubaQueryUpdateTest(TestCase):
+             resolve_threshold=10,
+             threshold_period=1,
+         )
+-        create_alert_rule_trigger(
++        trigger = create_alert_rule_trigger(
+             rule, "hi", AlertRuleThresholdType.ABOVE, 100, resolve_threshold=10
+         )
++        create_alert_rule_trigger_action(
++            trigger,
++            AlertRuleTriggerAction.Type.EMAIL,
++            AlertRuleTriggerAction.TargetType.USER,
++            six.text_type(self.user.id),
++        )
+         return rule
+ 
+     @fixture
+@@ -113,5 +130,6 @@ class HandleSnubaQueryUpdateTest(TestCase):
+             ).exists()
+ 
+         consumer = QuerySubscriptionConsumer("hi", topic=self.topic)
+-        with self.assertChanges(active_incident_exists, before=False, after=True):
++        with self.assertChanges(active_incident_exists, before=False, after=True), self.tasks():
++            # TODO: Need to check that the email gets sent once we hook that up
+             consumer.run()

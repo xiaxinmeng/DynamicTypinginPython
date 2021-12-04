@@ -1,0 +1,1166 @@
+commit 26dbdd11db2a6bffea47aa91bd202f526fc21f43
+Author: Armin Ronacher <armin.ronacher@active-4.com>
+Date:   Thu Mar 26 16:43:08 2020 +0100
+
+    feat(sessions): Change adoption metric to always be last 24h (#17870)
+
+diff --git a/src/sentry/api/endpoints/organization_releases.py b/src/sentry/api/endpoints/organization_releases.py
+index 021406477d..271d01c1f9 100644
+--- a/src/sentry/api/endpoints/organization_releases.py
++++ b/src/sentry/api/endpoints/organization_releases.py
+@@ -17,11 +17,12 @@ from sentry.api.serializers.rest_framework import (
+     ReleaseWithVersionSerializer,
+     ListField,
+ )
+-from sentry.models import Activity, Release, Project
++from sentry.models import Activity, Release, Project, ReleaseProject
+ from sentry.signals import release_created
+ from sentry.snuba.sessions import (
+     get_changed_project_release_model_adoptions,
+     get_project_releases_by_stability,
++    get_oldest_health_data_for_releases,
+     STATS_PERIODS,
+ )
+ from sentry.utils.apidocs import scenario, attach_scenarios
+@@ -107,20 +108,39 @@ def debounce_update_release_health_data(organization, project_ids):
+     projects = {p.id: p for p in Project.objects.get_many_from_cache(should_update.keys())}
+ 
+     # This gives us updates for all release-projects which have seen new
+-    # health data over the last 24 hours. It will miss releases where the last
+-    # date is <24h ago.  We need to aggregate the data for the totals per release
+-    # manually here now.  This does not take environments into account.
+-    for project_id, version in get_changed_project_release_model_adoptions(should_update.keys()):
+-        project = projects.get(project_id)
+-        if project is None:
+-            # should not happen
+-            continue
++    # health data over the last days. It will miss releases where the last
++    # date is longer than what `get_changed_project_release_model_adoptions`
++    # considers recent.
++    project_releases = get_changed_project_release_model_adoptions(should_update.keys())
++
++    # Check which we already have rows for.
++    existing = set(
++        ReleaseProject.objects.filter(
++            project_id__in=[x[0] for x in project_releases],
++            release__version__in=[x[1] for x in project_releases],
++        ).values_list("project_id", "release__version")
++    )
++    to_upsert = []
++    for key in project_releases:
++        if key not in existing:
++            to_upsert.append(key)
++
++    if to_upsert:
++        dates = get_oldest_health_data_for_releases(to_upsert)
++
++        for project_id, version in to_upsert:
++            project = projects.get(project_id)
++            if project is None:
++                # should not happen
++                continue
+ 
+         # We might have never observed the release.  This for instance can
+         # happen if the release only had health data so far.  For these cases
+         # we want to create the release the first time we observed it on the
+         # health side.
+-        release = Release.get_or_create(project=project, version=version)
++        release = Release.get_or_create(
++            project=project, version=version, date_added=dates.get((project_id, version))
++        )
+ 
+         # Make sure that the release knows about this project.  Like we had before
+         # the project might not have been associated with this release yet.
+@@ -148,12 +168,15 @@ class OrganizationReleasesEndpoint(OrganizationReleasesBaseEndpoint, Environment
+         with_health = request.GET.get("health") == "1"
+         flatten = request.GET.get("flatten") == "1"
+         sort = request.GET.get("sort") or "date"
++        health_stat = request.GET.get("healthStat") or "sessions"
+         summary_stats_period = request.GET.get("summaryStatsPeriod") or "14d"
+         health_stats_period = request.GET.get("healthStatsPeriod") or ("24h" if with_health else "")
+         if summary_stats_period not in STATS_PERIODS:
+             raise ParseError(detail=get_stats_period_detail("summaryStatsPeriod", STATS_PERIODS))
+         if health_stats_period and health_stats_period not in STATS_PERIODS:
+             raise ParseError(detail=get_stats_period_detail("healthStatsPeriod", STATS_PERIODS))
++        if health_stat not in ("sessions", "users"):
++            raise ParseError(detail="invalid healthStat")
+ 
+         paginator_cls = OffsetPaginator
+         paginator_kwargs = {}
+@@ -238,6 +261,7 @@ class OrganizationReleasesEndpoint(OrganizationReleasesBaseEndpoint, Environment
+                 x,
+                 request.user,
+                 with_health_data=with_health,
++                health_stat=health_stat,
+                 health_stats_period=health_stats_period,
+                 summary_stats_period=summary_stats_period,
+             ),
+diff --git a/src/sentry/api/endpoints/project_release_stats.py b/src/sentry/api/endpoints/project_release_stats.py
+index 799a234a9d..351aa437a2 100644
+--- a/src/sentry/api/endpoints/project_release_stats.py
++++ b/src/sentry/api/endpoints/project_release_stats.py
+@@ -6,10 +6,16 @@ from datetime import timedelta
+ from rest_framework.response import Response
+ 
+ from sentry.api.base import DocSection
++from sentry.api.exceptions import ResourceDoesNotExist
+ from sentry.api.bases.project import ProjectEndpoint, ProjectReleasePermission, ProjectEventsError
+ from sentry.api.serializers import serialize
+ from sentry.utils.dates import parse_stats_period
+-from sentry.snuba.sessions import get_project_release_stats, get_crash_free_breakdown
++from sentry.snuba.sessions import (
++    get_project_release_stats,
++    get_crash_free_breakdown,
++    get_oldest_health_data_for_releases,
++)
++from sentry.models import Release, ReleaseProject
+ 
+ # Maximum number of results we are willing to fetch.
+ # Clients should adapt the interval width based on their
+@@ -17,6 +23,19 @@ from sentry.snuba.sessions import get_project_release_stats, get_crash_free_brea
+ MAX_POINTS = 4500
+ 
+ 
++def upsert_missing_release(project, version):
++    """This adds a release to postgres if it should exist but does not do yet."""
++    try:
++        return ReleaseProject.objects.get(project=project, release__version=version).release
++    except ReleaseProject.DoesNotExist:
++        rows = get_oldest_health_data_for_releases([(project.id, version)])
++        if rows:
++            oldest = next(rows.values())
++            release = Release.get_or_create(project=project, version=version, date_added=oldest)
++            release.add_project(project)
++            return release
++
++
+ class ProjectReleaseStatsEndpoint(ProjectEndpoint):
+     doc_section = DocSection.RELEASES
+     permission_classes = (ProjectReleasePermission,)
+@@ -45,6 +64,10 @@ class ProjectReleaseStatsEndpoint(ProjectEndpoint):
+         except ProjectEventsError as e:
+             return Response({"detail": six.text_type(e)}, status=400)
+ 
++        release = upsert_missing_release(project, version)
++        if release is None:
++            raise ResourceDoesNotExist
++
+         stats = get_project_release_stats(
+             project_id=params["project_id"][0],
+             release=version,
+@@ -55,20 +78,22 @@ class ProjectReleaseStatsEndpoint(ProjectEndpoint):
+             environments=params.get("environment"),
+         )
+ 
+-        users_breakdown = {}
+-        for timespan, data in six.iteritems(
+-            get_crash_free_breakdown(
+-                project_id=params["project_id"][0],
+-                release=version,
+-                environments=params.get("environment"),
+-            )
++        users_breakdown = []
++        for data in get_crash_free_breakdown(
++            project_id=params["project_id"][0],
++            release=version,
++            environments=params.get("environment"),
++            start=release.date_added,
+         ):
+-            users_breakdown[timespan] = {
+-                "totalUsers": data["total_users"],
+-                "crashFreeUsers": data["crash_free_users"],
+-                "totalSessions": data["total_sessions"],
+-                "crashFreeSessions": data["crash_free_sessions"],
+-            }
++            users_breakdown.append(
++                {
++                    "date": data["date"],
++                    "totalUsers": data["total_users"],
++                    "crashFreeUsers": data["crash_free_users"],
++                    "totalSessions": data["total_sessions"],
++                    "crashFreeSessions": data["crash_free_sessions"],
++                }
++            )
+ 
+         return Response(serialize({"stats": stats, "usersBreakdown": users_breakdown}), status=200)
+ 
+diff --git a/src/sentry/api/serializers/models/release.py b/src/sentry/api/serializers/models/release.py
+index 4f7dc359ab..71d0b8d68f 100644
+--- a/src/sentry/api/serializers/models/release.py
++++ b/src/sentry/api/serializers/models/release.py
+@@ -231,6 +231,7 @@ class ReleaseSerializer(Serializer):
+         project = kwargs.get("project")
+         environment = kwargs.get("environment")
+         with_health_data = kwargs.get("with_health_data", False)
++        health_stat = kwargs.get("health_stat", None)
+         health_stats_period = kwargs.get("health_stats_period")
+         summary_stats_period = kwargs.get("summary_stats_period")
+ 
+@@ -260,6 +261,7 @@ class ReleaseSerializer(Serializer):
+                 [(pr["project__id"], pr["release__version"]) for pr in project_releases],
+                 health_stats_period=health_stats_period,
+                 summary_stats_period=summary_stats_period,
++                stat=health_stat,
+             )
+         else:
+             health_data = None
+@@ -335,6 +337,9 @@ class ReleaseSerializer(Serializer):
+                 "sessionsCrashed": data["sessions_crashed"],
+                 "sessionsErrored": data["sessions_errored"],
+                 "totalUsers": data["total_users"],
++                "totalUsers24h": data["total_users_24h"],
++                "totalSessions": data["total_sessions"],
++                "totalSessions24h": data["total_sessions_24h"],
+                 "adoption": data["adoption"],
+                 "stats": data.get("stats"),
+                 "hasHealthData": data["has_health_data"],
+diff --git a/src/sentry/snuba/sessions.py b/src/sentry/snuba/sessions.py
+index 4a6613b758..56b67ff469 100644
+--- a/src/sentry/snuba/sessions.py
++++ b/src/sentry/snuba/sessions.py
+@@ -23,11 +23,11 @@ def _get_conditions_and_filter_keys(project_releases, environments):
+ 
+ 
+ def get_changed_project_release_model_adoptions(project_ids):
+-    """Returns the last 48 hours worth of releases."""
+-    start = datetime.now(pytz.utc) - timedelta(days=2)
++    """Returns the last 72 hours worth of releases."""
++    start = datetime.now(pytz.utc) - timedelta(days=3)
+     rv = []
+ 
+-    # Find all releases with adoption in the last 24 hours
++    # Find all releases with adoption in the last 48 hours
+     for x in raw_query(
+         dataset=Dataset.Sessions,
+         selected_columns=["project_id", "release", "users"],
+@@ -40,6 +40,26 @@ def get_changed_project_release_model_adoptions(project_ids):
+     return rv
+ 
+ 
++def get_oldest_health_data_for_releases(project_releases):
++    """Returns the oldest health data we have observed in a release
++    in 90 days.  This is used for backfilling.
++    """
++    conditions = [["release", "IN", [x[1] for x in project_releases]]]
++    filter_keys = {"project_id": [x[0] for x in project_releases]}
++    rows = raw_query(
++        dataset=Dataset.Sessions,
++        selected_columns=[["min", ["started"], "oldest"], "project_id", "release"],
++        groupby=["release", "project_id"],
++        start=datetime.utcnow() - timedelta(days=90),
++        conditions=conditions,
++        filter_keys=filter_keys,
++    )["data"]
++    rv = {}
++    for row in rows:
++        rv[row["project_id"], row["release"]] = row["oldest"]
++    return rv
++
++
+ def check_has_health_data(project_releases):
+     conditions = [["release", "IN", list(x[1] for x in project_releases)]]
+     filter_keys = {"project_id": list(set(x[0] for x in project_releases))}
+@@ -128,31 +148,68 @@ def get_rollup_starts_and_buckets(period):
+     return seconds, start, buckets
+ 
+ 
++def get_release_adoption(project_releases, environments=None, now=None):
++    """Get the adoption of the last 24 hours (or a difference reference timestamp)."""
++    conditions, filter_keys = _get_conditions_and_filter_keys(project_releases, environments)
++    if now is None:
++        now = datetime.now(pytz.utc)
++    start = now - timedelta(days=1)
++
++    total_users = {}
++    for x in raw_query(
++        dataset=Dataset.Sessions,
++        selected_columns=["release", "users"],
++        groupby=["release", "project_id"],
++        start=start,
++        conditions=conditions,
++        filter_keys=filter_keys,
++    )["data"]:
++        total_users[x["project_id"]] = x["users"]
++
++    rv = {}
++    for x in raw_query(
++        dataset=Dataset.Sessions,
++        selected_columns=["release", "project_id", "users", "sessions"],
++        groupby=["release", "project_id"],
++        start=start,
++        conditions=conditions,
++        filter_keys=filter_keys,
++    )["data"]:
++        total = total_users.get(x["project_id"])
++        if not total:
++            adoption = None
++        else:
++            adoption = x["users"] / total * 100
++        rv[x["project_id"], x["release"]] = {
++            "adoption": adoption,
++            "users_24h": x["users"],
++            "sessions_24h": x["sessions"],
++        }
++
++    return rv
++
++
+ def get_release_health_data_overview(
+-    project_releases, environments=None, summary_stats_period=None, health_stats_period=None
++    project_releases,
++    environments=None,
++    summary_stats_period=None,
++    health_stats_period=None,
++    stat=None,
+ ):
+     """Checks quickly for which of the given project releases we have
+     health data available.  The argument is a tuple of `(project_id, release_name)`
+     tuples.  The return value is a set of all the project releases that have health
+     data.
+     """
++    if stat is None:
++        stat = "sessions"
++    assert stat in ("sessions", "users")
+ 
+     _, summary_start, _ = get_rollup_starts_and_buckets(summary_stats_period or "24h")
+     conditions, filter_keys = _get_conditions_and_filter_keys(project_releases, environments)
+ 
+     stats_rollup, stats_start, stats_buckets = get_rollup_starts_and_buckets(health_stats_period)
+ 
+-    total_users = {}
+-    for x in raw_query(
+-        dataset=Dataset.Sessions,
+-        selected_columns=["release", "users"],
+-        groupby=["release", "project_id"],
+-        start=summary_start,
+-        conditions=conditions,
+-        filter_keys=filter_keys,
+-    )["data"]:
+-        total_users[x["project_id"]] = x["users"]
+-
+     missing_releases = set(project_releases)
+     rv = {}
+     for x in raw_query(
+@@ -172,7 +229,6 @@ def get_release_health_data_overview(
+         conditions=conditions,
+         filter_keys=filter_keys,
+     )["data"]:
+-        x_total_users = total_users.get(x["project_id"])
+         rp = {
+             "duration_p50": _convert_duration(x["duration_quantiles"][0]),
+             "duration_p90": _convert_duration(x["duration_quantiles"][1]),
+@@ -186,7 +242,6 @@ def get_release_health_data_overview(
+             "total_sessions": x["sessions"],
+             "sessions_crashed": x["sessions_crashed"],
+             "sessions_errored": x["sessions_errored"],
+-            "adoption": x["users"] / x_total_users * 100 if x_total_users and x["users"] else None,
+             "has_health_data": True,
+         }
+         if health_stats_period:
+@@ -214,7 +269,6 @@ def get_release_health_data_overview(
+                 "total_sessions": 0,
+                 "sessions_crashed": 0,
+                 "sessions_errored": 0,
+-                "adoption": None,
+                 "has_health_data": key in has_health_data,
+             }
+             if health_stats_period:
+@@ -222,10 +276,18 @@ def get_release_health_data_overview(
+                     health_stats_period: _make_stats(stats_start, stats_rollup, stats_buckets)
+                 }
+ 
++    # Fill in release adoption
++    release_adoption = get_release_adoption(project_releases, environments)
++    for key in rv:
++        adoption_info = release_adoption.get(key) or {}
++        rv[key]["adoption"] = adoption_info.get("adoption")
++        rv[key]["total_users_24h"] = adoption_info.get("users_24h")
++        rv[key]["total_sessions_24h"] = adoption_info.get("sessions_24h")
++
+     if health_stats_period:
+         for x in raw_query(
+             dataset=Dataset.Sessions,
+-            selected_columns=["release", "project_id", "bucketed_started", "sessions"],
++            selected_columns=["release", "project_id", "bucketed_started", stat],
+             groupby=["release", "project_id", "bucketed_started"],
+             rollup=stats_rollup,
+             start=stats_start,
+@@ -237,27 +299,31 @@ def get_release_health_data_overview(
+                 / stats_rollup
+             )
+             rv[x["project_id"], x["release"]]["stats"][health_stats_period][time_bucket][1] = x[
+-                "sessions"
++                stat
+             ]
+ 
+     return rv
+ 
+ 
+-def get_crash_free_breakdown(project_id, release, environments=None):
++def get_crash_free_breakdown(project_id, release, start, environments=None):
+     filter_keys = {"project_id": [project_id]}
+     conditions = [["release", "=", release]]
+     if environments is not None:
+         conditions.append(["environment", "IN", environments])
+ 
+-    def _query_stats(start_delta):
++    now = datetime.now(pytz.utc)
++
++    def _query_stats(end):
+         row = raw_query(
+             dataset=Dataset.Sessions,
+             selected_columns=["users", "users_crashed", "sessions", "sessions_crashed"],
+-            start=datetime.now(pytz.utc) - start_delta,
++            end=end,
++            start=start,
+             conditions=conditions,
+             filter_keys=filter_keys,
+         )["data"][0]
+         return {
++            "date": end,
+             "total_users": row["users"],
+             "crash_free_users": 100 - row["users_crashed"] / float(row["users"]) * 100
+             if row["users"]
+@@ -268,12 +334,24 @@ def get_crash_free_breakdown(project_id, release, environments=None):
+             else None,
+         }
+ 
+-    return {
+-        "1d": _query_stats(timedelta(days=1)),
+-        "1w": _query_stats(timedelta(days=7)),
+-        "2w": _query_stats(timedelta(days=14)),
+-        "4w": _query_stats(timedelta(days=28)),
+-    }
++    last = None
++    rv = []
++    for offset in (
++        timedelta(days=1),
++        timedelta(days=2),
++        timedelta(days=7),
++        timedelta(days=14),
++        timedelta(days=30),
++    ):
++        item_start = start + offset
++        if item_start > now:
++            if last is None or (item_start - last).days > 1:
++                rv.append(_query_stats(now))
++            break
++        rv.append(_query_stats(item_start))
++        last = item_start
++
++    return rv
+ 
+ 
+ def get_project_release_stats(project_id, release, stat, rollup, start, end, environments=None):
+diff --git a/src/sentry/static/sentry/app/types/index.tsx b/src/sentry/static/sentry/app/types/index.tsx
+index 3503208d23..461cd58e02 100644
+--- a/src/sentry/static/sentry/app/types/index.tsx
++++ b/src/sentry/static/sentry/app/types/index.tsx
+@@ -131,8 +131,11 @@ export type ProjectRelease = {
+ };
+ 
+ export type Health = {
+-  crashFreeUsers: number | null;
+   totalUsers: number;
++  totalUsers24h: number;
++  totalSessions: number;
++  totalSessions24h: number;
++  crashFreeUsers: number | null;
+   crashFreeSessions: number | null;
+   stats: HealthGraphData;
+   sessionsCrashed: number;
+@@ -1082,10 +1085,9 @@ export type SentryServiceStatus = {
+ };
+ 
+ export type CrashFreeTimeBreakdown = {
+-  [key: string]: {
+-    totalSessions: number;
+-    crashFreeSessions: number | null;
+-    crashFreeUsers: number | null;
+-    totalUsers: number;
+-  };
+-};
++  date: string;
++  totalSessions: number;
++  crashFreeSessions: number | null;
++  crashFreeUsers: number | null;
++  totalUsers: number;
++}[];
+diff --git a/src/sentry/static/sentry/app/views/releasesV2/detail/overview/chart/releaseStatsRequest.tsx b/src/sentry/static/sentry/app/views/releasesV2/detail/overview/chart/releaseStatsRequest.tsx
+index 55242a3b1e..56545a7e94 100644
+--- a/src/sentry/static/sentry/app/views/releasesV2/detail/overview/chart/releaseStatsRequest.tsx
++++ b/src/sentry/static/sentry/app/views/releasesV2/detail/overview/chart/releaseStatsRequest.tsx
+@@ -310,7 +310,7 @@ class ReleaseStatsRequest extends React.Component<Props, State> {
+       errored,
+       chartData: data?.chartData ?? [],
+       chartSummary: data?.chartSummary ?? '',
+-      crashFreeTimeBreakdown: data?.crashFreeTimeBreakdown ?? {},
++      crashFreeTimeBreakdown: data?.crashFreeTimeBreakdown ?? [],
+     });
+   }
+ }
+diff --git a/src/sentry/static/sentry/app/views/releasesV2/detail/overview/index.tsx b/src/sentry/static/sentry/app/views/releasesV2/detail/overview/index.tsx
+index dbb05b20bf..5e6a9786aa 100644
+--- a/src/sentry/static/sentry/app/views/releasesV2/detail/overview/index.tsx
++++ b/src/sentry/static/sentry/app/views/releasesV2/detail/overview/index.tsx
+@@ -110,7 +110,6 @@ class ReleaseOverview extends AsyncView<Props> {
+                     {hasHealthData && (
+                       <TotalCrashFreeUsers
+                         crashFreeTimeBreakdown={crashFreeTimeBreakdown}
+-                        startDate={release.dateReleased ?? release.dateCreated}
+                       />
+                     )}
+                     {/* TODO(releasesV2): hidden for now */}
+diff --git a/src/sentry/static/sentry/app/views/releasesV2/detail/overview/sessionDuration.tsx b/src/sentry/static/sentry/app/views/releasesV2/detail/overview/sessionDuration.tsx
+index 8a8aec9427..c5636c6ade 100644
+--- a/src/sentry/static/sentry/app/views/releasesV2/detail/overview/sessionDuration.tsx
++++ b/src/sentry/static/sentry/app/views/releasesV2/detail/overview/sessionDuration.tsx
+@@ -3,7 +3,7 @@ import styled from '@emotion/styled';
+ 
+ import {t} from 'app/locale';
+ 
+-import UsersChart from '../../list/usersChart';
++import HealthStatsChart from '../../list/healthStatsChart';
+ import {mockData} from '../../list/mock';
+ import {SectionHeading, Wrapper} from './styles';
+ 
+@@ -13,9 +13,10 @@ type Props = {};
+ const SessionDuration = ({}: Props) => (
+   <StyledWrapper>
+     <SectionHeading>{t('Session Duration')}</SectionHeading>
+-    <UsersChart
++    <HealthStatsChart
+       data={{'24h': mockData[0].graphData['24h'].slice(0, 15)}}
+-      statsPeriod="24h"
++      period="24h"
++      subject="sessions"
+       height={50}
+     />
+   </StyledWrapper>
+diff --git a/src/sentry/static/sentry/app/views/releasesV2/detail/overview/totalCrashFreeUsers.tsx b/src/sentry/static/sentry/app/views/releasesV2/detail/overview/totalCrashFreeUsers.tsx
+index 62e895be9b..40c687d7a5 100644
+--- a/src/sentry/static/sentry/app/views/releasesV2/detail/overview/totalCrashFreeUsers.tsx
++++ b/src/sentry/static/sentry/app/views/releasesV2/detail/overview/totalCrashFreeUsers.tsx
+@@ -14,41 +14,29 @@ import {displayCrashFreePercent} from '../../utils';
+ 
+ type Props = {
+   crashFreeTimeBreakdown: CrashFreeTimeBreakdown;
+-  startDate?: string;
+ };
+ 
+-const TotalCrashFreeUsers = ({crashFreeTimeBreakdown, startDate}: Props) => {
+-  if (!startDate) {
++const TotalCrashFreeUsers = ({crashFreeTimeBreakdown}: Props) => {
++  if (!crashFreeTimeBreakdown?.length) {
+     return null;
+   }
+ 
+-  const periodToDays = {
+-    '1d': 1,
+-    '1w': 7,
+-    '2w': 14,
+-    '4w': 28,
+-  };
+-
+-  const periodToLabels = {
+-    '1d': t('Last day'),
+-    '1w': t('Last week'),
+-    '2w': t('Last 2 weeks'),
+-    '4w': t('Last month'),
+-  };
+-
+-  const timeline = Object.entries(crashFreeTimeBreakdown)
+-    // convert '1d', '1w', etc. to date objects
+-    .map(([period, value]) => {
+-      const date = moment().subtract(periodToDays[period], 'days');
+-      const crashFreeUserCount = Math.round(
+-        ((value.crashFreeUsers ?? 0) * value.totalUsers) / 100
+-      );
+-      return {...value, crashFreeUserCount, period, date};
++  const timeline = crashFreeTimeBreakdown
++    .map(({date, crashFreeUsers, totalUsers}, index, data) => {
++      // count number of crash free users from knowing percent and total
++      const crashFreeUserCount = Math.round(((crashFreeUsers ?? 0) * totalUsers) / 100);
++      // first item of timeline is release creation date, then we want to have relative date label
++      const dateLabel =
++        index === 0
++          ? t('Release created')
++          : `${moment(data[0].date).from(date, true)} ${t('later')}`;
++
++      return {date: moment(date), dateLabel, crashFreeUsers, crashFreeUserCount};
+     })
+-    // sort them by latest
+-    .sort((a, b) => (a.date.isAfter(b.date) ? -1 : 1))
+-    // remove those that are before release was created
+-    .filter(item => item.date.isAfter(startDate));
++    // remove those timeframes that are in the future
++    .filter(item => item.date.isBefore())
++    // we want timeline to go from bottom to up
++    .reverse();
+ 
+   if (!timeline.length) {
+     return null;
+@@ -68,7 +56,7 @@ const TotalCrashFreeUsers = ({crashFreeTimeBreakdown, startDate}: Props) => {
+               </Text>
+             </InnerRow>
+             <InnerRow>
+-              <Text>{periodToLabels[row.period]}</Text>
++              <Text>{row.dateLabel}</Text>
+               <Text right>
+                 {defined(row.crashFreeUsers)
+                   ? displayCrashFreePercent(row.crashFreeUsers)
+@@ -77,14 +65,6 @@ const TotalCrashFreeUsers = ({crashFreeTimeBreakdown, startDate}: Props) => {
+             </InnerRow>
+           </Row>
+         ))}
+-        <Row>
+-          <InnerRow>
+-            <Text bold>{moment(startDate).format('MMMM D')}</Text>
+-          </InnerRow>
+-          <InnerRow>
+-            <Text>{t('Release created')}</Text>
+-          </InnerRow>
+-        </Row>
+       </Timeline>
+     </Wrapper>
+   );
+diff --git a/src/sentry/static/sentry/app/views/releasesV2/list/adoptionTooltip.tsx b/src/sentry/static/sentry/app/views/releasesV2/list/adoptionTooltip.tsx
+new file mode 100644
+index 0000000000..a9fbb2cf65
+--- /dev/null
++++ b/src/sentry/static/sentry/app/views/releasesV2/list/adoptionTooltip.tsx
+@@ -0,0 +1,75 @@
++import React from 'react';
++import styled from '@emotion/styled';
++
++import {t} from 'app/locale';
++import space from 'app/styles/space';
++import Count from 'app/components/count';
++
++type Props = {
++  totalUsers: number;
++  totalUsers24h: number;
++  totalSessions: number;
++  totalSessions24h: number;
++};
++
++const AdoptionTooltip = ({
++  totalUsers,
++  totalUsers24h,
++  totalSessions,
++  totalSessions24h,
++}: Props) => {
++  return (
++    <Wrapper>
++      <Row>
++        <Title>{t('Last 24h')}:</Title>
++        <Value>
++          <Count value={totalUsers24h ?? 0} />
++        </Value>
++      </Row>
++      <Row>
++        <Title>{t('Total Users')}:</Title>
++        <Value>
++          <Count value={totalUsers ?? 0} />
++        </Value>
++      </Row>
++      <Divider />
++
++      <Row>
++        <Title>{t('Last 24h')}:</Title>
++        <Value>
++          <Count value={totalSessions24h ?? 0} />
++        </Value>
++      </Row>
++      <Row>
++        <Title>{t('Total Sessions')}:</Title>
++        <Value>
++          <Count value={totalSessions ?? 0} />
++        </Value>
++      </Row>
++    </Wrapper>
++  );
++};
++
++const Wrapper = styled('div')`
++  padding: ${space(0.75)};
++`;
++const Row = styled('div')`
++  display: grid;
++  grid-template-columns: auto auto;
++  grid-gap: ${space(4)};
++  justify-content: space-between;
++  padding-bottom: ${space(0.25)};
++`;
++const Title = styled('div')`
++  text-align: left;
++`;
++const Value = styled('div')`
++  color: ${p => p.theme.gray2};
++  text-align: right;
++`;
++const Divider = styled('div')`
++  border-top: 1px solid ${p => p.theme.gray5};
++  margin: ${space(0.75)} -${space(2)} ${space(1)};
++`;
++
++export default AdoptionTooltip;
+diff --git a/src/sentry/static/sentry/app/views/releasesV2/list/usersChart.tsx b/src/sentry/static/sentry/app/views/releasesV2/list/healthStatsChart.tsx
+similarity index 64%
+rename from src/sentry/static/sentry/app/views/releasesV2/list/usersChart.tsx
+rename to src/sentry/static/sentry/app/views/releasesV2/list/healthStatsChart.tsx
+index 82c42dc07a..8ed1b7dd42 100644
+--- a/src/sentry/static/sentry/app/views/releasesV2/list/usersChart.tsx
++++ b/src/sentry/static/sentry/app/views/releasesV2/list/healthStatsChart.tsx
+@@ -5,18 +5,22 @@ import LazyLoad from 'react-lazyload';
+ import {t} from 'app/locale';
+ import BarChart from 'app/components/barChart';
+ 
++import {StatsSubject} from './healthStatsSubject';
++import {StatsPeriod} from './healthStatsPeriod';
++
+ type DefaultProps = {
+   height: number;
+ };
+ 
+ type Props = DefaultProps & {
+-  statsPeriod: '24h' | '14d';
++  period: StatsPeriod;
++  subject: StatsSubject;
+   data: {
+     [statsPeriod: string]: [number, number][];
+   };
+ };
+ 
+-class UsersChart extends React.Component<Props> {
++class HealthStatsChart extends React.Component<Props> {
+   static defaultProps: DefaultProps = {
+     height: 24,
+   };
+@@ -25,14 +29,23 @@ class UsersChart extends React.Component<Props> {
+     // Sometimes statsPeriod updates before graph data has been
+     // pulled from server / propagated down to components ...
+     // don't update until data is available
+-    const {data, statsPeriod} = nextProps;
+-    return data.hasOwnProperty(statsPeriod);
++    const {data, period} = nextProps;
++    return data.hasOwnProperty(period);
++  }
++
++  getChartLabel() {
++    const {subject} = this.props;
++    if (subject === 'users') {
++      return t('users');
++    }
++
++    return t('sessions');
+   }
+ 
+   render() {
+-    const {height, statsPeriod, data} = this.props;
++    const {height, period, data} = this.props;
+ 
+-    const stats = statsPeriod ? data[statsPeriod] : null;
++    const stats = period ? data[period] : null;
+ 
+     if (!stats || !stats.length) {
+       return null;
+@@ -45,7 +58,7 @@ class UsersChart extends React.Component<Props> {
+         <BarChart
+           points={chartData}
+           height={height}
+-          label={t('sessions')}
++          label={this.getChartLabel()}
+           minHeights={[3]}
+           gap={1}
+         />
+@@ -54,4 +67,4 @@ class UsersChart extends React.Component<Props> {
+   }
+ }
+ 
+-export default UsersChart;
++export default HealthStatsChart;
+diff --git a/src/sentry/static/sentry/app/views/releasesV2/list/healthStatsPeriod.tsx b/src/sentry/static/sentry/app/views/releasesV2/list/healthStatsPeriod.tsx
+new file mode 100644
+index 0000000000..3ea124bbda
+--- /dev/null
++++ b/src/sentry/static/sentry/app/views/releasesV2/list/healthStatsPeriod.tsx
+@@ -0,0 +1,67 @@
++import React from 'react';
++import styled from '@emotion/styled';
++import {Location} from 'history';
++
++import {t} from 'app/locale';
++import space from 'app/styles/space';
++import Link from 'app/components/links/link';
++
++export type StatsPeriod = '24h' | '14d';
++
++type Props = {
++  location: Location;
++  activePeriod: StatsPeriod;
++};
++
++const HealthStatsPeriod = ({location, activePeriod}: Props) => {
++  const {pathname, query} = location;
++  const periods = [
++    {
++      key: '24h',
++      label: t('24h'),
++    },
++    {
++      key: '14d',
++      label: t('14d'),
++    },
++  ];
++
++  return (
++    <Wrapper>
++      {periods.map(period => (
++        <Period
++          key={period.key}
++          to={{
++            pathname,
++            query: {...query, healthStatsPeriod: period.key},
++          }}
++          selected={activePeriod === period.key}
++        >
++          {period.label}
++        </Period>
++      ))}
++    </Wrapper>
++  );
++};
++
++const Wrapper = styled('div')`
++  display: grid;
++  grid-auto-flow: column;
++  grid-column-gap: ${space(0.75)};
++  flex: 1;
++  justify-content: flex-end;
++  text-align: right;
++  margin-right: ${space(2)};
++  margin-left: ${space(0.5)};
++`;
++
++const Period = styled(Link)<{selected: boolean}>`
++  color: ${p => (p.selected ? p.theme.gray3 : p.theme.gray2)};
++
++  &:hover,
++  &:focus {
++    color: ${p => (p.selected ? p.theme.gray3 : p.theme.gray2)};
++  }
++`;
++
++export default HealthStatsPeriod;
+diff --git a/src/sentry/static/sentry/app/views/releasesV2/list/healthStatsSubject.tsx b/src/sentry/static/sentry/app/views/releasesV2/list/healthStatsSubject.tsx
+new file mode 100644
+index 0000000000..dbd71433d8
+--- /dev/null
++++ b/src/sentry/static/sentry/app/views/releasesV2/list/healthStatsSubject.tsx
+@@ -0,0 +1,64 @@
++import React from 'react';
++import styled from '@emotion/styled';
++import {Location} from 'history';
++
++import {t} from 'app/locale';
++import space from 'app/styles/space';
++import Link from 'app/components/links/link';
++
++export type StatsSubject = 'sessions' | 'users';
++
++type Props = {
++  location: Location;
++  activeSubject: StatsSubject;
++};
++
++const HealthStatsSubject = ({location, activeSubject}: Props) => {
++  const {pathname, query} = location;
++
++  const subjects = [
++    {
++      key: 'sessions',
++      label: t('Sessions'),
++    },
++    {
++      key: 'users',
++      label: t('Users'),
++    },
++  ];
++
++  return (
++    <Wrapper>
++      {subjects.map(subject => (
++        <Title
++          key={subject.key}
++          to={{
++            pathname,
++            query: {...query, healthStat: subject.key},
++          }}
++          selected={activeSubject === subject.key}
++        >
++          {subject.label}
++        </Title>
++      ))}
++    </Wrapper>
++  );
++};
++
++const Wrapper = styled('div')`
++  display: grid;
++  grid-auto-flow: column;
++  grid-column-gap: ${space(0.75)};
++  margin-right: ${space(0.25)};
++`;
++
++const Title = styled(Link)<{selected: boolean}>`
++  color: ${p => (p.selected ? p.theme.gray3 : p.theme.gray2)};
++
++  &:hover,
++  &:focus {
++    color: ${p => (p.selected ? p.theme.gray3 : p.theme.gray2)};
++  }
++`;
++
++export default HealthStatsSubject;
+diff --git a/src/sentry/static/sentry/app/views/releasesV2/list/index.tsx b/src/sentry/static/sentry/app/views/releasesV2/list/index.tsx
+index 2a8f8d413f..65f3228fb8 100644
+--- a/src/sentry/static/sentry/app/views/releasesV2/list/index.tsx
++++ b/src/sentry/static/sentry/app/views/releasesV2/list/index.tsx
+@@ -37,6 +37,8 @@ type Props = RouteComponentProps<RouteParams, {}> & {
+ type State = AsyncView['state'];
+ 
+ class ReleasesList extends AsyncView<Props, State> {
++  shouldReload = true;
++
+   getTitle() {
+     return routeTitleGen(t('Releases v2'), this.props.organization.slug, false);
+   }
+@@ -58,6 +60,7 @@ class ReleasesList extends AsyncView<Props, State> {
+         'query',
+         'sort',
+         'healthStatsPeriod',
++        'healthStat',
+       ]),
+       summaryStatsPeriod: location.query.statsPeriod,
+       per_page: 50,
+@@ -161,9 +164,9 @@ class ReleasesList extends AsyncView<Props, State> {
+ 
+   renderInnerBody() {
+     const {organization, location} = this.props;
+-    const {loading, releases} = this.state;
++    const {loading, releases, reloading} = this.state;
+ 
+-    if (loading) {
++    if ((loading && !reloading) || (loading && !releases.length)) {
+       return <LoadingIndicator />;
+     }
+ 
+@@ -182,6 +185,7 @@ class ReleasesList extends AsyncView<Props, State> {
+               release={release}
+               project={projects.find(p => p.slug === release.projectSlug)}
+               location={location}
++              reloading={reloading}
+             />
+           ))
+         }
+@@ -216,7 +220,7 @@ class ReleasesList extends AsyncView<Props, State> {
+                 <SearchBar
+                   placeholder={t('Search')}
+                   onSearch={this.handleSearch}
+-                  defaultQuery={this.getQuery()}
++                  query={this.getQuery()}
+                 />
+               </SortAndFilterWrapper>
+             </StyledPageHeader>
+diff --git a/src/sentry/static/sentry/app/views/releasesV2/list/releaseCard.tsx b/src/sentry/static/sentry/app/views/releasesV2/list/releaseCard.tsx
+index 71a15adae1..de31388a82 100644
+--- a/src/sentry/static/sentry/app/views/releasesV2/list/releaseCard.tsx
++++ b/src/sentry/static/sentry/app/views/releasesV2/list/releaseCard.tsx
+@@ -20,11 +20,11 @@ type Props = {
+   release: ProjectRelease;
+   project?: Project | AvatarProject;
+   location: Location;
++  reloading: boolean;
+ };
+ 
+-const ReleaseCard = ({release, project, location}: Props) => (
+-  // TODO(releasesv2): probably makes sense at this point to split the header and data to different files (move styles to share layout file)
+-  <Panel>
++const ReleaseCard = ({release, project, location, reloading}: Props) => (
++  <StyledPanel reloading={reloading ? 1 : 0}>
+     <PanelBody>
+       <StyledPanelItem>
+         <HeaderLayout>
+@@ -94,9 +94,14 @@ const ReleaseCard = ({release, project, location}: Props) => (
+     {release.healthData?.hasHealthData && (
+       <ReleaseHealth release={release} location={location} />
+     )}
+-  </Panel>
++  </StyledPanel>
+ );
+ 
++const StyledPanel = styled(Panel)<{reloading: number}>`
++  opacity: ${p => (p.reloading ? 0.5 : 1)};
++  pointer-events: ${p => (p.reloading ? 'none' : 'auto')};
++`;
++
+ const StyledPanelItem = styled(PanelItem)`
+   flex-direction: column;
+ `;
+diff --git a/src/sentry/static/sentry/app/views/releasesV2/list/releaseHealth.tsx b/src/sentry/static/sentry/app/views/releasesV2/list/releaseHealth.tsx
+index 511e08c646..230aa20fa1 100644
+--- a/src/sentry/static/sentry/app/views/releasesV2/list/releaseHealth.tsx
++++ b/src/sentry/static/sentry/app/views/releasesV2/list/releaseHealth.tsx
+@@ -2,7 +2,6 @@ import React from 'react';
+ import styled from '@emotion/styled';
+ import {Location} from 'history';
+ 
+-import Link from 'app/components/links/link';
+ import {ProjectRelease} from 'app/types';
+ import {PanelHeader, PanelBody, PanelItem} from 'app/components/panels';
+ import {t, tn} from 'app/locale';
+@@ -12,9 +11,13 @@ import Count from 'app/components/count';
+ import {defined} from 'app/utils';
+ import theme from 'app/utils/theme';
+ import ScoreBar, {Bar} from 'app/components/scoreBar';
++import Tooltip from 'app/components/tooltip';
+ 
+-import UsersChart from './usersChart';
++import HealthStatsChart from './healthStatsChart';
+ import {displayCrashFreePercent, convertAdoptionToProgress} from '../utils';
++import HealthStatsSubject, {StatsSubject} from './healthStatsSubject';
++import HealthStatsPeriod, {StatsPeriod} from './healthStatsPeriod';
++import AdoptionTooltip from './adoptionTooltip';
+ 
+ type Props = {
+   release: ProjectRelease;
+@@ -22,8 +25,9 @@ type Props = {
+ };
+ 
+ const ReleaseHealth = ({release, location}: Props) => {
+-  const {pathname, query} = location;
+-  const activeHealthStatsPeriod = (query.healthStatsPeriod || '24h') as '24h' | '14d';
++  const activeStatsPeriod = (location.query.healthStatsPeriod || '24h') as StatsPeriod;
++  const activeStatsSubject = (location.query.healthStat || 'sessions') as StatsSubject;
++
+   const {
+     adoption,
+     stats,
+@@ -31,39 +35,18 @@ const ReleaseHealth = ({release, location}: Props) => {
+     crashFreeSessions,
+     sessionsCrashed,
+     totalUsers,
++    totalUsers24h,
++    totalSessions,
++    totalSessions24h,
+   } = release.healthData!;
+ 
+-  const healthStatsPeriods = [
+-    {
+-      key: '24h',
+-      label: t('24h'),
+-    },
+-    {
+-      key: '14d',
+-      label: t('14d'),
+-    },
+-  ];
+-
+   return (
+     <React.Fragment>
+       <StyledPanelHeader>
+         <HeaderLayout>
+           <DailyUsersColumn>
+-            {t('Daily Sessions')}:
+-            <StatsPeriodChanger>
+-              {healthStatsPeriods.map(healthStatsPeriod => (
+-                <StatsPeriod
+-                  key={healthStatsPeriod.key}
+-                  to={{
+-                    pathname,
+-                    query: {...query, healthStatsPeriod: healthStatsPeriod.key},
+-                  }}
+-                  selected={activeHealthStatsPeriod === healthStatsPeriod.key}
+-                >
+-                  {healthStatsPeriod.label}
+-                </StatsPeriod>
+-              ))}
+-            </StatsPeriodChanger>
++            <HealthStatsSubject location={location} activeSubject={activeStatsSubject} />
++            <HealthStatsPeriod location={location} activePeriod={activeStatsPeriod} />
+           </DailyUsersColumn>
+           <AdoptionColumn>{t('Release adoption')}</AdoptionColumn>
+           <CrashFreeUsersColumn>{t('Crash free users')}</CrashFreeUsersColumn>
+@@ -78,19 +61,29 @@ const ReleaseHealth = ({release, location}: Props) => {
+           <Layout>
+             <DailyUsersColumn>
+               <ChartWrapper>
+-                <UsersChart
++                <HealthStatsChart
+                   data={stats}
+                   height={20}
+-                  statsPeriod={activeHealthStatsPeriod}
++                  period={activeStatsPeriod}
++                  subject={activeStatsSubject}
+                 />
+               </ChartWrapper>
+             </DailyUsersColumn>
+ 
+             <AdoptionColumn>
+               <AdoptionWrapper>
+-                {defined(adoption) && (
++                <Tooltip
++                  title={
++                    <AdoptionTooltip
++                      totalUsers={totalUsers}
++                      totalSessions={totalSessions}
++                      totalUsers24h={totalUsers24h}
++                      totalSessions24h={totalSessions24h}
++                    />
++                  }
++                >
+                   <StyledScoreBar
+-                    score={convertAdoptionToProgress(adoption)}
++                    score={convertAdoptionToProgress(adoption ?? 0)}
+                     size={14}
+                     thickness={14}
+                     palette={[
+@@ -101,10 +94,10 @@ const ReleaseHealth = ({release, location}: Props) => {
+                       theme.green,
+                     ]}
+                   />
+-                )}
++                </Tooltip>
+                 <div>
+-                  <Count value={totalUsers} /> &nbsp;
+-                  {tn('user', 'users', totalUsers)}
++                  <Count value={totalUsers24h ?? 0} />{' '}
++                  {tn('user', 'users', totalUsers24h)}
+                 </div>
+               </AdoptionWrapper>
+             </AdoptionColumn>
+@@ -266,23 +259,4 @@ const ChartWrapper = styled('div')`
+   }
+ `;
+ 
+-const StatsPeriodChanger = styled('div')`
+-  display: grid;
+-  grid-template-columns: auto auto;
+-  grid-column-gap: ${space(0.75)};
+-  flex: 1;
+-  justify-content: flex-end;
+-  text-align: right;
+-  margin-right: ${space(2)};
+-  margin-left: ${space(0.5)};
+-`;
+-
+-const StatsPeriod = styled(Link)<{selected: boolean}>`
+-  color: ${p => (p.selected ? p.theme.gray3 : p.theme.gray2)};
+-
+-  &:hover {
+-    color: ${p => (p.selected ? p.theme.gray3 : p.theme.gray2)};
+-  }
+-`;
+-
+ export default ReleaseHealth;

@@ -1,0 +1,320 @@
+commit 41c2d77c7cbd564ee47f63e442c792a6ee7efac2
+Author: David Cramer <dcramer@gmail.com>
+Date:   Mon May 23 14:57:44 2016 -0700
+
+    Persist auto resolve state to issues
+    
+    This adds a reasonable cost to issues that don't group well, but the benefits we can take advantage of should make it worth it:
+    
+    - improved query time for "unresolved issues"
+    - a reasonable way to denormalize counters for "unresolved issues"
+    - no more obscure magic everywhere in the code and UI
+    
+    @getsentry/infrastructure
+
+diff --git a/src/sentry/conf/server.py b/src/sentry/conf/server.py
+index bade834b7b..cb324e414c 100644
+--- a/src/sentry/conf/server.py
++++ b/src/sentry/conf/server.py
+@@ -379,9 +379,11 @@ CELERY_DEFAULT_ROUTING_KEY = "default"
+ CELERY_CREATE_MISSING_QUEUES = True
+ CELERY_IMPORTS = (
+     'sentry.tasks.auth',
++    'sentry.tasks.auto_resolve_issues',
+     'sentry.tasks.beacon',
+     'sentry.tasks.clear_expired_snoozes',
+     'sentry.tasks.check_auth',
++    'sentry.tasks.collect_project_platforms',
+     'sentry.tasks.deletion',
+     'sentry.tasks.digests',
+     'sentry.tasks.dsymcache',
+@@ -392,7 +394,6 @@ CELERY_IMPORTS = (
+     'sentry.tasks.ping',
+     'sentry.tasks.post_process',
+     'sentry.tasks.process_buffer',
+-    'sentry.tasks.collect_project_platforms',
+ )
+ CELERY_QUEUES = [
+     Queue('default', routing_key='default'),
+@@ -496,6 +497,13 @@ CELERYBEAT_SCHEDULE = {
+             'expires': 3600 * 24,
+         },
+     },
++    'schedule-auto-resolution': {
++        'task': 'sentry.tasks.schedule_auto_resolution',
++        'schedule': timedelta(minutes=15),
++        'options': {
++            'expires': 60 * 25,
++        },
++    },
+ }
+ 
+ LOGGING = {
+diff --git a/src/sentry/models/activity.py b/src/sentry/models/activity.py
+index 018e1bdd13..9be1062361 100644
+--- a/src/sentry/models/activity.py
++++ b/src/sentry/models/activity.py
+@@ -36,10 +36,12 @@ class Activity(Model):
+     UNASSIGNED = 12
+     SET_RESOLVED_IN_RELEASE = 13
+     MERGE = 14
++    SET_RESOLVED_BY_AGE = 13
+ 
+     TYPE = (
+         # (TYPE, verb-slug)
+         (SET_RESOLVED, 'set_resolved'),
++        (SET_RESOLVED_BY_AGE, 'set_resolved_by_age'),
+         (SET_RESOLVED_IN_RELEASE, 'set_resolved_in_release'),
+         (SET_UNRESOLVED, 'set_unresolved'),
+         (SET_MUTED, 'set_muted'),
+diff --git a/src/sentry/static/sentry/app/components/activity/item.jsx b/src/sentry/static/sentry/app/components/activity/item.jsx
+index 4d1e03b829..9e88f07b87 100644
+--- a/src/sentry/static/sentry/app/components/activity/item.jsx
++++ b/src/sentry/static/sentry/app/components/activity/item.jsx
+@@ -64,6 +64,11 @@ const ActivityItem = React.createClass({
+           author: author,
+           link: <Link to={`/${orgId}/${project.slug}/issues/${issue.id}/`} />
+         });
++      case 'set_resolved_by_age':
++        return tct('[author] marked [link:an issue] as resolved due to age', {
++          author: author,
++          link: <Link to={`/${orgId}/${project.slug}/issues/${issue.id}/`} />
++        });
+       case 'set_resolved_in_release':
+         if (data.version) {
+           return tct('[author] marked [link:an issue] as resolved in [version]', {
+diff --git a/src/sentry/static/sentry/app/views/groupActivity/index.jsx b/src/sentry/static/sentry/app/views/groupActivity/index.jsx
+index 3c171fd516..6a8da5171a 100644
+--- a/src/sentry/static/sentry/app/views/groupActivity/index.jsx
++++ b/src/sentry/static/sentry/app/views/groupActivity/index.jsx
+@@ -37,6 +37,10 @@ const GroupActivity = React.createClass({
+         return t('%s left a comment', author);
+       case 'set_resolved':
+         return t('%s marked this issue as resolved', author);
++      case 'set_resolved_by_age':
++        return t('%(author)s marked this issue as resolved due to inactivity', {
++          author: author,
++        });
+       case 'set_resolved_in_release':
+         return (data.version ?
+           t('%(author)s marked this issue as resolved in %(version)s', {
+diff --git a/src/sentry/static/sentry/less/includes/simple-slider.less b/src/sentry/static/sentry/less/includes/simple-slider.less
+index 76c9c27e5f..f240fc0563 100644
+--- a/src/sentry/static/sentry/less/includes/simple-slider.less
++++ b/src/sentry/static/sentry/less/includes/simple-slider.less
+@@ -1,6 +1,7 @@
+ .slider {
+   width: 300px;
+   padding-right: 100px;
++  position: relative;
+ 
+   > .dragger {
+     background: lighten(#4593DE, 5%);
+@@ -23,7 +24,7 @@
+   }
+ 
+   > .value {
+-    top: -1px;
++    top: -4px;
+     position: absolute;
+     right: -100px;
+     width: 80px;
+diff --git a/src/sentry/tasks/auto_resolve_issues.py b/src/sentry/tasks/auto_resolve_issues.py
+new file mode 100644
+index 0000000000..c56abff470
+--- /dev/null
++++ b/src/sentry/tasks/auto_resolve_issues.py
+@@ -0,0 +1,96 @@
++from __future__ import absolute_import, print_function
++
++from collections import defaultdict
++from datetime import datetime, timedelta
++from django.utils import timezone
++from time import time
++
++from sentry.models import (
++    Activity, Group, GroupStatus, Project, ProjectOption
++)
++from sentry.tasks.base import instrumented_task
++
++ONE_HOUR = 3600
++
++
++@instrumented_task(name='sentry.tasks.schedule_auto_resolution',
++                   time_limit=15,
++                   soft_time_limit=10)
++def schedule_auto_resolution():
++    options = ProjectOption.objects.filter(
++        key__in=['sentry:resolve_age', 'sentry:_last_auto_resolve'],
++    )
++    opts_by_project = defaultdict(dict)
++    for opt in options:
++        opts_by_project[opt.project_id][opt.key] = opt.value
++
++    cutoff = time() - ONE_HOUR
++    for project_id, options in opts_by_project.iteritems():
++        if not options.get('sentry:resolve_age'):
++            # kill the option to avoid it coming up in the future
++            ProjectOption.objects.filter(
++                key__in=['sentry:_last_auto_resolve', 'sentry:resolve_age'],
++                project=project_id,
++            ).delete()
++            continue
++
++        if int(options.get('sentry:_last_auto_resolve', 0)) > cutoff:
++            continue
++
++        auto_resolve_project_issues.delay(
++            project_id=project_id,
++            expires=ONE_HOUR,
++        )
++
++
++@instrumented_task(name='sentry.tasks.auto_resolve_project_issues',
++                   time_limit=15,
++                   soft_time_limit=10)
++def auto_resolve_project_issues(project_id, cutoff=None, chunk_size=1000,
++                                **kwargs):
++    project = Project.objects.get_from_cache(id=project_id)
++
++    age = project.get_option('sentry:resolve_age', None)
++    if not age:
++        return
++
++    project.update_option('sentry:_last_auto_resolve', int(time()))
++
++    if cutoff:
++        cutoff = datetime.utcfromtimestamp(cutoff, tzinfo=timezone.utc)
++    else:
++        cutoff = timezone.now() - timedelta(hours=int(age))
++
++    queryset = list(Group.objects.filter(
++        project=project,
++        last_seen__lte=cutoff,
++        status=GroupStatus.UNRESOLVED,
++    )[:chunk_size])
++
++    might_have_more = len(queryset) == chunk_size
++
++    for group in queryset:
++        happened = Group.objects.filter(
++            id=group.id,
++            status=GroupStatus.UNRESOLVED,
++        ).update(
++            status=GroupStatus.RESOLVED,
++            resolved_at=timezone.now(),
++        )
++
++        if happened:
++            Activity.objects.create(
++                group=group,
++                project=project,
++                type=Activity.SET_RESOLVED_BY_AGE,
++                data={
++                    'age': age,
++                },
++            )
++
++    if might_have_more:
++        auto_resolve_project_issues.delay(
++            project_id=project_id,
++            cutoff=int(cutoff.strftime('%s')),
++            chunk_size=chunk_size,
++        )
+diff --git a/src/sentry/templates/sentry/projects/manage.html b/src/sentry/templates/sentry/projects/manage.html
+index b28b0e9d38..432c948441 100644
+--- a/src/sentry/templates/sentry/projects/manage.html
++++ b/src/sentry/templates/sentry/projects/manage.html
+@@ -49,6 +49,7 @@
+       </div>
+       <div class="box-content with-padding">
+         {{ form.resolve_age|as_crispy_field }}
++        <p><small><strong>Note: Enabling auto resolve will immediately resolve anything that has not been seen within this period of time. There is no undo!</strong></small></p>
+         {{ form.scrub_data|as_crispy_field }}
+         {{ form.scrub_defaults|as_crispy_field }}
+         {{ form.sensitive_fields|as_crispy_field }}
+diff --git a/src/sentry/web/frontend/project_settings.py b/src/sentry/web/frontend/project_settings.py
+index 3b6fe3409a..10c69f5f9e 100644
+--- a/src/sentry/web/frontend/project_settings.py
++++ b/src/sentry/web/frontend/project_settings.py
+@@ -34,7 +34,7 @@ class EditProjectForm(forms.ModelForm):
+         help_text=_('Outbound requests matching Allowed Domains will have the header "X-Sentry-Token: {token}" appended.'))
+     resolve_age = RangeField(label=_('Auto resolve'), required=False,
+         min_value=0, max_value=168, step_value=1,
+-        help_text=_('Treat an event as resolved if it hasn\'t been seen for this amount of time.'))
++        help_text=_('Automatically resolve an issue if it hasn\'t been seen for this amount of time.'))
+     scrub_data = forms.BooleanField(
+         label=_('Data Scrubber'),
+         help_text=_('Enable server-side data scrubbing.'),
+diff --git a/tests/sentry/tasks/test_auto_resolve_issues.py b/tests/sentry/tasks/test_auto_resolve_issues.py
+new file mode 100644
+index 0000000000..13d7613643
+--- /dev/null
++++ b/tests/sentry/tasks/test_auto_resolve_issues.py
+@@ -0,0 +1,66 @@
++from __future__ import absolute_import
++
++from datetime import timedelta
++from django.utils import timezone
++from time import time
++
++from sentry.models import Group, GroupStatus
++from sentry.tasks.auto_resolve_issues import schedule_auto_resolution
++from sentry.testutils import TestCase
++
++
++class ScheduleAutoResolutionTest(TestCase):
++    def test_task_persistent_name(self):
++        assert schedule_auto_resolution.name == 'sentry.tasks.schedule_auto_resolution'
++
++    def test_simple(self):
++        project = self.create_project()
++        project2 = self.create_project()
++        project3 = self.create_project()
++        project4 = self.create_project()
++
++        current_ts = int(time()) - 1
++
++        project.update_option('sentry:resolve_age', 1)
++        project3.update_option('sentry:resolve_age', 1)
++        project3.update_option('sentry:_last_auto_resolve', current_ts)
++        project4.update_option('sentry:_last_auto_resolve', current_ts)
++
++        group1 = self.create_group(
++            project=project,
++            status=GroupStatus.UNRESOLVED,
++            last_seen=timezone.now() - timedelta(days=1),
++        )
++
++        group2 = self.create_group(
++            project=project,
++            status=GroupStatus.UNRESOLVED,
++            last_seen=timezone.now(),
++        )
++
++        group3 = self.create_group(
++            project=project3,
++            status=GroupStatus.UNRESOLVED,
++            last_seen=timezone.now() - timedelta(days=1),
++        )
++
++        with self.tasks():
++            schedule_auto_resolution()
++
++        assert Group.objects.get(
++            id=group1.id,
++        ).status == GroupStatus.RESOLVED
++
++        assert Group.objects.get(
++            id=group2.id,
++        ).status == GroupStatus.UNRESOLVED
++
++        assert Group.objects.get(
++            id=group3.id,
++        ).status == GroupStatus.UNRESOLVED
++
++        assert project.get_option('sentry:_last_auto_resolve') > current_ts
++        assert not project2.get_option('sentry:_last_auto_resolve')
++        assert project3.get_option('sentry:_last_auto_resolve') == current_ts
++        # this should get cleaned up since it had no resolve age set
++        assert not project4.get_option('sentry:_last_auto_resolve')

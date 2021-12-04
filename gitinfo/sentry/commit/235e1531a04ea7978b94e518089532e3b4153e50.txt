@@ -1,0 +1,967 @@
+commit 235e1531a04ea7978b94e518089532e3b4153e50
+Author: ted kaemming <t.kaemming+github@gmail.com>
+Date:   Mon May 23 14:00:25 2016 -0700
+
+    Replace memcached-based locks with abstract lock backend. (#3250)
+    
+    This replaces memcached-based locks with an abstract backend. Currently, only a Redis implementation is supported. This also introduces `sentry.utils.retries`, a module that contains various retry polices for callables.
+
+diff --git a/src/sentry/app.py b/src/sentry/app.py
+index 037e11f36b..a5f8e7b6d5 100644
+--- a/src/sentry/app.py
++++ b/src/sentry/app.py
+@@ -7,11 +7,16 @@ sentry.app
+ """
+ from __future__ import absolute_import
+ 
+-from django.conf import settings
+-from sentry.utils.imports import import_string
+ from threading import local
++
++from django.conf import settings
+ from raven.contrib.django.models import client
+ 
++from sentry.utils import redis
++from sentry.utils.imports import import_string
++from sentry.utils.locking.backends.redis import RedisLockBackend
++from sentry.utils.locking.manager import LockManager
++
+ 
+ class State(local):
+     request = None
+@@ -37,3 +42,4 @@ ratelimiter = get_instance(
+ search = get_instance(settings.SENTRY_SEARCH, settings.SENTRY_SEARCH_OPTIONS)
+ tsdb = get_instance(settings.SENTRY_TSDB, settings.SENTRY_TSDB_OPTIONS)
+ raven = client
++locks = LockManager(RedisLockBackend(redis.clusters.get('default')))
+diff --git a/src/sentry/auth/helper.py b/src/sentry/auth/helper.py
+index 4b76ab3b4a..454a0e9b8c 100644
+--- a/src/sentry/auth/helper.py
++++ b/src/sentry/auth/helper.py
+@@ -1,25 +1,26 @@
+ from __future__ import absolute_import, print_function
+ 
+ import logging
++from hashlib import md5
++from uuid import uuid4
+ 
+ from django.conf import settings
+-from django.core.urlresolvers import reverse
+ from django.contrib import messages
++from django.core.urlresolvers import reverse
+ from django.db import transaction
+ from django.http import HttpResponseRedirect
+ from django.utils import timezone
+ from django.utils.translation import ugettext_lazy as _
+-from hashlib import md5
+-from uuid import uuid4
+ 
++from sentry.app import locks
+ from sentry.models import (
+     AuditLogEntry, AuditLogEntryEvent, AuthIdentity, AuthProvider, Organization,
+     OrganizationMember, OrganizationMemberTeam, User
+ )
+ from sentry.tasks.auth import email_missing_links
+ from sentry.utils import auth
+-from sentry.utils.cache import Lock
+ from sentry.utils.http import absolute_uri
++from sentry.utils.retries import TimedRetryPolicy
+ from sentry.web.forms.accounts import AuthenticationForm
+ from sentry.web.helpers import render_to_response
+ 
+@@ -455,11 +456,14 @@ class AuthHelper(object):
+         their account.
+         """
+         auth_provider = self.auth_provider
+-        lock_key = 'sso:auth:{}:{}'.format(
+-            auth_provider.id,
+-            md5(unicode(identity['id'])).hexdigest(),
++        lock = locks.get(
++            'sso:auth:{}:{}'.format(
++                auth_provider.id,
++                md5(unicode(identity['id'])).hexdigest(),
++            ),
++            duration=5,
+         )
+-        with Lock(lock_key, timeout=5):
++        with TimedRetryPolicy(5)(lock.acquire):
+             try:
+                 auth_identity = AuthIdentity.objects.get(
+                     auth_provider=auth_provider,
+diff --git a/src/sentry/digests/backends/redis.py b/src/sentry/digests/backends/redis.py
+index 974380cefe..0d79a7105c 100644
+--- a/src/sentry/digests/backends/redis.py
++++ b/src/sentry/digests/backends/redis.py
+@@ -10,7 +10,8 @@ from redis.exceptions import ResponseError, WatchError
+ 
+ from sentry.digests import Record, ScheduleEntry
+ from sentry.digests.backends.base import Backend, InvalidState
+-from sentry.utils.cache import Lock
++from sentry.utils.locking.backends.redis import RedisLockBackend
++from sentry.utils.locking.manager import LockManager
+ from sentry.utils.redis import (
+     check_cluster_versions, get_cluster_from_options, load_script
+ )
+@@ -110,6 +111,7 @@ class RedisBackend(Backend):
+     """
+     def __init__(self, **options):
+         self.cluster, options = get_cluster_from_options('SENTRY_DIGESTS_OPTIONS', options)
++        self.locks = LockManager(RedisLockBackend(self.cluster))
+ 
+         self.namespace = options.pop('namespace', 'd')
+ 
+@@ -191,7 +193,13 @@ class RedisBackend(Backend):
+     def __schedule_partition(self, host, deadline, chunk):
+         connection = self.cluster.get_local_client(host)
+ 
+-        with Lock('{0}:s:{1}'.format(self.namespace, host), nowait=True, timeout=30):
++        lock = self.locks.get(
++            '{0}:s:{1}'.format(self.namespace, host),
++            duration=30,
++            routing_key=host,
++        )
++
++        with lock.acquire():
+             # Prevent a runaway loop by setting a maximum number of
+             # iterations. Note that this limits the total number of
+             # expected items in any specific scheduling interval to chunk *
+@@ -281,8 +289,17 @@ class RedisBackend(Backend):
+                 returning ``None``.
+                 """
+                 key, timestamp = item
+-                lock = Lock(make_timeline_key(self.namespace, key), timeout=5, nowait=True)
+-                return lock if lock.acquire() else None, item
++                timeline_key = make_timeline_key(self.namespace, key),
++                lock = self.locks.get(
++                    timeline_key,
++                    duration=5,
++                    routing_key=timeline_key,
++                )
++                try:
++                    lock.acquire()
++                except Exception:
++                    lock = None
++                return lock, item
+ 
+             # Try to take out a lock on each item. If we can't acquire the
+             # lock, that means this is currently being digested and cannot
+@@ -397,7 +414,8 @@ class RedisBackend(Backend):
+ 
+         connection = self.cluster.get_local_client_for_key(timeline_key)
+ 
+-        with Lock(timeline_key, nowait=True, timeout=30):
++        lock = self.locks.get(timeline_key, duration=30, routing_key=timeline_key)
++        with lock.acquire():
+             # Check to ensure the timeline is in the correct state ("ready")
+             # before sending. This acts as a throttling mechanism to prevent
+             # sending a digest before it's next scheduled delivery time in a
+@@ -495,8 +513,9 @@ class RedisBackend(Backend):
+         timeline_key = make_timeline_key(self.namespace, key)
+ 
+         connection = self.cluster.get_local_client_for_key(timeline_key)
+-        with Lock(timeline_key, nowait=True, timeout=30), \
+-                connection.pipeline() as pipeline:
++
++        lock = self.locks.get(timeline_key, duration=30, routing_key=timeline_key)
++        with lock.acquire(), connection.pipeline() as pipeline:
+             truncate_timeline(pipeline, (timeline_key,), (0, timeline_key))
+             truncate_timeline(pipeline, (make_digest_key(timeline_key),), (0, timeline_key))
+             pipeline.delete(make_last_processed_timestamp_key(timeline_key))
+diff --git a/src/sentry/models/file.py b/src/sentry/models/file.py
+index f6b26a6fbb..3d9c0f61e6 100644
+--- a/src/sentry/models/file.py
++++ b/src/sentry/models/file.py
+@@ -8,20 +8,23 @@ sentry.models.file
+ 
+ from __future__ import absolute_import
+ 
++from hashlib import sha1
++from uuid import uuid4
++
+ from django.conf import settings
+-from django.core.files.base import ContentFile, File as FileObj
++from django.core.files.base import File as FileObj
++from django.core.files.base import ContentFile
+ from django.core.files.storage import get_storage_class
+ from django.db import models
+ from django.utils import timezone
+-from hashlib import sha1
+ from jsonfield import JSONField
+-from uuid import uuid4
+ 
++from sentry.app import locks
+ from sentry.db.models import (
+     BoundedPositiveIntegerField, FlexibleForeignKey, Model
+ )
+ from sentry.utils import metrics
+-from sentry.utils.cache import Lock
++from sentry.utils.retries import TimedRetryPolicy
+ 
+ ONE_DAY = 60 * 60 * 24
+ 
+@@ -57,10 +60,10 @@ class FileBlob(Model):
+             checksum.update(chunk)
+         checksum = checksum.hexdigest()
+ 
+-        lock_key = 'fileblob:upload:{}'.format(checksum)
+         # TODO(dcramer): the database here is safe, but if this lock expires
+         # and duplicate files are uploaded then we need to prune one
+-        with Lock(lock_key, timeout=600):
++        lock = locks.get('fileblob:upload:{}'.format(checksum), duration=60 * 10)
++        with TimedRetryPolicy(60)(lock.acquire):
+             # test for presence
+             try:
+                 existing = FileBlob.objects.get(checksum=checksum)
+@@ -90,8 +93,8 @@ class FileBlob(Model):
+         return '/'.join(pieces)
+ 
+     def delete(self, *args, **kwargs):
+-        lock_key = 'fileblob:upload:{}'.format(self.checksum)
+-        with Lock(lock_key, timeout=600):
++        lock = locks.get('fileblob:upload:{}'.format(self.checksum), duration=60 * 10)
++        with TimedRetryPolicy(60)(lock.acquire):
+             if self.path:
+                 self.deletefile(commit=False)
+             super(FileBlob, self).delete(*args, **kwargs)
+diff --git a/src/sentry/models/organization.py b/src/sentry/models/organization.py
+index 594eab2297..ed9a15bb2c 100644
+--- a/src/sentry/models/organization.py
++++ b/src/sentry/models/organization.py
+@@ -15,13 +15,13 @@ from django.utils.functional import cached_property
+ from django.utils.translation import ugettext_lazy as _
+ 
+ from sentry import roles
++from sentry.app import locks
+ from sentry.constants import RESERVED_ORGANIZATION_SLUGS
+ from sentry.db.models import (
+-    BaseManager, BoundedPositiveIntegerField, Model,
+-    sane_repr
++    BaseManager, BoundedPositiveIntegerField, Model, sane_repr
+ )
+ from sentry.db.models.utils import slugify_instance
+-from sentry.utils.cache import Lock
++from sentry.utils.retries import TimedRetryPolicy
+ 
+ 
+ # TODO(dcramer): pull in enum library
+@@ -111,8 +111,8 @@ class Organization(Model):
+ 
+     def save(self, *args, **kwargs):
+         if not self.slug:
+-            lock_key = 'slug:organization'
+-            with Lock(lock_key):
++            lock = locks.get('slug:organization', duration=5)
++            with TimedRetryPolicy(10)(lock.acquire):
+                 slugify_instance(self, self.name,
+                                  reserved=RESERVED_ORGANIZATION_SLUGS)
+             super(Organization, self).save(*args, **kwargs)
+diff --git a/src/sentry/models/project.py b/src/sentry/models/project.py
+index 739aad4ebb..3ba9b88358 100644
+--- a/src/sentry/models/project.py
++++ b/src/sentry/models/project.py
+@@ -17,14 +17,15 @@ from django.db.models import F
+ from django.utils import timezone
+ from django.utils.translation import ugettext_lazy as _
+ 
++from sentry.app import locks
+ from sentry.db.models import (
+     BaseManager, BoundedPositiveIntegerField, FlexibleForeignKey, Model,
+     sane_repr
+ )
+ from sentry.db.models.utils import slugify_instance
+-from sentry.utils.cache import Lock
+-from sentry.utils.http import absolute_uri
+ from sentry.utils.colors import get_hashed_color
++from sentry.utils.http import absolute_uri
++from sentry.utils.retries import TimedRetryPolicy
+ 
+ 
+ # TODO(dcramer): pull in enum library
+@@ -110,8 +111,8 @@ class Project(Model):
+ 
+     def save(self, *args, **kwargs):
+         if not self.slug:
+-            lock_key = 'slug:project'
+-            with Lock(lock_key):
++            lock = locks.get('slug:project', duration=5)
++            with TimedRetryPolicy(10)(lock.acquire):
+                 slugify_instance(self, self.name, organization=self.organization)
+             super(Project, self).save(*args, **kwargs)
+         else:
+diff --git a/src/sentry/models/team.py b/src/sentry/models/team.py
+index 9cbd1fc08e..0a620086ca 100644
+--- a/src/sentry/models/team.py
++++ b/src/sentry/models/team.py
+@@ -14,13 +14,13 @@ from django.db import models
+ from django.utils import timezone
+ from django.utils.translation import ugettext_lazy as _
+ 
+-from sentry.app import env
++from sentry.app import env, locks
+ from sentry.db.models import (
+     BaseManager, BoundedPositiveIntegerField, FlexibleForeignKey, Model,
+     sane_repr
+ )
+ from sentry.db.models.utils import slugify_instance
+-from sentry.utils.cache import Lock
++from sentry.utils.retries import TimedRetryPolicy
+ 
+ 
+ class TeamManager(BaseManager):
+@@ -113,8 +113,8 @@ class Team(Model):
+ 
+     def save(self, *args, **kwargs):
+         if not self.slug:
+-            lock_key = 'slug:team'
+-            with Lock(lock_key):
++            lock = locks.get('slug:team', duration=5)
++            with TimedRetryPolicy(10)(lock.acquire):
+                 slugify_instance(self, self.name, organization=self.organization)
+             super(Team, self).save(*args, **kwargs)
+         else:
+diff --git a/src/sentry/scripts/utils/locking/delete_lock.lua b/src/sentry/scripts/utils/locking/delete_lock.lua
+new file mode 100644
+index 0000000000..63f3221b28
+--- /dev/null
++++ b/src/sentry/scripts/utils/locking/delete_lock.lua
+@@ -0,0 +1,12 @@
++local key = KEYS[1]
++local uuid = ARGV[1]
++
++local value = redis.call('GET', key)
++if not value then
++    return redis.error_reply(string.format("No lock at key exists at key: %s", key))
++elseif value ~= uuid then
++    return redis.error_reply(string.format("Lock at %s was set by %s, and cannot be released by %s.", key, value, uuid))
++else
++    redis.call('DEL', key)
++    return redis.status_reply("OK")
++end
+diff --git a/src/sentry/south_migrations/0213_migrate_file_blobs.py b/src/sentry/south_migrations/0213_migrate_file_blobs.py
+index 736a335426..13edf55eb8 100644
+--- a/src/sentry/south_migrations/0213_migrate_file_blobs.py
++++ b/src/sentry/south_migrations/0213_migrate_file_blobs.py
+@@ -1,20 +1,22 @@
+ # -*- coding: utf-8 -*-
+ from collections import defaultdict
+-from south.utils import datetime_utils as datetime
++
++from django.db import models
+ from south.db import db
++from south.utils import datetime_utils as datetime
+ from south.v2 import DataMigration
+-from django.db import models
+ 
+ 
+ class Migration(DataMigration):
+     def _ensure_blob(self, orm, file):
+-        from sentry.utils.cache import Lock
++        from sentry.app import locks
++        from sentry.utils.retries import TimedRetryPolicy
+ 
+         File = orm['sentry.File']
+         FileBlob = orm['sentry.FileBlob']
+ 
+-        lock_key = 'fileblob:convert:{}'.format(file.checksum)
+-        with Lock(lock_key, timeout=60):
++        lock = locks.get('fileblob:convert:{}'.format(file.checksum), duration=60)
++        with TimedRetryPolicy(60 * 5)(lock.acquire):
+             if not file.storage:
+                 return
+ 
+diff --git a/src/sentry/tasks/process_buffer.py b/src/sentry/tasks/process_buffer.py
+index 0fce3a7754..12d5b8b2a9 100644
+--- a/src/sentry/tasks/process_buffer.py
++++ b/src/sentry/tasks/process_buffer.py
+@@ -9,7 +9,6 @@ sentry.tasks.process_buffer
+ from __future__ import absolute_import
+ 
+ from sentry.tasks.base import instrumented_task
+-from sentry.utils.cache import Lock, UnableToGetLock
+ 
+ 
+ @instrumented_task(
+@@ -19,12 +18,9 @@ def process_pending():
+     Process pending buffers.
+     """
+     from sentry import app
+-    lock_key = 'buffer:process_pending'
+-    try:
+-        with Lock(lock_key, nowait=True, timeout=60):
+-            app.buffer.process_pending()
+-    except UnableToGetLock:
+-        pass
++    lock = app.locks.get('buffer:process_pending', duration=60)
++    with lock.acquire():
++        app.buffer.process_pending()
+ 
+ 
+ @instrumented_task(
+diff --git a/src/sentry/utils/cache.py b/src/sentry/utils/cache.py
+index 9cb95b52d1..7aebcef7da 100644
+--- a/src/sentry/utils/cache.py
++++ b/src/sentry/utils/cache.py
+@@ -8,124 +8,11 @@ sentry.utils.cache
+ from __future__ import absolute_import, print_function
+ 
+ import functools
+-import logging
+-import random
+ 
+ from django.core.cache import cache
+-from time import sleep, time
+ 
+-default_cache = cache
+-
+-logger = logging.getLogger(__name__)
+-
+-
+-class UnableToGetLock(Exception):
+-    pass
+-
+-
+-class LockAlreadyHeld(UnableToGetLock):
+-    pass
+ 
+-
+-class Lock(object):
+-    """
+-    Uses the defined cache backend to create a lock.
+-
+-    >>> with Lock('key name'):
+-    >>>     # do something
+-    """
+-    def __init__(self, lock_key, timeout=3, cache=None, nowait=False):
+-        if cache is None:
+-            self.cache = default_cache
+-        else:
+-            self.cache = cache
+-        self.timeout = timeout
+-        self.lock_key = lock_key
+-        self.nowait = nowait
+-
+-        self.__acquired_at = None
+-
+-    def __repr__(self):
+-        return '<Lock: %r>' % (self.lock_key,)
+-
+-    def acquire(self):
+-        """
+-        Attempt to acquire the lock, returning a boolean that represents if the
+-        lock is held.
+-        """
+-        # NOTE: This isn't API compatible with the standard Python
+-        # ``Lock.acquire`` method signature. It may make sense to make these
+-        # compatible in the future, but that would also require changes to the
+-        # the constructor: https://docs.python.org/2/library/threading.html#lock-objects
+-
+-        time_remaining = self.seconds_remaining
+-        if time_remaining:
+-            raise LockAlreadyHeld('Tried to acquire lock that is already held, %.3fs remaining: %r' % (time_remaining, self))
+-
+-        self.__acquired_at = None
+-
+-        delay = 0.01 + random.random() / 10
+-        for i in xrange(int(self.timeout // delay)):
+-            if i != 0:
+-                sleep(delay)
+-
+-            attempt_started_at = time()
+-            if self.cache.add(self.lock_key, '', self.timeout):
+-                self.__acquired_at = attempt_started_at
+-                break
+-
+-            if self.nowait:
+-                break
+-
+-        return self.__acquired_at is not None
+-
+-    def release(self):
+-        """
+-        Release the lock.
+-        """
+-        # If we went over the lock duration (timeout), we need to exit to avoid
+-        # accidentally releasing a lock that was acquired by another process.
+-        if not self.held:
+-            logger.warning('Tried to release unheld lock: %r', self)
+-            return False
+-
+-        try:
+-            # XXX: There is a possible race condition here -- this could be
+-            # actually past the timeout due to clock skew or the delete
+-            # operation could reach the server after the timeout for a variety
+-            # of reasons. The only real fix for this would be to use a check
+-            # and delete operation, but that is backend dependent and not
+-            # supported by the cache API.
+-            self.cache.delete(self.lock_key)
+-        except Exception as e:
+-            logger.exception(e)
+-        finally:
+-            self.__acquired_at = None
+-
+-        return True
+-
+-    @property
+-    def seconds_remaining(self):
+-        if self.__acquired_at is None:
+-            return 0
+-
+-        lifespan = time() - self.__acquired_at
+-        return max(self.timeout - lifespan, 0)
+-
+-    @property
+-    def held(self):
+-        return bool(self.seconds_remaining)
+-
+-    def __enter__(self):
+-        start = time()
+-
+-        if not self.acquire():
+-            raise UnableToGetLock('Unable to fetch lock after %.3fs: %r' % (time() - start, self,))
+-
+-        return self
+-
+-    def __exit__(self, exc_type, exc_value, traceback):
+-        self.release()
++default_cache = cache
+ 
+ 
+ class memoize(object):
+diff --git a/src/sentry/utils/locking/__init__.py b/src/sentry/utils/locking/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/src/sentry/utils/locking/backends/__init__.py b/src/sentry/utils/locking/backends/__init__.py
+new file mode 100644
+index 0000000000..b229442a0f
+--- /dev/null
++++ b/src/sentry/utils/locking/backends/__init__.py
+@@ -0,0 +1,24 @@
++class LockBackend(object):
++    """
++    Interface for providing lock behavior that is used by the
++    ``sentry.utils.locking.Lock`` class.
++    """
++    def acquire(self, key, duration, routing_key=None):
++        """
++        Acquire a lock, represented by the given key for the given duration (in
++        seconds.) This method should attempt to acquire the lock once, in a
++        non-blocking fashion, allowing attempt retry policies to be defined
++        separately. A routing key may also be provided to control placement,
++        but how or if it is implemented is dependent on the specific backend
++        implementation.
++
++        The return value is not used. If the lock cannot be acquired, an
++        exception should be raised.
++        """
++        raise NotImplementedError
++
++    def release(self, key, routing_key=None):
++        """
++        Release a lock. The return value is not used.
++        """
++        raise NotImplementedError
+diff --git a/src/sentry/utils/locking/backends/redis.py b/src/sentry/utils/locking/backends/redis.py
+new file mode 100644
+index 0000000000..40741ebfb7
+--- /dev/null
++++ b/src/sentry/utils/locking/backends/redis.py
+@@ -0,0 +1,50 @@
++from uuid import uuid4
++
++from sentry.utils import redis
++from sentry.utils.locking.backends import LockBackend
++
++delete_lock = redis.load_script('utils/locking/delete_lock.lua')
++
++
++class RedisLockBackend(LockBackend):
++    def __init__(self, cluster, prefix='l:', uuid=None):
++        if uuid is None:
++            uuid = uuid4().hex
++
++        self.cluster = cluster
++        self.prefix = prefix
++        self.uuid = uuid
++
++    def get_client(self, key, routing_key=None):
++        # This is a bit of an abstraction leak, but if an integer is provided
++        # we use that value to determine placement rather than the cluster
++        # router. This leaking allows us us to have more fine-grained control
++        # when data is already placed within partitions where the router
++        # wouldn't have placed it based on the key hash, and maintain data
++        # locality and failure isolation within those partitions. (For example,
++        # the entirety of a digest is bound to a specific partition by the
++        # *digest* key, even though a digest is composed of multiple values at
++        # different keys that would otherwise be placed on different
++        # partitions.)
++        if isinstance(routing_key, (int, long)):
++            index = routing_key % len(self.cluster.hosts)
++            return self.cluster.get_local_client(index)
++
++        if routing_key is not None:
++            key = routing_key
++        else:
++            key = self.prefix_key(key)
++
++        return self.cluster.get_local_client_for_key(key)
++
++    def prefix_key(self, key):
++        return u'{}{}'.format(self.prefix, key)
++
++    def acquire(self, key, duration, routing_key=None):
++        client = self.get_client(key, routing_key)
++        if client.set(self.prefix_key(key), self.uuid, ex=duration, nx=True) is not True:
++            raise Exception('Could not acquire lock!')
++
++    def release(self, key, routing_key=None):
++        client = self.get_client(key, routing_key)
++        delete_lock(client, (self.prefix_key(key),), (self.uuid,))
+diff --git a/src/sentry/utils/locking/lock.py b/src/sentry/utils/locking/lock.py
+new file mode 100644
+index 0000000000..1868100970
+--- /dev/null
++++ b/src/sentry/utils/locking/lock.py
+@@ -0,0 +1,46 @@
++import logging
++from contextlib import contextmanager
++
++logger = logging.getLogger(__name__)
++
++
++class Lock(object):
++    def __init__(self, backend, key, duration, routing_key=None):
++        self.backend = backend
++        self.key = key
++        self.duration = duration
++        self.routing_key = routing_key
++
++    def __repr__(self):
++        return '<Lock: {!r}>'.format(self.key)
++
++    def acquire(self):
++        """
++        Attempt to acquire the lock.
++
++        If the lock is successfully acquired, this method returns a context
++        manager that will automatically release the lock when exited. If the
++        lock cannot be acquired, an exception will be raised.
++        """
++        self.backend.acquire(self.key, self.duration, self.routing_key)
++
++        @contextmanager
++        def releaser():
++            try:
++                yield
++            finally:
++                self.release()
++
++        return releaser()
++
++    def release(self):
++        """
++        Attempt to release the lock.
++
++        Any exceptions raised when attempting to release the lock are logged
++        and supressed.
++        """
++        try:
++            self.backend.release(self.key, self.routing_key)
++        except Exception as error:
++            logger.warning('Failed to release %r due to error: %r', self, error, exc_info=True)
+diff --git a/src/sentry/utils/locking/manager.py b/src/sentry/utils/locking/manager.py
+new file mode 100644
+index 0000000000..e479dc5e1b
+--- /dev/null
++++ b/src/sentry/utils/locking/manager.py
+@@ -0,0 +1,12 @@
++from sentry.utils.locking.lock import Lock
++
++
++class LockManager(object):
++    def __init__(self, backend):
++        self.backend = backend
++
++    def get(self, key, duration, routing_key=None):
++        """
++        Retrieve a ``Lock`` instance.
++        """
++        return Lock(self.backend, key, duration, routing_key)
+diff --git a/src/sentry/utils/retries.py b/src/sentry/utils/retries.py
+new file mode 100644
+index 0000000000..b15856417a
+--- /dev/null
++++ b/src/sentry/utils/retries.py
+@@ -0,0 +1,60 @@
++from __future__ import absolute_import
++
++import itertools
++import logging
++import random
++import time
++
++logger = logging.getLogger(__name__)
++
++
++class RetryException(Exception):
++    def __init__(self, message, exception):
++        self.message = message
++        self.exception = exception
++
++
++class RetryPolicy(object):
++    def __call__(self, function):
++        raise NotImplementedError
++
++
++class TimedRetryPolicy(RetryPolicy):
++    """
++    A time-based policy that can be used to retry a callable in the case of
++    failure as many times as possible up to the ``timeout`` value (in seconds.)
++
++    The ``delay`` function accepts one argument, a number which represents the
++    number of this attempt (starting at 1.)
++    """
++    def __init__(self, timeout, delay=None, exceptions=(Exception,)):
++        if delay is None:
++            # 100ms +/- 50ms of randomized jitter
++            delay = lambda i: 0.1 + ((random.random() - 0.5) / 10)
++
++        self.timeout = timeout
++        self.delay = delay
++        self.exceptions = exceptions
++
++    def __call__(self, function):
++        start = time.time()
++        for i in itertools.count(1):
++            try:
++                return function()
++            except self.exceptions as error:
++                delay = self.delay(i)
++                now = time.time()
++                if (now + delay) > (start + self.timeout):
++                    raise RetryException(
++                        'Could not successfully execute %r within %.3f seconds (%s attempts.)' % (function, now - start, i),
++                        error,
++                    )
++                else:
++                    logger.debug(
++                        'Failed to execute %r due to %r on attempt #%s, retrying in %s seconds...',
++                        function,
++                        error,
++                        i,
++                        delay,
++                    )
++                    time.sleep(delay)
+diff --git a/tests/sentry/utils/locking/__init__.py b/tests/sentry/utils/locking/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/tests/sentry/utils/locking/backends/__init__.py b/tests/sentry/utils/locking/backends/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/tests/sentry/utils/locking/backends/test_redis.py b/tests/sentry/utils/locking/backends/test_redis.py
+new file mode 100644
+index 0000000000..e95af8103f
+--- /dev/null
++++ b/tests/sentry/utils/locking/backends/test_redis.py
+@@ -0,0 +1,50 @@
++import pytest
++from exam import fixture
++
++from sentry.testutils import TestCase
++from sentry.utils.locking.backends.redis import RedisLockBackend
++from sentry.utils.redis import clusters
++
++
++class RedisLockBackendTestCase(TestCase):
++    @fixture
++    def cluster(self):
++        return clusters.get('default')
++
++    @fixture
++    def backend(self):
++        return RedisLockBackend(self.cluster)
++
++    def test_success(self):
++        key = u"\U0001F4A9"
++        duration = 60
++        full_key = self.backend.prefix_key(key)
++        client = self.backend.get_client(key)
++
++        self.backend.acquire(key, duration)
++        assert client.get(full_key) == self.backend.uuid
++        assert duration - 2 < float(client.ttl(full_key)) <= duration
++
++        self.backend.release(key)
++        assert client.exists(full_key) is False
++
++    def test_acquire_fail_on_conflict(self):
++        key = 'lock'
++        duration = 60
++
++        other_cluster = RedisLockBackend(self.cluster)
++        other_cluster.acquire(key, duration)
++        with pytest.raises(Exception):
++            self.backend.acquire(key, duration)
++
++    def test_release_fail_on_missing(self):
++        with pytest.raises(Exception):
++            self.backend.release('missing-key')
++
++    def test_release_fail_on_conflict(self):
++        key = 'lock'
++        duration = 60
++        self.backend.get_client(key).set(self.backend.prefix_key(key), 'someone-elses-uuid')
++
++        with pytest.raises(Exception):
++            self.backend.acquire(key, duration)
+diff --git a/tests/sentry/utils/locking/test_lock.py b/tests/sentry/utils/locking/test_lock.py
+new file mode 100644
+index 0000000000..b4f9bddf75
+--- /dev/null
++++ b/tests/sentry/utils/locking/test_lock.py
+@@ -0,0 +1,48 @@
++import mock
++
++from sentry.testutils import TestCase
++from sentry.utils.locking.backends import LockBackend
++from sentry.utils.locking.lock import Lock
++
++
++class LockTestCase(TestCase):
++    def test_procedural_interface(self):
++        backend = mock.Mock(spec=LockBackend)
++        key = 'lock'
++        duration = 60
++        routing_key = None
++
++        lock = Lock(backend, key, duration, routing_key)
++
++        lock.acquire()
++        backend.acquire.assert_called_once_with(
++            key,
++            duration,
++            routing_key,
++        )
++
++        lock.release()
++        backend.release.assert_called_once_with(
++            key,
++            routing_key,
++        )
++
++    def test_context_manager_interface(self):
++        backend = mock.Mock(spec=LockBackend)
++        key = 'lock'
++        duration = 60
++        routing_key = None
++
++        lock = Lock(backend, key, duration, routing_key)
++
++        with lock.acquire():
++            backend.acquire.assert_called_once_with(
++                key,
++                duration,
++                routing_key,
++            )
++
++        backend.release.assert_called_once_with(
++            key,
++            routing_key,
++        )
+diff --git a/tests/sentry/utils/test_cache.py b/tests/sentry/utils/test_cache.py
+deleted file mode 100644
+index b6e39b3485..0000000000
+--- a/tests/sentry/utils/test_cache.py
++++ /dev/null
+@@ -1,55 +0,0 @@
+-from __future__ import absolute_import
+-
+-import functools
+-
+-import pytest
+-
+-from sentry.testutils import TestCase
+-from sentry.utils.cache import (
+-    Lock,
+-    LockAlreadyHeld,
+-    UnableToGetLock,
+-)
+-
+-
+-class LockTestCase(TestCase):
+-    def test_basic(self):
+-        timeout = 10
+-        lock = Lock('basic', timeout=timeout)
+-
+-        assert lock.held is False
+-        assert lock.seconds_remaining is 0
+-
+-        assert lock.acquire() is True
+-        assert timeout > lock.seconds_remaining > (timeout - 0.1)
+-        assert lock.held is True
+-
+-        with pytest.raises(LockAlreadyHeld):
+-            lock.acquire()
+-
+-        assert lock.release() is True
+-        assert lock.seconds_remaining is 0
+-        assert lock.held is False
+-        assert lock.release() is False
+-
+-    def test_context(self):
+-        timeout = 10
+-        lock = Lock('ctx', timeout=timeout)
+-
+-        with lock as result:
+-            assert lock is result
+-            assert lock.held is True
+-
+-        assert lock.held is False
+-
+-    def test_concurrent(self):
+-        make_lock = functools.partial(Lock, 'concurrent')
+-        first = make_lock()
+-        second = make_lock(nowait=True)
+-
+-        assert first.acquire() is True
+-        assert second.acquire() is False
+-
+-        with pytest.raises(UnableToGetLock):
+-            with second:
+-                pass
+diff --git a/tests/sentry/utils/test_retries.py b/tests/sentry/utils/test_retries.py
+new file mode 100644
+index 0000000000..9a3631b47d
+--- /dev/null
++++ b/tests/sentry/utils/test_retries.py
+@@ -0,0 +1,30 @@
++import mock
++
++from sentry.utils.retries import TimedRetryPolicy, RetryException
++from sentry.testutils import TestCase
++
++
++class TimedRetryPolicyTestCase(TestCase):
++    def test_policy_success(self):
++        bomb = Exception('Boom!')
++        callable = mock.MagicMock(side_effect=[bomb, mock.sentinel.OK])
++
++        retry = TimedRetryPolicy(30, delay=lambda i: 10)
++        with mock.patch('time.sleep'), mock.patch('time.time', side_effect=[0, 15]):
++            assert retry(callable) is mock.sentinel.OK
++            assert callable.call_count == 2
++
++    def test_policy_failure(self):
++        bomb = Exception('Boom!')
++        callable = mock.MagicMock(side_effect=bomb)
++
++        retry = TimedRetryPolicy(30, delay=lambda i: 10)
++        with mock.patch('time.sleep'), mock.patch('time.time', side_effect=[0, 15, 25]):
++            try:
++                retry(callable)
++            except RetryException as exception:
++                assert exception.exception is bomb
++            else:
++                self.fail('Expected {!r}!'.format(RetryException))
++
++            assert callable.call_count == 2

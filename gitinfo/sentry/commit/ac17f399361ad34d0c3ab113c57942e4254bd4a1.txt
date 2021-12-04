@@ -1,0 +1,508 @@
+commit ac17f399361ad34d0c3ab113c57942e4254bd4a1
+Author: Matt Robenolt <matt@ydekproductions.com>
+Date:   Fri Oct 21 15:01:21 2016 -0700
+
+    sourcemap: handle as bytes until absolutely needed (#4411)
+
+diff --git a/setup.py b/setup.py
+index 35d910bf36..e07cf08a99 100755
+--- a/setup.py
++++ b/setup.py
+@@ -110,7 +110,7 @@ install_requires = [
+     'lxml>=3.4.1',
+ 
+     'ipaddress>=1.0.16,<1.1.0',
+-    'libsourcemap>=0.4.5,<0.5.0',
++    'libsourcemap>=0.5.0,<0.6.0',
+     'mock>=0.8.0,<1.1',
+     'oauth2>=1.5.167',
+     'percy>=0.2.5',
+diff --git a/src/sentry/lang/javascript/cache.py b/src/sentry/lang/javascript/cache.py
+index d30f5ec115..e5805b631d 100644
+--- a/src/sentry/lang/javascript/cache.py
++++ b/src/sentry/lang/javascript/cache.py
+@@ -20,7 +20,34 @@ class SourceCache(object):
+ 
+     def get(self, url):
+         url = self._get_canonical_url(url)
+-        return self._cache.get(url)
++        try:
++            parsed, rv = self._cache[url]
++        except KeyError:
++            return None
++
++        # We have already gotten this file and we've
++        # decoded the response, so just return
++        if parsed:
++            return rv
++
++        # Otherwise, we have a 2-tuple that needs to be applied
++        body, encoding = rv
++
++        # Our body is lazily evaluated if it
++        # comes from libsourcemap
++        if callable(body):
++            body = body()
++
++        try:
++            body = body.decode(encoding or 'utf8', 'replace').split(u'\n')
++        except LookupError:
++            # We got an encoding that python doesn't support,
++            # so let's just coerce it to utf8
++            body = body.decode('utf8', 'replace').split(u'\n')
++
++        # Set back a marker to indicate we've parsed this url
++        self._cache[url] = (True, body)
++        return body
+ 
+     def get_errors(self, url):
+         url = self._get_canonical_url(url)
+@@ -35,9 +62,12 @@ class SourceCache(object):
+         else:
+             self._aliases[u2] = u1
+ 
+-    def add(self, url, source):
++    def add(self, url, source, encoding=None):
+         url = self._get_canonical_url(url)
+-        self._cache[url] = source
++        # Insert into the cache, an unparsed (source, encoding)
++        # tuple. This allows the source to be split and decoded
++        # on demand when first accessed.
++        self._cache[url] = (False, (source, encoding))
+ 
+     def add_error(self, url, error):
+         url = self._get_canonical_url(url)
+@@ -56,8 +86,8 @@ class SourceMapCache(object):
+     def link(self, url, sourcemap_url):
+         self._mapping[url] = sourcemap_url
+ 
+-    def add(self, sourcemap_url, sourcemap_index):
+-        self._cache[sourcemap_url] = sourcemap_index
++    def add(self, sourcemap_url, sourcemap_view):
++        self._cache[sourcemap_url] = sourcemap_view
+ 
+     def get(self, sourcemap_url):
+         return self._cache.get(sourcemap_url)
+diff --git a/src/sentry/lang/javascript/processor.py b/src/sentry/lang/javascript/processor.py
+index 3365425b53..c767779675 100644
+--- a/src/sentry/lang/javascript/processor.py
++++ b/src/sentry/lang/javascript/processor.py
+@@ -2,6 +2,7 @@ from __future__ import absolute_import, print_function
+ 
+ __all__ = ['SourceProcessor']
+ 
++import codecs
+ import logging
+ import re
+ import base64
+@@ -11,10 +12,10 @@ import zlib
+ 
+ from django.conf import settings
+ from django.core.exceptions import SuspiciousOperation
+-from django.utils.encoding import force_text
+ from collections import namedtuple
+ from os.path import splitext
+ from requests.exceptions import RequestException, Timeout
++from requests.utils import get_encoding_from_headers
+ from six.moves.urllib.parse import urlparse, urljoin, urlsplit
+ from libsourcemap import from_json as view_from_json
+ 
+@@ -65,8 +66,8 @@ MAX_URL_LENGTH = 150
+ # TODO(dcramer): we want to change these to be constants so they are easier
+ # to translate/link again
+ 
+-# UrlResult.body **must** be unicode
+-UrlResult = namedtuple('UrlResult', ['url', 'headers', 'body'])
++# UrlResult.body **must** be bytes
++UrlResult = namedtuple('UrlResult', ['url', 'headers', 'body', 'encoding'])
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -175,7 +176,7 @@ def discover_sourcemap(result):
+     sourcemap = result.headers.get('sourcemap', result.headers.get('x-sourcemap'))
+ 
+     if not sourcemap:
+-        parsed_body = result.body.split(u'\n')
++        parsed_body = result.body.split('\n')
+         # Source maps are only going to exist at either the top or bottom of the document.
+         # Technically, there isn't anything indicating *where* it should exist, so we
+         # are generous and assume it's somewhere either in the first or last 5 lines.
+@@ -188,7 +189,7 @@ def discover_sourcemap(result):
+         # We want to scan each line sequentially, and the last one found wins
+         # This behavior is undocumented, but matches what Chrome and Firefox do.
+         for line in possibilities:
+-            if line[:21] in (u'//# sourceMappingURL=', u'//@ sourceMappingURL='):
++            if line[:21] in ('//# sourceMappingURL=', '//@ sourceMappingURL='):
+                 # We want everything AFTER the indicator, which is 21 chars long
+                 sourcemap = line[21:].rstrip()
+ 
+@@ -272,36 +273,17 @@ def fetch_release_file(filename, release):
+             cache.set(cache_key, -1, 3600)
+             result = None
+         else:
+-            try:
+-                result = (releasefile.file.headers, body.decode('utf-8'), 200)
+-            except UnicodeDecodeError:
+-                error = {
+-                    'type': EventError.JS_INVALID_SOURCE_ENCODING,
+-                    'value': 'utf8',
+-                    'url': expose_url(releasefile.name),
+-                }
+-                raise CannotFetchSource(error)
+-            else:
+-                # Write the compressed version to cache, but return the deflated version
+-                cache.set(cache_key, (releasefile.file.headers, z_body, 200), 3600)
++            headers = {k.lower(): v for k, v in releasefile.file.headers.items()}
++            encoding = get_encoding_from_headers(headers)
++            result = (headers, body, 200, encoding)
++            cache.set(cache_key, (headers, z_body, 200, encoding), 3600)
+ 
+     elif result == -1:
+         # We cached an error, so normalize
+         # it down to None
+         result = None
+     else:
+-        # We got a cache hit, but the body is compressed, so we
+-        # need to decompress it before handing it off
+-        body = zlib.decompress(result[1])
+-        try:
+-            result = (result[0], body.decode('utf-8'), result[2])
+-        except UnicodeDecodeError:
+-            error = {
+-                'type': EventError.JS_INVALID_SOURCE_ENCODING,
+-                'value': 'utf8',
+-                'url': expose_url(releasefile.name),
+-            }
+-            raise CannotFetchSource(error)
++        result = (result[0], zlib.decompress(result[1]), result[2], result[3])
+ 
+     return result
+ 
+@@ -333,10 +315,15 @@ def fetch_file(url, project=None, release=None, allow_scraping=True):
+         logger.debug('Checking cache for url %r', url)
+         result = cache.get(cache_key)
+         if result is not None:
++            # Previous caches would be a 3-tuple instead of a 4-tuple,
++            # so this is being maintained for backwards compatibility
++            try:
++                encoding = result[3]
++            except IndexError:
++                encoding = None
+             # We got a cache hit, but the body is compressed, so we
+             # need to decompress it before handing it off
+-            body = zlib.decompress(result[1])
+-            result = (result[0], force_text(body), result[2])
++            result = (result[0], zlib.decompress(result[1]), result[2], encoding)
+ 
+     if result is None:
+         # lock down domains that are problematic
+@@ -440,10 +427,10 @@ def fetch_file(url, project=None, release=None, allow_scraping=True):
+                 body = b''.join(contents)
+                 z_body = zlib.compress(body)
+                 headers = {k.lower(): v for k, v in response.headers.items()}
+-                text_body = body.decode(response.encoding or 'utf-8', 'replace')
++                encoding = response.encoding
+ 
+-                cache.set(cache_key, (headers, z_body, response.status_code), 60)
+-                result = (headers, text_body, response.status_code)
++                cache.set(cache_key, (headers, z_body, response.status_code, encoding), 60)
++                result = (headers, body, response.status_code, encoding)
+             finally:
+                 if response is not None:
+                     response.close()
+@@ -473,13 +460,14 @@ def fetch_file(url, project=None, release=None, allow_scraping=True):
+             }
+             raise CannotFetchSource(error)
+ 
+-    # Make sure the file we're getting back is six.text_type, if it's not,
+-    # it's either some encoding that we don't understand, or it's binary
+-    # data which we can't process.
+-    if not isinstance(result[1], six.text_type):
++    # Make sure the file we're getting back is six.binary_type. The only
++    # reason it'd not be binary would be from old cached blobs, so
++    # for compatibility with current cached files, let's coerce back to
++    # binary and say utf8 encoding.
++    if not isinstance(result[1], six.binary_type):
+         try:
+-            result = (result[0], result[1].decode('utf8'), result[2])
+-        except UnicodeDecodeError:
++            result = (result[0], result[1].encode('utf8'), None)
++        except UnicodeEncodeError:
+             error = {
+                 'type': EventError.JS_INVALID_SOURCE_ENCODING,
+                 'value': 'utf8',
+@@ -487,19 +475,36 @@ def fetch_file(url, project=None, release=None, allow_scraping=True):
+             }
+             raise CannotFetchSource(error)
+ 
+-    return UrlResult(url, result[0], result[1])
++    return UrlResult(url, result[0], result[1], result[3])
++
++
++def is_utf8(encoding):
++    if encoding is None:
++        return True
++    try:
++        return codecs.lookup(encoding).name == 'utf-8'
++    except LookupError:
++        # Encoding is entirely unknown, so definitely not utf-8
++        return False
+ 
+ 
+ def fetch_sourcemap(url, project=None, release=None, allow_scraping=True):
+     if is_data_uri(url):
+         body = base64.b64decode(url[BASE64_PREAMBLE_LENGTH:])
+     else:
+-        # TODO(mattrobenolt): this is returning unicodes, and there's no
+-        # reason we need to do this. We operate on this payload as bytes.
+         result = fetch_file(url, project=project, release=release,
+                             allow_scraping=allow_scraping)
+         body = result.body
+ 
++        # This is just a quick sanity check, but doesn't guarantee
++        if not is_utf8(result.encoding):
++            error = {
++                'type': EventError.JS_INVALID_SOURCE_ENCODING,
++                'value': 'utf8',
++                'url': expose_url(url),
++            }
++            raise CannotFetchSource(error)
++
+     try:
+         return view_from_json(body)
+     except Exception as exc:
+@@ -863,7 +868,7 @@ class SourceProcessor(object):
+             cache.add_error(filename, exc.data)
+             return
+ 
+-        cache.add(filename, result.body.split('\n'))
++        cache.add(filename, result.body, result.encoding)
+         cache.alias(result.url, filename)
+ 
+         sourcemap_url = discover_sourcemap(result)
+@@ -890,21 +895,13 @@ class SourceProcessor(object):
+         sourcemaps.add(sourcemap_url, sourcemap_view)
+ 
+         # cache any inlined sources
+-        # inline_sources = sourcemap_view.get_inline_content_sources(sourcemap_url)
+         for src_id, source in sourcemap_view.iter_sources():
+-            # TODO(mattrobenolt): This is slightly less than ideal,
+-            # but it's the simplest path for now.
+-            # Ideally, we would do this lazily.
+-            content = sourcemap_view.get_source_contents(src_id)
+-            if content is not None:
+-                # TODO(mattrobenolt): This is gross. libsourcemap returns back
+-                # bytes, and our internal stuff assumed unicode. So everything else in
+-                # the pipeline assumes unicode and working with bytes is harder.
+-                # So let's coerce here to unicodes just to conform to API for both,
+-                # but remove this and handle bytes down the line when done.
+-                if isinstance(content, six.binary_type):
+-                    content = content.decode('utf-8', errors='replace')
+-                self.cache.add(urljoin(sourcemap_url, source), content.split(u'\n'))
++            if sourcemap_view.has_source_contents(src_id):
++                self.cache.add(
++                    urljoin(sourcemap_url, source),
++                    lambda view=sourcemap_view, id=src_id: view.get_source_contents(id),
++                    None,
++                )
+ 
+     def populate_source_cache(self, frames, release):
+         """
+diff --git a/tests/sentry/lang/javascript/test_plugin.py b/tests/sentry/lang/javascript/test_plugin.py
+index 71988ff8d1..fe23a9d571 100644
+--- a/tests/sentry/lang/javascript/test_plugin.py
++++ b/tests/sentry/lang/javascript/test_plugin.py
+@@ -142,6 +142,7 @@ class JavascriptIntegrationTest(TestCase):
+         }
+ 
+         mock_fetch_file.return_value.body = '\n'.join('hello world')
++        mock_fetch_file.return_value.encoding = None
+ 
+         resp = self._postWithHeader(data)
+         assert resp.status_code, 200
+@@ -197,6 +198,7 @@ class JavascriptIntegrationTest(TestCase):
+ 
+         mock_fetch_file.return_value.url = 'http://example.com/test.min.js'
+         mock_fetch_file.return_value.body = '\n'.join('<generated source>')
++        mock_fetch_file.return_value.encoding = None
+ 
+         resp = self._postWithHeader(data)
+         assert resp.status_code, 200
+diff --git a/tests/sentry/lang/javascript/test_processor.py b/tests/sentry/lang/javascript/test_processor.py
+index 44ebac9f67..bd49eb7bb1 100644
+--- a/tests/sentry/lang/javascript/test_processor.py
++++ b/tests/sentry/lang/javascript/test_processor.py
+@@ -13,12 +13,13 @@ from requests.exceptions import RequestException
+ from sentry.interfaces.stacktrace import Stacktrace
+ from sentry.lang.javascript.processor import (
+     BadSource, discover_sourcemap, fetch_sourcemap, fetch_file, generate_module,
+-    SourceProcessor, trim_line, UrlResult, fetch_release_file
++    SourceProcessor, trim_line, UrlResult, fetch_release_file, CannotFetchSource,
++    UnparseableSourcemap,
+ )
+ from sentry.lang.javascript.errormapping import (
+     rewrite_exception, REACT_MAPPING_URL
+ )
+-from sentry.models import File, Release, ReleaseFile
++from sentry.models import File, Release, ReleaseFile, EventError
+ from sentry.testutils import TestCase
+ 
+ base64_sourcemap = 'data:application/json;base64,eyJ2ZXJzaW9uIjozLCJmaWxlIjoiZ2VuZXJhdGVkLmpzIiwic291cmNlcyI6WyIvdGVzdC5qcyJdLCJuYW1lcyI6W10sIm1hcHBpbmdzIjoiO0FBQUEiLCJzb3VyY2VzQ29udGVudCI6WyJjb25zb2xlLmxvZyhcImhlbGxvLCBXb3JsZCFcIikiXX0='
+@@ -42,7 +43,9 @@ class FetchReleaseFileTest(TestCase):
+             type='release.file',
+             headers={'Content-Type': 'application/json; charset=utf-8'},
+         )
+-        file.putfile(six.BytesIO(unicode_body.encode('utf-8')))
++
++        binary_body = unicode_body.encode('utf-8')
++        file.putfile(six.BytesIO(binary_body))
+ 
+         ReleaseFile.objects.create(
+             name='file.min.js',
+@@ -53,11 +56,12 @@ class FetchReleaseFileTest(TestCase):
+ 
+         result = fetch_release_file('file.min.js', release)
+ 
+-        assert type(result[1]) is six.text_type
++        assert type(result[1]) is six.binary_type
+         assert result == (
+-            {'Content-Type': 'application/json; charset=utf-8'},
+-            unicode_body,
+-            200
++            {'content-type': 'application/json; charset=utf-8'},
++            binary_body,
++            200,
++            'utf-8',
+         )
+ 
+         # test with cache hit, which should be compressed
+@@ -130,7 +134,8 @@ class FetchFileTest(TestCase):
+         mock_fetch_release_file.return_value = (
+             {'content-type': 'application/json'},
+             'foo',
+-            200
++            200,
++            None,
+         )
+ 
+         release = Release.objects.create(project=self.project, version='1')
+@@ -138,21 +143,9 @@ class FetchFileTest(TestCase):
+         result = fetch_file('/example.js', release=release)
+         assert result.url == '/example.js'
+         assert result.body == 'foo'
+-        assert isinstance(result.body, six.text_type)
++        assert isinstance(result.body, six.binary_type)
+         assert result.headers == {'content-type': 'application/json'}
+-
+-    @patch('sentry.lang.javascript.processor.fetch_release_file')
+-    def test_non_unicode_release_file(self, mock_fetch_release_file):
+-        mock_fetch_release_file.return_value = (
+-            {'content-type': 'application/octet-stream'},
+-            '\xffff',  # This is some random binary data
+-            200
+-        )
+-
+-        release = Release.objects.create(project=self.project, version='1')
+-
+-        with pytest.raises(BadSource):
+-            fetch_file('/example.js', release=release)
++        assert result.encoding is None
+ 
+     @responses.activate
+     def test_unicode_body(self):
+@@ -165,8 +158,9 @@ class FetchFileTest(TestCase):
+         assert len(responses.calls) == 1
+ 
+         assert result.url == 'http://example.com'
+-        assert result.body == u'"fôo bar"'
++        assert result.body == '"f\xc3\xb4o bar"'
+         assert result.headers == {'content-type': 'application/json; charset=utf-8'}
++        assert result.encoding == 'utf-8'
+ 
+         # ensure we use the cached result
+         result2 = fetch_file('http://example.com')
+@@ -179,38 +173,38 @@ class FetchFileTest(TestCase):
+ class DiscoverSourcemapTest(TestCase):
+     # discover_sourcemap(result)
+     def test_simple(self):
+-        result = UrlResult('http://example.com', {}, '')
++        result = UrlResult('http://example.com', {}, '', None)
+         assert discover_sourcemap(result) is None
+ 
+         result = UrlResult('http://example.com', {
+             'x-sourcemap': 'http://example.com/source.map.js'
+-        }, '')
++        }, '', None)
+         assert discover_sourcemap(result) == 'http://example.com/source.map.js'
+ 
+         result = UrlResult('http://example.com', {
+             'sourcemap': 'http://example.com/source.map.js'
+-        }, '')
++        }, '', None)
+         assert discover_sourcemap(result) == 'http://example.com/source.map.js'
+ 
+-        result = UrlResult('http://example.com', {}, '//@ sourceMappingURL=http://example.com/source.map.js\nconsole.log(true)')
++        result = UrlResult('http://example.com', {}, '//@ sourceMappingURL=http://example.com/source.map.js\nconsole.log(true)', None)
+         assert discover_sourcemap(result) == 'http://example.com/source.map.js'
+ 
+-        result = UrlResult('http://example.com', {}, '//# sourceMappingURL=http://example.com/source.map.js\nconsole.log(true)')
++        result = UrlResult('http://example.com', {}, '//# sourceMappingURL=http://example.com/source.map.js\nconsole.log(true)', None)
+         assert discover_sourcemap(result) == 'http://example.com/source.map.js'
+ 
+-        result = UrlResult('http://example.com', {}, 'console.log(true)\n//@ sourceMappingURL=http://example.com/source.map.js')
++        result = UrlResult('http://example.com', {}, 'console.log(true)\n//@ sourceMappingURL=http://example.com/source.map.js', None)
+         assert discover_sourcemap(result) == 'http://example.com/source.map.js'
+ 
+-        result = UrlResult('http://example.com', {}, 'console.log(true)\n//# sourceMappingURL=http://example.com/source.map.js')
++        result = UrlResult('http://example.com', {}, 'console.log(true)\n//# sourceMappingURL=http://example.com/source.map.js', None)
+         assert discover_sourcemap(result) == 'http://example.com/source.map.js'
+ 
+-        result = UrlResult('http://example.com', {}, 'console.log(true)\n//# sourceMappingURL=http://example.com/source.map.js\n//# sourceMappingURL=http://example.com/source2.map.js')
++        result = UrlResult('http://example.com', {}, 'console.log(true)\n//# sourceMappingURL=http://example.com/source.map.js\n//# sourceMappingURL=http://example.com/source2.map.js', None)
+         assert discover_sourcemap(result) == 'http://example.com/source2.map.js'
+ 
+-        result = UrlResult('http://example.com', {}, '//# sourceMappingURL=app.map.js/*ascii:lol*/')
++        result = UrlResult('http://example.com', {}, '//# sourceMappingURL=app.map.js/*ascii:lol*/', None)
+         assert discover_sourcemap(result) == 'http://example.com/app.map.js'
+ 
+-        result = UrlResult('http://example.com', {}, '//# sourceMappingURL=/*lol*/')
++        result = UrlResult('http://example.com', {}, '//# sourceMappingURL=/*lol*/', None)
+         with self.assertRaises(AssertionError):
+             discover_sourcemap(result)
+ 
+@@ -245,8 +239,8 @@ class GenerateModuleTest(TestCase):
+         assert generate_module('~/app/components/projectHeader/projectSelector.jsx') == 'app/components/projectHeader/projectSelector'
+ 
+ 
+-class FetchBase64SourcemapTest(TestCase):
+-    def test_simple(self):
++class FetchSourcemapTest(TestCase):
++    def test_simple_base64(self):
+         smap_view = fetch_sourcemap(base64_sourcemap)
+         tokens = [Token(1, 0, '/test.js', 0, 0, 0, None)]
+ 
+@@ -254,6 +248,24 @@ class FetchBase64SourcemapTest(TestCase):
+         assert smap_view.get_source_contents(0) == 'console.log("hello, World!")'
+         assert smap_view.get_source_name(0) == u'/test.js'
+ 
++    @responses.activate
++    def test_simple_non_utf8(self):
++        responses.add(responses.GET, 'http://example.com', body='{}',
++                      content_type='application/json; charset=NOPE')
++
++        with pytest.raises(CannotFetchSource) as exc:
++            fetch_sourcemap('http://example.com')
++
++        assert exc.value.data['type'] == EventError.JS_INVALID_SOURCE_ENCODING
++
++    @responses.activate
++    def test_garbage_json(self):
++        responses.add(responses.GET, 'http://example.com', body='xxxx',
++                      content_type='application/json')
++
++        with pytest.raises(UnparseableSourcemap):
++            fetch_sourcemap('http://example.com')
++
+ 
+ class TrimLineTest(TestCase):
+     long_line = 'The public is more familiar with bad design than good design. It is, in effect, conditioned to prefer bad design, because that is what it lives with. The new becomes threatening, the old reassuring.'

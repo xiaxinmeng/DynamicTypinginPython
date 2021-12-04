@@ -1,0 +1,191 @@
+commit f9766d0b4f427506a350a66a0080bc42823b09c8
+Author: Chris Fuller <cfuller@sentry.io>
+Date:   Thu Mar 5 11:55:09 2020 -0500
+
+    fix(workflow): Improved error handling of target identifier (#17433)
+    
+    * Fixing slack errors and serializer bug
+
+diff --git a/src/sentry/incidents/endpoints/serializers.py b/src/sentry/incidents/endpoints/serializers.py
+index ac5933dfd5..5b496a73a0 100644
+--- a/src/sentry/incidents/endpoints/serializers.py
++++ b/src/sentry/incidents/endpoints/serializers.py
+@@ -6,12 +6,15 @@ import operator
+ 
+ from rest_framework import serializers
+ 
++from django.db import transaction
++
+ from sentry.api.serializers.rest_framework.base import CamelSnakeModelSerializer
+ from sentry.api.serializers.rest_framework.project import ProjectField
+ from sentry.api.serializers.rest_framework.environment import EnvironmentField
+ from sentry.incidents.logic import (
+     AlertRuleNameAlreadyUsedError,
+     AlertRuleTriggerLabelAlreadyUsedError,
++    InvalidTriggerActionError,
+     create_alert_rule,
+     create_alert_rule_trigger,
+     create_alert_rule_trigger_action,
+@@ -138,12 +141,20 @@ class AlertRuleTriggerActionSerializer(CamelSnakeModelSerializer):
+         return attrs
+ 
+     def create(self, validated_data):
+-        return create_alert_rule_trigger_action(trigger=self.context["trigger"], **validated_data)
++        try:
++            return create_alert_rule_trigger_action(
++                trigger=self.context["trigger"], **validated_data
++            )
++        except InvalidTriggerActionError as e:
++            raise serializers.ValidationError(e.message)
+ 
+     def update(self, instance, validated_data):
+         if "id" in validated_data:
+             validated_data.pop("id")
+-        return update_alert_rule_trigger_action(instance, **validated_data)
++        try:
++            return update_alert_rule_trigger_action(instance, **validated_data)
++        except InvalidTriggerActionError as e:
++            raise serializers.ValidationError(e.message)
+ 
+ 
+ class AlertRuleTriggerSerializer(CamelSnakeModelSerializer):
+@@ -189,7 +200,7 @@ class AlertRuleTriggerSerializer(CamelSnakeModelSerializer):
+             alert_rule_trigger = create_alert_rule_trigger(
+                 alert_rule=self.context["alert_rule"], **validated_data
+             )
+-            self._handle_action_updates(alert_rule_trigger, actions)
++            self._handle_actions(alert_rule_trigger, actions)
+ 
+             return alert_rule_trigger
+         except AlertRuleTriggerLabelAlreadyUsedError:
+@@ -201,12 +212,12 @@ class AlertRuleTriggerSerializer(CamelSnakeModelSerializer):
+             validated_data.pop("id")
+         try:
+             alert_rule_trigger = update_alert_rule_trigger(instance, **validated_data)
+-            self._handle_action_updates(alert_rule_trigger, actions)
++            self._handle_actions(alert_rule_trigger, actions)
+             return alert_rule_trigger
+         except AlertRuleTriggerLabelAlreadyUsedError:
+             raise serializers.ValidationError("This label is already in use for this alert rule")
+ 
+-    def _handle_action_updates(self, alert_rule_trigger, actions):
++    def _handle_actions(self, alert_rule_trigger, actions):
+         if actions is not None:
+             # Delete actions we don't have present in the updated data.
+             action_ids = [x["id"] for x in actions if "id" in x]
+@@ -388,12 +399,13 @@ class AlertRuleSerializer(CamelSnakeModelSerializer):
+ 
+     def create(self, validated_data):
+         try:
+-            triggers = validated_data.pop("triggers")
+-            alert_rule = create_alert_rule(
+-                organization=self.context["organization"], **validated_data
+-            )
+-            self._handle_trigger_updates(alert_rule, triggers)
+-            return alert_rule
++            with transaction.atomic():
++                triggers = validated_data.pop("triggers")
++                alert_rule = create_alert_rule(
++                    organization=self.context["organization"], **validated_data
++                )
++                self._handle_triggers(alert_rule, triggers)
++                return alert_rule
+         except AlertRuleNameAlreadyUsedError:
+             raise serializers.ValidationError("This name is already in use for this project")
+ 
+@@ -402,13 +414,14 @@ class AlertRuleSerializer(CamelSnakeModelSerializer):
+         if "id" in validated_data:
+             validated_data.pop("id")
+         try:
+-            alert_rule = update_alert_rule(instance, **validated_data)
+-            self._handle_trigger_updates(alert_rule, triggers)
+-            return alert_rule
++            with transaction.atomic():
++                alert_rule = update_alert_rule(instance, **validated_data)
++                self._handle_triggers(alert_rule, triggers)
++                return alert_rule
+         except AlertRuleNameAlreadyUsedError:
+             raise serializers.ValidationError("This name is already in use for this project")
+ 
+-    def _handle_trigger_updates(self, alert_rule, triggers):
++    def _handle_triggers(self, alert_rule, triggers):
+         if triggers is not None:
+             # Delete triggers we don't have present in the incoming data
+             trigger_ids = [x["id"] for x in triggers if "id" in x]
+diff --git a/tests/sentry/incidents/endpoints/test_serializers.py b/tests/sentry/incidents/endpoints/test_serializers.py
+index 1565ee0fec..321762e0b3 100644
+--- a/tests/sentry/incidents/endpoints/test_serializers.py
++++ b/tests/sentry/incidents/endpoints/test_serializers.py
+@@ -2,6 +2,7 @@ from __future__ import absolute_import
+ 
+ import six
+ from exam import fixture
++from rest_framework import serializers
+ 
+ from sentry.auth.access import from_user
+ from sentry.incidents.endpoints.serializers import (
+@@ -12,8 +13,9 @@ from sentry.incidents.endpoints.serializers import (
+     string_to_action_type,
+     string_to_action_target_type,
+ )
+-from sentry.incidents.logic import create_alert_rule_trigger, InvalidTriggerActionError
++from sentry.incidents.logic import create_alert_rule_trigger
+ from sentry.incidents.models import (
++    AlertRule,
+     AlertRuleThresholdType,
+     AlertRuleTriggerAction,
+     AlertRuleEnvironment,
+@@ -215,6 +217,46 @@ class TestAlertRuleSerializer(TestCase):
+ 
+         assert serializer.is_valid(), serializer.errors
+ 
++    def test_invalid_slack_channel(self):
++        # We had an error where an invalid slack channel was spitting out unclear
++        # error for the user, and CREATING THE RULE. So the next save (after fixing slack action)
++        # says "Name already in use". This test makes sure that is not happening anymore.
++        # We save a rule with an invalid slack, make sure we get back a useful error
++        # and that the rule is not created.
++        base_params = self.valid_params.copy()
++        base_params["name"] = "Aun1qu3n4m3"
++        integration = Integration.objects.create(
++            external_id="1",
++            provider="slack",
++            metadata={"access_token": "xoxp-xxxxxxxxx-xxxxxxxxxx-xxxxxxxxxxxx"},
++        )
++        integration.add_organization(self.organization, self.user)
++        base_params["triggers"][0]["actions"].append(
++            {
++                "type": AlertRuleTriggerAction.get_registered_type(
++                    AlertRuleTriggerAction.Type.SLACK
++                ).slug,
++                "targetType": action_target_type_to_string[
++                    AlertRuleTriggerAction.TargetType.SPECIFIC
++                ],
++                "targetIdentifier": "123",
++                "integration": six.text_type(integration.id),
++            }
++        )
++        serializer = AlertRuleSerializer(context=self.context, data=base_params)
++        assert serializer.is_valid()
++        with self.assertRaises(serializers.ValidationError):
++            serializer.save()
++
++        # Make sure the rule was not created.
++        assert len(list(AlertRule.objects.filter(name="Aun1qu3n4m3"))) == 0
++
++        # Make sure the action was not created.
++        alert_rule_trigger_actions = list(
++            AlertRuleTriggerAction.objects.filter(integration=integration)
++        )
++        assert len(alert_rule_trigger_actions) == 0
++
+ 
+ class TestAlertRuleTriggerSerializer(TestCase):
+     @fixture
+@@ -407,5 +449,5 @@ class TestAlertRuleTriggerActionSerializer(TestCase):
+         )
+         serializer = AlertRuleTriggerActionSerializer(context=self.context, data=base_params)
+         assert serializer.is_valid()
+-        with self.assertRaises(InvalidTriggerActionError):
++        with self.assertRaises(serializers.ValidationError):
+             serializer.save()

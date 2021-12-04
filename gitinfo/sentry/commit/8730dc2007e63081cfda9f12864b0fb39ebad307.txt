@@ -1,0 +1,641 @@
+commit 8730dc2007e63081cfda9f12864b0fb39ebad307
+Author: Jan Michael Auer <jan.auer@sentry.io>
+Date:   Wed Feb 26 15:41:52 2020 +0100
+
+    feat(quotas): Introduce scoped quotas (#17248)
+    
+    Introduces scopes and data categories into quotas without changing execution logic.
+    
+    The logic for running quotas and Redis keys all stay the same. The only change is the schema in which quotas are specified. The Relay configuration endpoint also continues to return the old quota schema in the project_keys section, until Relay supports the new schema. This will be implemented in a follow-up.
+
+diff --git a/src/sentry/quotas/base.py b/src/sentry/quotas/base.py
+index a683589911..296e524f24 100644
+--- a/src/sentry/quotas/base.py
++++ b/src/sentry/quotas/base.py
+@@ -4,11 +4,150 @@ import six
+ 
+ from django.conf import settings
+ from django.core.cache import cache
++from enum import IntEnum, unique
+ 
+ from sentry import options
++from sentry.utils.json import prune_empty_keys
+ from sentry.utils.services import Service
+ 
+ 
++@unique
++class QuotaScope(IntEnum):
++    ORGANIZATION = 1
++    PROJECT = 2
++    KEY = 3
++
++    def api_name(self):
++        return self.name.lower()
++
++
++@unique
++class DataCategory(IntEnum):
++    DEFAULT = 0
++    ERROR = 1
++    TRANSACTION = 2
++    SECURITY = 3
++    ATTACHMENT = 4
++    SESSION = 5
++    CRASH = 6
++
++    def api_name(self):
++        return self.name.lower()
++
++
++class QuotaConfig(object):
++    """
++    Abstract configuration for a quota.
++
++    Sentry applies multiple quotas to an event before accepting it, some of
++    which can be configured by the user depending on plan. An event will be
++    counted against all quotas that it matches with based on the ``category``.
++
++    The `QuotaConfig` object is not persisted, but is the contract between
++    Sentry and Relay. Most importantly, a `QuotaConfig` instance does not
++    contain information about how many events can still be accepted, it only
++    represents settings that should be applied. The actual counts are in the
++    rate limiter (e.g. implemented via Redis caches).
++
++    :param id:          The unique identifier for counting this quota. Required
++                        except for quotas with ``limit=0``, since they are
++                        statically enforced.
++    :param categories:  A set of data categories that this quota applies to. If
++                        missing or empty, this quota applies to all data.
++    :param scope:       A scope for this quota. This quota is enforced
++                        separately within each instance of this scope (e.g. for
++                        each project key separately). Defaults to ORGANIZATION.
++    :param scope_id:    Identifier of the scope to apply to. If set, then this
++                        quota will only apply to the specified scope instance
++                        (e.g. a project key). Requires ``scope`` to be set
++                        explicitly.
++    :param limit:       Maxmimum number of matching events allowed. Can be ``0``
++                        to reject all events, ``None`` for an unlimited counted
++                        quota, or a positive number for enforcement. Requires
++                        ``window`` if the limit is not ``0``.
++    :param window:      The time window in seconds to enforce this quota in.
++                        Required in all cases except ``limit=0``, since those
++                        quotas are not measured.
++    :param reason_code: A machine readable reason returned when this quota is
++                        exceeded. Required in all cases except ``limit=None``,
++                        since unlimited quotas can never be exceeded.
++    """
++
++    __slots__ = ["id", "categories", "scope", "scope_id", "limit", "window", "reason_code"]
++
++    def __init__(
++        self,
++        id=None,
++        categories=None,
++        scope=None,
++        scope_id=None,
++        limit=None,
++        window=None,
++        reason_code=None,
++    ):
++        if limit is not None:
++            assert reason_code, "reason code required for fallible quotas"
++
++        if limit == 0:
++            assert window is None, "zero-sized quotas cannot have a window"
++        else:
++            assert id, "measured quotas require an identifier"
++            assert window and window > 0, "window cannot be zero"
++
++        if scope_id is not None:
++            assert scope, "scope must be declared explicitly when scope_id is given"
++        elif scope is None:
++            scope = QuotaScope.ORGANIZATION
++
++        self.id = id
++        self.scope = scope
++        self.scope_id = six.text_type(scope_id) if scope_id is not None else None
++        self.categories = set(categories or [])
++        # NOTE: Use `quotas.base._limit_from_settings` to map from settings
++        self.limit = limit
++        self.window = window
++        self.reason_code = reason_code
++
++    @property
++    def should_track(self):
++        """
++        Whether the quotas service should track this quota at all.
++        """
++
++        return self.id is not None
++
++    def to_json_legacy(self):
++        data = {
++            "prefix": six.text_type(self.id) if self.id is not None else None,
++            "subscope": six.text_type(self.scope_id) if self.scope_id is not None else None,
++            "limit": self.limit,
++            "window": self.window,
++            "reasonCode": self.reason_code,
++        }
++
++        if self.scope != QuotaScope.ORGANIZATION and self.scope_id is not None:
++            data["subscope"] = self.scope_id
++
++        return prune_empty_keys(data)
++
++    def to_json(self):
++        categories = None
++        if self.categories:
++            categories = [c.api_name() for c in self.categories]
++
++        data = {
++            "id": six.text_type(self.id) if self.id is not None else None,
++            "scope": self.scope.api_name(),
++            "scope_id": self.scope_id,
++            "categories": categories,
++            "limit": self.limit,
++            "window": self.window,
++            "reasonCode": self.reason_code,
++        }
++
++        return prune_empty_keys(data)
++
++
+ class RateLimit(object):
+     __slots__ = ["is_limited", "retry_after", "reason", "reason_code"]
+ 
+diff --git a/src/sentry/quotas/redis.py b/src/sentry/quotas/redis.py
+index 1a56c21dbe..635f302347 100644
+--- a/src/sentry/quotas/redis.py
++++ b/src/sentry/quotas/redis.py
+@@ -5,118 +5,25 @@ import six
+ 
+ from time import time
+ 
+-from sentry.quotas.base import NotRateLimited, Quota, RateLimited
++from sentry.quotas.base import (
++    DataCategory,
++    NotRateLimited,
++    Quota,
++    QuotaConfig,
++    QuotaScope,
++    RateLimited,
++)
+ from sentry.utils.redis import (
+     get_dynamic_cluster_from_options,
+     validate_dynamic_cluster,
+     load_script,
+ )
+-from sentry.utils.json import prune_empty_keys
+ from sentry.utils.compat import map
+ from sentry.utils.compat import zip
+ 
+ is_rate_limited = load_script("quotas/is_rate_limited.lua")
+ 
+ 
+-class BasicRedisQuota(object):
+-    """
+-    A quota in the most abstract sense consists of an identifier (such as
+-    `"organization quota"`, `"smart limit"`, etc) and two integers `limit` and
+-    `window` (we accept "limit" events per "window" seconds).
+-
+-    Sentry applies multiple quotas to an event before accepting it, some of
+-    which can be configured by the user depending on plan. An event will be
+-    counted against all quotas. For example:
+-
+-    * If Sentry is told to apply two quotas "one event per minute" and "9999999
+-      events per hour", it will practically accept only one event per minute
+-    * If Sentry is told to apply "one event per minute" and "30 events per
+-      hour", we will be able to get one event accepted every minute. However, if
+-      we do that for 30 minutes (ingesting 30 events), we will not be able to get
+-      an event through for the rest of the hour. (This example assumes that we
+-      start sending events exactly at the start of the time window)
+-
+-    A `BasicRedisQuota` is a specific quota type that also includes some
+-    attributes necessary for looking up event counters and refunds in Redis.
+-
+-    The `BasicRedisQuota` object is not persisted in any way. It is just a
+-    function argument passed around in code. Most importantly, a
+-    `BasicRedisQuota` instance does not contain information about how many
+-    events can still be accepted (that stuff is stored in Redis but isn't typed
+-    out), it only represents settings that should be applied.
+-    """
+-
+-    __slots__ = ["prefix", "subscope", "limit", "window", "reason_code"]
+-
+-    def __init__(self, prefix=None, subscope=None, limit=None, window=None, reason_code=None):
+-        if limit == 0:
+-            assert prefix is None and subscope is None, "zero-sized quotas are not tracked in redis"
+-            assert window is None, "zero-sized quotas cannot have a window"
+-        else:
+-            assert prefix, "measured quotas need a prefix to run in redis"
+-            assert window and window > 0, "window cannot be zero"
+-
+-        self.prefix = prefix
+-        self.subscope = subscope
+-        # maximum number of events in the given window
+-        #
+-        # None indicates "unlimited amount"
+-        # 0 indicates "reject all"
+-        # NOTE: Use `quotas.base._limit_from_settings` to map from settings
+-        self.limit = limit
+-        # time in seconds that this quota reflects
+-        self.window = window
+-        # a machine readable string
+-        self.reason_code = reason_code
+-
+-    @classmethod
+-    def reject_all(cls, reason_code):
+-        """
+-        A zero-sized quota, which is never counted in Redis. Unconditionally
+-        reject the event.
+-        """
+-
+-        return cls(limit=0, reason_code=reason_code)
+-
+-    @classmethod
+-    def limited(cls, prefix, limit, window, reason_code, subscope=None):
+-        """
+-        A regular quota with limit.
+-        """
+-
+-        assert limit and limit > 0
+-        return cls(
+-            prefix=prefix, limit=limit, window=window, reason_code=reason_code, subscope=subscope
+-        )
+-
+-    @classmethod
+-    def unlimited(cls, prefix, window, subscope=None):
+-        """
+-        Unlimited quota that is still being counted.
+-        """
+-
+-        return cls(prefix=prefix, window=window, subscope=subscope)
+-
+-    @property
+-    def should_track(self):
+-        """
+-        Whether the quotas service should track this quota at all.
+-        """
+-
+-        return self.prefix is not None
+-
+-    def to_json(self):
+-        return prune_empty_keys(
+-            {
+-                "prefix": six.text_type(self.prefix) if self.prefix is not None else None,
+-                "subscope": six.text_type(self.subscope) if self.subscope is not None else None,
+-                "limit": self.limit,
+-                "window": self.window,
+-                "reasonCode": self.reason_code,
+-            }
+-        )
+-
+-
+ class RedisQuota(Quota):
+     #: The ``grace`` period allows accommodating for clock drift in TTL
+     #: calculation since the clock on the Redis instance used to store quota
+@@ -149,11 +56,12 @@ class RedisQuota(Quota):
+ 
+     def __get_redis_key(self, quota, timestamp, shift, organization_id):
+         if self.is_redis_cluster:
++            scope_id = quota.scope_id or "" if quota.scope != QuotaScope.ORGANIZATION else ""
+             # new style redis cluster format which always has the organization id in
+-            local_key = "%s{%s}%s" % (quota.prefix, organization_id, quota.subscope or "")
++            local_key = "%s{%s}%s" % (quota.id, organization_id, scope_id)
+         else:
+             # legacy key format
+-            local_key = "%s:%s" % (quota.prefix, quota.subscope or organization_id)
++            local_key = "%s:%s" % (quota.id, quota.scope_id or organization_id)
+ 
+         interval = quota.window
+         return u"{}:{}:{}".format(self.namespace, local_key, int((timestamp - shift) // interval))
+@@ -167,9 +75,10 @@ class RedisQuota(Quota):
+         pquota = self.get_project_quota(project)
+         if pquota[0] is not None:
+             results.append(
+-                BasicRedisQuota.limited(
+-                    prefix="p",
+-                    subscope=project.id,
++                QuotaConfig(
++                    id="p",
++                    scope=QuotaScope.PROJECT,
++                    scope_id=project.id,
+                     limit=pquota[0],
+                     window=pquota[1],
+                     reason_code="project_quota",
+@@ -179,8 +88,13 @@ class RedisQuota(Quota):
+         oquota = self.get_organization_quota(project.organization)
+         if oquota[0] is not None:
+             results.append(
+-                BasicRedisQuota.limited(
+-                    prefix="o", limit=oquota[0], window=oquota[1], reason_code="org_quota"
++                QuotaConfig(
++                    id="o",
++                    scope=QuotaScope.ORGANIZATION,
++                    scope_id=project.organization.id,
++                    limit=oquota[0],
++                    window=oquota[1],
++                    reason_code="org_quota",
+                 )
+             )
+ 
+@@ -188,9 +102,10 @@ class RedisQuota(Quota):
+             kquota = self.get_key_quota(key)
+             if kquota[0] is not None:
+                 results.append(
+-                    BasicRedisQuota.limited(
+-                        prefix="k",
+-                        subscope=key.id,
++                    QuotaConfig(
++                        id="k",
++                        scope=QuotaScope.KEY,
++                        scope_id=key.id,
+                         limit=kquota[0],
+                         window=kquota[1],
+                         reason_code="key_quota",
+@@ -266,10 +181,23 @@ class RedisQuota(Quota):
+         return (((timestamp - shift) // interval) + 1) * interval + shift
+ 
+     def is_rate_limited(self, project, key=None, timestamp=None):
++        # XXX: This is effectively deprecated and scheduled for removal. Event
++        # ingestion quotas are now enforced in Relay. This function will be
++        # deleted once the Python store endpoints are removed.
++
+         if timestamp is None:
+             timestamp = time()
+ 
+-        quotas = self.get_quotas(project, key=key)
++        # Relay supports separate rate limiting per data category and and can
++        # handle scopes explicitly. This function implements a simplified logic
++        # that treats all events the same and ignores transaction rate limits.
++        # Thus, we filter for (1) no categories, which implies this quota
++        # affects all data, and (2) quotas that specify `error` events.
++        quotas = [
++            q
++            for q in self.get_quotas(project, key=key)
++            if not q.categories or DataCategory.ERROR in q.categories
++        ]
+ 
+         # If there are no quotas to actually check, skip the trip to the database.
+         if not quotas:
+diff --git a/src/sentry/relay/config.py b/src/sentry/relay/config.py
+index ad28dd94de..1ba950f695 100644
+--- a/src/sentry/relay/config.py
++++ b/src/sentry/relay/config.py
+@@ -32,7 +32,9 @@ def get_public_key_configs(project, full_config, project_keys=None):
+         key = {"publicKey": project_key.public_key, "isEnabled": project_key.status == 0}
+ 
+         if full_config:
+-            key["quotas"] = [q.to_json() for q in quotas.get_quotas(project, key=project_key)]
++            key["quotas"] = [
++                q.to_json_legacy() for q in quotas.get_quotas(project, key=project_key)
++            ]
+             key["numericId"] = project_key.id
+ 
+         public_keys.append(key)
+diff --git a/tests/sentry/quotas/redis/tests.py b/tests/sentry/quotas/redis/tests.py
+index 00ce41721d..9e5e6eb2bc 100644
+--- a/tests/sentry/quotas/redis/tests.py
++++ b/tests/sentry/quotas/redis/tests.py
+@@ -2,14 +2,14 @@
+ 
+ from __future__ import absolute_import
+ 
+-import pytest
+ from sentry.utils.compat import mock
+ import six
+ import time
+ 
+ from exam import fixture, patcher
+ 
+-from sentry.quotas.redis import is_rate_limited, BasicRedisQuota, RedisQuota
++from sentry.quotas.base import QuotaConfig, QuotaScope
++from sentry.quotas.redis import is_rate_limited, RedisQuota
+ from sentry.testutils import TestCase
+ from sentry.utils.redis import clusters
+ from six.moves import xrange
+@@ -88,12 +88,12 @@ class RedisQuotaTest(TestCase):
+         self.get_project_quota.return_value = (200, 60)
+         self.get_organization_quota.return_value = (300, 60)
+         quotas = self.quota.get_quotas(self.project)
+-        assert quotas[0].prefix == u"p"
+-        assert quotas[0].subscope == self.project.id
++        assert quotas[0].id == u"p"
++        assert quotas[0].scope_id == six.text_type(self.project.id)
+         assert quotas[0].limit == 200
+         assert quotas[0].window == 60
+-        assert quotas[1].prefix == u"o"
+-        assert quotas[1].subscope is None
++        assert quotas[1].id == u"o"
++        assert quotas[1].scope_id == six.text_type(self.organization.id)
+         assert quotas[1].limit == 300
+         assert quotas[1].window == 60
+ 
+@@ -120,10 +120,22 @@ class RedisQuotaTest(TestCase):
+     @mock.patch("sentry.quotas.redis.is_rate_limited", return_value=(False, False))
+     def test_not_limited_with_unlimited_quota(self, mock_is_rate_limited, mock_get_quotas):
+         mock_get_quotas.return_value = (
+-            BasicRedisQuota(
+-                prefix="p", subscope=1, limit=None, window=1, reason_code="project_quota"
++            QuotaConfig(
++                id="p",
++                scope=QuotaScope.PROJECT,
++                scope_id=1,
++                limit=None,
++                window=1,
++                reason_code="project_quota",
++            ),
++            QuotaConfig(
++                id="p",
++                scope=QuotaScope.PROJECT,
++                scope_id=2,
++                limit=1,
++                window=1,
++                reason_code="project_quota",
+             ),
+-            BasicRedisQuota(prefix="p", subscope=2, limit=1, window=1, reason_code="project_quota"),
+         )
+ 
+         assert not self.quota.is_rate_limited(self.project).is_limited
+@@ -132,10 +144,22 @@ class RedisQuotaTest(TestCase):
+     @mock.patch("sentry.quotas.redis.is_rate_limited", return_value=(False, True))
+     def test_limited_with_unlimited_quota(self, mock_is_rate_limited, mock_get_quotas):
+         mock_get_quotas.return_value = (
+-            BasicRedisQuota(
+-                prefix="p", subscope=1, limit=None, window=1, reason_code="project_quota"
++            QuotaConfig(
++                id="p",
++                scope=QuotaScope.PROJECT,
++                scope_id=1,
++                limit=None,
++                window=1,
++                reason_code="project_quota",
++            ),
++            QuotaConfig(
++                id="p",
++                scope=QuotaScope.PROJECT,
++                scope_id=2,
++                limit=1,
++                window=1,
++                reason_code="project_quota",
+             ),
+-            BasicRedisQuota(prefix="p", subscope=2, limit=1, window=1, reason_code="project_quota"),
+         )
+ 
+         assert self.quota.is_rate_limited(self.project).is_limited
+@@ -156,8 +180,8 @@ class RedisQuotaTest(TestCase):
+             self.project.organization_id,
+             quotas
+             + [
+-                BasicRedisQuota(prefix="unlimited", limit=None, window=60, reason_code="unlimited"),
+-                BasicRedisQuota(prefix="dummy", limit=10, window=60, reason_code="dummy"),
++                QuotaConfig(id="unlimited", limit=None, window=60, reason_code="unlimited"),
++                QuotaConfig(id="dummy", limit=10, window=60, reason_code="dummy"),
+             ],
+             timestamp=timestamp,
+         ) == [n for _ in quotas] + [0, 0]
+@@ -167,10 +191,22 @@ class RedisQuotaTest(TestCase):
+         timestamp = time.time()
+ 
+         mock_get_quotas.return_value = (
+-            BasicRedisQuota(
+-                prefix="p", subscope=1, limit=None, window=1, reason_code="project_quota"
++            QuotaConfig(
++                id="p",
++                scope=QuotaScope.PROJECT,
++                scope_id=1,
++                limit=None,
++                window=1,
++                reason_code="project_quota",
++            ),
++            QuotaConfig(
++                id="p",
++                scope=QuotaScope.PROJECT,
++                scope_id=2,
++                limit=1,
++                window=1,
++                reason_code="project_quota",
+             ),
+-            BasicRedisQuota(prefix="p", subscope=2, limit=1, window=1, reason_code="project_quota"),
+         )
+ 
+         self.quota.refund(self.project, timestamp=timestamp)
+@@ -203,23 +239,9 @@ class RedisQuotaTest(TestCase):
+             self.project.organization_id,
+             quotas
+             + [
+-                BasicRedisQuota(prefix="unlimited", limit=None, window=60, reason_code="unlimited"),
+-                BasicRedisQuota(prefix="dummy", limit=10, window=60, reason_code="dummy"),
++                QuotaConfig(id="unlimited", limit=None, window=60, reason_code="unlimited"),
++                QuotaConfig(id="dummy", limit=10, window=60, reason_code="dummy"),
+             ],
+             timestamp=timestamp,
+             # the - 1 is because we refunded once
+         ) == [n - 1 for _ in quotas] + [0, 0]
+-
+-
+-@pytest.mark.parametrize(
+-    "obj,json",
+-    [
+-        (
+-            BasicRedisQuota(prefix="p", subscope=1, limit=None, window=1, reason_code="go_away"),
+-            {"prefix": "p", "subscope": "1", "window": 1, "reasonCode": "go_away"},
+-        ),
+-        (BasicRedisQuota(limit=0, reason_code="go_away"), {"limit": 0, "reasonCode": "go_away"}),
+-    ],
+-)
+-def test_quotas_to_json(obj, json):
+-    assert obj.to_json() == json
+diff --git a/tests/sentry/quotas/test_base.py b/tests/sentry/quotas/test_base.py
+index 594420f8d2..686d988644 100644
+--- a/tests/sentry/quotas/test_base.py
++++ b/tests/sentry/quotas/test_base.py
+@@ -3,9 +3,11 @@
+ from __future__ import absolute_import
+ 
+ from sentry.models import OrganizationOption, ProjectKey
+-from sentry.quotas.base import Quota
++from sentry.quotas.base import Quota, QuotaConfig, QuotaScope, DataCategory
+ from sentry.testutils import TestCase
+ 
++import pytest
++
+ 
+ class QuotaTest(TestCase):
+     def setUp(self):
+@@ -84,3 +86,75 @@ class QuotaTest(TestCase):
+             SENTRY_DEFAULT_MAX_EVENTS_PER_MINUTE="50%", SENTRY_SINGLE_ORGANIZATION=True
+         ), self.options({"system.rate-limit": 10}):
+             assert self.backend.get_organization_quota(org) == (10, 60)
++
++
++@pytest.mark.parametrize(
++    "obj,json",
++    [
++        (
++            QuotaConfig(id="o", limit=4711, window=42, reason_code="not_so_fast"),
++            {"prefix": "o", "limit": 4711, "window": 42, "reasonCode": "not_so_fast"},
++        ),
++        (
++            QuotaConfig(
++                id="p",
++                scope=QuotaScope.PROJECT,
++                scope_id=1,
++                limit=None,
++                window=1,
++                reason_code="go_away",
++            ),
++            {"prefix": "p", "subscope": "1", "window": 1, "reasonCode": "go_away"},
++        ),
++        (QuotaConfig(limit=0, reason_code="go_away"), {"limit": 0, "reasonCode": "go_away"}),
++        (
++            QuotaConfig(limit=0, categories=[DataCategory.TRANSACTION], reason_code="not_yet"),
++            {"limit": 0, "reasonCode": "not_yet"},
++        ),
++    ],
++)
++def test_quotas_to_json_legacy(obj, json):
++    assert obj.to_json_legacy() == json
++
++
++@pytest.mark.parametrize(
++    "obj,json",
++    [
++        (
++            QuotaConfig(id="o", limit=4711, window=42, reason_code="not_so_fast"),
++            {
++                "id": "o",
++                "scope": "organization",
++                "limit": 4711,
++                "window": 42,
++                "reasonCode": "not_so_fast",
++            },
++        ),
++        (
++            QuotaConfig(
++                id="p",
++                scope=QuotaScope.PROJECT,
++                scope_id=1,
++                limit=None,
++                window=1,
++                reason_code="go_away",
++            ),
++            {"id": "p", "scope": "project", "scope_id": "1", "window": 1, "reasonCode": "go_away"},
++        ),
++        (
++            QuotaConfig(limit=0, reason_code="go_away"),
++            {"limit": 0, "scope": "organization", "reasonCode": "go_away"},
++        ),
++        (
++            QuotaConfig(limit=0, categories=[DataCategory.TRANSACTION], reason_code="go_away"),
++            {
++                "limit": 0,
++                "scope": "organization",
++                "categories": ["transaction"],
++                "reasonCode": "go_away",
++            },
++        ),
++    ],
++)
++def test_quotas_to_json(obj, json):
++    assert obj.to_json() == json

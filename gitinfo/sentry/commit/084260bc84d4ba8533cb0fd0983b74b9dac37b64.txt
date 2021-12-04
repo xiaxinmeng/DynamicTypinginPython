@@ -1,0 +1,441 @@
+commit 084260bc84d4ba8533cb0fd0983b74b9dac37b64
+Author: Armin Ronacher <armin.ronacher@active-4.com>
+Date:   Fri Nov 16 13:47:26 2018 +0100
+
+    feat(files): Upload chunks concurrently for dif assemble (#10587)
+    
+    * feat: Upload chunks concurrently for dif assemble
+    
+    * fix: Fix a broken test
+    
+    * ref: Raise blob size for chunk uploads
+    
+    * test: Sync to getsentry
+    
+    * ref: fixed a bad test
+    
+    * fix: Make blob size a power of two
+    
+    * meta: Clarify blob size requirement
+    
+    * feat: Added an assemble_file with FileBlob.from_files test
+    
+    * ref: Added another test for blob upload
+    
+    * fix: Ensure blobs are owned when uploaded through from_files
+    
+    * ref: Rename DEFAULT_BLOB_SIZE in chunk.py
+
+diff --git a/src/sentry/api/endpoints/chunk.py b/src/sentry/api/endpoints/chunk.py
+index 6d51f5a4d6..9985b71cd0 100644
+--- a/src/sentry/api/endpoints/chunk.py
++++ b/src/sentry/api/endpoints/chunk.py
+@@ -1,5 +1,6 @@
+ from __future__ import absolute_import
+ 
++import six
+ from io import BytesIO
+ from gzip import GzipFile
+ from itertools import izip
+@@ -8,15 +9,15 @@ from six.moves.urllib.parse import urljoin
+ from rest_framework.response import Response
+ from django.core.urlresolvers import reverse
+ from django.conf import settings
+-from django.db import IntegrityError, transaction
+ 
+ from sentry import options
+-from sentry.models import FileBlob, FileBlobOwner
+-from sentry.models.file import DEFAULT_BLOB_SIZE
++from sentry.models import FileBlob
+ from sentry.api.bases.organization import (OrganizationEndpoint,
+                                            OrganizationReleasePermission)
+ 
+ 
++# The blob size must be a power of two
++CHUNK_UPLOAD_BLOB_SIZE = 8 * 1024 * 1024  # 8MB
+ MAX_CHUNKS_PER_REQUEST = 64
+ MAX_REQUEST_SIZE = 32 * 1024 * 1024
+ MAX_CONCURRENCY = settings.DEBUG and 1 or 4
+@@ -51,7 +52,7 @@ class ChunkUploadEndpoint(OrganizationEndpoint):
+         return Response(
+             {
+                 'url': endpoint,
+-                'chunkSize': DEFAULT_BLOB_SIZE,
++                'chunkSize': CHUNK_UPLOAD_BLOB_SIZE,
+                 'chunksPerRequest': MAX_CHUNKS_PER_REQUEST,
+                 'maxRequestSize': MAX_REQUEST_SIZE,
+                 'concurrency': MAX_CONCURRENCY,
+@@ -81,7 +82,7 @@ class ChunkUploadEndpoint(OrganizationEndpoint):
+         size = 0
+         for chunk in files:
+             size += chunk.size
+-            if chunk.size > DEFAULT_BLOB_SIZE:
++            if chunk.size > CHUNK_UPLOAD_BLOB_SIZE:
+                 return Response({'error': 'Chunk size too large'},
+                                 status=status.HTTP_400_BAD_REQUEST)
+             checksums.append(chunk.name)
+@@ -94,21 +95,11 @@ class ChunkUploadEndpoint(OrganizationEndpoint):
+             return Response({'error': 'Too many chunks'},
+                             status=status.HTTP_400_BAD_REQUEST)
+ 
+-        for checksum, chunk in izip(checksums, files):
+-            # Here we create the actual blob
+-            blob = FileBlob.from_file(chunk)
+-            # Add ownership to the blob here
+-            try:
+-                with transaction.atomic():
+-                    FileBlobOwner.objects.create(
+-                        organization=organization,
+-                        blob=blob
+-                    )
+-            except IntegrityError:
+-                pass
+-            if blob.checksum != checksum:
+-                # We do not clean up here since we have a cleanup job
+-                return Response({'error': 'Checksum missmatch'},
+-                                status=status.HTTP_400_BAD_REQUEST)
++        try:
++            FileBlob.from_files(izip(files, checksums),
++                                organization=organization)
++        except IOError as err:
++            return Response({'error': six.text_type(err)},
++                            status=status.HTTP_400_BAD_REQUEST)
+ 
+         return Response(status=status.HTTP_200_OK)
+diff --git a/src/sentry/models/file.py b/src/sentry/models/file.py
+index 1b18237a98..3e65a5c6cc 100644
+--- a/src/sentry/models/file.py
++++ b/src/sentry/models/file.py
+@@ -15,13 +15,15 @@ import tempfile
+ 
+ from hashlib import sha1
+ from uuid import uuid4
++from threading import Semaphore
+ from concurrent.futures import ThreadPoolExecutor
++from contextlib import contextmanager
+ 
+ from django.conf import settings
+ from django.core.files.base import File as FileObj
+ from django.core.files.base import ContentFile
+ from django.core.files.storage import get_storage_class
+-from django.db import models, transaction
++from django.db import models, transaction, IntegrityError
+ from django.utils import timezone
+ from jsonfield import JSONField
+ 
+@@ -35,6 +37,7 @@ ONE_DAY = 60 * 60 * 24
+ 
+ DEFAULT_BLOB_SIZE = 1024 * 1024  # one mb
+ CHUNK_STATE_HEADER = '__state'
++MULTI_BLOB_UPLOAD_CONCURRENCY = 8
+ 
+ 
+ def enum(**named_values):
+@@ -50,6 +53,31 @@ ChunkFileState = enum(
+ )
+ 
+ 
++def _get_size_and_checksum(fileobj):
++    size = 0
++    checksum = sha1()
++    while 1:
++        chunk = fileobj.read(65536)
++        if not chunk:
++            break
++        size += len(chunk)
++        checksum.update(chunk)
++
++    return size, checksum.hexdigest()
++
++
++@contextmanager
++def _locked_blob(checksum):
++    lock = locks.get(u'fileblob:upload:{}'.format(checksum), duration=60 * 10)
++    with TimedRetryPolicy(60)(lock.acquire):
++        # test for presence
++        try:
++            existing = FileBlob.objects.get(checksum=checksum)
++        except FileBlob.DoesNotExist:
++            existing = None
++        yield existing
++
++
+ class AssembleChecksumMismatch(Exception):
+     pass
+ 
+@@ -81,41 +109,125 @@ class FileBlob(Model):
+         db_table = 'sentry_fileblob'
+ 
+     @classmethod
+-    def from_file(cls, fileobj):
++    def from_files(cls, files, organization=None):
++        """A faster version of `from_file` for multiple files at the time.
++        If an organization is provided it will also create `FileBlobOwner`
++        entries.  Files can be a list of files or tuples of file and checksum.
++        If both are provided then a checksum check is performed.
++
++        If the checksums mismatch an `IOError` is raised.
+         """
+-        Retrieve a list of FileBlobIndex instances for the given file.
++        files_with_checksums = []
++        for fileobj in files:
++            if isinstance(fileobj, tuple):
++                files_with_checksums.append(fileobj)
++            else:
++                files_with_checksums.append((fileobj, None))
+ 
+-        If not already present, this will cause it to be stored.
++        checksums_seen = set()
++        blobs_created = []
++        blobs_to_save = []
++        locks = set()
++        semaphore = Semaphore(value=MULTI_BLOB_UPLOAD_CONCURRENCY)
+ 
+-        >>> blobs = FileBlob.from_file(fileobj)
+-        """
+-        size = 0
++        def _upload_and_pend_chunk(fileobj, size, checksum, lock):
++            blob = cls(size=size, checksum=checksum)
++            blob.path = cls.generate_unique_path(blob.timestamp)
++            storage = get_storage()
++            storage.save(blob.path, fileobj)
++            blobs_to_save.append((blob, lock))
+ 
+-        checksum = sha1(b'')
+-        for chunk in fileobj:
+-            size += len(chunk)
+-            checksum.update(chunk)
+-        checksum = checksum.hexdigest()
++        def _ensure_blob_owned(blob):
++            if organization is None:
++                return
++            try:
++                with transaction.atomic():
++                    FileBlobOwner.objects.create(
++                        organization=organization,
++                        blob=blob
++                    )
++            except IntegrityError:
++                pass
++
++        def _save_blob(blob):
++            blob.save()
++            _ensure_blob_owned(blob)
++
++        def _flush_blobs():
++            while 1:
++                try:
++                    blob, lock = blobs_to_save.pop()
++                except IndexError:
++                    break
++
++                _save_blob(blob)
++                lock.__exit__(None, None, None)
++                locks.discard(lock)
++                semaphore.release()
++
++        try:
++            with ThreadPoolExecutor(max_workers=MULTI_BLOB_UPLOAD_CONCURRENCY) as exe:
++                for fileobj, reference_checksum in files_with_checksums:
++                    _flush_blobs()
++
++                    # Before we go and do something with the files we calculate
++                    # the checksums and compare it against the reference.  This
++                    # also deduplicates duplicates uploaded in the same request.
++                    # This is necessary because we acquire multiple locks in one
++                    # go which would let us deadlock otherwise.
++                    size, checksum = _get_size_and_checksum(fileobj)
++                    if reference_checksum is not None and checksum != reference_checksum:
++                        raise IOError('Checksum mismatch')
++                    if checksum in checksums_seen:
++                        continue
++                    checksums_seen.add(checksum)
++
++                    # Check if we need to lock the blob.  If we get a result back
++                    # here it means the blob already exists.
++                    lock = _locked_blob(checksum)
++                    existing = lock.__enter__()
++                    if existing is not None:
++                        lock.__exit__(None, None, None)
++                        blobs_created.append(existing)
++                        _ensure_blob_owned(existing)
++                        continue
++
++                    # Remember the lock to force unlock all at the end if we
++                    # encounter any difficulties.
++                    locks.add(lock)
++
++                    # Otherwise we leave the blob locked and submit the task.
++                    # We use the semaphore to ensure we never schedule too
++                    # many.  The upload will be done with a certain amount
++                    # of concurrency controlled by the semaphore and the
++                    # `_flush_blobs` call will take all those uploaded
++                    # blobs and associate them with the database.
++                    semaphore.acquire()
++                    exe.submit(_upload_and_pend_chunk(fileobj, size, checksum, lock))
++
++            _flush_blobs()
++        finally:
++            for lock in locks:
++                try:
++                    lock.__exit__(None, None, None)
++                except Exception:
++                    pass
++
++    @classmethod
++    def from_file(cls, fileobj):
++        """
++        Retrieve a single FileBlob instances for the given file.
++        """
++        size, checksum = _get_size_and_checksum(fileobj)
+ 
+         # TODO(dcramer): the database here is safe, but if this lock expires
+         # and duplicate files are uploaded then we need to prune one
+-        lock = locks.get(u'fileblob:upload:{}'.format(checksum), duration=60 * 10)
+-        with TimedRetryPolicy(60)(lock.acquire):
+-            # test for presence
+-            try:
+-                existing = FileBlob.objects.get(checksum=checksum)
+-            except FileBlob.DoesNotExist:
+-                pass
+-            else:
++        with _locked_blob(checksum) as existing:
++            if existing is not None:
+                 return existing
+ 
+-            blob = cls(
+-                size=size,
+-                checksum=checksum,
+-            )
+-
++            blob = cls(size=size, checksum=checksum)
+             blob.path = cls.generate_unique_path(blob.timestamp)
+-
+             storage = get_storage()
+             storage.save(blob.path, fileobj)
+             blob.save()
+diff --git a/tests/sentry/api/endpoints/test_chunk_upload.py b/tests/sentry/api/endpoints/test_chunk_upload.py
+index 5c67474e94..77b64ff23a 100644
+--- a/tests/sentry/api/endpoints/test_chunk_upload.py
++++ b/tests/sentry/api/endpoints/test_chunk_upload.py
+@@ -7,10 +7,10 @@ from django.core.files.uploadedfile import SimpleUploadedFile
+ 
+ from sentry import options
+ from sentry.models import ApiToken, FileBlob
+-from sentry.models.file import DEFAULT_BLOB_SIZE
+ from sentry.testutils import APITestCase
+ from sentry.api.endpoints.chunk import (MAX_CHUNKS_PER_REQUEST, MAX_CONCURRENCY,
+-                                        HASH_ALGORITHM, MAX_REQUEST_SIZE)
++                                        HASH_ALGORITHM, MAX_REQUEST_SIZE,
++                                        CHUNK_UPLOAD_BLOB_SIZE)
+ 
+ 
+ class ChunkUploadTest(APITestCase):
+@@ -35,7 +35,7 @@ class ChunkUploadTest(APITestCase):
+             endpoint = options.get('system.url-prefix')
+ 
+         assert response.status_code == 200, response.content
+-        assert response.data['chunkSize'] == DEFAULT_BLOB_SIZE
++        assert response.data['chunkSize'] == CHUNK_UPLOAD_BLOB_SIZE
+         assert response.data['chunksPerRequest'] == MAX_CHUNKS_PER_REQUEST
+         assert response.data['maxRequestSize'] == MAX_REQUEST_SIZE
+         assert response.data['concurrency'] == MAX_CONCURRENCY
+@@ -141,7 +141,7 @@ class ChunkUploadTest(APITestCase):
+ 
+     def test_too_large_chunk(self):
+         files = []
+-        content = "x" * (DEFAULT_BLOB_SIZE + 1)
++        content = "x" * (CHUNK_UPLOAD_BLOB_SIZE + 1)
+         files.append(SimpleUploadedFile(sha1(content).hexdigest(), content))
+ 
+         response = self.client.post(
+@@ -157,7 +157,7 @@ class ChunkUploadTest(APITestCase):
+ 
+     def test_checksum_missmatch(self):
+         files = []
+-        content = "x" * (DEFAULT_BLOB_SIZE + 1)
++        content = "x" * (CHUNK_UPLOAD_BLOB_SIZE + 1)
+         files.append(SimpleUploadedFile('wrong checksum', content))
+ 
+         response = self.client.post(
+diff --git a/tests/sentry/models/test_file.py b/tests/sentry/models/test_file.py
+index d6ac31e529..d26b7981be 100644
+--- a/tests/sentry/models/test_file.py
++++ b/tests/sentry/models/test_file.py
+@@ -16,7 +16,9 @@ class FileBlobTest(TestCase):
+ 
+         assert my_file1.path
+ 
++        fileobj.seek(0)
+         my_file2 = FileBlob.from_file(fileobj)
++
+         # deep check
+         assert my_file1.id == my_file2.id
+         assert my_file1.checksum == my_file2.checksum
+diff --git a/tests/sentry/tasks/test_assemble.py b/tests/sentry/tasks/test_assemble.py
+index 753ea6d77f..e221dc54ee 100644
+--- a/tests/sentry/tasks/test_assemble.py
++++ b/tests/sentry/tasks/test_assemble.py
+@@ -1,12 +1,14 @@
+ from __future__ import absolute_import
+ 
++import os
++import io
+ from hashlib import sha1
+ 
+ from django.core.files.base import ContentFile
+ 
+ from sentry.testutils import TestCase
+-from sentry.tasks.assemble import assemble_dif
+-from sentry.models import FileBlob
++from sentry.tasks.assemble import assemble_dif, assemble_file
++from sentry.models import FileBlob, FileBlobOwner
+ from sentry.models.file import ChunkFileState
+ from sentry.models.debugfile import get_assemble_status, ProjectDebugFile
+ 
+@@ -69,3 +71,45 @@ class AssembleTest(TestCase):
+         assert dif.file.headers == {'Content-Type': 'text/x-breakpad'}
+         assert dif.projectsymcachefile.exists()
+         assert dif.projectcficachefile.exists()
++
++    def test_assemble_from_files(self):
++        files = []
++        file_checksum = sha1()
++        for _ in xrange(8):
++            blob = os.urandom(1024 * 1024 * 8)
++            hash = sha1(blob).hexdigest()
++            file_checksum.update(blob)
++            files.append((io.BytesIO(blob), hash))
++
++        # upload all blobs
++        FileBlob.from_files(files, organization=self.organization)
++
++        # find all blobs
++        for reference, checksum in files:
++            blob = FileBlob.objects.get(checksum=checksum)
++            ref_bytes = reference.getvalue()
++            assert blob.getfile().read(len(ref_bytes)) == ref_bytes
++            FileBlobOwner.objects.filter(
++                blob=blob,
++                organization=self.organization
++            ).get()
++
++        rv = assemble_file(
++            self.project, 'testfile', file_checksum.hexdigest(),
++            [x[1] for x in files], 'dummy.type')
++
++        assert rv is not None
++        f, tmp = rv
++        assert f.checksum == file_checksum.hexdigest()
++        assert f.type == 'dummy.type'
++
++        # upload all blobs a second time
++        for f, _ in files:
++            f.seek(0)
++        FileBlob.from_files(files, organization=self.organization)
++
++        # assemble a second time
++        f = assemble_file(
++            self.project, 'testfile', file_checksum.hexdigest(),
++            [x[1] for x in files], 'dummy.type')[0]
++        assert f.checksum == file_checksum.hexdigest()

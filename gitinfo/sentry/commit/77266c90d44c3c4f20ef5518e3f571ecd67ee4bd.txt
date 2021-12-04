@@ -1,0 +1,428 @@
+commit 77266c90d44c3c4f20ef5518e3f571ecd67ee4bd
+Author: Jan Michael Auer <jan.auer@sentry.io>
+Date:   Fri Mar 6 14:47:32 2020 +0100
+
+    fix(event_manager): Emit outcomes for transaction events (#17500)
+    
+    Moves emission of outcomes into EventManager and restores correct behavior for transaction events.
+
+diff --git a/src/sentry/event_manager.py b/src/sentry/event_manager.py
+index d089e7d74e..6a0acbe341 100644
+--- a/src/sentry/event_manager.py
++++ b/src/sentry/event_manager.py
+@@ -41,6 +41,7 @@ from sentry.coreapi import (
+     decode_data,
+     safely_load_json_string,
+ )
++from sentry.ingest.outcomes_consumer import mark_signal_sent
+ from sentry.interfaces.base import get_interface
+ from sentry.lang.native.utils import STORE_CRASH_REPORTS_ALL, convert_crashreport_count
+ from sentry.models import (
+@@ -59,6 +60,7 @@ from sentry.models import (
+     GroupResolution,
+     GroupStatus,
+     Project,
++    ProjectKey,
+     Release,
+     ReleaseEnvironment,
+     ReleaseProject,
+@@ -69,6 +71,7 @@ from sentry.models import (
+     get_crashreport_key,
+ )
+ from sentry.plugins.base import plugins
++from sentry import quotas
+ from sentry.signals import event_discarded, event_saved, first_event_received
+ from sentry.tasks.integrations import kick_off_status_syncs
+ from sentry.utils import json, metrics
+@@ -79,7 +82,8 @@ from sentry.utils.data_filters import (
+     is_valid_error_message,
+     FilterStatKeys,
+ )
+-from sentry.utils.dates import to_timestamp
++from sentry.utils.dates import to_timestamp, to_datetime
++from sentry.utils.outcomes import Outcome, track_outcome
+ from sentry.utils.safe import safe_execute, trim, get_path, setdefault_path
+ from sentry.stacktraces.processing import normalize_stacktraces_for_grouping
+ from sentry.culprit import generate_culprit
+@@ -423,7 +427,7 @@ class EventManager(object):
+         return self._data
+ 
+     @metrics.wraps("event_manager.save")
+-    def save(self, project_id, raw=False, assume_normalized=False, cache_key=None):
++    def save(self, project_id, raw=False, assume_normalized=False, start_time=None, cache_key=None):
+         """
+         After normalizing and processing an event, save adjacent models such as
+         releases and environments to postgres and write the event into
+@@ -455,7 +459,8 @@ class EventManager(object):
+ 
+         if self._data.get("type") == "transaction":
+             self._data["project"] = int(project_id)
+-            jobs = save_transaction_events([self._data], projects)
++            job = {"data": self._data, "start_time": start_time}
++            jobs = save_transaction_events([job], projects)
+             return jobs[0]["event"]
+ 
+         with metrics.timer("event_manager.save.organization.get_from_cache"):
+@@ -463,7 +468,7 @@ class EventManager(object):
+                 id=project.organization_id
+             )
+ 
+-        job = {"data": self._data, "project_id": project_id, "raw": raw}
++        job = {"data": self._data, "project_id": project_id, "raw": raw, "start_time": start_time}
+         jobs = [job]
+ 
+         _pull_out_data(jobs, projects)
+@@ -533,6 +538,30 @@ class EventManager(object):
+         except HashDiscarded:
+             event_discarded.send_robust(project=project, sender=EventManager)
+ 
++            project_key = None
++            if job["key_id"] is not None:
++                try:
++                    project_key = ProjectKey.objects.get_from_cache(id=job["key_id"])
++                except ProjectKey.DoesNotExist:
++                    pass
++
++            quotas.refund(project, key=project_key, timestamp=start_time)
++
++            # The outcomes_consumer generically handles all FILTERED outcomes,
++            # but needs to skip this since it cannot dispatch event_discarded.
++            mark_signal_sent(project_id, job["event"].event_id)
++
++            track_outcome(
++                project.organization_id,
++                project_id,
++                job["key_id"],
++                Outcome.FILTERED,
++                FilterStatKeys.DISCARDED_HASH,
++                to_datetime(job["start_time"]),
++                job["event"].event_id,
++                job["category"],
++            )
++
+             metrics.incr(
+                 "events.discarded",
+                 skip_internal=True,
+@@ -633,6 +662,8 @@ class EventManager(object):
+             tags=metric_tags,
+         )
+ 
++        _track_outcome_accepted_many(jobs)
++
+         self._data = job["event"].data.data
+         return job["event"]
+ 
+@@ -656,6 +687,11 @@ def _pull_out_data(jobs, projects):
+             transaction_name = force_text(transaction_name)
+         job["transaction"] = transaction_name
+ 
++        key_id = None if data is None else data.get("key_id")
++        if key_id is not None:
++            key_id = int(key_id)
++        job["key_id"] = key_id
++
+         job["logger_name"] = logger_name = data.get("logger")
+         job["level"] = level = data.get("level")
+         job["release"] = data.get("release")
+@@ -911,6 +947,27 @@ def _eventstream_insert_many(jobs):
+         )
+ 
+ 
++@metrics.wraps("save_event.track_outcome_accepted_many")
++def _track_outcome_accepted_many(jobs):
++    for job in jobs:
++        event = job["event"]
++
++        # This is where we can finally say that we have accepted the event.
++        if options.get("sentry:skip-accepted-signal-in-save-event") != "1":
++            mark_signal_sent(event.project.id, event.event_id)
++
++        track_outcome(
++            event.project.organization_id,
++            job["project_id"],
++            job["key_id"],
++            Outcome.ACCEPTED,
++            None,
++            to_datetime(job["start_time"]),
++            event.event_id,
++            job["category"],
++        )
++
++
+ @metrics.wraps("event_manager.get_event_instance")
+ def _get_event_instance(data, project_id):
+     event_id = data.get("event_id")
+@@ -1308,7 +1365,7 @@ def _materialize_event_metrics(jobs):
+ 
+ 
+ @metrics.wraps("event_manager.save_transaction_events")
+-def save_transaction_events(events, projects):
++def save_transaction_events(jobs, projects):
+     with metrics.timer("event_manager.save_transactions.collect_organization_ids"):
+         organization_ids = set(project.organization_id for project in six.itervalues(projects))
+ 
+@@ -1325,18 +1382,13 @@ def save_transaction_events(events, projects):
+                 continue
+ 
+     with metrics.timer("event_manager.save_transactions.prepare_jobs"):
+-        jobs = list(
+-            {
+-                "data": event,
+-                "project_id": event["project"],
+-                "raw": False,
+-                "group": None,
+-                "is_new": False,
+-                "is_regression": False,
+-                "is_new_group_environment": False,
+-            }
+-            for event in events
+-        )
++        for job in jobs:
++            job["project_id"] = job["data"]["project"]
++            job["raw"] = False
++            job["group"] = None
++            job["is_new"] = False
++            job["is_regression"] = False
++            job["is_new_group_environment"] = False
+ 
+     _pull_out_data(jobs, projects)
+     _get_or_create_release_many(jobs, projects)
+@@ -1351,4 +1403,5 @@ def save_transaction_events(events, projects):
+     _materialize_event_metrics(jobs)
+     _nodestore_save_many(jobs)
+     _eventstream_insert_many(jobs)
++    _track_outcome_accepted_many(jobs)
+     return jobs
+diff --git a/src/sentry/ingest/ingest_consumer.py b/src/sentry/ingest/ingest_consumer.py
+index 3361df382e..a7ef42de14 100644
+--- a/src/sentry/ingest/ingest_consumer.py
++++ b/src/sentry/ingest/ingest_consumer.py
+@@ -114,19 +114,20 @@ class IngestConsumerWorker(AbstractBatchWorker):
+ 
+ @metrics.wraps("ingest_consumer.process_transactions_batch")
+ def process_transactions_batch(messages, projects):
+-    events = []
++    jobs = []
+     for message in messages:
+         payload = message["payload"]
+         project_id = int(message["project_id"])
++        start_time = float(message["start_time"])
+ 
+         if project_id not in projects:
+             continue
+ 
+         with metrics.timer("ingest_consumer.decode_transaction_json"):
+             data = json.loads(payload)
+-            events.append(data)
++        jobs.append({"data": data, "start_time": start_time})
+ 
+-    save_transaction_events(events, projects)
++    save_transaction_events(jobs, projects)
+ 
+ 
+ @metrics.wraps("ingest_consumer.process_event")
+diff --git a/src/sentry/tasks/store.py b/src/sentry/tasks/store.py
+index afd7c98f2d..11f0da0471 100644
+--- a/src/sentry/tasks/store.py
++++ b/src/sentry/tasks/store.py
+@@ -9,8 +9,7 @@ from django.conf import settings
+ 
+ from sentry_relay.processing import StoreNormalizer
+ 
+-from sentry import features, reprocessing, options
+-from sentry.constants import DataCategory
++from sentry import features, reprocessing
+ from sentry.relay.config import get_project_config
+ from sentry.datascrubbing import scrub_data
+ from sentry.constants import DEFAULT_STORE_NORMALIZER_ARGS
+@@ -20,7 +19,6 @@ from sentry.tasks.base import instrumented_task
+ from sentry.utils import metrics
+ from sentry.utils.safe import safe_execute
+ from sentry.stacktraces.processing import process_stacktraces, should_process_for_stacktraces
+-from sentry.utils.data_filters import FilterStatKeys
+ from sentry.utils.canonical import CanonicalKeyDict, CANONICAL_TYPES
+ from sentry.utils.dates import to_datetime
+ from sentry.utils.sdk import configure_scope
+@@ -464,11 +462,7 @@ def _do_save_event(
+     Saves an event to the database.
+     """
+ 
+-    from sentry.event_manager import HashDiscarded, EventManager
+-    from sentry import quotas
+-    from sentry.models import ProjectKey
+-    from sentry.utils.outcomes import Outcome, track_outcome
+-    from sentry.ingest.outcomes_consumer import mark_signal_sent
++    from sentry.event_manager import EventManager, HashDiscarded
+ 
+     event_type = "none"
+ 
+@@ -478,8 +472,6 @@ def _do_save_event(
+             if data is not None:
+                 metric_tags["event_type"] = event_type = data.get("type") or "none"
+ 
+-    data_category = DataCategory.from_event_type(event_type)
+-
+     with metrics.global_tags(event_type=event_type):
+         if data is not None:
+             data = CanonicalKeyDict(data)
+@@ -492,11 +484,6 @@ def _do_save_event(
+         if project_id is None:
+             project_id = data.pop("project")
+ 
+-        key_id = None if data is None else data.get("key_id")
+-        if key_id is not None:
+-            key_id = int(key_id)
+-        timestamp = to_datetime(start_time) if start_time is not None else None
+-
+         # We only need to delete raw events for events that support
+         # reprocessing.  If the data cannot be found we want to assume
+         # that we need to delete the raw event.
+@@ -528,50 +515,12 @@ def _do_save_event(
+             with metrics.timer("tasks.store.do_save_event.event_manager.save"):
+                 manager = EventManager(data)
+                 # event.project.organization is populated after this statement.
+-                event = manager.save(project_id, assume_normalized=True, cache_key=cache_key)
+-
+-            with metrics.timer("tasks.store.do_save_event.track_outcome"):
+-                # This is where we can finally say that we have accepted the event.
+-                if options.get("sentry:skip-accepted-signal-in-save-event") != "1":
+-                    mark_signal_sent(event.project.id, event_id)
+-                track_outcome(
+-                    event.project.organization_id,
+-                    event.project.id,
+-                    key_id,
+-                    Outcome.ACCEPTED,
+-                    None,
+-                    timestamp,
+-                    event_id,
+-                    data_category,
++                event = manager.save(
++                    project_id, assume_normalized=True, start_time=start_time, cache_key=cache_key
+                 )
+ 
+         except HashDiscarded:
+-            project = Project.objects.get_from_cache(id=project_id)
+-            reason = FilterStatKeys.DISCARDED_HASH
+-            project_key = None
+-            try:
+-                if key_id is not None:
+-                    project_key = ProjectKey.objects.get_from_cache(id=key_id)
+-            except ProjectKey.DoesNotExist:
+-                pass
+-
+-            quotas.refund(project, key=project_key, timestamp=start_time)
+-
+-            # This outcome corresponds to the event_discarded signal. The
+-            # outcomes_consumer generically handles all FILTERED outcomes, but
+-            # needs to skip this one.
+-            mark_signal_sent(project_id, event_id)
+-
+-            track_outcome(
+-                project.organization_id,
+-                project_id,
+-                key_id,
+-                Outcome.FILTERED,
+-                reason,
+-                timestamp,
+-                event_id,
+-                data_category,
+-            )
++            pass
+ 
+         finally:
+             if cache_key:
+diff --git a/src/sentry/utils/dates.py b/src/sentry/utils/dates.py
+index 7acb8dcb63..b0fac21ce1 100644
+--- a/src/sentry/utils/dates.py
++++ b/src/sentry/utils/dates.py
+@@ -29,6 +29,9 @@ def to_datetime(value):
+     The timestamp value must be a numeric type (either a integer or float,
+     since it may contain a fractional component.)
+     """
++    if value is None:
++        return None
++
+     return epoch + timedelta(seconds=value)
+ 
+ 
+diff --git a/tests/sentry/event_manager/test_event_manager.py b/tests/sentry/event_manager/test_event_manager.py
+index b9e438148e..e593c58284 100644
+--- a/tests/sentry/event_manager/test_event_manager.py
++++ b/tests/sentry/event_manager/test_event_manager.py
+@@ -1029,6 +1029,19 @@ class EventManagerTest(TestCase):
+             mock_event_discarded, project=group.project, sender=EventManager, signal=event_discarded
+         )
+ 
++        def query(model, key, **kwargs):
++            return tsdb.get_sums(model, [key], event.datetime, event.datetime, **kwargs)[key]
++
++        # Ensure that we incremented TSDB counts
++        assert query(tsdb.models.organization_total_received, event.project.organization.id) == 2
++        assert query(tsdb.models.project_total_received, event.project.id) == 2
++
++        assert query(tsdb.models.project, event.project.id) == 1
++        assert query(tsdb.models.group, event.group.id) == 1
++
++        assert query(tsdb.models.organization_total_blacklisted, event.project.organization.id) == 1
++        assert query(tsdb.models.project_total_blacklisted, event.project.id) == 1
++
+     def test_event_saved_signal(self):
+         mock_event_saved = mock.Mock()
+         event_saved.connect(mock_event_saved)
+diff --git a/tests/sentry/tasks/test_store.py b/tests/sentry/tasks/test_store.py
+index 6e11c4a7a8..cf7c199cb9 100644
+--- a/tests/sentry/tasks/test_store.py
++++ b/tests/sentry/tasks/test_store.py
+@@ -5,11 +5,10 @@ import pytest
+ from sentry.utils.compat import mock
+ from time import time
+ 
+-from sentry import quotas, tsdb
++from sentry import quotas
+ from sentry.event_manager import EventManager, HashDiscarded
+ from sentry.plugins.base.v2 import Plugin2
+ from sentry.tasks.store import preprocess_event, process_event, save_event
+-from sentry.utils.dates import to_datetime
+ from sentry.testutils.helpers.features import Feature
+ 
+ EVENT_ID = "cc3e6c2bb6b6498097f336d1e6979f4b"
+@@ -70,12 +69,6 @@ def mock_default_cache():
+         yield m
+ 
+ 
+-@pytest.fixture
+-def mock_incr():
+-    with mock.patch.object(tsdb, "incr_multi") as m:
+-        yield m
+-
+-
+ @pytest.fixture
+ def mock_refund():
+     with mock.patch.object(quotas, "refund") as m:
+@@ -203,7 +196,7 @@ def test_process_event_unprocessed(
+ 
+ 
+ @pytest.mark.django_db
+-def test_hash_discarded_raised(default_project, mock_refund, mock_incr, register_plugin):
++def test_hash_discarded_raised(default_project, mock_refund, register_plugin):
+     register_plugin(BasicPreprocessorPlugin)
+ 
+     data = {
+@@ -219,16 +212,7 @@ def test_hash_discarded_raised(default_project, mock_refund, mock_incr, register
+     mock_save.side_effect = HashDiscarded
+     with mock.patch.object(EventManager, "save", mock_save):
+         save_event(data=data, start_time=now)
+-        mock_incr.assert_called_with(
+-            [
+-                (tsdb.models.project_total_received, default_project.id),
+-                (tsdb.models.organization_total_received, default_project.organization.id),
+-                (tsdb.models.project_total_blacklisted, default_project.id),
+-                (tsdb.models.organization_total_blacklisted, default_project.organization_id),
+-                (tsdb.models.project_total_received_discarded, default_project.id),
+-            ],
+-            timestamp=to_datetime(now),
+-        )
++        # should be caught
+ 
+ 
+ @pytest.fixture(params=["org", "project"])

@@ -1,0 +1,664 @@
+commit b2af31a93d0444ec5d1ddeb1cf2307e420f85a40
+Author: Amit Patankar <amitpatankar@google.com>
+Date:   Fri Nov 30 09:41:16 2018 -0800
+
+    Experimenting with cifar keras.
+
+diff --git a/official/resnet/cifar10_main.py b/official/resnet/cifar10_main.py
+index b07d0f2e..a1ad1330 100644
+--- a/official/resnet/cifar10_main.py
++++ b/official/resnet/cifar10_main.py
+@@ -111,7 +111,7 @@ def preprocess_image(image, is_training):
+ 
+ def input_fn(is_training, data_dir, batch_size, num_epochs=1,
+              dtype=tf.float32, datasets_num_private_threads=None,
+-             num_parallel_batches=1):
++             num_parallel_batches=1, parse_record_fn=parse_record):
+   """Input function which provides batches for train or eval.
+ 
+   Args:
+@@ -134,7 +134,7 @@ def input_fn(is_training, data_dir, batch_size, num_epochs=1,
+       is_training=is_training,
+       batch_size=batch_size,
+       shuffle_buffer=_NUM_IMAGES['train'],
+-      parse_record_fn=parse_record,
++      parse_record_fn=parse_record_fn,
+       num_epochs=num_epochs,
+       dtype=dtype,
+       datasets_num_private_threads=datasets_num_private_threads,
+diff --git a/official/resnet/keras/keras_cifar_main.py b/official/resnet/keras/keras_cifar_main.py
+new file mode 100644
+index 00000000..dd9ffbeb
+--- /dev/null
++++ b/official/resnet/keras/keras_cifar_main.py
+@@ -0,0 +1,296 @@
++# Copyright 2017 The TensorFlow Authors. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# ==============================================================================
++"""Runs a ResNet model on the ImageNet dataset."""
++
++from __future__ import absolute_import
++from __future__ import division
++from __future__ import print_function
++
++import time
++
++from absl import app as absl_app
++from absl import flags
++import numpy as np
++import tensorflow as tf  # pylint: disable=g-bad-import-order
++
++from official.resnet import cifar10_main as cifar_main
++from official.resnet import resnet_run_loop
++from official.resnet.keras import keras_resnet_model
++from official.utils.flags import core as flags_core
++from official.utils.logs import logger
++from official.utils.misc import distribution_utils
++from tensorflow.python.keras.optimizer_v2 import gradient_descent as gradient_descent_v2
++
++
++class TimeHistory(tf.keras.callbacks.Callback):
++  """Callback for Keras models."""
++
++  def __init__(self, batch_size):
++    """Callback for Keras models.
++
++    Args:
++      batch_size: Total batch size.
++
++    """
++    self._batch_size = batch_size
++    super(TimeHistory, self).__init__()
++
++  def on_train_begin(self, logs=None):
++    self.epoch_times_secs = []
++    self.batch_times_secs = []
++    self.record_batch = True
++
++  def on_epoch_begin(self, epoch, logs=None):
++    self.epoch_time_start = time.time()
++
++  def on_epoch_end(self, epoch, logs=None):
++    self.epoch_times_secs.append(time.time() - self.epoch_time_start)
++
++  def on_batch_begin(self, batch, logs=None):
++    if self.record_batch:
++      self.batch_time_start = time.time()
++      self.record_batch = False
++
++  def on_batch_end(self, batch, logs=None):
++    n = 100
++    if batch % n == 0:
++      last_n_batches = time.time() - self.batch_time_start
++      examples_per_second = (self._batch_size * n) / last_n_batches
++      self.batch_times_secs.append(last_n_batches)
++      self.record_batch = True
++      # TODO(anjalisridhar): add timestamp as well.
++      if batch != 0:
++        tf.logging.info("BenchmarkMetric: {'num_batches':%d, 'time_taken': %f,"
++                        "'images_per_second': %f}" %
++                        (batch, last_n_batches, examples_per_second))
++
++
++LR_SCHEDULE = [    # (multiplier, epoch to start) tuples
++    (1.0, 5), (0.1, 30), (0.01, 60), (0.001, 80)
++]
++BASE_LEARNING_RATE = 0.4 #0.128
++
++def learning_rate_schedule(current_epoch, current_batch, batches_per_epoch):
++  """Handles linear scaling rule, gradual warmup, and LR decay.
++
++  The learning rate starts at 0, then it increases linearly per step.
++  After 5 epochs we reach the base learning rate (scaled to account
++    for batch size).
++  After 30, 60 and 80 epochs the learning rate is divided by 10.
++  After 90 epochs training stops and the LR is set to 0. This ensures
++    that we train for exactly 90 epochs for reproducibility.
++
++  Args:
++    current_epoch: integer, current epoch indexed from 0.
++    current_batch: integer, current batch in the current epoch, indexed from 0.
++
++  Returns:
++    Adjusted learning rate.
++  """
++  epoch = current_epoch + float(current_batch) / batches_per_epoch
++  warmup_lr_multiplier, warmup_end_epoch = LR_SCHEDULE[0]
++  if epoch < warmup_end_epoch:
++    # Learning rate increases linearly per step.
++    return BASE_LEARNING_RATE * warmup_lr_multiplier * epoch / warmup_end_epoch
++  for mult, start_epoch in LR_SCHEDULE:
++    if epoch >= start_epoch:
++      learning_rate = BASE_LEARNING_RATE * mult
++    else:
++      break
++  return learning_rate
++
++
++class LearningRateBatchScheduler(tf.keras.callbacks.Callback):
++  """Callback to update learning rate on every batch (not epoch boundaries).
++
++  N.B. Only support Keras optimizers, not TF optimizers.
++
++  Args:
++      schedule: a function that takes an epoch index and a batch index as input
++          (both integer, indexed from 0) and returns a new learning rate as
++          output (float).
++  """
++
++  def __init__(self, schedule, batch_size, num_images):
++    super(LearningRateBatchScheduler, self).__init__()
++    self.schedule = schedule
++    self.batches_per_epoch = num_images / batch_size
++    self.epochs = -1
++    self.prev_lr = -1
++
++  def on_epoch_begin(self, epoch, logs=None):
++    #if not hasattr(self.model.optimizer, 'learning_rate'):
++    #  raise ValueError('Optimizer must have a "learning_rate" attribute.')
++    self.epochs += 1
++
++  def on_batch_begin(self, batch, logs=None):
++    lr = self.schedule(self.epochs, batch, self.batches_per_epoch)
++    if not isinstance(lr, (float, np.float32, np.float64)):
++      raise ValueError('The output of the "schedule" function should be float.')
++    if lr != self.prev_lr:
++      tf.keras.backend.set_value(self.model.optimizer.learning_rate, lr)
++      self.prev_lr = lr
++      tf.logging.debug('Epoch %05d Batch %05d: LearningRateBatchScheduler change '
++                   'learning rate to %s.', self.epochs, batch, lr)
++
++
++
++def parse_record_keras(raw_record, is_training, dtype):
++  """Parses a record containing a training example of an image.
++
++  The input record is parsed into a label and image, and the image is passed
++  through preprocessing steps (cropping, flipping, and so on).
++
++  Args:
++    raw_record: scalar Tensor tf.string containing a serialized
++      Example protocol buffer.
++    is_training: A boolean denoting whether the input is for training.
++    dtype: Data type to use for input images.
++
++  Returns:
++    Tuple with processed image tensor and one-hot-encoded label tensor.
++  """
++  image, label = cifar_main.parse_record(raw_record, is_training, dtype)
++  label = tf.sparse_to_dense(label, (cifar_main._NUM_CLASSES,), 1)
++  return image, label
++
++
++def run_cifar_with_keras(flags_obj):
++  """Run ResNet ImageNet training and eval loop using native Keras APIs.
++
++  Args:
++    flags_obj: An object containing parsed flag values.
++
++  Raises:
++    ValueError: If fp16 is passed as it is not currently supported.
++  """
++  dtype = flags_core.get_tf_dtype(flags_obj)
++  if dtype == 'fp16':
++    raise ValueError('dtype fp16 is not supported in Keras. Use the default '
++                     'value(fp32).')
++
++  per_device_batch_size = distribution_utils.per_device_batch_size(
++      flags_obj.batch_size, flags_core.get_num_gpus(flags_obj))
++
++  # pylint: disable=protected-access
++  if flags_obj.use_synthetic_data:
++    synth_input_fn = resnet_run_loop.get_synth_input_fn(
++        cifar_main._HEIGHT, cifar_main._WIDTH,
++        cifar_main._NUM_CHANNELS, cifar_main._NUM_CLASSES,
++        dtype=flags_core.get_tf_dtype(flags_obj))
++    train_input_dataset = synth_input_fn(
++        True,
++        flags_obj.data_dir,
++        batch_size=per_device_batch_size,
++        height=cifar_main._HEIGHT,
++        width=cifar_main._WIDTH,
++        num_channels=cifar_main._NUM_CHANNELS,
++        num_classes=cifar_main._NUM_CLASSES,
++        dtype=dtype)
++    eval_input_dataset = synth_input_fn(
++        False,
++        flags_obj.data_dir,
++        batch_size=per_device_batch_size,
++        height=cifar_main._HEIGHT,
++        width=cifar_main._WIDTH,
++        num_channels=cifar_main._NUM_CHANNELS,
++        num_classes=cifar_main._NUM_CLASSES,
++        dtype=dtype)
++  # pylint: enable=protected-access
++
++  else:
++    train_input_dataset = cifar_main.input_fn(
++          True,
++          flags_obj.data_dir,
++          batch_size=per_device_batch_size,
++          num_epochs=flags_obj.train_epochs,
++          parse_record_fn=parse_record_keras)
++
++    eval_input_dataset = cifar_main.input_fn(
++          False,
++          flags_obj.data_dir,
++          batch_size=per_device_batch_size,
++          num_epochs=flags_obj.train_epochs,
++          parse_record_fn=parse_record_keras)
++
++
++  # Use Keras ResNet50 applications model and native keras APIs
++  # initialize RMSprop optimizer
++  # TODO(anjalisridhar): Move to using MomentumOptimizer.
++  # opt = tf.train.GradientDescentOptimizer(learning_rate=0.0001)
++  # I am setting an initial LR of 0.001 since this will be reset
++  # at the beginning of the training loop.
++  opt = gradient_descent_v2.SGD(learning_rate=0.1, momentum=0.9)
++
++  # TF Optimizer:
++  # opt = tf.train.MomentumOptimizer(learning_rate=0.1, momentum=0.9)
++  
++  strategy = distribution_utils.get_distribution_strategy(
++      num_gpus=flags_obj.num_gpus)
++
++  model = keras_resnet_model.ResNet56(input_shape=(32, 32, 3),
++                                       include_top=True,
++                                       classes=cifar_main._NUM_CLASSES,
++                                       weights=None)
++    
++
++  loss = 'categorical_crossentropy'
++  accuracy = 'categorical_accuracy'
++ 
++  model.compile(loss=loss,
++                optimizer=opt,
++                metrics=[accuracy],
++                distribute=strategy)
++
++  steps_per_epoch = cifar_main._NUM_IMAGES['train'] // flags_obj.batch_size
++
++  time_callback = TimeHistory(flags_obj.batch_size)
++
++  tesorboard_callback = tf.keras.callbacks.TensorBoard(
++    log_dir=flags_obj.model_dir)
++    # update_freq="batch")  # Add this if want per batch logging.
++
++  lr_callback = LearningRateBatchScheduler(
++    learning_rate_schedule,
++    batch_size=flags_obj.batch_size,
++    num_images=cifar_main._NUM_IMAGES['train'])
++    
++  num_eval_steps = (cifar_main._NUM_IMAGES['validation'] //
++                  flags_obj.batch_size)
++  
++  model.fit(train_input_dataset,
++            epochs=flags_obj.train_epochs,
++            steps_per_epoch=steps_per_epoch,
++            callbacks=[
++              time_callback,
++              lr_callback,
++              tesorboard_callback
++            ],
++            verbose=1)
++  
++  eval_output = model.evaluate(eval_input_dataset,
++                               steps=num_eval_steps,
++                               verbose=1)
++  print('Test loss:', eval_output[0])
++
++def main(_):
++  with logger.benchmark_context(flags.FLAGS):
++    run_cifar_with_keras(flags.FLAGS)
++
++
++if __name__ == '__main__':
++  tf.logging.set_verbosity(tf.logging.DEBUG)
++  cifar_main.define_cifar_flags()
++  absl_app.run(main)
+diff --git a/official/resnet/keras/keras_resnet_model.py b/official/resnet/keras/keras_resnet_model.py
+index 0d24ab64..6bce85c8 100644
+--- a/official/resnet/keras/keras_resnet_model.py
++++ b/official/resnet/keras/keras_resnet_model.py
+@@ -466,3 +466,329 @@ def ResNet50(include_top=True,
+     model.load_weights(weights)
+ 
+   return model
++
++
++def identity_building_block(input_tensor, kernel_size, filters, stage, block, training):
++  """The identity block is the block that has no conv layer at shortcut.
++
++  Arguments:
++    input_tensor: input tensor
++    kernel_size: default 3, the kernel size of
++        middle conv layer at main path
++    filters: list of integers, the filters of 3 conv layer at main path
++    stage: integer, current stage label, used for generating layer names
++    block: 'a','b'..., current block label, used for generating layer names
++
++  Returns:
++    Output tensor for the block.
++  """
++  filters1, filters2 = filters
++  if tf.keras.backend.image_data_format() == 'channels_last':
++    bn_axis = 3
++  else:
++    bn_axis = 1
++  conv_name_base = 'res' + str(stage) + block + '_branch'
++  bn_name_base = 'bn' + str(stage) + block + '_branch'
++
++  x = tf.keras.layers.Conv2D(filters1, kernel_size,
++                             padding='same',
++                             kernel_regularizer=
++                             tf.keras.regularizers.l2(L2_WEIGHT_DECAY),
++                             bias_regularizer=
++                             tf.keras.regularizers.l2(L2_WEIGHT_DECAY),
++                             name=conv_name_base + '2a')(input_tensor)
++  x = tf.keras.layers.BatchNormalization(axis=bn_axis,
++                                         name=bn_name_base + '2a',
++                                         momentum=BATCH_NORM_DECAY,
++                                         epsilon=BATCH_NORM_EPSILON)(
++      x, training=training)
++  x = tf.keras.layers.Activation('relu')(x)
++
++  x = tf.keras.layers.Conv2D(filters2, kernel_size,
++                             padding='same',
++                             kernel_regularizer=
++                             tf.keras.regularizers.l2(L2_WEIGHT_DECAY),
++                             bias_regularizer=
++                             tf.keras.regularizers.l2(L2_WEIGHT_DECAY),
++                             name=conv_name_base + '2b')(x)
++  x = tf.keras.layers.BatchNormalization(axis=bn_axis,
++                                         name=bn_name_base + '2b',
++                                         momentum=BATCH_NORM_DECAY,
++                                         epsilon=BATCH_NORM_EPSILON)(
++      x, training=training)
++
++  x = tf.keras.layers.add([x, input_tensor])
++  x = tf.keras.layers.Activation('relu')(x)
++  return x
++
++
++def conv_building_block(input_tensor,
++    kernel_size,
++    filters,
++    stage,
++    block,
++    strides=(2, 2),
++    training=True):
++  """A block that has a conv layer at shortcut.
++
++  Arguments:
++    input_tensor: input tensor
++    kernel_size: default 3, the kernel size of
++        middle conv layer at main path
++    filters: list of integers, the filters of 3 conv layer at main path
++    stage: integer, current stage label, used for generating layer names
++    block: 'a','b'..., current block label, used for generating layer names
++    strides: Strides for the first conv layer in the block.
++    training: Boolean to indicate if we are in the training loop.
++
++  Returns:
++    Output tensor for the block.
++
++  Note that from stage 3,
++  the first conv layer at main path is with strides=(2, 2)
++  And the shortcut should have strides=(2, 2) as well
++  """
++  filters1, filters2 = filters
++  if tf.keras.backend.image_data_format() == 'channels_last':
++    bn_axis = 3
++  else:
++    bn_axis = 1
++  conv_name_base = 'res' + str(stage) + block + '_branch'
++  bn_name_base = 'bn' + str(stage) + block + '_branch'
++
++  x = tf.keras.layers.Conv2D(filters1, kernel_size,
++                             padding='same',
++                             kernel_regularizer=
++                             tf.keras.regularizers.l2(L2_WEIGHT_DECAY),
++                             bias_regularizer=
++                             tf.keras.regularizers.l2(L2_WEIGHT_DECAY),
++                             name=conv_name_base + '2a', strides=strides)(input_tensor)
++  x = tf.keras.layers.BatchNormalization(axis=bn_axis,
++                                         name=bn_name_base + '2a',
++                                         momentum=BATCH_NORM_DECAY,
++                                         epsilon=BATCH_NORM_EPSILON)(
++      x, training=training)
++  x = tf.keras.layers.Activation('relu')(x)
++
++  x = tf.keras.layers.Conv2D(filters2, kernel_size, padding='same',
++                             kernel_regularizer=
++                             tf.keras.regularizers.l2(L2_WEIGHT_DECAY),
++                             bias_regularizer=
++                             tf.keras.regularizers.l2(L2_WEIGHT_DECAY),
++                             name=conv_name_base + '2b')(x)
++  x = tf.keras.layers.BatchNormalization(axis=bn_axis,
++                                         name=bn_name_base + '2b',
++                                         momentum=BATCH_NORM_DECAY,
++                                         epsilon=BATCH_NORM_EPSILON)(
++      x, training=training)
++
++  shortcut = tf.keras.layers.Conv2D(filters2, (1, 1), strides=strides,
++                                    kernel_regularizer=
++                                    tf.keras.regularizers.l2(L2_WEIGHT_DECAY),
++                                    bias_regularizer=
++                                    tf.keras.regularizers.l2(L2_WEIGHT_DECAY),
++                                    name=conv_name_base + '1')(input_tensor)
++  shortcut = tf.keras.layers.BatchNormalization(
++      axis=bn_axis, name=bn_name_base + '1',
++      momentum=BATCH_NORM_DECAY, epsilon=BATCH_NORM_EPSILON)(
++      shortcut, training=training)
++
++  x = tf.keras.layers.add([x, shortcut])
++  x = tf.keras.layers.Activation('relu')(x)
++  return x
++
++
++def ResNet56(include_top=True,
++    weights=None,
++    input_tensor=None,
++    input_shape=None,
++    pooling=None,
++    classes=1000,
++    training=True):
++  """Instantiates the ResNet50 architecture.
++
++  Optionally loads weights pre-trained on ImageNet.
++  Note that the data format convention used by the model is
++  the one specified in your Keras config at `~/.keras/keras.json`.
++
++  Arguments:
++      include_top: whether to include the fully-connected
++          layer at the top of the network.
++      weights: one of `None` (random initialization),
++            'imagenet' (pre-training on ImageNet),
++            or the path to the weights file to be loaded.
++      input_tensor: optional Keras tensor (i.e. output of `layers.Input()`)
++          to use as image input for the model.
++      input_shape: optional shape tuple, only to be specified
++          if `include_top` is False (otherwise the input shape
++          has to be `(224, 224, 3)` (with `channels_last` data format)
++          or `(3, 224, 224)` (with `channels_first` data format).
++          It should have exactly 3 inputs channels,
++          and width and height should be no smaller than 197.
++          E.g. `(200, 200, 3)` would be one valid value.
++      pooling: Optional pooling mode for feature extraction
++          when `include_top` is `False`.
++          - `None` means that the output of the model will be
++              the 4D tensor output of the
++              last convolutional layer.
++          - `avg` means that global average pooling
++              will be applied to the output of the
++              last convolutional layer, and thus
++              the output of the model will be a 2D tensor.
++          - `max` means that global max pooling will
++              be applied.
++      classes: optional number of classes to classify images
++          into, only to be specified if `include_top` is True, and
++          if no `weights` argument is specified.
++      training: optional boolean indicating if this model will be
++          used for training or evaluation. This boolean is then
++          passed to the BatchNorm layer.
++
++  Returns:
++      A Keras model instance.
++
++  Raises:
++      ValueError: in case of invalid argument for `weights`,
++          or invalid input shape.
++  """
++  if not (weights in {'imagenet', None} or os.path.exists(weights)):
++    raise ValueError('The `weights` argument should be either '
++                     '`None` (random initialization), `imagenet` '
++                     '(pre-training on ImageNet), '
++                     'or the path to the weights file to be loaded.')
++
++  if weights == 'imagenet' and include_top and classes != 1000:
++    raise ValueError('If using `weights` as `"imagenet"` with `include_top`'
++                     ' as true, `classes` should be 1000')
++
++  # Determine proper input shape
++  input_shape = _obtain_input_shape(
++      input_shape,
++      default_size=32,
++      min_size=32,
++      data_format=tf.keras.backend.image_data_format(),
++      require_flatten=include_top,
++      weights=weights)
++
++  if input_tensor is None:
++    img_input = tf.keras.layers.Input(shape=input_shape)
++  else:
++    if not tf.keras.backend.is_keras_tensor(input_tensor):
++      img_input = tf.keras.layers.Input(tensor=input_tensor, shape=input_shape)
++    else:
++      img_input = input_tensor
++  if tf.keras.backend.image_data_format() == 'channels_last':
++    bn_axis = 3
++  else:
++    bn_axis = 1
++
++  x = tf.keras.layers.ZeroPadding2D(padding=(1, 1), name='conv1_pad')(img_input)
++  x = tf.keras.layers.Conv2D(16, (3, 3),
++                             strides=(1, 1),
++                             padding='valid',
++                             name='conv1')(x)
++  x = tf.keras.layers.BatchNormalization(axis=bn_axis, name='bn_conv1',
++                                         momentum=BATCH_NORM_DECAY,
++                                         epsilon=BATCH_NORM_EPSILON)(
++      x, training=training)
++  x = tf.keras.layers.Activation('relu')(x)
++  # x = tf.keras.layers.MaxPooling2D((3, 3), strides=(2, 2))(x)
++
++  x = conv_building_block(x, 3, [16, 16], stage=2, block='a', strides=(1, 1),
++                          training=training)
++  x = identity_building_block(x, 3, [16, 16], stage=2, block='b',
++                              training=training)
++  x = identity_building_block(x, 3, [16, 16], stage=2, block='c',
++                              training=training)
++  x = identity_building_block(x, 3, [16, 16], stage=2, block='d',
++                              training=training)
++  x = identity_building_block(x, 3, [16, 16], stage=2, block='e',
++                              training=training)
++  x = identity_building_block(x, 3, [16, 16], stage=2, block='f',
++                              training=training)
++  x = identity_building_block(x, 3, [16, 16], stage=2, block='g',
++                              training=training)
++  x = identity_building_block(x, 3, [16, 16], stage=2, block='h',
++                              training=training)
++  x = identity_building_block(x, 3, [16, 16], stage=2, block='i',
++                              training=training)
++
++  x = conv_building_block(x, 3, [32, 32], stage=3, block='a',
++                          training=training)
++  x = identity_building_block(x, 3, [32, 32], stage=3, block='b',
++                              training=training)
++  x = identity_building_block(x, 3, [32, 32], stage=3, block='c',
++                              training=training)
++  x = identity_building_block(x, 3, [32, 32], stage=3, block='d',
++                              training=training)
++  x = identity_building_block(x, 3, [32, 32], stage=3, block='e',
++                              training=training)
++  x = identity_building_block(x, 3, [32, 32], stage=3, block='f',
++                              training=training)
++  x = identity_building_block(x, 3, [32, 32], stage=3, block='g',
++                              training=training)
++  x = identity_building_block(x, 3, [32, 32], stage=3, block='h',
++                              training=training)
++  x = identity_building_block(x, 3, [32, 32], stage=3, block='i',
++                              training=training)
++
++  x = conv_building_block(x, 3, [64, 64], stage=4, block='a',
++                          training=training)
++  x = identity_building_block(x, 3, [64, 64], stage=4, block='b',
++                              training=training)
++  x = identity_building_block(x, 3, [64, 64], stage=4, block='c',
++                              training=training)
++  x = identity_building_block(x, 3, [64, 64], stage=4, block='d',
++                              training=training)
++  x = identity_building_block(x, 3, [64, 64], stage=4, block='e',
++                              training=training)
++  x = identity_building_block(x, 3, [64, 64], stage=4, block='f',
++                              training=training)
++  x = identity_building_block(x, 3, [64, 64], stage=4, block='g',
++                              training=training)
++  x = identity_building_block(x, 3, [64, 64], stage=4, block='h',
++                              training=training)
++  x = identity_building_block(x, 3, [64, 64], stage=4, block='i',
++                              training=training)
++
++  if include_top:
++    x = tf.keras.layers.AveragePooling2D((8, 8), name='avg_pool')(x)
++    x = tf.keras.layers.Flatten()(x)
++    x = tf.keras.layers.Dense(classes, activation='softmax', name='fc10')(x)
++  else:
++    if pooling == 'avg':
++      x = tf.keras.layers.GlobalAveragePooling2D()(x)
++    elif pooling == 'max':
++      x = tf.keras.layers.GlobalMaxPooling2D()(x)
++    else:
++      warnings.warn('The output shape of `ResNet50(include_top=False)` '
++                    'has been changed since Keras 2.2.0.')
++
++  # Ensure that the model takes into account
++  # any potential predecessors of `input_tensor`.
++  if input_tensor is not None:
++    inputs = tf.keras.engine.get_source_inputs(input_tensor)
++  else:
++    inputs = img_input
++  # Create model.
++  model = tf.keras.models.Model(inputs, x, name='resnet56')
++
++  # Load weights.
++  if weights == 'imagenet':
++    if include_top:
++      weights_path = tf.keras.utils.get_file(
++          'resnet50_weights_tf_dim_ordering_tf_kernels.h5',
++          WEIGHTS_PATH,
++          cache_subdir='models',
++          md5_hash='a7b3fe01876f51b976af0dea6bc144eb')
++    else:
++      weights_path = tf.keras.utils.get_file(
++          'resnet50_weights_tf_dim_ordering_tf_kernels_notop.h5',
++          WEIGHTS_PATH_NO_TOP,
++          cache_subdir='models',
++          md5_hash='a268eb855778b3df3c7506639542a6af')
++    model.load_weights(weights_path)
++  elif weights is not None:
++    model.load_weights(weights)
++
++  return model

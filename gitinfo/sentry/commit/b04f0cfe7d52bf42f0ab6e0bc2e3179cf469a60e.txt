@@ -1,0 +1,431 @@
+commit b04f0cfe7d52bf42f0ab6e0bc2e3179cf469a60e
+Author: Markus Unterwaditzer <markus@unterwaditzer.net>
+Date:   Wed Feb 19 10:55:05 2020 +0100
+
+     feat: Datascrubbing after processing (#17054)
+    
+    Hard-depends on getsentry/relay#464 to make CI pass
+    Related: getsentry/relay#469
+    
+    get_event_enhancers now runs before scrubbing, and get_event_preprocessors after. All of our stacktrace processing happens in enhancers and stacktrace plugins.
+    
+    I am making the assumption here that sessionstack data should not be scrubbed.
+
+diff --git a/requirements-base.txt b/requirements-base.txt
+index 4ab7bd15f3..0dc01883fa 100644
+--- a/requirements-base.txt
++++ b/requirements-base.txt
+@@ -49,7 +49,7 @@ redis-py-cluster==1.3.4
+ redis>=2.10.3,<2.10.6
+ requests-oauthlib==1.2.0
+ requests[security]>=2.20.0,<2.21.0
+-sentry-relay>=0.5.2,<0.6.0
++sentry-relay>=0.5.3,<0.6.0
+ sentry-sdk>=0.13.5
+ simplejson>=3.2.0,<3.9.0
+ six>=1.10.0,<1.11.0
+diff --git a/src/sentry/datascrubbing.py b/src/sentry/datascrubbing.py
+new file mode 100644
+index 0000000000..658eecc8ef
+--- /dev/null
++++ b/src/sentry/datascrubbing.py
+@@ -0,0 +1,117 @@
++from __future__ import absolute_import
++
++import re
++import copy
++
++import sentry_relay
++import six
++
++from sentry.utils import metrics
++from sentry.utils.canonical import CanonicalKeyDict
++
++_KEY_RE = re.compile(u"^[a-zA-Z0-9_-]+$")
++
++
++def _escape_key(key):
++    """
++    Attempt to escape the key for PII config path selectors.
++
++    If this fails and we cannot represent the key, return None
++    """
++    if _KEY_RE.match(key):
++        return key
++
++    # TODO: Quote string here once it's implemented in Relay
++    return None
++
++
++def _path_selectors_from_diff(old_data, data):
++    """
++    Datascrubbing is not idempotent, so scrubbing the same value
++    twice might cause weird glitches. When data scrubbing after
++    processing, we can still limit the likelihood of such glitches
++    by constraining data scrubbing to fields we saw change.
++
++    This function takes two events and yields a list of path selectors of
++    fields that changed.
++    """
++
++    if type(old_data) != type(data):
++        yield None
++        yield u"**"
++
++    elif isinstance(data, (CanonicalKeyDict, dict)):
++        for key, value in six.iteritems(data):
++            old_value = old_data.get(key)
++            key = _escape_key(key)
++            if key is None:
++                continue
++
++            for selector in _path_selectors_from_diff(old_value, value):
++                if selector is not None:
++                    yield u"{}.{}".format(key, selector)
++                else:
++                    yield key
++
++    elif isinstance(data, list):
++        for i, value in enumerate(data):
++            old_value = old_data[i] if len(old_data) > i else None
++            for selector in _path_selectors_from_diff(old_value, value):
++                if selector is not None:
++                    yield u"{}.{}".format(i, selector)
++                else:
++                    yield six.text_type(i)
++
++    elif old_data != data:
++        yield None
++
++
++def _narrow_pii_config_for_processing(config, old_event, event):
++    if not config.get("applications"):
++        return config
++
++    additional_selectors = u"|".join(_path_selectors_from_diff(old_event, event))
++
++    metrics.timing("datascrubbing.config.additional_selectors.size", len(additional_selectors))
++
++    if not additional_selectors:
++        # No new data has been added, so we must not scrub
++        return {}
++
++    config = copy.deepcopy(config)
++
++    for selector in list(config["applications"]):
++        new_selector = u"(({})&{})".format(additional_selectors, selector)
++        config["applications"][new_selector] = config["applications"].pop(selector)
++
++    return config
++
++
++def get_all_pii_configs(project_config):
++    # Note: This logic is duplicated in Relay store.
++    pii_config = project_config.config["piiConfig"]
++    if pii_config:
++        yield pii_config
++
++    yield sentry_relay.convert_datascrubbing_config(project_config.config["datascrubbingSettings"])
++
++
++def scrub_data(project_config, event, in_processing=False, old_event=None):
++    for config in get_all_pii_configs(project_config):
++        metrics.timing(
++            "datascrubbing.config.num_applications", len(config.get("applications") or ())
++        )
++        total_rules = 0
++        for selector, rules in six.iteritems(config.get("applications") or {}):
++            metrics.timing("datascrubbing.config.selectors.size", len(selector))
++            metrics.timing("datascrubbing.config.rules_per_selector.size", len(rules))
++            total_rules += len(rules)
++
++        metrics.timing("datascrubbing.config.rules.size", total_rules)
++
++        if in_processing:
++            assert old_event is not None
++            config = _narrow_pii_config_for_processing(config, old_event, event)
++        event = sentry_relay.pii_strip_event(config, event)
++
++    return event
+diff --git a/src/sentry/tasks/store.py b/src/sentry/tasks/store.py
+index 5f09bfad4d..68efc8da8e 100644
+--- a/src/sentry/tasks/store.py
++++ b/src/sentry/tasks/store.py
+@@ -1,5 +1,6 @@
+ from __future__ import absolute_import
+ 
++import copy
+ import logging
+ from datetime import datetime
+ 
+@@ -9,6 +10,8 @@ from django.utils import timezone
+ from sentry_relay.processing import StoreNormalizer
+ 
+ from sentry import features, reprocessing
++from sentry.relay.config import get_project_config
++from sentry.datascrubbing import scrub_data
+ from sentry.constants import DEFAULT_STORE_NORMALIZER_ARGS
+ from sentry.attachments import attachment_cache
+ from sentry.cache import default_cache
+@@ -38,6 +41,7 @@ class RetrySymbolication(Exception):
+         self.retry_after = retry_after
+ 
+ 
++@metrics.wraps("should_process")
+ def should_process(data):
+     """Quick check if processing is needed at all."""
+     from sentry.plugins.base import plugins
+@@ -182,9 +186,20 @@ def _do_process_event(cache_key, start_time, event_id, process_task, data=None):
+         return
+ 
+     data = CanonicalKeyDict(data)
++
+     project_id = data["project"]
+     event_id = data["event_id"]
+ 
++    project = Project.objects.get_from_cache(id=project_id)
++
++    with_datascrubbing = features.has(
++        "organizations:datascrubbers-v2", project.organization, actor=None
++    )
++
++    if with_datascrubbing:
++        with metrics.timer("tasks.store.datascrubbers.data_bak"):
++            data_bak = copy.deepcopy(data.data)
++
+     with configure_scope() as scope:
+         scope.set_tag("project", project_id)
+ 
+@@ -236,6 +251,34 @@ def _do_process_event(cache_key, start_time, event_id, process_task, data=None):
+             )
+             return
+ 
++    # Second round of datascrubbing after stacktrace and language-specific
++    # processing. First round happened as part of ingest.
++    #
++    # We assume that all potential PII is produced as part of stacktrace
++    # processors and event enhancers.
++    #
++    # We assume that plugins for eg sessionstack (running via
++    # `plugin.get_event_preprocessors`) are not producing data that should be
++    # PII-stripped, ever.
++    #
++    # XXX(markus): Javascript event error translation is happening after this block
++    # because it uses `get_event_preprocessors` instead of
++    # `get_event_enhancers`, possibly move?
++    if has_changed and with_datascrubbing:
++        with metrics.timer("tasks.store.datascrubbers.scrub"):
++            project_config = get_project_config(project)
++
++            new_data = safe_execute(
++                scrub_data,
++                project_config=project_config,
++                event=data.data,
++                in_processing=True,
++                old_event=data_bak,
++            )
++
++            if new_data is not None:
++                data.data = new_data
++
+     # TODO(dcramer): ideally we would know if data changed by default
+     # Default event processors.
+     for plugin in plugins.all(version=2):
+@@ -248,8 +291,7 @@ def _do_process_event(cache_key, start_time, event_id, process_task, data=None):
+                 data = result
+                 has_changed = True
+ 
+-    assert data["project"] == project_id, "Project cannot be mutated by preprocessor"
+-    project = Project.objects.get_from_cache(id=project_id)
++    assert data["project"] == project_id, "Project cannot be mutated by plugins"
+ 
+     # We cannot persist canonical types in the cache, so we need to
+     # downgrade this.
+diff --git a/src/sentry/web/api.py b/src/sentry/web/api.py
+index 0af1f600ee..3e240e33b4 100644
+--- a/src/sentry/web/api.py
++++ b/src/sentry/web/api.py
+@@ -27,7 +27,7 @@ from django.views.generic.base import View as BaseView
+ from functools import wraps
+ from querystring_parser import parser
+ from symbolic import ProcessMinidumpError, Unreal4Crash, Unreal4Error
+-from sentry_relay import ProcessingActionInvalidTransaction, scrub_event
++from sentry_relay import ProcessingErrorInvalidTransaction
+ 
+ from sentry import features, options, quotas
+ from sentry.attachments import CachedAttachment
+@@ -75,6 +75,7 @@ from sentry.utils.sdk import configure_scope
+ from sentry.web.helpers import render_to_response
+ from sentry.web.client_config import get_client_config
+ from sentry.relay.config import get_project_config
++from sentry.datascrubbing import scrub_data
+ 
+ logger = logging.getLogger("sentry")
+ minidumps_logger = logging.getLogger("sentry.minidumps")
+@@ -284,8 +285,7 @@ def process_event(event_manager, project, key, remote_addr, helper, attachments,
+         )
+         raise APIForbidden("An event with the same ID already exists (%s)" % (event_id,))
+ 
+-    datascrubbing_settings = project_config.config.get("datascrubbingSettings") or {}
+-    data = scrub_event(datascrubbing_settings, dict(data))
++    data = scrub_data(project_config, dict(data))
+ 
+     # mutates data (strips a lot of context if not queued)
+     helper.insert_data_to_database(data, start_time=start_time, attachments=attachments)
+@@ -624,7 +624,7 @@ class StoreView(APIView):
+ 
+         try:
+             event_manager.normalize()
+-        except ProcessingActionInvalidTransaction as e:
++        except ProcessingErrorInvalidTransaction as e:
+             track_outcome(
+                 organization_id, project_id, key.id, Outcome.INVALID, "invalid_transaction"
+             )
+diff --git a/tests/sentry/tasks/test_store.py b/tests/sentry/tasks/test_store.py
+index 84f69e9903..3ab0c66a09 100644
+--- a/tests/sentry/tasks/test_store.py
++++ b/tests/sentry/tasks/test_store.py
+@@ -10,6 +10,7 @@ from sentry.event_manager import EventManager, HashDiscarded
+ from sentry.plugins.base.v2 import Plugin2
+ from sentry.tasks.store import preprocess_event, process_event, save_event
+ from sentry.utils.dates import to_datetime
++from sentry.testutils.helpers.features import Feature
+ 
+ EVENT_ID = "cc3e6c2bb6b6498097f336d1e6979f4b"
+ 
+@@ -40,10 +41,11 @@ class BasicPreprocessorPlugin(Plugin2):
+ 
+ 
+ @pytest.fixture
+-def register_plugin(request):
++def register_plugin(request, monkeypatch):
+     def inner(cls):
+         from sentry.plugins.base import plugins
+ 
++        monkeypatch.setitem(globals(), cls.__name__, cls)
+         plugins.register(cls)
+         request.addfinalizer(lambda: plugins.unregister(cls))
+ 
+@@ -227,3 +229,58 @@ def test_hash_discarded_raised(default_project, mock_refund, mock_incr, register
+             ],
+             timestamp=to_datetime(now),
+         )
++
++
++@pytest.mark.django_db
++def test_scrubbing_after_processing(
++    default_project, default_organization, mock_save_event, register_plugin, mock_default_cache
++):
++    @register_plugin
++    class TestPlugin(Plugin2):
++        def get_event_enhancers(self, data):
++            def more_extra(data):
++                data["extra"]["new_aaa"] = "remove me"
++                return data
++
++            return [more_extra]
++
++        def get_event_preprocessors(self, data):
++            # Right now we do not scrub data from event preprocessors, only
++            # from event enhancers.
++            def more_extra(data):
++                data["extra"]["new_aaa2"] = "event preprocessor"
++                return data
++
++            return [more_extra]
++
++        def is_enabled(self, project=None):
++            return True
++
++    default_project.update_option("sentry:sensitive_fields", ["a"])
++    default_project.update_option("sentry:scrub_data", True)
++
++    data = {
++        "project": default_project.id,
++        "platform": "python",
++        "logentry": {"formatted": "test"},
++        "event_id": EVENT_ID,
++        "extra": {"aaa": "do not remove me"},
++    }
++
++    mock_default_cache.get.return_value = data
++
++    with Feature({"organizations:datascrubbers-v2": True}):
++        process_event(cache_key="e:1", start_time=1)
++
++    (_, (key, event, duration), _), = mock_default_cache.set.mock_calls
++    assert key == "e:1"
++    assert event["extra"] == {
++        u"aaa": u"do not remove me",
++        u"new_aaa": u"[Filtered]",
++        u"new_aaa2": u"event preprocessor",
++    }
++    assert duration == 3600
++
++    mock_save_event.delay.assert_called_once_with(
++        cache_key="e:1", data=None, start_time=1, event_id=EVENT_ID, project_id=default_project.id
++    )
+diff --git a/tests/sentry/test_datascrubbing.py b/tests/sentry/test_datascrubbing.py
+new file mode 100644
+index 0000000000..b14e809e5e
+--- /dev/null
++++ b/tests/sentry/test_datascrubbing.py
+@@ -0,0 +1,58 @@
++# coding: utf-8
++from __future__ import absolute_import
++
++import pytest
++
++from sentry.datascrubbing import _path_selectors_from_diff, scrub_data
++from sentry.relay.config import ProjectConfig
++
++
++def test_path_selectors_from_diff():
++    def f(old_event, event):
++        return list(_path_selectors_from_diff(old_event, event))
++
++    assert f({}, {"foo": {"bar": ["baz"]}}) == ["foo", "foo.**"]
++    assert f({"foo": {"bar": ["baz"]}}, {}) == []
++    assert f({"foo": {"bar": ["bam"]}}, {"foo": {"bar": ["baz"]}}) == ["foo.bar.0"]
++    assert f(42, {}) == [None, "**"]
++    assert f({"foo": {"bar": []}}, {"foo": {"bar": [42]}}) == ["foo.bar.0", "foo.bar.0.**"]
++    assert f({"foo": {"bar": [42]}}, {"foo": {"bar": []}}) == []
++
++
++@pytest.mark.parametrize(
++    "field",
++    [
++        u"aaa",
++        pytest.param(u"aää", marks=pytest.mark.xfail),
++        pytest.param(u"a a", marks=pytest.mark.xfail),
++        pytest.param(u"a\na", marks=pytest.mark.xfail),
++    ],
++)
++def test_scrub_data_in_processing(field):
++    project_config = ProjectConfig(
++        None,
++        config={
++            "datascrubbingSettings": {
++                "excludeFields": [],
++                "scrubData": True,
++                "scrubIpAddresses": False,
++                "sensitiveFields": ["a"],
++                "scrubDefaults": False,
++            },
++            "piiConfig": {},
++        },
++    )
++
++    new_field = u"new_{}".format(field)
++
++    old_event = {"extra": {field: "do not remove"}}
++    event = {"extra": {field: "do not remove", new_field: "do remove"}}
++
++    new_event = scrub_data(project_config, event, in_processing=True, old_event=old_event)
++
++    assert new_event == {
++        u"_meta": {
++            u"extra": {new_field: {u"": {u"len": 9, u"rem": [[u"strip-fields", u"s", 0, 10]]}}}
++        },
++        u"extra": {field: u"do not remove", new_field: u"[Filtered]"},
++    }

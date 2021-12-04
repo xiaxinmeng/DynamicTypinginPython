@@ -1,0 +1,501 @@
+commit 0b39c6f3baa84b626b9b72a79c5de99a815d68d2
+Author: Dan Fuller <dfuller@sentry.io>
+Date:   Wed Jul 31 16:15:44 2019 -0700
+
+    feat(api): Implement alert rule deletion api (SEN-825)
+    
+    Implements an api for deleting alert rules. When we delete an alert rule we just mark it as deleted,
+    and trigger a task to completely delete it later.
+
+diff --git a/src/sentry/deletions/base.py b/src/sentry/deletions/base.py
+index d4ff722870..1c81737354 100644
+--- a/src/sentry/deletions/base.py
++++ b/src/sentry/deletions/base.py
+@@ -135,6 +135,7 @@ class BaseDeletionTask(object):
+ 
+ class ModelDeletionTask(BaseDeletionTask):
+     DEFAULT_QUERY_LIMIT = None
++    manager_name = 'objects'
+ 
+     def __init__(self, manager, model, query, query_limit=None, order_by=None, **kwargs):
+         super(ModelDeletionTask, self).__init__(manager, **kwargs)
+@@ -167,7 +168,7 @@ class ModelDeletionTask(BaseDeletionTask):
+         query_limit = self.query_limit
+         remaining = self.chunk_size
+         while remaining > 0:
+-            queryset = self.model.objects.filter(**self.query)
++            queryset = getattr(self.model, self.manager_name).filter(**self.query)
+             if self.order_by:
+                 queryset = queryset.order_by(self.order_by)
+ 
+diff --git a/src/sentry/deletions/defaults/project.py b/src/sentry/deletions/defaults/project.py
+index 9647c9977b..b2747bb375 100644
+--- a/src/sentry/deletions/defaults/project.py
++++ b/src/sentry/deletions/defaults/project.py
+@@ -6,7 +6,7 @@ from ..base import (BulkModelDeletionTask, ModelDeletionTask, ModelRelation)
+ class ProjectDeletionTask(ModelDeletionTask):
+     def get_child_relations(self, instance):
+         from sentry import models
+-        from sentry.incidents.models import IncidentProject
++        from sentry.incidents.models import IncidentProject, AlertRule
+ 
+         relations = [
+             # ProjectKey gets revoked immediately, in bulk
+@@ -20,7 +20,9 @@ class ProjectDeletionTask(ModelDeletionTask):
+             models.GroupHash, models.GroupRelease, models.GroupRuleStatus, models.GroupSeen,
+             models.GroupShare, models.GroupSubscription, models.ProjectBookmark, models.ProjectKey,
+             models.ProjectTeam, models.PromptsActivity, models.SavedSearchUserDefault, models.SavedSearch,
+-            models.ServiceHook, models.UserReport, models.DiscoverSavedQueryProject, IncidentProject
++            models.ServiceHook, models.UserReport, models.DiscoverSavedQueryProject, IncidentProject,
++            AlertRule,
++
+         )
+ 
+         relations.extend(
+diff --git a/src/sentry/incidents/endpoints/project_alert_rule_details.py b/src/sentry/incidents/endpoints/project_alert_rule_details.py
+index f44ba8515f..b882c7f822 100644
+--- a/src/sentry/incidents/endpoints/project_alert_rule_details.py
++++ b/src/sentry/incidents/endpoints/project_alert_rule_details.py
+@@ -7,6 +7,10 @@ from sentry.api.serializers import serialize
+ from sentry.api.serializers.models.alert_rule import AlertRuleSerializer
+ from sentry.incidents.endpoints.bases import ProjectAlertRuleEndpoint
+ from sentry.incidents.endpoints.serializers import AlertRuleSerializer as DrfAlertRuleSerializer
++from sentry.incidents.logic import (
++    AlreadyDeletedError,
++    delete_alert_rule,
++)
+ 
+ 
+ class ProjectAlertRuleDetailsEndpoint(ProjectAlertRuleEndpoint):
+@@ -32,3 +36,13 @@ class ProjectAlertRuleDetailsEndpoint(ProjectAlertRuleEndpoint):
+             return Response(serialize(alert_rule, request.user), status=status.HTTP_200_OK)
+ 
+         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
++
++    def delete(self, request, project, alert_rule):
++        try:
++            delete_alert_rule(alert_rule)
++            return Response(status=status.HTTP_204_NO_CONTENT)
++        except AlreadyDeletedError:
++            return Response(
++                'This rule has already been deleted',
++                status=status.HTTP_400_BAD_REQUEST,
++            )
+diff --git a/src/sentry/incidents/logic.py b/src/sentry/incidents/logic.py
+index 28e8929371..5f8fb57ce8 100644
+--- a/src/sentry/incidents/logic.py
++++ b/src/sentry/incidents/logic.py
+@@ -12,6 +12,7 @@ from sentry import analytics
+ from sentry.api.event_search import get_snuba_query_args
+ from sentry.incidents.models import (
+     AlertRule,
++    AlertRuleStatus,
+     Incident,
+     IncidentActivity,
+     IncidentActivityType,
+@@ -29,10 +30,7 @@ from sentry.models import (
+     Commit,
+     Release,
+ )
+-from sentry.incidents.tasks import (
+-    calculate_incident_suspects,
+-    send_subscriber_notifications,
+-)
++from sentry.incidents import tasks
+ from sentry.utils.committers import get_event_file_committers
+ from sentry.utils.snuba import (
+     bulk_raw_query,
+@@ -47,6 +45,10 @@ class StatusAlreadyChangedError(Exception):
+     pass
+ 
+ 
++class AlreadyDeletedError(Exception):
++    pass
++
++
+ def create_incident(
+     organization,
+     type,
+@@ -107,7 +109,7 @@ def create_incident(
+             incident_type=type.value,
+         )
+ 
+-    calculate_incident_suspects.apply_async(kwargs={'incident_id': incident.id})
++    tasks.calculate_incident_suspects.apply_async(kwargs={'incident_id': incident.id})
+     return incident
+ 
+ 
+@@ -226,7 +228,7 @@ def create_incident_activity(
+                 IncidentSubscription(incident=incident, user_id=mentioned_user_id)
+                 for mentioned_user_id in user_ids_to_subscribe
+             ])
+-    send_subscriber_notifications.apply_async(
++    tasks.send_subscriber_notifications.apply_async(
+         kwargs={'activity_id': activity.id},
+         countdown=10,
+     )
+@@ -625,6 +627,27 @@ def update_alert_rule(
+     return alert_rule
+ 
+ 
++def delete_alert_rule(alert_rule):
++    """
++    Marks an alert rule as deleted and fires off a task to actually delete it.
++    :param alert_rule:
++    """
++    if alert_rule.status in (
++        AlertRuleStatus.PENDING_DELETION.value,
++        AlertRuleStatus.DELETION_IN_PROGRESS.value,
++    ):
++        raise AlreadyDeletedError()
++
++    alert_rule.update(
++        # Randomize the name here so that we don't get unique constraint issues
++        # while waiting for the deletion to process
++        name=uuid4().get_hex(),
++        status=AlertRuleStatus.PENDING_DELETION.value,
++    )
++    tasks.delete_alert_rule.apply_async(kwargs={'alert_rule_id': alert_rule.id})
++    delete_snuba_subscription(alert_rule.subscription_id)
++
++
+ def validate_alert_rule_query(query):
+     # TODO: We should add more validation here to reject queries that include
+     # fields that are invalid in alert rules. For now this will just make sure
+diff --git a/src/sentry/incidents/models.py b/src/sentry/incidents/models.py
+index 2bdfe1bc0b..ee8bde7534 100644
+--- a/src/sentry/incidents/models.py
++++ b/src/sentry/incidents/models.py
+@@ -289,6 +289,7 @@ class AlertRule(Model):
+     __core__ = True
+ 
+     objects = AlertRuleManager()
++    objects_with_deleted = BaseManager()
+ 
+     project = FlexibleForeignKey('sentry.Project', db_index=False, db_constraint=False)
+     name = models.TextField()
+diff --git a/src/sentry/incidents/tasks.py b/src/sentry/incidents/tasks.py
+index 21a8986ab7..12980c74c4 100644
+--- a/src/sentry/incidents/tasks.py
++++ b/src/sentry/incidents/tasks.py
+@@ -1,19 +1,28 @@
+ from __future__ import absolute_import
+ 
++from uuid import uuid4
++
+ from django.core.urlresolvers import reverse
+ from django.db import transaction
+ from six.moves.urllib.parse import urlencode
+ 
++from sentry import deletions
+ from sentry.app import locks
+ from sentry.auth.access import from_user
++from sentry.exceptions import DeleteAborted
+ from sentry.incidents.models import (
++    AlertRule,
++    AlertRuleStatus,
+     Incident,
+     IncidentActivity,
+     IncidentActivityType,
+     IncidentStatus,
+     IncidentSuspectCommit,
+ )
+-from sentry.tasks.base import instrumented_task
++from sentry.tasks.base import (
++    instrumented_task,
++    retry,
++)
+ from sentry.utils.email import MessageBuilder
+ from sentry.utils.http import absolute_uri
+ from sentry.utils.linksign import generate_signed_link
+@@ -119,3 +128,45 @@ def calculate_incident_suspects(incident_id):
+                 IncidentSuspectCommit(incident=incident, commit_id=commit_id, order=i)
+                 for i, commit_id in enumerate(suspect_commits)
+             ])
++
++
++@instrumented_task(
++    name='sentry.incidents.tasks.delete_alert_rule',
++    queue='cleanup',
++    default_retry_delay=60 * 5,
++    max_retries=1
++)
++@retry(exclude=(DeleteAborted, ))
++def delete_alert_rule(alert_rule_id, transaction_id=None, **kwargs):
++    from sentry.incidents.models import AlertRule
++    try:
++        instance = AlertRule.objects_with_deleted.get(id=alert_rule_id)
++    except AlertRule.DoesNotExist:
++        return
++
++    if instance.status not in (
++        AlertRuleStatus.DELETION_IN_PROGRESS.value,
++        AlertRuleStatus.PENDING_DELETION.value,
++    ):
++        raise DeleteAborted
++
++    task = deletions.get(
++        model=AlertRule,
++        query={
++            'id': alert_rule_id,
++        },
++        transaction_id=transaction_id or uuid4().hex,
++    )
++    has_more = task.chunk()
++    if has_more:
++        delete_alert_rule.apply_async(
++            kwargs={'alert_rule_id': alert_rule_id, 'transaction_id': transaction_id},
++            countdown=15,
++        )
++
++
++class AlertRuleDeletionTask(deletions.ModelDeletionTask):
++    manager_name = 'objects_with_deleted'
++
++
++deletions.default_manager.register(AlertRule, AlertRuleDeletionTask)
+diff --git a/tests/sentry/incidents/endpoints/test_project_alert_rule_details.py b/tests/sentry/incidents/endpoints/test_project_alert_rule_details.py
+index 268f927431..c70c1b0d96 100644
+--- a/tests/sentry/incidents/endpoints/test_project_alert_rule_details.py
++++ b/tests/sentry/incidents/endpoints/test_project_alert_rule_details.py
+@@ -12,7 +12,7 @@ from sentry.incidents.models import (
+ from sentry.testutils import APITestCase
+ 
+ 
+-class AlertRuleDetailsGetEndpointTest(APITestCase):
++class AlertRuleDetailsBase(object):
+     endpoint = 'sentry-api-0-project-alert-rule-details'
+ 
+     @fixture
+@@ -42,7 +42,12 @@ class AlertRuleDetailsGetEndpointTest(APITestCase):
+         )
+ 
+     def test_invalid_rule_id(self):
+-        self.create_team(organization=self.organization, members=[self.user])
++        self.create_member(
++            user=self.user,
++            organization=self.organization,
++            role='owner',
++            teams=[self.team],
++        )
+         self.login_as(self.user)
+         with self.feature('organizations:incidents'):
+             resp = self.get_response(
+@@ -53,18 +58,6 @@ class AlertRuleDetailsGetEndpointTest(APITestCase):
+ 
+         assert resp.status_code == 404
+ 
+-    def test_simple(self):
+-        self.create_team(organization=self.organization, members=[self.user])
+-        self.login_as(self.user)
+-        with self.feature('organizations:incidents'):
+-            resp = self.get_valid_response(
+-                self.organization.slug,
+-                self.project.slug,
+-                self.alert_rule.id,
+-            )
+-
+-        assert resp.data == serialize(self.alert_rule)
+-
+     def test_permissions(self):
+         self.create_team(organization=self.organization, members=[self.user])
+         self.login_as(self.create_user())
+@@ -78,7 +71,12 @@ class AlertRuleDetailsGetEndpointTest(APITestCase):
+         assert resp.status_code == 403
+ 
+     def test_no_feature(self):
+-        self.create_team(organization=self.organization, members=[self.user])
++        self.create_member(
++            user=self.user,
++            organization=self.organization,
++            role='owner',
++            teams=[self.team],
++        )
+         self.login_as(self.user)
+         resp = self.get_response(
+             self.organization.slug,
+@@ -88,52 +86,23 @@ class AlertRuleDetailsGetEndpointTest(APITestCase):
+         assert resp.status_code == 404
+ 
+ 
+-class AlertRuleDetailsPutEndpointTest(APITestCase):
+-    method = 'put'
+-    endpoint = 'sentry-api-0-project-alert-rule-details'
+-
+-    @fixture
+-    def organization(self):
+-        return self.create_organization()
+-
+-    @fixture
+-    def project(self):
+-        return self.create_project(organization=self.organization)
+-
+-    @fixture
+-    def user(self):
+-        return self.create_user()
++class AlertRuleDetailsGetEndpointTest(AlertRuleDetailsBase, APITestCase):
+ 
+-    @fixture
+-    def alert_rule(self):
+-        return create_alert_rule(
+-            self.project,
+-            'hello',
+-            AlertRuleThresholdType.ABOVE,
+-            'level:error',
+-            [AlertRuleAggregations.TOTAL],
+-            10,
+-            1000,
+-            400,
+-            1,
+-        )
+-
+-    def test_invalid_rule_id(self):
+-        self.create_member(
+-            user=self.user,
+-            organization=self.organization,
+-            role='owner',
+-            teams=[self.team],
+-        )
++    def test_simple(self):
++        self.create_team(organization=self.organization, members=[self.user])
+         self.login_as(self.user)
+         with self.feature('organizations:incidents'):
+-            resp = self.get_response(
++            resp = self.get_valid_response(
+                 self.organization.slug,
+                 self.project.slug,
+-                1234,
++                self.alert_rule.id,
+             )
+ 
+-        assert resp.status_code == 404
++        assert resp.data == serialize(self.alert_rule)
++
++
++class AlertRuleDetailsPutEndpointTest(AlertRuleDetailsBase, APITestCase):
++    method = 'put'
+ 
+     def test_simple(self):
+         self.create_member(
+@@ -180,20 +149,11 @@ class AlertRuleDetailsPutEndpointTest(APITestCase):
+         updated_alert_rule = AlertRule.objects.get(id=self.alert_rule.id)
+         assert updated_alert_rule.subscription_id == self.alert_rule.subscription_id
+ 
+-    def test_permissions(self):
+-        self.create_team(organization=self.organization, members=[self.user])
+-        self.login_as(self.create_user())
+-        with self.feature('organizations:incidents'):
+-            resp = self.get_response(
+-                self.organization.slug,
+-                self.project.slug,
+-                self.alert_rule.id,
+-                name='what',
+-            )
+ 
+-        assert resp.status_code == 403
++class AlertRuleDetailsDeleteEndpointTest(AlertRuleDetailsBase, APITestCase):
++    method = 'delete'
+ 
+-    def test_no_feature(self):
++    def test_simple(self):
+         self.create_member(
+             user=self.user,
+             organization=self.organization,
+@@ -201,10 +161,14 @@ class AlertRuleDetailsPutEndpointTest(APITestCase):
+             teams=[self.team],
+         )
+         self.login_as(self.user)
+-        resp = self.get_response(
+-            self.organization.slug,
+-            self.project.slug,
+-            self.alert_rule.id,
+-            name='what',
+-        )
+-        assert resp.status_code == 404
++        with self.feature('organizations:incidents'):
++            self.get_valid_response(
++                self.organization.slug,
++                self.project.slug,
++                self.alert_rule.id,
++                status_code=204,
++            )
++
++        assert not AlertRule.objects.filter(id=self.alert_rule.id).exists()
++        assert not AlertRule.objects_with_deleted.filter(name=self.alert_rule.name)
++        assert AlertRule.objects_with_deleted.filter(id=self.alert_rule.id).exists()
+diff --git a/tests/sentry/incidents/test_logic.py b/tests/sentry/incidents/test_logic.py
+index f451b1d561..881b37e9d0 100644
+--- a/tests/sentry/incidents/test_logic.py
++++ b/tests/sentry/incidents/test_logic.py
+@@ -31,6 +31,7 @@ from sentry.incidents.logic import (
+     create_incident_activity,
+     create_incident_snapshot,
+     create_initial_event_stats_snapshot,
++    delete_alert_rule,
+     DEFAULT_ALERT_RULE_RESOLUTION,
+     get_incident_aggregates,
+     get_incident_event_stats,
+@@ -43,6 +44,7 @@ from sentry.incidents.logic import (
+     update_incident_status,
+ )
+ from sentry.incidents.models import (
++    AlertRule,
+     AlertRuleAggregations,
+     AlertRuleStatus,
+     AlertRuleThresholdType,
+@@ -68,7 +70,7 @@ from sentry.testutils import (
+ 
+ class CreateIncidentTest(TestCase):
+     record_event = patcher('sentry.analytics.base.Analytics.record_event')
+-    calculate_incident_suspects = patcher('sentry.incidents.logic.calculate_incident_suspects')
++    calculate_incident_suspects = patcher('sentry.incidents.tasks.calculate_incident_suspects')
+ 
+     def test_simple(self):
+         incident_type = IncidentType.CREATED
+@@ -413,7 +415,7 @@ class CreateEventStatTest(TestCase, BaseIncidentsTest):
+ 
+ @freeze_time()
+ class CreateIncidentActivityTest(TestCase, BaseIncidentsTest):
+-    send_subscriber_notifications = patcher('sentry.incidents.logic.send_subscriber_notifications')
++    send_subscriber_notifications = patcher('sentry.incidents.tasks.send_subscriber_notifications')
+     record_event = patcher('sentry.analytics.base.Analytics.record_event')
+ 
+     def assert_notifications_sent(self, activity):
+@@ -924,3 +926,37 @@ class UpdateAlertRuleTest(TestCase, BaseIncidentsTest):
+     def test_invalid_query(self):
+         with self.assertRaises(InvalidSearchQuery):
+             update_alert_rule(self.alert_rule, query='has:')
++
++
++class DeleteAlertRuleTest(TestCase, BaseIncidentsTest):
++    @fixture
++    def alert_rule(self):
++        return create_alert_rule(
++            self.project,
++            'hello',
++            AlertRuleThresholdType.ABOVE,
++            'level:error',
++            [AlertRuleAggregations.TOTAL],
++            10,
++            1000,
++            400,
++            1,
++        )
++
++    def test(self):
++        alert_rule_id = self.alert_rule.id
++        with self.tasks():
++            delete_alert_rule(self.alert_rule)
++
++        assert not AlertRule.objects_with_deleted.filter(id=alert_rule_id).exists()
++
++    def test_with_incident(self):
++        incident = self.create_incident()
++        incident.update(alert_rule=self.alert_rule)
++        alert_rule_id = self.alert_rule.id
++        with self.tasks():
++            delete_alert_rule(self.alert_rule)
++
++        assert not AlertRule.objects_with_deleted.filter(id=alert_rule_id).exists()
++        incident = Incident.objects.get(id=incident.id)
++        assert Incident.objects.filter(id=incident.id, alert_rule_id__isnull=True).exists()

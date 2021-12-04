@@ -1,0 +1,441 @@
+commit ae23ac3e0421f3ba613c1ae398dda28c34de0c4b
+Author: David Cramer <dcramer@gmail.com>
+Date:   Wed May 4 18:36:48 2011 -0700
+
+    Implement new client/server protocol and introduce signed message transfer (fixes GH-134)
+
+diff --git a/CHANGES b/CHANGES
+index a23679eaf6..77c4f0cacb 100644
+--- a/CHANGES
++++ b/CHANGES
+@@ -1,3 +1,7 @@
++1.7.5
++
++* Implemented new client/server storage API and signing methods.
++
+ 1.7.4
+ 
+ * Fixed a bug with potential recursion issues.
+diff --git a/docs/technical.rst b/docs/technical.rst
+index 82806afd72..145fb6e889 100644
+--- a/docs/technical.rst
++++ b/docs/technical.rst
+@@ -66,32 +66,40 @@ own severity level.
+ On top of these, Sentry requires the logger to report the ``view``,
+ the name of the function that has caused the logging record.
+ 
++Authentication
++~~~~~~~~~~~~~~
++
+ A logging handler integrating with Sentry sends the records it handles
+ to the Sentry server.  The server listens for JSON POST requests,
+ with the following structure::
+ 
+     POST /store/
+-    key=SENTRY_KEY
+-    format=json
+-    data=<the encoded record>
++    <the encoded record>
++
++You must also send along the following authentication headers::
++
++    Authorization: Sentry sentry_signature=<hmac signature>,
++    sentry_timestamp=<signature timestamp>,
++    sentry_version=<client version, arbitrary>
++
++The header is composed of a SHA1-signed HMAC, the timestamp from when the message
++was generated, and an arbitrary client version string. To generate the HMAC signature,
++take the following example (in Python)::
++
++    hmac.new(SENTRY_KEY, '%s %s' % (timestamp, message), hashlib.sha1).hexdigest()
+ 
+ The ``SENTRY_KEY`` is a shared secret key between client and server.  It
+ travels unencrypted in the POST request so make sure the client server
+ connection is not sniffable or that you are not doing serious work.
+ 
+-The ``data`` is the string representation of a JSON object and is
++POST Body
++~~~~~~~~~
++
++The body of the post is a string representation of a JSON object and is
+ (optionally and preferably) gzipped and then (necessarily) base64
+ encoded.  
+ 
+-    A thought for the future: sending a clear-text ``key`` could be made
+-    superfluous if ``data`` is encrypted and signed.  Then the Sentry
+-    server could check the signature against a set of known public keys
+-    and retrieve the corresponding key.  Encrypting could be alternative
+-    to ``zlib`` encoding.
+-
+-    Other option: sending not a key but a signature of the ``message_id``.
+-
+-This ``data`` JSON object contains the following fields:
++This JSON object contains the following fields:
+ 
+     :``message``: the text of the formatted logging record.
+     :``timestamp``: indicates when the logging record was created (in the Sentry client).  The Sentry server assumes the time is in UTC.
+diff --git a/sentry/client/base.py b/sentry/client/base.py
+index 89ba75d6f1..32a5c59731 100644
+--- a/sentry/client/base.py
++++ b/sentry/client/base.py
+@@ -1,12 +1,9 @@
+ from __future__ import absolute_import
+ 
+ import base64
+-try:
+-    import cPickle as pickle
+-except ImportError:
+-    import pickle
+ import logging
+ import sys
++import time
+ import traceback
+ import urllib2
+ import uuid
+@@ -17,9 +14,10 @@ from django.template.loader import LoaderOrigin
+ from django.utils import simplejson
+ from django.views.debug import ExceptionReporter
+ 
++import sentry
+ from sentry import conf
+-from sentry.helpers import construct_checksum, varmap, transform, get_installed_apps, urlread, force_unicode, \
+-                           get_versions, shorten
++from sentry.helpers import construct_checksum, varmap, transform, get_installed_apps, force_unicode, \
++                           get_versions, shorten, get_signature, get_auth_header
+ 
+ logger = logging.getLogger('sentry.errors')
+ 
+@@ -139,20 +137,28 @@ class SentryClient(object):
+         
+         return message_id
+ 
+-    def send_remote(self, url=None, data=None):
+-        return urlread(url, post=data, timeout=conf.REMOTE_TIMEOUT)
++    def send_remote(self, url, data, headers={}):
++        req = urllib2.Request(url, headers=headers)
++        try:
++            response = urllib2.urlopen(req, data, conf.REMOTE_TIMEOUT).read()
++        except:
++            response = urllib2.urlopen(req, data).read()
++        return response
+ 
+     def send(self, **kwargs):
+         "Sends the message to the server."
+         if conf.REMOTE_URL:
+             for url in conf.REMOTE_URL:
+-                data = {
+-                    'data': base64.b64encode(simplejson.dumps(kwargs).encode('zlib')),
+-                    'format': 'json',
+-                    'key': conf.KEY,
++                message = base64.b64encode(simplejson.dumps(kwargs).encode('zlib'))
++                timestamp = time.time()
++                signature = get_signature(message, timestamp)
++                headers={
++                    'Authorization': get_auth_header(signature, timestamp, '%s/%s' % (self.__class__.__name__, sentry.VERSION)),
++                    'Content-Type': 'application/octet-stream',
+                 }
++                
+                 try:
+-                    return self.send_remote(url=url, data=data)
++                    return self.send_remote(url=url, data=message, headers=headers)
+                 except urllib2.HTTPError, e:
+                     body = e.read()
+                     logger.error('Unable to reach Sentry log server: %s (url: %%s, body: %%s)' % (e,), url, body,
+diff --git a/sentry/helpers.py b/sentry/helpers.py
+index 1cabd1d56c..1d6c26b6e2 100644
+--- a/sentry/helpers.py
++++ b/sentry/helpers.py
+@@ -1,15 +1,15 @@
++import hmac
+ import logging
+ import sys
+-import urllib
+-import urllib2
+ import uuid
+ from types import ClassType, TypeType
+ 
+ import django
+ from django.conf import settings
+ from django.utils.encoding import force_unicode
+-from django.utils.hashcompat import md5_constructor
++from django.utils.hashcompat import md5_constructor, sha_constructor
+ 
++import sentry
+ from sentry import conf
+ 
+ _FILTER_CACHE = None
+@@ -193,14 +193,6 @@ class cached_property(object):
+             obj.__dict__[self.__name__] = value
+         return value
+ 
+-def urlread(url, get={}, post={}, headers={}, timeout=None):
+-    req = urllib2.Request(url, urllib.urlencode(get), headers=headers)
+-    try:
+-        response = urllib2.urlopen(req, urllib.urlencode(post), timeout).read()
+-    except:
+-        response = urllib2.urlopen(req, urllib.urlencode(post)).read()
+-    return response
+-
+ def get_versions(module_list=None):
+     if not module_list:
+         module_list = settings.INSTALLED_APPS + ['django']
+@@ -247,4 +239,17 @@ def is_float(var):
+         float(var)
+     except ValueError:
+         return False
+-    return True
+\ No newline at end of file
++    return True
++
++def get_signature(message, timestamp):
++    return hmac.new(conf.KEY, '%s %s' % (timestamp, message), sha_constructor).hexdigest()
++
++def get_auth_header(signature, timestamp, client):
++    return 'Sentry sentry_signature=%s, sentry_timestamp=%s, sentry_client=%s' % (
++        signature,
++        timestamp,
++        sentry.VERSION,
++    )
++
++def parse_auth_header(header):
++    return dict(map(lambda x: x.strip().split('='), header.split(' ', 1)[1].split(',')))
+\ No newline at end of file
+diff --git a/sentry/plugins/sentry_redmine/models.py b/sentry/plugins/sentry_redmine/models.py
+index c85a111964..3adb57a683 100644
+--- a/sentry/plugins/sentry_redmine/models.py
++++ b/sentry/plugins/sentry_redmine/models.py
+@@ -7,7 +7,6 @@ from django.shortcuts import render_to_response
+ from django.utils import simplejson
+ from django.utils.safestring import mark_safe
+ 
+-from sentry.helpers import urlread
+ from sentry.models import GroupedMessage
+ from sentry.plugins import GroupActionProvider
+ from sentry.plugins.sentry_redmine import conf
+diff --git a/sentry/runtests.py b/sentry/runtests.py
+index 32ab9f82c6..2b4b5eae67 100644
+--- a/sentry/runtests.py
++++ b/sentry/runtests.py
+@@ -10,6 +10,11 @@ from django.conf import settings
+ if not settings.configured:
+     settings.configure(
+         DATABASE_ENGINE='sqlite3',
++        DATABASES={
++            'default': {
++                'ENGINE': 'sqlite3',
++            },
++        },
+         # HACK: this fixes our threaded runserver remote tests
+         # DATABASE_NAME='test_sentry',
+         # TEST_DATABASE_NAME='test_sentry',
+diff --git a/sentry/tests/tests.py b/sentry/tests/tests.py
+index a6593ec589..2a13fa5e55 100644
+--- a/sentry/tests/tests.py
++++ b/sentry/tests/tests.py
+@@ -10,6 +10,7 @@ import getpass
+ import logging
+ import os.path
+ import sys
++import time
+ import threading
+ import warnings
+ 
+@@ -23,10 +24,11 @@ from django.core.signals import got_request_exception
+ from django.core.servers import basehttp
+ from django.test import TestCase
+ from django.template import TemplateSyntaxError
++from django.utils import simplejson
+ from django.utils.encoding import smart_unicode
+ 
+ from sentry import conf
+-from sentry.helpers import transform
++from sentry.helpers import transform, get_signature, get_auth_header
+ from sentry.models import Message, GroupedMessage
+ from sentry.client.base import SentryClient
+ from sentry.client.handlers import SentryHandler
+@@ -852,7 +854,7 @@ class SentryViewsTest(TestCase):
+     def testGroup(self):
+         self.client.login(username='admin', password='admin')
+         resp = self.client.get(reverse('sentry-group', args=[2]), follow=True)
+-        self.assertEquals(resp.status_code, 200)
++        self.assertEquals(resp.status_code, 200, resp.content)
+         self.assertTemplateUsed(resp, 'sentry/group/details.html')
+ 
+ class RemoteSentryTest(TestCase):
+@@ -884,15 +886,13 @@ class RemoteSentryTest(TestCase):
+ 
+     def testNoKey(self):
+         resp = self.client.post(reverse('sentry-store'))
+-        self.assertEquals(resp.status_code, 403)
+-        self.assertEquals(resp.content, 'Invalid credentials')
++        self.assertEquals(resp.status_code, 400)
+ 
+     def testNoData(self):
+         resp = self.client.post(reverse('sentry-store'), {
+             'key': conf.KEY,
+         })
+-        self.assertEquals(resp.status_code, 403)
+-        self.assertEquals(resp.content, 'Missing data')
++        self.assertEquals(resp.status_code, 400)
+ 
+     def testBadData(self):
+         resp = self.client.post(reverse('sentry-store'), {
+@@ -921,7 +921,7 @@ class RemoteSentryTest(TestCase):
+             'data': base64.b64encode(pickle.dumps(transform(kwargs)).encode('zlib')),
+             'key': conf.KEY,
+         })
+-        self.assertEquals(resp.status_code, 200)
++        self.assertEquals(resp.status_code, 200, resp.content)
+         instance = Message.objects.get()
+         self.assertEquals(instance.message, 'hello')
+         self.assertEquals(instance.server_name, 'not_dcramer.local')
+@@ -935,7 +935,7 @@ class RemoteSentryTest(TestCase):
+             'data': base64.b64encode(pickle.dumps(transform(kwargs)).encode('zlib')),
+             'key': conf.KEY,
+         })
+-        self.assertEquals(resp.status_code, 200)
++        self.assertEquals(resp.status_code, 200, resp.content)
+         instance = Message.objects.get()
+         self.assertEquals(instance.message, 'hello')
+         self.assertEquals(instance.datetime, timestamp)
+@@ -956,6 +956,7 @@ class RemoteSentryTest(TestCase):
+         self.assertEquals(instance.site, 'not_a_real_site')
+         self.assertEquals(instance.level, 40)
+ 
++
+     def testByteSequence(self):
+         """
+         invalid byte sequence for encoding "UTF8": 0xedb7af
+@@ -977,6 +978,20 @@ class RemoteSentryTest(TestCase):
+         self.assertEquals(instance.level, 40)
+         self.assertTrue(instance.data['__sentry__']['exc'])
+ 
++    def testSignature(self):
++        kwargs = {'message': 'hello', 'server_name': 'not_dcramer.local', 'level': 40, 'site': 'not_a_real_site'}
++        ts = time.time()
++        message = base64.b64encode(simplejson.dumps(transform(kwargs)))
++        sig = get_signature(message, ts)
++
++        resp = self.client.post(reverse('sentry-store'), message, content_type='application/octet-stream', AUTHORIZATION=get_auth_header(sig, ts, 'foo'))
++        self.assertEquals(resp.status_code, 200, resp.content)
++        instance = Message.objects.get()
++        self.assertEquals(instance.message, 'hello')
++        self.assertEquals(instance.server_name, 'not_dcramer.local')
++        self.assertEquals(instance.site, 'not_a_real_site')
++        self.assertEquals(instance.level, 40)
++
+     # def testFunctionException(self):
+     #     try: raise Exception(lambda:'foo')
+     #     except: get_client().create_from_exception()
+diff --git a/sentry/views.py b/sentry/views.py
+index 90512919c6..0275ef6640 100644
+--- a/sentry/views.py
++++ b/sentry/views.py
+@@ -6,12 +6,15 @@ except ImportError:
+ import datetime
+ import logging
+ import re
++import time
++import warnings
+ import zlib
+ 
+ from django.core.context_processors import csrf
+ from django.core.urlresolvers import reverse
+ from django.http import HttpResponse, HttpResponseBadRequest, \
+-    HttpResponseForbidden, HttpResponseRedirect, Http404, HttpResponseNotModified
++    HttpResponseForbidden, HttpResponseRedirect, Http404, HttpResponseNotModified, \
++    HttpResponseNotAllowed, HttpResponseGone
+ from django.shortcuts import get_object_or_404
+ from django.template.loader import render_to_string
+ from django.utils import simplejson
+@@ -20,7 +23,7 @@ from django.utils.safestring import mark_safe
+ from django.views.decorators.csrf import csrf_protect, csrf_exempt
+ 
+ from sentry import conf
+-from sentry.helpers import get_filters, is_float
++from sentry.helpers import get_filters, is_float, get_signature, parse_auth_header
+ from sentry.models import GroupedMessage, Message
+ from sentry.plugins import GroupActionProvider
+ from sentry.templatetags.sentry_helpers import with_priority
+@@ -347,17 +350,50 @@ def group_message_details(request, group_id, message_id):
+ 
+ @csrf_exempt
+ def store(request):
+-    key = request.POST.get('key')
+-    if key != conf.KEY:
+-        return HttpResponseForbidden('Invalid credentials')
++    if request.method != 'POST':
++        return HttpResponseNotAllowed('This method only supports POST requests')
+ 
+-    format = request.POST.get('format', 'pickle')
+-    if format not in ('pickle', 'json'):
+-        return HttpResponseForbidden('Invalid format')
+-    
+-    data = request.POST.get('data')
+-    if not data:
+-        return HttpResponseForbidden('Missing data')
++    if request.META.get('AUTHORIZATION', '').startswith('Sentry'):
++        auth_vars = parse_auth_header(request.META['AUTHORIZATION'])
++        
++        signature = auth_vars.get('sentry_signature')
++        timestamp = auth_vars.get('sentry_timestamp')
++
++        format = 'json'
++
++        data = request.raw_post_data
++
++        # Signed data packet
++        if signature and timestamp:
++            try:
++                timestamp = float(timestamp)
++            except ValueError:
++                return HttpResponseBadRequest('Invalid timestamp')
++
++            if timestamp < time.time() - 3600: # 1 hour
++                return HttpResponseGone('Message has expired')
++
++            sig_hmac = get_signature(data, timestamp)
++            if sig_hmac != signature:
++                return HttpResponseForbidden('Invalid signature')
++        else:
++            return HttpResponse('Unauthorized', status_code=401)
++    else:
++        data = request.POST.get('data')
++        if not data:
++            return HttpResponseBadRequest('Missing data')
++
++        format = request.POST.get('format', 'pickle')
++
++        if format not in ('pickle', 'json'):
++            return HttpResponseBadRequest('Invalid format')
++
++        # Legacy request (deprecated as of 2.0)
++        key = request.POST.get('key')
++        
++        if key != conf.KEY:
++            warnings.warn('A client is sending the `key` parameter, which will be removed in Sentry 2.0', DeprecationWarning)
++            return HttpResponseForbidden('Invalid credentials')
+ 
+     logger = logging.getLogger('sentry.server')
+ 
+@@ -371,6 +407,7 @@ def store(request):
+         # bug somewhere in the client's code.
+         logger.exception('Bad data received')
+         return HttpResponseForbidden('Bad data decoding request (%s, %s)' % (e.__class__.__name__, e))
++
+     try:
+         if format == 'pickle':
+             data = pickle.loads(data)
+diff --git a/setup.py b/setup.py
+index 1a9b45f527..27ade8a80e 100644
+--- a/setup.py
++++ b/setup.py
+@@ -17,7 +17,7 @@ tests_require = [
+ 
+ setup(
+     name='django-sentry',
+-    version='1.7.4',
++    version='1.7.5',
+     author='David Cramer',
+     author_email='dcramer@gmail.com',
+     url='http://github.com/dcramer/django-sentry',

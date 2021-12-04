@@ -1,0 +1,506 @@
+commit c81cf035a047d36615ff95c850ab43bf93cf4c7a
+Author: Matte Noble <me@mattenoble.com>
+Date:   Thu Sep 13 09:59:50 2018 -0700
+
+    fix(integrations): Improve Org Plugin Performance (#9596)
+    
+    For very large Organizations, the previous endpoint logic was timing
+    out. It was iterating every Project, and then every Plugin, and
+    serializing all that. That proved to be too much for Organizations with
+    a large number of Projects.
+    
+    Instead, this does two things to try to combat that.
+    
+    1) allow the front-end to specify the plugins it cares about. This will
+    limit what the endpoint needs to lookup.
+    
+    2) Determine whether a plugin is installed on a Project by one query to
+    both sentry_project and sentry_projectoption, instead of iterating every
+    individual plugin.
+
+diff --git a/src/sentry/api/endpoints/organization_plugins.py b/src/sentry/api/endpoints/organization_plugins.py
+index 57ef60bd56..525ddfd2c6 100644
+--- a/src/sentry/api/endpoints/organization_plugins.py
++++ b/src/sentry/api/endpoints/organization_plugins.py
+@@ -6,21 +6,40 @@ from sentry.plugins import plugins
+ from sentry.api.bases.organization import OrganizationEndpoint
+ from sentry.api.serializers import serialize
+ from sentry.api.serializers.models.organization_plugin import OrganizationPluginSerializer
+-from sentry.models import Project
++from sentry.models import ProjectOption
+ 
+ 
+ class OrganizationPluginsEndpoint(OrganizationEndpoint):
+     def get(self, request, organization):
+-        _plugins = []
+-
+-        for project in Project.objects.filter(organization=organization):
+-            for plugin in plugins.configurable_for_project(project, version=None):
+-                _plugins.append(
+-                    serialize(
+-                        plugin,
+-                        request.user,
+-                        OrganizationPluginSerializer(project),
+-                    )
++        # Just load all Plugins once.
++        all_plugins = dict([
++            (p.slug, p) for p in plugins.all()
++        ])
++
++        if 'plugins' in request.GET:
++            desired_plugins = set(request.GET.getlist('plugins'))
++        else:
++            desired_plugins = set(all_plugins.keys())
++
++        if not desired_plugins.issubset(set(all_plugins.keys())):
++            return Response({'detail': 'Invalid plugins'}, status=422)
++
++        # Each tuple represents an enabled Plugin (of only the ones we care
++        # about) and its corresponding Project.
++        enabled_plugins = ProjectOption.objects.filter(
++            key__in=['%s:enabled' % slug for slug in desired_plugins],
++            project__organization=organization,
++        ).select_related('project')
++
++        resources = []
++
++        for project_option in enabled_plugins:
++            resources.append(
++                serialize(
++                    all_plugins[project_option.key.split(':')[0]],
++                    request.user,
++                    OrganizationPluginSerializer(project_option.project),
+                 )
++            )
+ 
+-        return Response(_plugins)
++        return Response(resources)
+diff --git a/src/sentry/api/endpoints/organization_repositories.py b/src/sentry/api/endpoints/organization_repositories.py
+index 1f25a424aa..114e10aa94 100644
+--- a/src/sentry/api/endpoints/organization_repositories.py
++++ b/src/sentry/api/endpoints/organization_repositories.py
+@@ -7,6 +7,7 @@ from sentry.api.base import DocSection
+ from sentry.api.bases.organization import OrganizationEndpoint
+ from sentry.api.paginator import OffsetPaginator
+ from sentry.api.serializers import serialize
++from sentry.app import raven
+ from sentry.constants import ObjectStatus
+ from sentry.models import Integration, Repository
+ from sentry.plugins import bindings
+@@ -54,8 +55,6 @@ class OrganizationRepositoriesEndpoint(OrganizationEndpoint):
+         # TODO(mn): Remove once old Plugins are removed or everyone migrates to
+         # the new Integrations. Hopefully someday?
+         elif status == 'unmigratable':
+-            repos = []
+-
+             integrations = Integration.objects.filter(
+                 organizationintegration__organization=organization,
+                 organizationintegration__status=ObjectStatus.ACTIVE,
+@@ -63,12 +62,17 @@ class OrganizationRepositoriesEndpoint(OrganizationEndpoint):
+                 status=ObjectStatus.ACTIVE,
+             )
+ 
+-            repos = [
+-                repo
+-                for i in integrations
+-                for repo in i.get_installation(organization.id)
+-                             .get_unmigratable_repositories()
+-            ]
++            repos = []
++
++            for i in integrations:
++                try:
++                    repos.extend(i.get_installation(organization.id)
++                                  .get_unmigratable_repositories())
++                except Exception:
++                    raven.captureException()
++                    # Don't rely on the Integration's API being available. If
++                    # it's not, the page should still render.
++                    continue
+ 
+             return Response(serialize(repos, request.user))
+ 
+diff --git a/src/sentry/integrations/client.py b/src/sentry/integrations/client.py
+index 33d84ed16a..ae8a25c0dc 100644
+--- a/src/sentry/integrations/client.py
++++ b/src/sentry/integrations/client.py
+@@ -128,7 +128,8 @@ class ApiClient(object):
+         return path
+ 
+     def _request(self, method, path, headers=None, data=None, params=None,
+-                 auth=None, json=True, allow_text=None, allow_redirects=None):
++                 auth=None, json=True, allow_text=None, allow_redirects=None,
++                 timeout=None):
+ 
+         if allow_text is None:
+             allow_text = self.allow_text
+@@ -139,6 +140,9 @@ class ApiClient(object):
+         if allow_redirects is None:  # is still None
+             allow_redirects = method.upper() == 'GET'
+ 
++        if timeout is None:
++            timeout = 30
++
+         full_url = self.build_url(path)
+         session = build_session()
+         try:
+@@ -151,6 +155,7 @@ class ApiClient(object):
+                 auth=auth,
+                 verify=self.verify_ssl,
+                 allow_redirects=allow_redirects,
++                timeout=timeout,
+             )
+             resp.raise_for_status()
+         except ConnectionError as e:
+diff --git a/src/sentry/integrations/vsts/client.py b/src/sentry/integrations/vsts/client.py
+index eb4bb07b7a..cb2f846260 100644
+--- a/src/sentry/integrations/vsts/client.py
++++ b/src/sentry/integrations/vsts/client.py
+@@ -45,7 +45,7 @@ class VstsApiClient(ApiClient, OAuth2RefreshMixin):
+         if 'access_token' not in self.identity.data:
+             raise ValueError('Vsts Identity missing access token')
+ 
+-    def request(self, method, path, data=None, params=None, api_preview=False):
++    def request(self, method, path, data=None, params=None, api_preview=False, timeout=None):
+         self.check_auth(redirect_url=self.oauth_redirect_url)
+         headers = {
+             'Accept': u'application/json; api-version={}{}'.format(self.api_version, self.api_version_preview if api_preview else ''),
+@@ -54,7 +54,8 @@ class VstsApiClient(ApiClient, OAuth2RefreshMixin):
+             'X-TFS-FedAuthRedirect': 'Suppress',
+             'Authorization': u'Bearer {}'.format(self.identity.data['access_token'])
+         }
+-        return self._request(method, path, headers=headers, data=data, params=params)
++        return self._request(method, path, headers=headers, data=data,
++                             params=params, timeout=timeout)
+ 
+     def create_work_item(self, instance, project, title=None,
+                          description=None, comment=None, link=None):
+@@ -180,6 +181,7 @@ class VstsApiClient(ApiClient, OAuth2RefreshMixin):
+                 instance=instance,
+                 project=u'{}/'.format(project) if project else '',
+             ),
++            timeout=5,
+         )
+ 
+     def get_commits(self, instance, repo_id, commit, limit=100):
+diff --git a/src/sentry/static/sentry/app/views/organizationIntegrations/index.jsx b/src/sentry/static/sentry/app/views/organizationIntegrations/index.jsx
+index ee96df9050..365883c51b 100644
+--- a/src/sentry/static/sentry/app/views/organizationIntegrations/index.jsx
++++ b/src/sentry/static/sentry/app/views/organizationIntegrations/index.jsx
+@@ -26,11 +26,12 @@ export default class OrganizationIntegrations extends AsyncComponent {
+ 
+   getEndpoints() {
+     let {orgId} = this.props.params;
++    const query = {plugins: ['vsts', 'github', 'bitbucket']};
+ 
+     return [
+       ['config', `/organizations/${orgId}/config/integrations/`],
+       ['integrations', `/organizations/${orgId}/integrations/`],
+-      ['plugins', `/organizations/${orgId}/plugins/`],
++      ['plugins', `/organizations/${orgId}/plugins/`, {query}],
+       ['unmigratableRepos', `/organizations/${orgId}/repos/?status=unmigratable`],
+     ];
+   }
+diff --git a/src/sentry/static/sentry/app/views/organizationIntegrations/installedIntegration.jsx b/src/sentry/static/sentry/app/views/organizationIntegrations/installedIntegration.jsx
+index 7c447a6073..b68c2e679d 100644
+--- a/src/sentry/static/sentry/app/views/organizationIntegrations/installedIntegration.jsx
++++ b/src/sentry/static/sentry/app/views/organizationIntegrations/installedIntegration.jsx
+@@ -13,16 +13,6 @@ import Tooltip from 'app/components/tooltip';
+ 
+ const CONFIGURABLE_FEATURES = ['commits', 'alert_rule'];
+ 
+-const StyledButton = styled(Button)`
+-  color: ${p => p.theme.gray2};
+-`;
+-
+-const removeButton = (
+-  <StyledButton borderless icon="icon-trash">
+-    Remove
+-  </StyledButton>
+-);
+-
+ export default class InstalledIntegration extends React.Component {
+   static propTypes = {
+     orgId: PropTypes.string.isRequired,
+@@ -56,6 +46,14 @@ export default class InstalledIntegration extends React.Component {
+     this.props.onReinstallIntegration(activeIntegration);
+   };
+ 
++  get removeButton() {
++    return (
++      <StyledButton borderless icon="icon-trash">
++        Remove
++      </StyledButton>
++    );
++  }
++
+   renderDisableIntegration(integration) {
+     const {body, actionText} = integration.provider.aspects.disable_dialog;
+     const message = (
+@@ -74,7 +72,7 @@ export default class InstalledIntegration extends React.Component {
+         priority="danger"
+         onConfirm={() => this.props.onDisable(integration)}
+       >
+-        {removeButton}
++        {this.removeButton}
+       </Confirm>
+     );
+   }
+@@ -113,7 +111,7 @@ export default class InstalledIntegration extends React.Component {
+         priority="danger"
+         onConfirm={() => this.props.onRemove(integration)}
+       >
+-        {removeButton}
++        {this.removeButton}
+       </Confirm>
+     );
+   }
+@@ -165,3 +163,7 @@ export default class InstalledIntegration extends React.Component {
+     );
+   }
+ }
++
++const StyledButton = styled(Button)`
++  color: ${p => p.theme.gray2};
++`;
+diff --git a/src/sentry/static/sentry/app/views/organizationIntegrations/migrationWarnings.jsx b/src/sentry/static/sentry/app/views/organizationIntegrations/migrationWarnings.jsx
+index 8a941968a6..d355f0686b 100644
+--- a/src/sentry/static/sentry/app/views/organizationIntegrations/migrationWarnings.jsx
++++ b/src/sentry/static/sentry/app/views/organizationIntegrations/migrationWarnings.jsx
+@@ -20,6 +20,11 @@ export default class MigrationWarnings extends React.Component {
+ 
+       const provider = this.props.providers.find(p => p.key === key);
+ 
++      // The Org might not have access to this Integration yet.
++      if (!provider) {
++        return '';
++      }
++
+       return (
+         <AddIntegration
+           key={provider.key}
+diff --git a/tests/acceptance/test_organization_integrations_settings.py b/tests/acceptance/test_organization_integrations_settings.py
+index c473ac8e93..bb699631d4 100644
+--- a/tests/acceptance/test_organization_integrations_settings.py
++++ b/tests/acceptance/test_organization_integrations_settings.py
+@@ -2,6 +2,9 @@ from __future__ import absolute_import
+ 
+ from sentry.models import Integration
+ from sentry.testutils import AcceptanceTestCase
++from tests.sentry.plugins.testutils import (
++    register_mock_plugins, unregister_mock_plugins
++)
+ 
+ 
+ class OrganizationIntegrationSettingsTest(AcceptanceTestCase):
+@@ -35,8 +38,12 @@ class OrganizationIntegrationSettingsTest(AcceptanceTestCase):
+ 
+         self.org_integration = self.model.add_organization(self.org, self.user)
+ 
++        register_mock_plugins()
+         self.login_as(self.user)
+ 
++    def tearDown(self):
++        unregister_mock_plugins()
++
+     def test_all_integrations_list(self):
+         path = u'/settings/{}/integrations/'.format(self.org.slug)
+         self.browser.get(path)
+diff --git a/tests/sentry/api/endpoints/test_organization_plugins.py b/tests/sentry/api/endpoints/test_organization_plugins.py
+index be570bd541..46664af049 100644
+--- a/tests/sentry/api/endpoints/test_organization_plugins.py
++++ b/tests/sentry/api/endpoints/test_organization_plugins.py
+@@ -7,20 +7,43 @@ from sentry.testutils import APITestCase
+ 
+ 
+ class OrganizationPluginsTest(APITestCase):
+-    def test_exposes_plugins_across_all_org_projects(self):
+-        projectA = self.create_project()
+-        projectB = self.create_project(organization=projectA.organization)
++    def setUp(self):
++        self.projectA = self.create_project()
++        self.projectB = self.create_project(organization=self.projectA.organization)
+ 
+-        plugins.get('webhooks').enable(projectA)
+-        plugins.get('mail').enable(projectB)
++        plugins.get('webhooks').enable(self.projectA)
++        plugins.get('mail').enable(self.projectB)
+ 
+         self.login_as(user=self.user)
+ 
++    def test_exposes_plugins_across_all_org_projects(self):
++        url = reverse(
++            'sentry-api-0-organization-plugins',
++            kwargs={'organization_slug': self.projectA.organization.slug}
++        )
++
++        url = u'{}?{}'.format(url, 'plugins=mail&plugins=webhooks')
++
++        response = self.client.get(url)
++
++        assert response.status_code == 200, \
++            (response.status_code, response.content)
++
++        enabled_plugins = [
++            (p['project']['id'], p['slug']) for p in
++            filter(lambda p: p['enabled'], response.data)
++        ]
++
++        assert (self.projectA.id, 'webhooks') in enabled_plugins
++        assert (self.projectB.id, 'mail') in enabled_plugins
++
++    def test_exposes_specific_plugins_across_all_org_projects(self):
+         url = reverse(
+             'sentry-api-0-organization-plugins',
+-            kwargs={'organization_slug': projectA.organization.slug}
++            kwargs={'organization_slug': self.projectA.organization.slug}
+         )
+ 
++        url = '{}?plugins=mail'.format(url)
+         response = self.client.get(url)
+ 
+         assert response.status_code == 200, \
+@@ -31,5 +54,5 @@ class OrganizationPluginsTest(APITestCase):
+             filter(lambda p: p['enabled'], response.data)
+         ]
+ 
+-        assert (projectA.id, 'webhooks') in enabled_plugins
+-        assert (projectB.id, 'mail') in enabled_plugins
++        assert (self.projectA.id, 'webhooks') not in enabled_plugins
++        assert (self.projectB.id, 'mail') in enabled_plugins
+diff --git a/tests/sentry/integrations/bitbucket/test_installed.py b/tests/sentry/integrations/bitbucket/test_installed.py
+index 343b9a0aca..ef7c56c9ac 100644
+--- a/tests/sentry/integrations/bitbucket/test_installed.py
++++ b/tests/sentry/integrations/bitbucket/test_installed.py
+@@ -7,7 +7,10 @@ from sentry.integrations.bitbucket.installed import BitbucketInstalledEndpoint
+ from sentry.integrations.bitbucket.integration import scopes, BitbucketIntegrationProvider
+ from sentry.models import Integration, Repository, Project
+ from sentry.plugins import plugins
+-from tests.sentry.plugins.testutils import BitbucketPlugin  # NOQA
++from tests.sentry.plugins.testutils import (
++    register_mock_plugins,
++    unregister_mock_plugins,
++)
+ 
+ 
+ class BitbucketInstalledEndpointTest(APITestCase):
+@@ -67,6 +70,12 @@ class BitbucketInstalledEndpointTest(APITestCase):
+             }
+         }
+ 
++        register_mock_plugins()
++
++    def tearDown(self):
++        unregister_mock_plugins()
++        super(BitbucketInstalledEndpointTest, self).tearDown()
++
+     def test_default_permissions(self):
+         # Permissions must be empty so that it will be accessible to bitbucket.
+         assert BitbucketInstalledEndpoint.authentication_classes == ()
+diff --git a/tests/sentry/integrations/github/test_integration.py b/tests/sentry/integrations/github/test_integration.py
+index aafe1ff1ce..24b13ddea8 100644
+--- a/tests/sentry/integrations/github/test_integration.py
++++ b/tests/sentry/integrations/github/test_integration.py
+@@ -15,7 +15,10 @@ from sentry.models import (
+ )
+ from sentry.plugins import plugins
+ from sentry.testutils import IntegrationTestCase
+-from tests.sentry.plugins.testutils import GitHubPlugin  # NOQA
++from tests.sentry.plugins.testutils import (
++    register_mock_plugins,
++    unregister_mock_plugins,
++)
+ 
+ 
+ class GitHubIntegrationTest(IntegrationTestCase):
+@@ -31,6 +34,11 @@ class GitHubIntegrationTest(IntegrationTestCase):
+         self.expires_at = '3000-01-01T00:00:00Z'
+ 
+         self._stub_github()
++        register_mock_plugins()
++
++    def tearDown(self):
++        unregister_mock_plugins()
++        super(GitHubIntegrationTest, self).tearDown()
+ 
+     def _stub_github(self):
+         responses.reset()
+diff --git a/tests/sentry/integrations/vsts/test_integration.py b/tests/sentry/integrations/vsts/test_integration.py
+index 5f3e51a225..aabe117aab 100644
+--- a/tests/sentry/integrations/vsts/test_integration.py
++++ b/tests/sentry/integrations/vsts/test_integration.py
+@@ -9,13 +9,25 @@ from sentry.models import (
+     Project
+ )
+ from sentry.plugins import plugins
+-from tests.sentry.plugins.testutils import VstsPlugin  # NOQA
++from tests.sentry.plugins.testutils import (
++    register_mock_plugins,
++    unregister_mock_plugins,
++    VstsPlugin,
++)
+ from .testutils import VstsIntegrationTestCase, CREATE_SUBSCRIPTION
+ 
+ 
+ class VstsIntegrationProviderTest(VstsIntegrationTestCase):
+     # Test data setup in ``VstsIntegrationTestCase``
+ 
++    def setUp(self):
++        super(VstsIntegrationProviderTest, self).setUp()
++        register_mock_plugins()
++
++    def tearDown(self):
++        unregister_mock_plugins()
++        super(VstsIntegrationProviderTest, self).tearDown()
++
+     def test_basic_flow(self):
+         self.assert_installation()
+ 
+@@ -65,9 +77,7 @@ class VstsIntegrationProviderTest(VstsIntegrationTestCase):
+         self.project = Project.objects.create(
+             organization_id=self.organization.id,
+         )
+-
+-        self.plugin = plugins.get('vsts')
+-        self.plugin.enable(self.project)
++        VstsPlugin().enable(project=self.project)
+ 
+     def test_disabled_plugin_when_fully_migrated(self):
+         self.setupPluginTest()
+diff --git a/tests/sentry/plugins/testutils.py b/tests/sentry/plugins/testutils.py
+index 319c1ac4c7..0b43b10ace 100644
+--- a/tests/sentry/plugins/testutils.py
++++ b/tests/sentry/plugins/testutils.py
+@@ -5,19 +5,29 @@ from sentry.plugins import plugins, IssueTrackingPlugin2
+ 
+ class VstsPlugin(IssueTrackingPlugin2):
+     slug = 'vsts'
++    name = 'VSTS Mock Plugin'
+     conf_key = slug
+ 
+ 
+ class GitHubPlugin(IssueTrackingPlugin2):
+     slug = 'github'
++    name = 'GitHub Mock Plugin'
+     conf_key = slug
+ 
+ 
+ class BitbucketPlugin(IssueTrackingPlugin2):
+     slug = 'bitbucket'
++    name = 'Bitbucket Mock Plugin'
+     conf_key = slug
+ 
+ 
+-plugins.register(VstsPlugin)
+-plugins.register(GitHubPlugin)
+-plugins.register(BitbucketPlugin)
++def unregister_mock_plugins():
++    plugins.unregister(VstsPlugin)
++    plugins.unregister(GitHubPlugin)
++    plugins.unregister(BitbucketPlugin)
++
++
++def register_mock_plugins():
++    plugins.register(VstsPlugin)
++    plugins.register(GitHubPlugin)
++    plugins.register(BitbucketPlugin)

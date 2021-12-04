@@ -1,0 +1,327 @@
+commit d2d44db173630c4bc052a99a5a9b7c0a3639f1a9
+Author: Mark Story <mark@sentry.io>
+Date:   Wed Jan 8 10:12:52 2020 -0500
+
+    feat(discover2) Add high-level API for getting discover facets (#16248)
+    
+    Right now we half let users define which tags they want in the facet
+    bars, and then use many HTTP requests and snuba queries to get that
+    information. This new API will allow us to use fewer HTTP requests and
+    more importantly fewer snuba queries to fetch tag facets.
+    
+    The project facet requires special casing as it is not actually a tag.
+    This API will also allow us to add more clever logic to deciding which
+    results to show in the future as well.
+    
+    Turn sampling on after 9 projects. I've chosen 9 arbitrarily as
+    a starting point.
+    
+    We do a separate query for the environment 'tag' as using the tags array
+    for environments will skip environment='' records which we want to consider.
+
+diff --git a/src/sentry/snuba/discover.py b/src/sentry/snuba/discover.py
+index 53f17a2573..8a4949b083 100644
+--- a/src/sentry/snuba/discover.py
++++ b/src/sentry/snuba/discover.py
+@@ -35,11 +35,13 @@ __all__ = (
+     "query",
+     "timeseries_query",
+     "get_pagination_ids",
++    "get_facets",
+ )
+ 
+ 
+ ReferenceEvent = namedtuple("ReferenceEvent", ["organization", "slug", "fields"])
+ PaginationResult = namedtuple("PaginationResult", ["next", "previous", "oldest", "latest"])
++FacetResult = namedtuple("FacetResult", ["key", "value", "count"])
+ 
+ 
+ def is_real_column(col):
+@@ -415,3 +417,121 @@ def get_pagination_ids(event, query, params, reference_event=None, referrer=None
+         latest=get_id(eventstore.get_latest_event_id(event, filter=snuba_filter)),
+         oldest=get_id(eventstore.get_earliest_event_id(event, filter=snuba_filter)),
+     )
++
++
++def get_facets(query, params, limit=20, referrer=None):
++    """
++    High-level API for getting 'facet map' results.
++
++    Facets are high frequency tags and attribute results that
++    can be used to further refine user queries. When many projects
++    are requested sampling will be enabled to help keep response times low.
++
++    query (str) Filter query string to create conditions from.
++    params (Dict[str, str]) Filtering parameters with start, end, project_id, environment
++    limit (int) The number of records to fetch.
++    referrer (str|None) A referrer string to help locate the origin of this query.
++
++    Returns Sequence[FacetResult]
++    """
++    snuba_filter = get_filter(query, params)
++
++    # TODO(mark) Refactor the need for this translation shim.
++    snuba_args = {
++        "start": snuba_filter.start,
++        "end": snuba_filter.end,
++        "conditions": snuba_filter.conditions,
++        "filter_keys": snuba_filter.filter_keys,
++    }
++    # Resolve the public aliases into the discover dataset names.
++    snuba_args, translated_columns = resolve_discover_aliases(snuba_args)
++
++    # Force sampling for more than 9 projects. 9 was chosen arbitrarily.
++    sample = len(snuba_filter.filter_keys["project_id"]) > 9
++
++    # Exclude tracing tags as they are noisy and generally not helpful.
++    conditions = snuba_args.get("conditions", [])
++    conditions.append(["tags_key", "NOT IN", ["trace", "trace.ctx", "trace.span"]])
++
++    # Get the most frequent tag keys, enable sampling
++    # as we don't need accuracy here.
++    key_names = raw_query(
++        aggregations=[["count", None, "count"]],
++        start=snuba_args.get("start"),
++        end=snuba_args.get("end"),
++        conditions=snuba_args.get("conditions"),
++        filter_keys=snuba_args.get("filter_keys"),
++        orderby=["-count", "tags_key"],
++        groupby="tags_key",
++        dataset=Dataset.Discover,
++        limit=limit,
++        referrer=referrer,
++        turbo=sample,
++    )
++    top_tags = [r["tags_key"] for r in key_names["data"]]
++    if not top_tags:
++        return []
++
++    fetch_projects = False
++    if len(params.get("project_id", [])) > 1:
++        if len(top_tags) == limit:
++            top_tags.pop()
++        fetch_projects = True
++
++    results = []
++    if fetch_projects:
++        project_values = raw_query(
++            aggregations=[["uniq", "event_id", "count"]],
++            start=snuba_args.get("start"),
++            end=snuba_args.get("end"),
++            conditions=snuba_args.get("conditions"),
++            filter_keys=snuba_args.get("filter_keys"),
++            groupby="project_id",
++            orderby="-count",
++            dataset=Dataset.Discover,
++            referrer=referrer,
++        )
++        results.extend(
++            [FacetResult("project", r["project_id"], r["count"]) for r in project_values["data"]]
++        )
++
++    # Environment is a special case because of the "" value which is stored as null
++    # in the environment column but not in the tag arrays.
++    if "environment" in top_tags:
++        top_tags.remove("environment")
++        environment_values = raw_query(
++            aggregations=[["uniq", "event_id", "count"]],
++            start=snuba_args.get("start"),
++            end=snuba_args.get("end"),
++            conditions=snuba_args.get("conditions"),
++            filter_keys=snuba_args.get("filter_keys"),
++            groupby="environment",
++            orderby=["-count", "environment"],
++            dataset=Dataset.Discover,
++            referrer=referrer,
++        )
++        results.extend(
++            [
++                FacetResult("environment", r["environment"], r["count"])
++                for r in environment_values["data"]
++            ]
++        )
++
++    # Get tag counts for our top tags.
++    conditions.append(["tags_key", "IN", top_tags])
++    tag_values = raw_query(
++        aggregations=[["count", None, "count"]],
++        conditions=conditions,
++        start=snuba_args.get("start"),
++        end=snuba_args.get("end"),
++        filter_keys=snuba_args.get("filter_keys"),
++        orderby=["tags_key", "-count"],
++        groupby=["tags_key", "tags_value"],
++        dataset=Dataset.Discover,
++        referrer=referrer,
++    )
++    results.extend(
++        [FacetResult(r["tags_key"], r["tags_value"], int(r["count"])) for r in tag_values["data"]]
++    )
++
++    return results
+diff --git a/tests/sentry/snuba/test_discover.py b/tests/sentry/snuba/test_discover.py
+index 47d6ff4454..96a55e5f45 100644
+--- a/tests/sentry/snuba/test_discover.py
++++ b/tests/sentry/snuba/test_discover.py
+@@ -1021,3 +1021,161 @@ class GetPaginationIdsTest(SnubaTestCase, TestCase):
+         assert result.next == "c" * 32
+         assert result.oldest == "a" * 32
+         assert result.latest == "c" * 32
++
++
++class GetFacetsTest(SnubaTestCase, TestCase):
++    def setUp(self):
++        super(GetFacetsTest, self).setUp()
++
++        self.project = self.create_project()
++        self.min_ago = before_now(minutes=1)
++        self.day_ago = before_now(days=1)
++
++    def test_invalid_query(self):
++        with pytest.raises(InvalidSearchQuery):
++            discover.get_facets(
++                "\n", {"project_id": [self.project.id], "end": self.min_ago, "start": self.day_ago}
++            )
++
++    def test_no_results(self):
++        results = discover.get_facets(
++            "", {"project_id": [self.project.id], "end": self.min_ago, "start": self.day_ago}
++        )
++        assert results == []
++
++    def test_single_project(self):
++        self.store_event(
++            data={
++                "message": "very bad",
++                "type": "default",
++                "timestamp": iso_format(before_now(minutes=2)),
++                "tags": {"color": "red", "paying": "1"},
++            },
++            project_id=self.project.id,
++        )
++        self.store_event(
++            data={
++                "message": "very bad",
++                "type": "default",
++                "timestamp": iso_format(before_now(minutes=2)),
++                "tags": {"color": "blue", "paying": "0"},
++            },
++            project_id=self.project.id,
++        )
++        params = {"project_id": [self.project.id], "start": self.day_ago, "end": self.min_ago}
++        result = discover.get_facets("", params)
++        assert len(result) == 5
++        assert {r.key for r in result} == {"color", "paying", "level"}
++        assert {r.value for r in result} == {"red", "blue", "1", "0", "error"}
++        assert {r.count for r in result} == {1, 2}
++
++    def test_project_filter(self):
++        self.store_event(
++            data={
++                "message": "very bad",
++                "type": "default",
++                "timestamp": iso_format(before_now(minutes=2)),
++                "tags": {"color": "red"},
++            },
++            project_id=self.project.id,
++        )
++        other_project = self.create_project()
++        self.store_event(
++            data={
++                "message": "very bad",
++                "type": "default",
++                "timestamp": iso_format(before_now(minutes=2)),
++                "tags": {"toy": "train"},
++            },
++            project_id=other_project.id,
++        )
++        params = {"project_id": [self.project.id], "start": self.day_ago, "end": self.min_ago}
++        result = discover.get_facets("", params)
++        keys = {r.key for r in result}
++        assert keys == {"color", "level"}
++
++        # Query more than one project.
++        params = {
++            "project_id": [self.project.id, other_project.id],
++            "start": self.day_ago,
++            "end": self.min_ago,
++        }
++        result = discover.get_facets("", params)
++        keys = {r.key for r in result}
++        assert keys == {"level", "toy", "color", "project"}
++
++        projects = [f for f in result if f.key == "project"]
++        assert [p.count for p in projects] == [1, 1]
++
++    def test_enviroment_promoted_tag(self):
++        for env in ("prod", "staging", None):
++            self.store_event(
++                data={
++                    "message": "very bad",
++                    "type": "default",
++                    "environment": env,
++                    "timestamp": iso_format(before_now(minutes=2)),
++                },
++                project_id=self.project.id,
++            )
++        params = {"project_id": [self.project.id], "start": self.day_ago, "end": self.min_ago}
++        result = discover.get_facets("", params)
++        keys = {r.key for r in result}
++        assert keys == {"environment", "level"}
++        assert {"prod", "staging", None} == {f.value for f in result if f.key == "environment"}
++        assert {1} == {f.count for f in result if f.key == "environment"}
++
++    def test_query_string(self):
++        self.store_event(
++            data={
++                "message": "very bad",
++                "type": "default",
++                "timestamp": iso_format(before_now(minutes=2)),
++                "tags": {"color": "red"},
++            },
++            project_id=self.project.id,
++        )
++        self.store_event(
++            data={
++                "message": "oh my",
++                "type": "default",
++                "timestamp": iso_format(before_now(minutes=2)),
++                "tags": {"toy": "train"},
++            },
++            project_id=self.project.id,
++        )
++        params = {"project_id": [self.project.id], "start": self.day_ago, "end": self.min_ago}
++        result = discover.get_facets("bad", params)
++        keys = {r.key for r in result}
++        assert "color" in keys
++        assert "toy" not in keys
++
++        result = discover.get_facets("color:red", params)
++        keys = {r.key for r in result}
++        assert "color" in keys
++        assert "toy" not in keys
++
++    def test_date_params(self):
++        self.store_event(
++            data={
++                "message": "very bad",
++                "type": "default",
++                "timestamp": iso_format(before_now(minutes=2)),
++                "tags": {"color": "red"},
++            },
++            project_id=self.project.id,
++        )
++        self.store_event(
++            data={
++                "message": "oh my",
++                "type": "default",
++                "timestamp": iso_format(before_now(days=2)),
++                "tags": {"toy": "train"},
++            },
++            project_id=self.project.id,
++        )
++        params = {"project_id": [self.project.id], "start": self.day_ago, "end": self.min_ago}
++        result = discover.get_facets("", params)
++        keys = {r.key for r in result}
++        assert "color" in keys
++        assert "toy" not in keys

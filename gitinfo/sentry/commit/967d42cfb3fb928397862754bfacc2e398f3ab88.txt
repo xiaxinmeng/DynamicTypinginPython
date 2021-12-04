@@ -1,0 +1,244 @@
+commit 967d42cfb3fb928397862754bfacc2e398f3ab88
+Author: Jess MacQueen <macqueen@users.noreply.github.com>
+Date:   Wed Jan 2 13:29:45 2019 -0800
+
+    ref(api): Add snuba version of stream group serializer to support multi env (#11120)
+
+diff --git a/src/sentry/api/serializers/models/group.py b/src/sentry/api/serializers/models/group.py
+index c3aa1bf2c2..ce1c1f7415 100644
+--- a/src/sentry/api/serializers/models/group.py
++++ b/src/sentry/api/serializers/models/group.py
+@@ -5,6 +5,7 @@ from collections import defaultdict
+ from datetime import timedelta
+ 
+ import six
++from django.conf import settings
+ from django.core.urlresolvers import reverse
+ from django.db.models import Q
+ from django.utils import timezone
+@@ -20,6 +21,7 @@ from sentry.models import (
+     UserOptionValue
+ )
+ from sentry.tagstore.snuba.backend import SnubaTagStorage
++from sentry.tsdb.snuba import SnubaTSDB
+ from sentry.utils.db import attach_foreignkey
+ from sentry.utils.http import absolute_uri
+ from sentry.utils.safe import safe_execute
+@@ -36,6 +38,10 @@ SUBSCRIPTION_REASON_MAP = {
+ disabled = object()
+ 
+ 
++# TODO(jess): remove when snuba is primary backend
++snuba_tsdb = SnubaTSDB(**settings.SENTRY_TSDB_OPTIONS)
++
++
+ class GroupSerializerBase(Serializer):
+     def _get_seen_stats(self, item_list, user):
+         """
+@@ -440,12 +446,33 @@ class GroupSerializer(GroupSerializerBase):
+         return attrs
+ 
+ 
+-class StreamGroupSerializer(GroupSerializer):
++class GroupStatsMixin(object):
+     STATS_PERIOD_CHOICES = {
+         '14d': StatsPeriod(14, timedelta(hours=24)),
+         '24h': StatsPeriod(24, timedelta(hours=1)),
+     }
+ 
++    def query_tsdb(self, group_ids, query_params):
++        raise NotImplementedError
++
++    def get_stats(self, item_list, user):
++        if self.stats_period:
++            # we need to compute stats at 1d (1h resolution), and 14d
++            group_ids = [g.id for g in item_list]
++
++            segments, interval = self.STATS_PERIOD_CHOICES[self.stats_period]
++            now = timezone.now()
++            query_params = {
++                'start': now - ((segments - 1) * interval),
++                'end': now,
++                'rollup': int(interval.total_seconds()),
++            }
++
++            return self.query_tsdb(group_ids, query_params)
++
++
++class StreamGroupSerializer(GroupSerializer, GroupStatsMixin):
++
+     def __init__(self, environment_func=None, stats_period=None,
+                  matching_event_id=None, matching_event_environment=None):
+         super(StreamGroupSerializer, self).__init__(environment_func)
+@@ -457,35 +484,27 @@ class StreamGroupSerializer(GroupSerializer):
+         self.matching_event_id = matching_event_id
+         self.matching_event_environment = matching_event_environment
+ 
++    def query_tsdb(self, group_ids, query_params):
++        try:
++            environment = self.environment_func()
++        except Environment.DoesNotExist:
++            stats = {key: tsdb.make_series(0, **query_params) for key in group_ids}
++        else:
++            stats = tsdb.get_range(
++                model=tsdb.models.group,
++                keys=group_ids,
++                environment_ids=environment and [environment.id],
++                **query_params
++            )
++
++        return stats
++
+     def get_attrs(self, item_list, user):
+         attrs = super(StreamGroupSerializer, self).get_attrs(item_list, user)
+ 
+         if self.stats_period:
+-            # we need to compute stats at 1d (1h resolution), and 14d
+-            group_ids = [g.id for g in item_list]
+-
+-            segments, interval = self.STATS_PERIOD_CHOICES[self.stats_period]
+-            now = timezone.now()
+-            query_params = {
+-                'start': now - ((segments - 1) * interval),
+-                'end': now,
+-                'rollup': int(interval.total_seconds()),
+-            }
+-
+-            try:
+-                environment = self.environment_func()
+-            except Environment.DoesNotExist:
+-                stats = {key: tsdb.make_series(0, **query_params) for key in group_ids}
+-            else:
+-                stats = tsdb.get_range(
+-                    model=tsdb.models.group,
+-                    keys=group_ids,
+-                    environment_ids=environment and [environment.id],
+-                    **query_params
+-                )
+-
++            stats = self.get_stats(item_list, user)
+             for item in item_list:
+-
+                 attrs[item].update({
+                     'stats': stats[item.id],
+                 })
+@@ -572,3 +591,43 @@ class GroupSerializerSnuba(GroupSerializerBase):
+             }
+ 
+         return attrs
++
++
++class StreamGroupSerializerSnuba(GroupSerializerSnuba, GroupStatsMixin):
++    def __init__(self, environment_ids=None, stats_period=None):
++        super(StreamGroupSerializerSnuba, self).__init__(environment_ids)
++
++        if stats_period is not None:
++            assert stats_period in self.STATS_PERIOD_CHOICES
++
++        self.stats_period = stats_period
++
++    def query_tsdb(self, group_ids, query_params):
++        return snuba_tsdb.get_range(
++            model=snuba_tsdb.models.group,
++            keys=group_ids,
++            environment_ids=self.environment_ids,
++            **query_params
++        )
++
++    def get_attrs(self, item_list, user):
++        attrs = super(StreamGroupSerializerSnuba, self).get_attrs(item_list, user)
++
++        if self.stats_period:
++            stats = self.get_stats(item_list, user)
++            for item in item_list:
++                attrs[item].update({
++                    'stats': stats[item.id],
++                })
++
++        return attrs
++
++    def serialize(self, obj, attrs, user):
++        result = super(StreamGroupSerializerSnuba, self).serialize(obj, attrs, user)
++
++        if self.stats_period:
++            result['stats'] = {
++                self.stats_period: attrs['stats'],
++            }
++
++        return result
+diff --git a/src/sentry/tsdb/base.py b/src/sentry/tsdb/base.py
+index 46d319ca97..a7d4c04206 100644
+--- a/src/sentry/tsdb/base.py
++++ b/src/sentry/tsdb/base.py
+@@ -148,7 +148,7 @@ class BaseTSDB(Service):
+         models.users_affected_by_project,
+     ])
+ 
+-    def __init__(self, rollups=None, legacy_rollups=None):
++    def __init__(self, rollups=None, legacy_rollups=None, **options):
+         if rollups is None:
+             rollups = settings.SENTRY_TSDB_ROLLUPS
+ 
+diff --git a/tests/snuba/api/serializers/test_group.py b/tests/snuba/api/serializers/test_group.py
+index c9b10a121a..0cf157f749 100644
+--- a/tests/snuba/api/serializers/test_group.py
++++ b/tests/snuba/api/serializers/test_group.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import absolute_import
+ 
++import mock
+ import six
+ 
+ from datetime import timedelta
+@@ -10,9 +11,9 @@ from django.utils import timezone
+ from mock import patch
+ 
+ from sentry.api.serializers import serialize
+-from sentry.api.serializers.models.group import GroupSerializerSnuba
++from sentry.api.serializers.models.group import GroupSerializerSnuba, StreamGroupSerializerSnuba, snuba_tsdb
+ from sentry.models import (
+-    GroupLink, GroupResolution, GroupSnooze, GroupStatus,
++    Environment, GroupLink, GroupResolution, GroupSnooze, GroupStatus,
+     GroupSubscription, UserOption, UserOptionValue
+ )
+ from sentry.testutils import APITestCase, SnubaTestCase
+@@ -325,3 +326,38 @@ class GroupSerializerSnubaTest(APITestCase, SnubaTestCase):
+         assert result['lastSeen'] == self.min_ago - timedelta(microseconds=self.min_ago.microsecond)
+         assert result['firstSeen'] == self.day_ago - \
+             timedelta(microseconds=self.day_ago.microsecond)
++
++
++class StreamGroupSerializerTestCase(APITestCase, SnubaTestCase):
++    def test_environment(self):
++        group = self.group
++
++        environment = Environment.get_or_create(group.project, 'production')
++
++        with mock.patch(
++                'sentry.api.serializers.models.group.snuba_tsdb.get_range',
++                side_effect=snuba_tsdb.get_range) as get_range:
++            serialize(
++                [group],
++                serializer=StreamGroupSerializerSnuba(
++                    environment_ids=[environment.id],
++                    stats_period='14d',
++                ),
++            )
++            assert get_range.call_count == 1
++            for args, kwargs in get_range.call_args_list:
++                assert kwargs['environment_ids'] == [environment.id]
++
++        with mock.patch(
++                'sentry.api.serializers.models.group.snuba_tsdb.get_range',
++                side_effect=snuba_tsdb.get_range) as get_range:
++            serialize(
++                [group],
++                serializer=StreamGroupSerializerSnuba(
++                    environment_ids=None,
++                    stats_period='14d',
++                )
++            )
++            assert get_range.call_count == 1
++            for args, kwargs in get_range.call_args_list:
++                assert kwargs['environment_ids'] is None

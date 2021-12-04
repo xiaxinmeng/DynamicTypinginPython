@@ -1,0 +1,326 @@
+commit f57cfb922b035777f340476e5da867e201981ab1
+Author: Markus Unterwaditzer <markus@unterwaditzer.net>
+Date:   Mon Mar 2 10:43:09 2020 +0100
+
+    fix(pii): Just assume datascrubbing is idempotent (#17379)
+    
+    We initially assumed that we cannot make data scrubbing idempotent (so
+    we tried to selectively scrub the event based on what actually changed
+    in processing).
+    
+    This assumption is already undermined by external Relays. Let's assume
+    datascrubbing is idempotent so we can figure out the bugs there early as
+    long as datascrubbers-v2 is not generally available.
+    
+    It also makes a lot of code simpler which was buggy already because of
+    the "specific selectors" concept in PII configs.
+    
+    It also likely fixes the performance issues we have when creating large
+    amounts of selectors.
+
+diff --git a/src/sentry/datascrubbing.py b/src/sentry/datascrubbing.py
+index c1686f987a..31fa99fe84 100644
+--- a/src/sentry/datascrubbing.py
++++ b/src/sentry/datascrubbing.py
+@@ -1,12 +1,9 @@
+ from __future__ import absolute_import
+ 
+-import copy
+-
+ import sentry_relay
+ import six
+ 
+ from sentry.utils import metrics
+-from sentry.utils.canonical import CanonicalKeyDict
+ 
+ 
+ def _escape_key(key):
+@@ -19,71 +16,6 @@ def _escape_key(key):
+     return u"'{}'".format(key.replace("'", "''"))
+ 
+ 
+-def _path_selectors_from_diff(old_data, data):
+-    """
+-    Datascrubbing is not idempotent, so scrubbing the same value
+-    twice might cause weird glitches. When data scrubbing after
+-    processing, we can still limit the likelihood of such glitches
+-    by constraining data scrubbing to fields we saw change.
+-
+-    This function takes two events and yields a list of path selectors of
+-    fields that changed.
+-    """
+-
+-    dict_types = (CanonicalKeyDict, dict)
+-
+-    if isinstance(old_data, dict_types) and isinstance(data, dict_types):
+-        for key, value in six.iteritems(data):
+-            old_value = old_data.get(key)
+-            key = _escape_key(key)
+-            if key is None:
+-                continue
+-
+-            for selector in _path_selectors_from_diff(old_value, value):
+-                if selector is not None:
+-                    yield u"{}.{}".format(key, selector)
+-                else:
+-                    yield key
+-
+-    elif isinstance(old_data, list) and isinstance(data, list):
+-        for i, value in enumerate(data):
+-            old_value = old_data[i] if len(old_data) > i else None
+-            for selector in _path_selectors_from_diff(old_value, value):
+-                if selector is not None:
+-                    yield u"{}.{}".format(i, selector)
+-                else:
+-                    yield six.text_type(i)
+-
+-    elif old_data != data:
+-        # If the values are not equal we yield out both
+-        #
+-        # * the specific selector (for changes from null <-> int|string)
+-        # * the deep-wildcard one (for changes array|dict <-> null)
+-        yield None
+-        yield u"**"
+-
+-
+-def _narrow_pii_config_for_processing(config, old_event, event):
+-    if not config.get("applications"):
+-        return config
+-
+-    additional_selectors = u"|".join(_path_selectors_from_diff(old_event, event))
+-
+-    metrics.timing("datascrubbing.config.additional_selectors.size", len(additional_selectors))
+-
+-    if not additional_selectors:
+-        # No new data has been added, so we must not scrub
+-        return {}
+-
+-    config = copy.deepcopy(config)
+-
+-    for selector in list(config["applications"]):
+-        new_selector = u"(({})&{})".format(additional_selectors, selector)
+-        config["applications"][new_selector] = config["applications"].pop(selector)
+-
+-    return config
+-
+-
+ def get_all_pii_configs(project_config):
+     # Note: This logic is duplicated in Relay store.
+     pii_config = project_config.config["piiConfig"]
+@@ -93,7 +25,7 @@ def get_all_pii_configs(project_config):
+     yield sentry_relay.convert_datascrubbing_config(project_config.config["datascrubbingSettings"])
+ 
+ 
+-def scrub_data(project_config, event, in_processing=False, old_event=None):
++def scrub_data(project_config, event):
+     for config in get_all_pii_configs(project_config):
+         metrics.timing(
+             "datascrubbing.config.num_applications", len(config.get("applications") or ())
+@@ -106,10 +38,6 @@ def scrub_data(project_config, event, in_processing=False, old_event=None):
+ 
+         metrics.timing("datascrubbing.config.rules.size", total_rules)
+ 
+-        if in_processing:
+-            assert old_event is not None
+-            config = _narrow_pii_config_for_processing(config, old_event, event)
+-
+         event = sentry_relay.pii_strip_event(config, event)
+ 
+     return event
+diff --git a/src/sentry/tasks/store.py b/src/sentry/tasks/store.py
+index a5bcd3f006..701d6724b2 100644
+--- a/src/sentry/tasks/store.py
++++ b/src/sentry/tasks/store.py
+@@ -1,6 +1,5 @@
+ from __future__ import absolute_import
+ 
+-import copy
+ import logging
+ from datetime import datetime
+ 
+@@ -194,14 +193,6 @@ def _do_process_event(cache_key, start_time, event_id, process_task, data=None):
+ 
+     project = Project.objects.get_from_cache(id=project_id)
+ 
+-    with_datascrubbing = features.has(
+-        "organizations:datascrubbers-v2", project.organization, actor=None
+-    )
+-
+-    if with_datascrubbing:
+-        with metrics.timer("tasks.store.datascrubbers.data_bak"):
+-            data_bak = copy.deepcopy(data.data)
+-
+     with configure_scope() as scope:
+         scope.set_tag("project", project_id)
+ 
+@@ -266,18 +257,16 @@ def _do_process_event(cache_key, start_time, event_id, process_task, data=None):
+     # XXX(markus): Javascript event error translation is happening after this block
+     # because it uses `get_event_preprocessors` instead of
+     # `get_event_enhancers`, possibly move?
+-    if has_changed and with_datascrubbing:
++    if has_changed and features.has(
++        "organizations:datascrubbers-v2", project.organization, actor=None
++    ):
+         with metrics.timer("tasks.store.datascrubbers.scrub"):
+             project_config = get_project_config(project)
+ 
+-            new_data = safe_execute(
+-                scrub_data,
+-                project_config=project_config,
+-                event=data.data,
+-                in_processing=True,
+-                old_event=data_bak,
+-            )
++            new_data = safe_execute(scrub_data, project_config=project_config, event=data.data)
+ 
++            # XXX(markus): When datascrubbing is finally "totally stable", we might want
++            # to drop the event if it crashes to avoid saving PII
+             if new_data is not None:
+                 data.data = new_data
+ 
+diff --git a/tests/sentry/tasks/test_store.py b/tests/sentry/tasks/test_store.py
+index 3ab0c66a09..4bd8637251 100644
+--- a/tests/sentry/tasks/test_store.py
++++ b/tests/sentry/tasks/test_store.py
+@@ -239,7 +239,7 @@ def test_scrubbing_after_processing(
+     class TestPlugin(Plugin2):
+         def get_event_enhancers(self, data):
+             def more_extra(data):
+-                data["extra"]["new_aaa"] = "remove me"
++                data["extra"]["aaa"] = "remove me"
+                 return data
+ 
+             return [more_extra]
+@@ -248,7 +248,7 @@ def test_scrubbing_after_processing(
+             # Right now we do not scrub data from event preprocessors, only
+             # from event enhancers.
+             def more_extra(data):
+-                data["extra"]["new_aaa2"] = "event preprocessor"
++                data["extra"]["aaa2"] = "event preprocessor"
+                 return data
+ 
+             return [more_extra]
+@@ -264,7 +264,7 @@ def test_scrubbing_after_processing(
+         "platform": "python",
+         "logentry": {"formatted": "test"},
+         "event_id": EVENT_ID,
+-        "extra": {"aaa": "do not remove me"},
++        "extra": {},
+     }
+ 
+     mock_default_cache.get.return_value = data
+@@ -274,11 +274,7 @@ def test_scrubbing_after_processing(
+ 
+     (_, (key, event, duration), _), = mock_default_cache.set.mock_calls
+     assert key == "e:1"
+-    assert event["extra"] == {
+-        u"aaa": u"do not remove me",
+-        u"new_aaa": u"[Filtered]",
+-        u"new_aaa2": u"event preprocessor",
+-    }
++    assert event["extra"] == {u"aaa": u"[Filtered]", u"aaa2": u"event preprocessor"}
+     assert duration == 3600
+ 
+     mock_save_event.delay.assert_called_once_with(
+diff --git a/tests/sentry/test_datascrubbing.py b/tests/sentry/test_datascrubbing.py
+index 2ac3653b4c..40dadd211c 100644
+--- a/tests/sentry/test_datascrubbing.py
++++ b/tests/sentry/test_datascrubbing.py
+@@ -3,30 +3,12 @@ from __future__ import absolute_import
+ 
+ import pytest
+ 
+-from sentry.datascrubbing import _path_selectors_from_diff, scrub_data
++from sentry.datascrubbing import scrub_data
+ from sentry.relay.config import ProjectConfig
+ 
+ 
+-def test_path_selectors_from_diff():
+-    def f(old_event, event):
+-        return list(_path_selectors_from_diff(old_event, event))
+-
+-    assert f({}, {"foo": {"bar": ["baz"]}}) == ["'foo'", "'foo'.**"]
+-    assert f({"foo": {"bar": ["baz"]}}, {}) == []
+-    assert f({"foo": {"bar": ["bam"]}}, {"foo": {"bar": ["baz"]}}) == [
+-        "'foo'.'bar'.0",
+-        "'foo'.'bar'.0.**",
+-    ]
+-    assert f(42, {}) == [None, "**"]
+-    assert f({"foo": {"bar": []}}, {"foo": {"bar": [42]}}) == ["'foo'.'bar'.0", "'foo'.'bar'.0.**"]
+-    assert f({"foo": {"bar": [42]}}, {"foo": {"bar": []}}) == []
+-
+-    # unicode vs bytes
+-    assert f({"foo": {"bar": b"baz"}}, {"foo": {"bar": u"baz"}}) == []
+-
+-
+ @pytest.mark.parametrize("field", [u"aaa", u"aää", u"a a", u"a\na", u"a'a"])
+-def test_scrub_data_in_processing(field):
++def test_scrub_data(field):
+     project_config = ProjectConfig(
+         None,
+         config={
+@@ -37,20 +19,52 @@ def test_scrub_data_in_processing(field):
+                 "sensitiveFields": ["a"],
+                 "scrubDefaults": False,
+             },
+-            "piiConfig": {},
++            "piiConfig": {
++                "applications": {
++                    "debug_meta.images.*.code_file": ["@userpath:replace"],
++                    "debug_meta.images.*.debug_file": ["@userpath:replace"],
++                }
++            },
+         },
+     )
+ 
+-    new_field = u"new_{}".format(field)
+-
+-    old_event = {"extra": {field: "do not remove"}}
+-    event = {"extra": {field: "do not remove", new_field: "do remove"}}
+-
+-    new_event = scrub_data(project_config, event, in_processing=True, old_event=old_event)
+-
+-    assert new_event == {
+-        u"_meta": {
+-            u"extra": {new_field: {u"": {u"len": 9, u"rem": [[u"strip-fields", u"s", 0, 10]]}}}
++    event = {
++        "extra": {field: "pls remove"},
++        "debug_meta": {
++            "images": [
++                {"type": "symbolic", "debug_file": "/Users/foo/bar", "code_file": "/Users/foo/bar"}
++            ]
+         },
+-        u"extra": {field: u"do not remove", new_field: u"[Filtered]"},
+     }
++
++    new_event = scrub_data(project_config, event)
++
++    assert new_event == (
++        {
++            u"_meta": {
++                u"debug_meta": {
++                    u"images": {
++                        u"0": {
++                            u"code_file": {
++                                u"": {u"len": 10, u"rem": [[u"@userpath:replace", u"s", 7, 13]]}
++                            },
++                            u"debug_file": {
++                                u"": {u"len": 10, u"rem": [[u"@userpath:replace", u"s", 7, 13]]}
++                            },
++                        }
++                    }
++                },
++                u"extra": {field: {u"": {u"len": 10, u"rem": [[u"strip-fields", u"s", 0, 10]]}}},
++            },
++            u"debug_meta": {
++                u"images": [
++                    {
++                        u"code_file": u"/Users/[user]/bar",
++                        u"debug_file": u"/Users/[user]/bar",
++                        u"type": u"symbolic",
++                    }
++                ]
++            },
++            u"extra": {field: u"[Filtered]"},
++        }
++    )

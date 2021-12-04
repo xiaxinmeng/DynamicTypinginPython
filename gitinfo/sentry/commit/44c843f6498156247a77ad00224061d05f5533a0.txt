@@ -1,0 +1,470 @@
+commit 44c843f6498156247a77ad00224061d05f5533a0
+Author: Jan Michael Auer <jan.auer@sentry.io>
+Date:   Wed Dec 4 11:28:19 2019 +0100
+
+    fix(javascript): Cache large sourcemaps on workers (#15888)
+    
+    This is another attempt at #15848 and avoids repeated downloads of very large release files in the javascript processor.
+
+diff --git a/src/sentry/bgtasks/clean_releasefilecache.py b/src/sentry/bgtasks/clean_releasefilecache.py
+new file mode 100644
+index 0000000000..be133e7a9e
+--- /dev/null
++++ b/src/sentry/bgtasks/clean_releasefilecache.py
+@@ -0,0 +1,9 @@
++from __future__ import absolute_import
++
++from sentry.bgtasks.api import bgtask
++from sentry.models import ReleaseFile
++
++
++@bgtask()
++def clean_releasefilecache():
++    ReleaseFile.cache.clear_old_entries()
+diff --git a/src/sentry/conf/server.py b/src/sentry/conf/server.py
+index 3fecd3dc96..2cd544894e 100644
+--- a/src/sentry/conf/server.py
++++ b/src/sentry/conf/server.py
+@@ -679,7 +679,11 @@ CELERYBEAT_SCHEDULE = {
+ }
+ 
+ BGTASKS = {
+-    "sentry.bgtasks.clean_dsymcache:clean_dsymcache": {"interval": 5 * 60, "roles": ["worker"]}
++    "sentry.bgtasks.clean_dsymcache:clean_dsymcache": {"interval": 5 * 60, "roles": ["worker"]},
++    "sentry.bgtasks.clean_releasefilecache:clean_releasefilecache": {
++        "interval": 5 * 60,
++        "roles": ["worker"],
++    },
+ }
+ 
+ # Sentry logs to two major places: stdout, and it's internal project.
+diff --git a/src/sentry/lang/javascript/processor.py b/src/sentry/lang/javascript/processor.py
+index 7299a2660a..b1696d7a8b 100644
+--- a/src/sentry/lang/javascript/processor.py
++++ b/src/sentry/lang/javascript/processor.py
+@@ -244,7 +244,7 @@ def fetch_release_file(filename, release, dist=None):
+         )
+         try:
+             with metrics.timer("sourcemaps.release_file_read"):
+-                with releasefile.file.getfile() as fp:
++                with ReleaseFile.cache.getfile(releasefile) as fp:
+                     z_body, body = compress_file(fp)
+         except Exception:
+             logger.error("sourcemap.compress_read_failed", exc_info=sys.exc_info())
+@@ -253,6 +253,8 @@ def fetch_release_file(filename, release, dist=None):
+             headers = {k.lower(): v for k, v in releasefile.file.headers.items()}
+             encoding = get_encoding_from_headers(headers)
+             result = http.UrlResult(filename, headers, body, 200, encoding)
++            # This will implicitly skip too large payloads. Those will be cached
++            # on the file system by `ReleaseFile.cache`, instead.
+             cache.set(cache_key, (headers, z_body, 200, encoding), 3600)
+ 
+     elif result == -1:
+diff --git a/src/sentry/models/debugfile.py b/src/sentry/models/debugfile.py
+index 6e094063d7..e262b48ac5 100644
+--- a/src/sentry/models/debugfile.py
++++ b/src/sentry/models/debugfile.py
+@@ -4,7 +4,6 @@ import re
+ import os
+ import six
+ import uuid
+-import time
+ import errno
+ import shutil
+ import hashlib
+@@ -18,16 +17,13 @@ from symbolic import Archive, SymbolicError, ObjectErrorUnsupportedObject, norma
+ from sentry import options
+ from sentry.constants import KNOWN_DIF_FORMATS
+ from sentry.db.models import FlexibleForeignKey, Model, sane_repr, BaseManager, JSONField
+-from sentry.models.file import File
++from sentry.models.file import File, clear_cached_files
+ from sentry.reprocessing import resolve_processing_issue, bump_reprocessing_revision
+ from sentry.utils.zip import safe_extract_zip
+ 
+ 
+ logger = logging.getLogger(__name__)
+ 
+-ONE_DAY = 60 * 60 * 24
+-ONE_DAY_AND_A_HALF = int(ONE_DAY * 1.5)
+-
+ # How long we cache a conversion failure by checksum in cache.  Currently
+ # 10 minutes is assumed to be a reasonable value here.
+ CONVERSION_ERROR_TTL = 60 * 10
+@@ -427,30 +423,7 @@ class DIFCache(object):
+         return rv
+ 
+     def clear_old_entries(self):
+-        try:
+-            cache_folders = os.listdir(self.cache_path)
+-        except OSError:
+-            return
+-
+-        cutoff = int(time.time()) - ONE_DAY_AND_A_HALF
+-
+-        for cache_folder in cache_folders:
+-            cache_folder = os.path.join(self.cache_path, cache_folder)
+-            try:
+-                items = os.listdir(cache_folder)
+-            except OSError:
+-                continue
+-            for cached_file in items:
+-                cached_file = os.path.join(cache_folder, cached_file)
+-                try:
+-                    mtime = os.path.getmtime(cached_file)
+-                except OSError:
+-                    continue
+-                if mtime < cutoff:
+-                    try:
+-                        os.remove(cached_file)
+-                    except OSError:
+-                        pass
++        clear_cached_files(self.cache_path)
+ 
+ 
+ ProjectDebugFile.difcache = DIFCache()
+diff --git a/src/sentry/models/file.py b/src/sentry/models/file.py
+index f3e5ca7dac..49f2870345 100644
+--- a/src/sentry/models/file.py
++++ b/src/sentry/models/file.py
+@@ -4,6 +4,7 @@ import os
+ import six
+ import mmap
+ import tempfile
++import time
+ 
+ from hashlib import sha1
+ from uuid import uuid4
+@@ -25,6 +26,7 @@ from sentry.utils import metrics
+ from sentry.utils.retries import TimedRetryPolicy
+ 
+ ONE_DAY = 60 * 60 * 24
++ONE_DAY_AND_A_HALF = int(ONE_DAY * 1.5)
+ 
+ UPLOAD_RETRY_TIME = getattr(settings, "SENTRY_UPLOAD_RETRY_TIME", 60)  # 1min
+ 
+@@ -328,20 +330,12 @@ class File(Model):
+             delete=delete,
+         )
+ 
+-    def getfile(self, mode=None, prefetch=False, as_tempfile=False):
++    def getfile(self, mode=None, prefetch=False):
+         """Returns a file object.  By default the file is fetched on
+         demand but if prefetch is enabled the file is fully prefetched
+         into a tempfile before reading can happen.
+-
+-        Additionally if `as_tempfile` is passed a NamedTemporaryFile is
+-        returned instead which can help in certain situations where a
+-        tempfile is necessary.
+         """
+-        if as_tempfile:
+-            prefetch = True
+         impl = self._get_chunked_blob(mode, prefetch)
+-        if as_tempfile:
+-            return impl.detach_tempfile()
+         return FileObj(impl, self.name)
+ 
+     def save_to(self, path):
+@@ -608,3 +602,30 @@ class FileBlobOwner(Model):
+         app_label = "sentry"
+         db_table = "sentry_fileblobowner"
+         unique_together = (("blob", "organization"),)
++
++
++def clear_cached_files(cache_path):
++    try:
++        cache_folders = os.listdir(cache_path)
++    except OSError:
++        return
++
++    cutoff = int(time.time()) - ONE_DAY_AND_A_HALF
++
++    for cache_folder in cache_folders:
++        cache_folder = os.path.join(cache_path, cache_folder)
++        try:
++            items = os.listdir(cache_folder)
++        except OSError:
++            continue
++        for cached_file in items:
++            cached_file = os.path.join(cache_folder, cached_file)
++            try:
++                mtime = os.path.getmtime(cached_file)
++            except OSError:
++                continue
++            if mtime < cutoff:
++                try:
++                    os.remove(cached_file)
++                except OSError:
++                    pass
+diff --git a/src/sentry/models/releasefile.py b/src/sentry/models/releasefile.py
+index f8e2d93b10..8e356d0432 100644
+--- a/src/sentry/models/releasefile.py
++++ b/src/sentry/models/releasefile.py
+@@ -1,9 +1,17 @@
+ from __future__ import absolute_import
+ 
++import os
++import errno
++import six
++
++from django.core.files.base import File as FileObj
+ from django.db import models
+ from six.moves.urllib.parse import urlsplit, urlunsplit
+ 
++from sentry import options
+ from sentry.db.models import BoundedPositiveIntegerField, FlexibleForeignKey, Model, sane_repr
++from sentry.models import clear_cached_files
++from sentry.utils import metrics
+ from sentry.utils.hashlib import sha1_text
+ 
+ 
+@@ -77,3 +85,38 @@ class ReleaseFile(Model):
+         if query:
+             urls.append("~" + urlunsplit(uri_relative_without_query))
+         return urls
++
++
++class ReleaseFileCache(object):
++    @property
++    def cache_path(self):
++        return options.get("releasefile.cache-path")
++
++    def getfile(self, releasefile):
++        cutoff = options.get("releasefile.cache-limit")
++        file_size = releasefile.file.size
++        if file_size < cutoff:
++            metrics.timing("release_file.cache.get.size", file_size, tags={"cutoff": True})
++            return releasefile.file.getfile()
++
++        file_id = six.text_type(releasefile.file_id)
++        organization_id = six.text_type(releasefile.organization_id)
++        file_path = os.path.join(self.cache_path, organization_id, file_id)
++
++        hit = True
++        try:
++            os.stat(file_path)
++        except OSError as e:
++            if e.errno != errno.ENOENT:
++                raise
++            releasefile.file.save_to(file_path)
++            hit = False
++
++        metrics.timing("release_file.cache.get.size", file_size, tags={"hit": hit, "cutoff": False})
++        return FileObj(open(file_path, "rb"))
++
++    def clear_old_entries(self):
++        clear_cached_files(self.cache_path)
++
++
++ReleaseFile.cache = ReleaseFileCache()
+diff --git a/src/sentry/options/defaults.py b/src/sentry/options/defaults.py
+index a8f0a3f2d7..33a35a18b6 100644
+--- a/src/sentry/options/defaults.py
++++ b/src/sentry/options/defaults.py
+@@ -42,10 +42,17 @@ register(
+ )
+ register("redis.options", type=Dict, flags=FLAG_NOSTORE)
+ 
+-# symbolizer specifics
++# Processing worker caches
+ register(
+     "dsym.cache-path", type=String, default="/tmp/sentry-dsym-cache", flags=FLAG_PRIORITIZE_DISK
+ )
++register(
++    "releasefile.cache-path",
++    type=String,
++    default="/tmp/sentry-releasefile-cache",
++    flags=FLAG_PRIORITIZE_DISK,
++)
++register("releasefile.cache-limit", type=Int, default=10 * 1024 * 1024, flags=FLAG_PRIORITIZE_DISK)
+ 
+ # Mail
+ register("mail.backend", default="smtp", flags=FLAG_NOSTORE)
+diff --git a/src/sentry/testutils/factories.py b/src/sentry/testutils/factories.py
+index 74ec9e87d7..3e2aafe594 100644
+--- a/src/sentry/testutils/factories.py
++++ b/src/sentry/testutils/factories.py
+@@ -68,6 +68,7 @@ from sentry.models import (
+     EventAttachment,
+     UserReport,
+     PlatformExternalIssue,
++    ReleaseFile,
+ )
+ from sentry.models.integrationfeature import Feature, IntegrationFeature
+ from sentry.signals import project_created
+@@ -345,6 +346,23 @@ class Factories(object):
+ 
+         return release
+ 
++    @staticmethod
++    def create_release_file(release, file=None, name=None, dist=None):
++        if file is None:
++            file = Factories.create_file(
++                name="log.txt",
++                size=32,
++                headers={"Content-Type": "text/plain"},
++                checksum="dc1e3f3e411979d336c3057cce64294f3420f93a",
++            )
++
++        if name is None:
++            name = file.name
++
++        return ReleaseFile.objects.create(
++            organization=release.organization, release=release, name=name, file=file, dist=dist
++        )
++
+     @staticmethod
+     def create_artifact_bundle(org, release, project=None):
+         import zipfile
+diff --git a/src/sentry/testutils/fixtures.py b/src/sentry/testutils/fixtures.py
+index 55c0a03755..6f2833919c 100644
+--- a/src/sentry/testutils/fixtures.py
++++ b/src/sentry/testutils/fixtures.py
+@@ -47,6 +47,10 @@ class Fixtures(object):
+             name="Bar", slug="bar", teams=[self.team], fire_project_created=True
+         )
+ 
++    @cached_property
++    def release(self):
++        return self.create_release(project=self.project, version="foo-1.0")
++
+     @cached_property
+     def environment(self):
+         return self.create_environment(name="development", project=self.project)
+@@ -104,6 +108,11 @@ class Fixtures(object):
+             project = self.project
+         return Factories.create_release(project=project, user=user, *args, **kwargs)
+ 
++    def create_release_file(self, release=None, file=None, name=None, dist=None):
++        if release is None:
++            release = self.release
++        return Factories.create_release_file(release, file, name, dist)
++
+     def create_artifact_bundle(self, org=None, release=None, *args, **kwargs):
+         if org is None:
+             org = self.organization.slug
+diff --git a/tests/sentry/lang/javascript/test_processor.py b/tests/sentry/lang/javascript/test_processor.py
+index 064172c15c..c76c0385e8 100644
+--- a/tests/sentry/lang/javascript/test_processor.py
++++ b/tests/sentry/lang/javascript/test_processor.py
+@@ -11,7 +11,7 @@ from copy import deepcopy
+ from mock import patch
+ from requests.exceptions import RequestException
+ 
+-from sentry import http
++from sentry import http, options
+ from sentry.lang.javascript.processor import (
+     JavaScriptStacktraceProcessor,
+     discover_sourcemap,
+@@ -179,6 +179,43 @@ class FetchReleaseFileTest(TestCase):
+             "utf-8",
+         )
+ 
++    def test_caching(self):
++        # Set the threshold to zero to force caching on the file system
++        options.set("releasefile.cache-limit", 0)
++
++        project = self.project
++        release = Release.objects.create(organization_id=project.organization_id, version="abc")
++        release.add_project(project)
++
++        file = File.objects.create(
++            name="file.min.js",
++            type="release.file",
++            headers={"Content-Type": "application/json; charset=utf-8"},
++        )
++
++        binary_body = unicode_body.encode("utf-8")
++        file.putfile(six.BytesIO(binary_body))
++
++        ReleaseFile.objects.create(
++            name="file.min.js", release=release, organization_id=project.organization_id, file=file
++        )
++
++        result = fetch_release_file("file.min.js", release)
++
++        assert isinstance(result.body, six.binary_type)
++        assert result == http.UrlResult(
++            "file.min.js",
++            {"content-type": "application/json; charset=utf-8"},
++            binary_body,
++            200,
++            "utf-8",
++        )
++
++        # test with cache hit, coming from the FS
++        new_result = fetch_release_file("file.min.js", release)
++
++        assert result == new_result
++
+ 
+ class FetchFileTest(TestCase):
+     @responses.activate
+diff --git a/tests/sentry/models/test_releasefile.py b/tests/sentry/models/test_releasefile.py
+index 7573b8f58d..d7f6a9554f 100644
+--- a/tests/sentry/models/test_releasefile.py
++++ b/tests/sentry/models/test_releasefile.py
+@@ -1,5 +1,10 @@
+ from __future__ import absolute_import
+ 
++import errno
++import os
++import six
++
++from sentry import options
+ from sentry.models import ReleaseFile
+ from sentry.testutils import TestCase
+ 
+@@ -29,3 +34,53 @@ class ReleaseFileTestCase(TestCase):
+         # unclear if we actually experience this case in the real
+         # world, but worth documenting the behavior
+         assert n("foo.js") == ["foo.js", "~foo.js"]
++
++
++class ReleaseFileCacheTest(TestCase):
++    def test_getfile_fs_cache(self):
++        file_content = b"this is a test"
++
++        file = self.create_file(name="dummy.txt")
++        file.putfile(six.BytesIO(file_content))
++        release_file = self.create_release_file(file=file)
++
++        expected_path = os.path.join(
++            options.get("releasefile.cache-path"),
++            six.text_type(self.organization.id),
++            six.text_type(file.id),
++        )
++
++        # Set the threshold to zero to force caching on the file system
++        options.set("releasefile.cache-limit", 0)
++        with ReleaseFile.cache.getfile(release_file) as f:
++            assert f.read() == file_content
++            assert f.name == expected_path
++
++        # Check that the file was cached
++        os.stat(expected_path)
++
++    def test_getfile_streaming(self):
++        file_content = b"this is a test"
++
++        file = self.create_file(name="dummy.txt")
++        file.putfile(six.BytesIO(file_content))
++        release_file = self.create_release_file(file=file)
++
++        expected_path = os.path.join(
++            options.get("releasefile.cache-path"),
++            six.text_type(self.organization.id),
++            six.text_type(file.id),
++        )
++
++        # Set the threshold larger than the file size to force streaming
++        options.set("releasefile.cache-limit", 1024)
++        with ReleaseFile.cache.getfile(release_file) as f:
++            assert f.read() == file_content
++
++        # Check that the file was not cached
++        try:
++            os.stat(expected_path)
++        except OSError as e:
++            assert e.errno == errno.ENOENT
++        else:
++            assert False, "file should not exist"

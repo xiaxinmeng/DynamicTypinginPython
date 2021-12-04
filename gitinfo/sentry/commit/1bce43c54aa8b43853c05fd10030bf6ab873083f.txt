@@ -1,0 +1,188 @@
+commit 1bce43c54aa8b43853c05fd10030bf6ab873083f
+Author: Dan Fuller <dfuller@sentry.io>
+Date:   Tue Feb 18 18:27:11 2020 -0800
+
+    perf(subscriptions): Cache alert rule in subscription processor
+    
+    Adding in caching around these queries so that we can scale well as we have more queries coming in.
+    First up just adding caching around fetching an alert rule by subscription. We'll only ever have one
+    alert rule for each subscription, and so we can clear the cache whenever the subscription is updated
+    or deleted. We don't need to worry about clearing the cache on alert rule deletion, since we always
+    delete all subscriptions when we delete an alert rule.
+
+diff --git a/src/sentry/incidents/models.py b/src/sentry/incidents/models.py
+index 8126481e98..2fff14c166 100644
+--- a/src/sentry/incidents/models.py
++++ b/src/sentry/incidents/models.py
+@@ -3,7 +3,9 @@ from __future__ import absolute_import
+ from collections import namedtuple
+ 
+ from django.conf import settings
++from django.core.cache import cache
+ from django.db import IntegrityError, models, transaction
++from django.db.models.signals import post_delete, post_save
+ from django.utils import timezone
+ from enum import Enum
+ 
+@@ -11,7 +13,7 @@ from sentry.db.models import FlexibleForeignKey, Model, UUIDField, OneToOneCasca
+ from sentry.db.models import ArrayField, sane_repr
+ from sentry.db.models.manager import BaseManager
+ from sentry.models import Team, User
+-from sentry.snuba.models import QueryAggregations
++from sentry.snuba.models import QueryAggregations, QuerySubscription
+ from sentry.utils import metrics
+ from sentry.utils.retries import TimedRetryPolicy
+ 
+@@ -230,6 +232,8 @@ class AlertRuleManager(BaseManager):
+     A manager that excludes all rows that are pending deletion.
+     """
+ 
++    CACHE_SUBSCRIPTION_KEY = "alert_rule:subscription:%s"
++
+     def get_queryset(self):
+         return (
+             super(AlertRuleManager, self)
+@@ -248,6 +252,37 @@ class AlertRuleManager(BaseManager):
+     def fetch_for_project(self, project):
+         return self.filter(query_subscriptions__project=project)
+ 
++    @classmethod
++    def __build_subscription_cache_key(self, subscription_id):
++        return self.CACHE_SUBSCRIPTION_KEY % subscription_id
++
++    def get_for_subscription(self, subscription):
++        """
++        Fetches the AlertRule associated with a Subscription. Attempts to fetch from
++        cache then hits the database
++        """
++        cache_key = self.__build_subscription_cache_key(subscription.id)
++        alert_rule = cache.get(cache_key)
++        if alert_rule is None:
++            alert_rule = AlertRule.objects.get(query_subscriptions=subscription)
++            cache.set(cache_key, alert_rule, 3600)
++
++        return alert_rule
++
++    @classmethod
++    def clear_subscription_cache(cls, instance, **kwargs):
++        cache.delete(cls.__build_subscription_cache_key(instance.id))
++
++    @classmethod
++    def clear_alert_rule_subscription_caches(cls, instance, **kwargs):
++        subscription_ids = AlertRuleQuerySubscription.objects.filter(
++            alert_rule=instance
++        ).values_list("query_subscription_id", flat=True)
++        if subscription_ids:
++            cache.delete_many(
++                cls.__build_subscription_cache_key(sub_id) for sub_id in subscription_ids
++            )
++
+ 
+ class AlertRuleEnvironment(Model):
+     __core__ = True
+@@ -482,3 +517,9 @@ class AlertRuleTriggerAction(Model):
+     @classmethod
+     def get_registered_types(cls):
+         return cls._type_registrations.values()
++
++
++post_delete.connect(AlertRuleManager.clear_subscription_cache, sender=QuerySubscription)
++post_save.connect(AlertRuleManager.clear_subscription_cache, sender=QuerySubscription)
++post_save.connect(AlertRuleManager.clear_alert_rule_subscription_caches, sender=AlertRule)
++post_delete.connect(AlertRuleManager.clear_alert_rule_subscription_caches, sender=AlertRule)
+diff --git a/src/sentry/incidents/subscription_processor.py b/src/sentry/incidents/subscription_processor.py
+index 547521aa5f..9cbb071cc0 100644
+--- a/src/sentry/incidents/subscription_processor.py
++++ b/src/sentry/incidents/subscription_processor.py
+@@ -53,7 +53,7 @@ class SubscriptionProcessor(object):
+     def __init__(self, subscription):
+         self.subscription = subscription
+         try:
+-            self.alert_rule = AlertRule.objects.get(query_subscriptions=subscription)
++            self.alert_rule = AlertRule.objects.get_for_subscription(subscription)
+         except AlertRule.DoesNotExist:
+             return
+ 
+diff --git a/tests/sentry/incidents/test_models.py b/tests/sentry/incidents/test_models.py
+index 08a087f9c5..a6b76487c1 100644
+--- a/tests/sentry/incidents/test_models.py
++++ b/tests/sentry/incidents/test_models.py
+@@ -4,6 +4,7 @@ import unittest
+ from datetime import timedelta
+ 
+ import six
++from django.core.cache import cache
+ from django.db import IntegrityError, transaction
+ from django.utils import timezone
+ from exam import patcher
+@@ -11,7 +12,14 @@ from freezegun import freeze_time
+ from sentry.utils.compat.mock import Mock, patch
+ 
+ from sentry.db.models.manager import BaseManager
+-from sentry.incidents.models import AlertRuleTriggerAction, Incident, IncidentStatus, IncidentType
++from sentry.incidents.models import (
++    AlertRule,
++    AlertRuleTriggerAction,
++    Incident,
++    IncidentStatus,
++    IncidentType,
++)
++from sentry.incidents.logic import delete_alert_rule
+ from sentry.testutils import TestCase
+ 
+ 
+@@ -54,6 +62,54 @@ class FetchForOrganizationTest(TestCase):
+         )
+ 
+ 
++class IncidentGetForSubscriptionTest(TestCase):
++    def test(self):
++        alert_rule = self.create_alert_rule()
++        subscription = alert_rule.query_subscriptions.get()
++        # First test fetching from database
++        assert cache.get(AlertRule.objects.CACHE_SUBSCRIPTION_KEY % subscription.id) is None
++        assert AlertRule.objects.get_for_subscription(subscription) == alert_rule
++
++        # Now test fetching from cache
++        assert cache.get(AlertRule.objects.CACHE_SUBSCRIPTION_KEY % subscription.id) == alert_rule
++        assert AlertRule.objects.get_for_subscription(subscription) == alert_rule
++
++
++class IncidentClearSubscriptionCacheTest(TestCase):
++    def setUp(self):
++        self.alert_rule = self.create_alert_rule()
++        self.subscription = self.alert_rule.query_subscriptions.get()
++
++    def test_updated_subscription(self):
++        AlertRule.objects.get_for_subscription(self.subscription)
++        assert (
++            cache.get(AlertRule.objects.CACHE_SUBSCRIPTION_KEY % self.subscription.id)
++            == self.alert_rule
++        )
++        self.subscription.save()
++        assert cache.get(AlertRule.objects.CACHE_SUBSCRIPTION_KEY % self.subscription.id) is None
++
++    def test_deleted_subscription(self):
++        AlertRule.objects.get_for_subscription(self.subscription)
++        assert (
++            cache.get(AlertRule.objects.CACHE_SUBSCRIPTION_KEY % self.subscription.id)
++            == self.alert_rule
++        )
++        self.subscription.delete()
++        with self.assertRaises(AlertRule.DoesNotExist):
++            AlertRule.objects.get_for_subscription(self.subscription)
++
++    def test_deleted_alert_rule(self):
++        AlertRule.objects.get_for_subscription(self.subscription)
++        assert (
++            cache.get(AlertRule.objects.CACHE_SUBSCRIPTION_KEY % self.subscription.id)
++            == self.alert_rule
++        )
++        delete_alert_rule(self.alert_rule)
++        with self.assertRaises(AlertRule.DoesNotExist):
++            AlertRule.objects.get_for_subscription(self.subscription)
++
++
+ class IncidentCreationTest(TestCase):
+     def test_simple(self):
+         title = "hello"

@@ -1,0 +1,290 @@
+commit 0124168e374dc7af1a493ee08b96317ad79182e1
+Author: Jan Michael Auer <account@jauer.org>
+Date:   Wed Dec 13 19:19:03 2017 +0100
+
+    ref(minidump): Do not store minidumps before processing (#6696)
+
+diff --git a/src/sentry/coreapi.py b/src/sentry/coreapi.py
+index d8597522ec..006de47233 100644
+--- a/src/sentry/coreapi.py
++++ b/src/sentry/coreapi.py
+@@ -28,7 +28,8 @@ from sentry.cache import default_cache
+ from sentry.constants import VERSION_LENGTH
+ from sentry.interfaces.csp import Csp
+ from sentry.event_manager import EventManager
+-from sentry.models import EventError, ProjectKey, upload_minidump, merge_minidump_event
++from sentry.lang.native.utils import merge_minidump_event
++from sentry.models import ProjectKey
+ from sentry.tasks.store import preprocess_event, \
+     preprocess_event_from_reprocessing
+ from sentry.utils import json
+@@ -405,33 +406,16 @@ class MinidumpApiHelper(ClientApiHelper):
+         # Copy/pasted from above in ClientApiHelper.validate_data
+         if release:
+             release = six.text_type(release)
+-            if len(release) <= VERSION_LENGTH:
+-                validated['release'] = release
+-            else:
+-                validated['errors'].append({
+-                    'type': EventError.VALUE_TOO_LONG,
+-                    'name': 'release',
+-                    'value': release,
+-                })
+ 
+         return validated
+ 
+     def insert_data_to_database(self, data, start_time=None, from_reprocessing=False):
+         # Seems like the event is valid and we can do some more expensive
+-        # work on the minidump. That is, persisting the file itself for
+-        # later postprocessing and extracting some more information from
+-        # the minidump to populate the initial callstacks and exception
++        # work on the minidump. We process the minidump to extract some more
++        # information to populate the initial callstacks and exception
+         # information.
+-        event_id = data['event_id']
+         minidump = data['extra'].pop('upload_file_minidump')
+         merge_minidump_event(data, minidump.temporary_file_path())
+-        upload_minidump(minidump, event_id)
+-
+-        # All more advanced analysis, such as stack frame symbolication,
+-        # requires a proper stacktrace, which requires call frame infos
+-        # (CFI) for more accurate stackwalking. This task is executed
+-        # even before starting the native language plugin, which will
+-        # ultimately perform stack frame symbolication.
+ 
+         # Continue with persisting the event in the usual manner and
+         # schedule default preprocessing tasks
+diff --git a/src/sentry/lang/native/utils.py b/src/sentry/lang/native/utils.py
+index 9ebe11a360..06d132a387 100644
+--- a/src/sentry/lang/native/utils.py
++++ b/src/sentry/lang/native/utils.py
+@@ -1,11 +1,13 @@
+ from __future__ import absolute_import
+ 
++import re
+ import six
+ import logging
+ 
+ from collections import namedtuple
+-from symbolic import parse_addr, arch_from_macho, arch_is_known
++from symbolic import parse_addr, arch_from_macho, arch_is_known, ProcessState
+ 
++from sentry.constants import LOG_LEVELS_MAP
+ from sentry.interfaces.contexts import DeviceContextType
+ 
+ logger = logging.getLogger(__name__)
+@@ -17,6 +19,14 @@ KNOWN_DSYM_TYPES = {
+     'watchOS': 'macho',
+ }
+ 
++# Regular expression to parse OS versions from a minidump OS string
++VERSION_RE = re.compile(r'(\d+\.\d+\.\d+)\s+(.*)')
++
++# Mapping of well-known minidump OS constants to our internal names
++MINIDUMP_OS_TYPES = {
++    'Mac OS X': 'macOS',
++}
++
+ AppInfo = namedtuple('AppInfo', ['id', 'version', 'build', 'name'])
+ 
+ 
+@@ -140,3 +150,77 @@ def sdk_info_to_sdk_id(sdk_info):
+     if build is not None:
+         rv = '%s_%s' % (rv, build)
+     return rv
++
++
++def merge_minidump_event(data, minidump_path):
++    state = ProcessState.from_minidump(minidump_path)
++
++    data['level'] = LOG_LEVELS_MAP['fatal'] if state.crashed else LOG_LEVELS_MAP['info']
++    data['message'] = 'Assertion Error: %s' % state.assertion if state.assertion \
++        else 'Fatal Error: %s' % state.crash_reason
++
++    if state.timestamp:
++        data['timestamp'] = float(state.timestamp)
++
++    # Extract as much system information as we can. TODO: We should create
++    # a custom context and implement a specific minidump view in the event
++    # UI.
++    info = state.system_info
++    context = data.setdefault('contexts', {})
++    os = context.setdefault('os', {})
++    device = context.setdefault('device', {})
++    os['type'] = 'os'  # Required by "get_sdk_from_event"
++    os['name'] = MINIDUMP_OS_TYPES.get(info.os_name, info.os_name)
++    device['arch'] = info.cpu_family
++
++    # Breakpad reports the version and build number always in one string,
++    # but a version number is guaranteed even on certain linux distros.
++    match = VERSION_RE.search(info.os_version)
++    if match is not None:
++        version, build = match.groups()
++        os['version'] = version
++        os['build'] = build
++
++    # We can extract stack traces here already but since CFI is not
++    # available yet (without debug symbols), the stackwalker will
++    # resort to stack scanning which yields low-quality results. If
++    # the user provides us with debug symbols, we could reprocess this
++    # minidump and add improved stacktraces later.
++    threads = [{
++        'id': thread.thread_id,
++        'crashed': False,
++        'stacktrace': {
++            'frames': [{
++                'instruction_addr': '0x%x' % frame.instruction,
++                'function': '<unknown>',  # Required by interface
++            } for frame in thread.frames()],
++        },
++    } for thread in state.threads()]
++    data.setdefault('threads', {})['values'] = threads
++
++    # Mark the crashed thread and add its stacktrace to the exception
++    crashed_thread = threads[state.requesting_thread]
++    crashed_thread['crashed'] = True
++
++    # Extract the crash reason and infos
++    exception = {
++        'value': data['message'],
++        'thread_id': crashed_thread['id'],
++        'type': state.crash_reason,
++        # Move stacktrace here from crashed_thread (mutating!)
++        'stacktrace': crashed_thread.pop('stacktrace'),
++    }
++
++    data.setdefault('sentry.interfaces.Exception', {}) \
++        .setdefault('values', []) \
++        .append(exception)
++
++    # Extract referenced (not all loaded) images
++    images = [{
++        'type': 'apple',  # Required by interface
++        'uuid': six.text_type(module.uuid),
++        'image_addr': '0x%x' % module.addr,
++        'image_size': '0x%x' % module.size,
++        'name': module.name,
++    } for module in state.modules()]
++    data.setdefault('debug_meta', {})['images'] = images
+diff --git a/src/sentry/models/minidump.py b/src/sentry/models/minidump.py
+index 8155b43ed7..ae22f87b7f 100644
+--- a/src/sentry/models/minidump.py
++++ b/src/sentry/models/minidump.py
+@@ -7,21 +7,8 @@ sentry.models.minidump
+ """
+ 
+ from __future__ import absolute_import
+-
+-import re
+-import six
+-from django.db import models, transaction
+-from symbolic import ProcessState
+-
+-from sentry.constants import LOG_LEVELS_MAP
++from django.db import models
+ from sentry.db.models import FlexibleForeignKey, Model, sane_repr
+-from sentry.models.file import File
+-
+-_version_re = re.compile(r'(\d+\.\d+\.\d+)\s+(.*)')
+-
+-_minidump_os_mapping = {
+-    'Mac OS X': 'macOS',
+-}
+ 
+ 
+ class MinidumpFile(Model):
+@@ -39,94 +26,3 @@ class MinidumpFile(Model):
+     def delete(self, *args, **kwargs):
+         super(MinidumpFile, self).delete(*args, **kwargs)
+         self.file.delete()
+-
+-
+-def upload_minidump(fileobj, event_id):
+-    """Creates a new minidump file object and stores it."""
+-    with transaction.atomic():
+-        file = File.objects.create(
+-            name=event_id,
+-            type='event.minidump',
+-            headers={'Content-Type': 'application/x-minidump'},
+-        )
+-
+-        file.putfile(fileobj)
+-
+-        return MinidumpFile.objects.create(
+-            file=file,
+-            event_id=event_id,
+-        )
+-
+-
+-def merge_minidump_event(data, minidump_path):
+-    state = ProcessState.from_minidump(minidump_path)
+-
+-    data['level'] = LOG_LEVELS_MAP['fatal'] if state.crashed else LOG_LEVELS_MAP['info']
+-    data['message'] = 'Assertion Error: %s' % state.assertion if state.assertion \
+-        else 'Fatal Error: %s' % state.crash_reason
+-
+-    if state.timestamp:
+-        data['timestamp'] = float(state.timestamp)
+-
+-    # Extract as much system information as we can. TODO: We should create
+-    # a custom context and implement a specific minidump view in the event
+-    # UI.
+-    info = state.system_info
+-    context = data.setdefault('contexts', {})
+-    os = context.setdefault('os', {})
+-    device = context.setdefault('device', {})
+-    os['type'] = 'os'  # Required by "get_sdk_from_event"
+-    os['name'] = _minidump_os_mapping.get(info.os_name, info.os_name)
+-    device['arch'] = info.cpu_family
+-
+-    # Breakpad reports the version and build number always in one string,
+-    # but a version number is guaranteed even on certain linux distros.
+-    match = _version_re.search(info.os_version)
+-    if match is not None:
+-        version, build = match.groups()
+-        os['version'] = version
+-        os['build'] = build
+-
+-    # We can extract stack traces here already but since CFI is not
+-    # available yet (without debug symbols), the stackwalker will
+-    # resort to stack scanning which yields low-quality results. If
+-    # the user provides us with debug symbols, we will reprocess this
+-    # minidump and add improved stacktraces later.
+-    threads = [{
+-        'id': thread.thread_id,
+-        'crashed': False,
+-        'stacktrace': {
+-            'frames': [{
+-                'instruction_addr': '0x%x' % frame.instruction,
+-                'function': '<unknown>',  # Required by interface
+-            } for frame in thread.frames()],
+-        },
+-    } for thread in state.threads()]
+-    data.setdefault('threads', {})['values'] = threads
+-
+-    # Mark the crashed thread and add its stacktrace to the exception
+-    crashed_thread = threads[state.requesting_thread]
+-    crashed_thread['crashed'] = True
+-
+-    # Extract the crash reason and infos
+-    exception = {
+-        'value': data['message'],
+-        'thread_id': crashed_thread['id'],
+-        'type': state.crash_reason,
+-        # Move stacktrace here from crashed_thread (mutating!)
+-        'stacktrace': crashed_thread.pop('stacktrace'),
+-    }
+-
+-    data.setdefault('sentry.interfaces.Exception', {}) \
+-        .setdefault('values', []) \
+-        .append(exception)
+-
+-    # Extract referenced (not all loaded) images
+-    images = [{
+-        'type': 'apple',  # Required by interface
+-        'uuid': six.text_type(module.uuid),
+-        'image_addr': '0x%x' % module.addr,
+-        'image_size': '0x%x' % module.size,
+-        'name': module.name,
+-    } for module in state.modules()]
+-    data.setdefault('debug_meta', {})['images'] = images

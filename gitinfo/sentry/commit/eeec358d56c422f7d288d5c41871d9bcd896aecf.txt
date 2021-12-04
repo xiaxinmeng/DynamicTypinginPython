@@ -1,0 +1,311 @@
+commit eeec358d56c422f7d288d5c41871d9bcd896aecf
+Author: David Cramer <dcramer@gmail.com>
+Date:   Thu Dec 24 14:21:44 2015 -0600
+
+    Optimize JS source processing
+    
+    This changes the remote source fetch behavior to be on-demand. This will only affect situations where sourcemaps are used, but will ensure that sources will only be fetched if they're actually used.
+    
+    Fixes GH-2488
+
+diff --git a/src/sentry/lang/javascript/plugin.py b/src/sentry/lang/javascript/plugin.py
+index 21fc96d076..756f473ae4 100644
+--- a/src/sentry/lang/javascript/plugin.py
++++ b/src/sentry/lang/javascript/plugin.py
+@@ -18,8 +18,11 @@ def preprocess_event(data):
+ 
+     allow_scraping = bool(project.get_option('sentry:scrape_javascript', True))
+ 
+-    processor = SourceProcessor(allow_scraping=allow_scraping)
+-    return processor.process(project, data)
++    processor = SourceProcessor(
++        project=project,
++        allow_scraping=allow_scraping,
++    )
++    return processor.process(data)
+ 
+ 
+ class JavascriptPlugin(Plugin2):
+diff --git a/src/sentry/lang/javascript/processor.py b/src/sentry/lang/javascript/processor.py
+index 60f6caed7a..8b195e0f74 100644
+--- a/src/sentry/lang/javascript/processor.py
++++ b/src/sentry/lang/javascript/processor.py
+@@ -413,11 +413,14 @@ class SourceProcessor(object):
+ 
+     Mutates the input ``data`` with expanded context if available.
+     """
+-    def __init__(self, max_fetches=MAX_RESOURCE_FETCHES, allow_scraping=True):
++    def __init__(self, project, max_fetches=MAX_RESOURCE_FETCHES,
++                 allow_scraping=True):
+         self.allow_scraping = allow_scraping
+         self.max_fetches = max_fetches
++        self.fetch_count = 0
+         self.cache = SourceCache()
+         self.sourcemaps = SourceMapCache()
++        self.project = project
+ 
+     def get_stacktraces(self, data):
+         try:
+@@ -447,16 +450,16 @@ class SourceProcessor(object):
+             ])
+         return frames
+ 
+-    def get_release(self, project, data):
++    def get_release(self, data):
+         if not data.get('release'):
+             return
+ 
+         return Release.get(
+-            project=project,
++            project=self.project,
+             version=data['release'],
+         )
+ 
+-    def process(self, project, data):
++    def process(self, data):
+         stacktraces = self.get_stacktraces(data)
+         if not stacktraces:
+             logger.debug('No stacktrace for event %r', data['event_id'])
+@@ -471,11 +474,11 @@ class SourceProcessor(object):
+         data.setdefault('errors', [])
+         errors = data['errors']
+ 
+-        release = self.get_release(project, data)
++        release = self.get_release(data)
+         # all of these methods assume mutation on the original
+         # objects rather than re-creation
+-        self.populate_source_cache(project, frames, release)
+-        errors.extend(self.expand_frames(frames) or [])
++        self.populate_source_cache(frames, release)
++        errors.extend(self.expand_frames(frames, release) or [])
+         self.ensure_module_names(frames)
+         self.fix_culprit(data, stacktraces)
+         self.update_stacktraces(stacktraces)
+@@ -507,7 +510,7 @@ class SourceProcessor(object):
+             if not frame.module and frame.abs_path.startswith(('http:', 'https:', 'webpack:')):
+                 frame.module = generate_module(frame.abs_path)
+ 
+-    def expand_frames(self, frames):
++    def expand_frames(self, frames, release):
+         last_state = None
+         state = None
+ 
+@@ -520,13 +523,18 @@ class SourceProcessor(object):
+             if errors:
+                 all_errors.extend(errors)
+ 
+-            source = cache.get(frame.abs_path)
++            source = self.get_source(frame.abs_path, release)
+             if source is None:
+                 logger.debug('No source found for %s', frame.abs_path)
+                 continue
+ 
+             sourcemap_url, sourcemap_idx = sourcemaps.get_link(frame.abs_path)
+-            if sourcemap_idx and frame.colno is not None:
++            if sourcemap_idx and frame.colno is None:
++                all_errors.append({
++                    'type': EventError.JS_NO_COLUMN,
++                    'url': force_bytes(frame.abs_path, errors='replace'),
++                })
++            elif sourcemap_idx:
+                 last_state = state
+                 state = find_source(sourcemap_idx, frame.lineno, frame.colno)
+ 
+@@ -538,7 +546,7 @@ class SourceProcessor(object):
+                 abs_path = urljoin(sourcemap_url, state.src)
+ 
+                 logger.debug('Mapping compressed source %r to mapping in %r', frame.abs_path, abs_path)
+-                source = cache.get(abs_path)
++                source = self.get_source(abs_path, release)
+                 if not source:
+                     frame.data = {
+                         'sourcemap': sourcemap_label,
+@@ -612,91 +620,84 @@ class SourceProcessor(object):
+                 source=source, lineno=frame.lineno, colno=frame.colno or 0)
+         return all_errors
+ 
+-    def populate_source_cache(self, project, frames, release):
+-        pending_file_list = set()
+-        done_file_list = set()
+-        sourcemap_capable = set()
++    def get_source(self, filename, release):
++        if filename not in self.cache:
++            self.cache_source(filename, release)
++        return self.cache.get(filename)
+ 
+-        cache = self.cache
++    def cache_source(self, filename, release):
+         sourcemaps = self.sourcemaps
++        cache = self.cache
+ 
+-        for f in frames:
+-            # We can't even attempt to fetch source if abs_path is None
+-            if f.abs_path is None:
+-                continue
+-            # tbh not entirely sure how this happens, but raven-js allows this
+-            # to be caught. I think this comes from dev consoles and whatnot
+-            # where there is no page. This just bails early instead of exposing
+-            # a fetch error that may be confusing.
+-            if f.abs_path == '<anonymous>':
+-                continue
+-            pending_file_list.add(f.abs_path)
+-            if f.colno is not None:
+-                sourcemap_capable.add(f.abs_path)
++        self.fetch_count += 1
+ 
+-        idx = 0
+-        while pending_file_list:
+-            filename = pending_file_list.pop()
+-            done_file_list.add(filename)
++        if self.fetch_count > self.max_fetches:
++            cache.add_error(filename, {
++                'type': EventError.JS_TOO_MANY_REMOTE_SOURCES,
++            })
++            return
+ 
+-            if idx > self.max_fetches:
+-                cache.add_error(filename, {
+-                    'type': EventError.JS_TOO_MANY_REMOTE_SOURCES,
+-                })
+-                continue
++        # TODO: respect cache-control/max-age headers to some extent
++        logger.debug('Fetching remote source %r', filename)
++        try:
++            result = fetch_file(filename, project=self.project, release=release,
++                                allow_scraping=self.allow_scraping)
++        except BadSource as exc:
++            cache.add_error(filename, exc.data)
++            return
+ 
+-            idx += 1
++        cache.add(filename, result.body.split('\n'))
++        cache.alias(result.url, filename)
+ 
+-            # TODO: respect cache-control/max-age headers to some extent
+-            logger.debug('Fetching remote source %r', filename)
+-            try:
+-                result = fetch_file(filename, project=project, release=release,
+-                                    allow_scraping=self.allow_scraping)
+-            except BadSource as exc:
+-                cache.add_error(filename, exc.data)
+-                continue
++        sourcemap_url = discover_sourcemap(result)
++        if not sourcemap_url:
++            return
+ 
+-            cache.add(filename, result.body.split('\n'))
+-            cache.alias(result.url, filename)
++        logger.debug('Found sourcemap %r for minified script %r', sourcemap_url[:256], result.url)
++        sourcemaps.link(filename, sourcemap_url)
++        if sourcemap_url in sourcemaps:
++            return
+ 
+-            sourcemap_url = discover_sourcemap(result)
+-            if not sourcemap_url:
+-                continue
++        # pull down sourcemap
++        try:
++            sourcemap_idx = fetch_sourcemap(
++                sourcemap_url,
++                project=self.project,
++                release=release,
++                allow_scraping=self.allow_scraping,
++            )
++        except BadSource as exc:
++            cache.add_error(filename, exc.data)
++            return
+ 
+-            # If we didn't have a colno, a sourcemap wont do us any good
+-            if filename not in sourcemap_capable:
+-                cache.add_error(filename, {
+-                    'type': EventError.JS_NO_COLUMN,
+-                    'url': filename,
+-                })
+-                continue
++        sourcemaps.add(sourcemap_url, sourcemap_idx)
+ 
+-            logger.debug('Found sourcemap %r for minified script %r', sourcemap_url[:256], result.url)
++        # cache any inlined sources
++        for source in sourcemap_idx.sources:
++            next_filename = urljoin(sourcemap_url, source)
++            if source in sourcemap_idx.content:
++                cache.add(next_filename, sourcemap_idx.content[source])
+ 
+-            sourcemaps.link(filename, sourcemap_url)
+-            if sourcemap_url in sourcemaps:
++    def populate_source_cache(self, frames, release):
++        """
++        Fetch all sources that we know are required (being referenced directly
++        in frames).
++        """
++        pending_file_list = set()
++        for f in frames:
++            # We can't even attempt to fetch source if abs_path is None
++            if f.abs_path is None:
+                 continue
+-
+-            # pull down sourcemap
+-            try:
+-                sourcemap_idx = fetch_sourcemap(
+-                    sourcemap_url,
+-                    project=project,
+-                    release=release,
+-                    allow_scraping=self.allow_scraping,
+-                )
+-            except BadSource as exc:
+-                cache.add_error(filename, exc.data)
++            # tbh not entirely sure how this happens, but raven-js allows this
++            # to be caught. I think this comes from dev consoles and whatnot
++            # where there is no page. This just bails early instead of exposing
++            # a fetch error that may be confusing.
++            if f.abs_path == '<anonymous>':
+                 continue
++            pending_file_list.add(f.abs_path)
+ 
+-            sourcemaps.add(sourcemap_url, sourcemap_idx)
+-
+-            # queue up additional source files for download
+-            for source in sourcemap_idx.sources:
+-                next_filename = urljoin(sourcemap_url, source)
+-                if next_filename not in done_file_list:
+-                    if source in sourcemap_idx.content:
+-                        cache.add(next_filename, sourcemap_idx.content[source])
+-                        done_file_list.add(next_filename)
+-                    else:
+-                        pending_file_list.add(next_filename)
++        for idx, filename in enumerate(pending_file_list):
++            self.cache_source(
++                filename=filename,
++                release=release,
++            )
+diff --git a/tests/sentry/lang/javascript/test_processor.py b/tests/sentry/lang/javascript/test_processor.py
+index f2900b1052..2128433e95 100644
+--- a/tests/sentry/lang/javascript/test_processor.py
++++ b/tests/sentry/lang/javascript/test_processor.py
+@@ -203,7 +203,7 @@ class SourceProcessorTest(TestCase):
+             },
+         }
+ 
+-        processor = SourceProcessor()
++        processor = SourceProcessor(project=self.project)
+         result = processor.get_stacktraces(data)
+         assert len(result) == 1
+         assert type(result[0][1]) is Stacktrace
+@@ -235,7 +235,7 @@ class SourceProcessorTest(TestCase):
+             }
+         }
+ 
+-        processor = SourceProcessor()
++        processor = SourceProcessor(project=self.project)
+         result = processor.get_stacktraces(data)
+         assert len(result) == 1
+         assert type(result[0][1]) is Stacktrace
+@@ -269,6 +269,6 @@ class SourceProcessorTest(TestCase):
+             }
+         }
+ 
+-        processor = SourceProcessor()
+-        result = processor.process(self.project, data)
++        processor = SourceProcessor(project=self.project)
++        result = processor.process(data)
+         assert result['culprit'] == 'bar in oops'

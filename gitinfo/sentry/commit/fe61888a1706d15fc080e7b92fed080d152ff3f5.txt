@@ -1,0 +1,2287 @@
+commit fe61888a1706d15fc080e7b92fed080d152ff3f5
+Author: Dan Fuller <dfuller@sentry.io>
+Date:   Tue Feb 5 16:54:35 2019 -0800
+
+    feat(api): Start passing search filters to search backend, and use them for some filtering
+    
+    This diff adds in support for our new search filters to the search backend. At the moment it's only
+    used for a subset of parameters, and only used if `use_new_filters=1` is passed as a query param.
+    
+    Refactored the `QuerySetBuilder` to be able to work with Q objects, which allows us to handle
+    negations more easily. Also change it to operate off of a list of params rather than a dictionary.
+    Add versions that support either the old style params or new style search filters.
+    
+    Plan is to start using this for additional filters, but wanted to keep this diff reasonably small.
+    I'll leave `DjangoSearchBackend._query` as is for a while, since we're only using Snuba in
+    production and I want to get this finished. Once the feature is working though I'll go back and
+    clean up the `DjangoSearchBackend` so that we can remove the old QuerysetBuilders.
+    
+    Unfortunately, the test changes are huge, but the refactors I did there are reasonably simple, and
+    allow us to run all tests with both new and old style parameters, so we can be reasonably sure that
+    the results are equivalent. Some of the test changes are for tests filters that aren't actually
+    using the new style search filters yet. I expect these to break as I use them for more filters,
+    will be helpful as I continue converting things across.
+
+diff --git a/src/sentry/api/event_search.py b/src/sentry/api/event_search.py
+index 2751bb2a90..97cd6696a5 100644
+--- a/src/sentry/api/event_search.py
++++ b/src/sentry/api/event_search.py
+@@ -130,7 +130,11 @@ class InvalidSearchQuery(Exception):
+ 
+ 
+ class SearchFilter(namedtuple('SearchFilter', 'key operator value')):
+-    pass
++
++    def __str__(self):
++        return ''.join(
++            map(six.text_type, (self.key.name, self.operator, self.value.raw_value)),
++        )
+ 
+ 
+ class SearchKey(namedtuple('SearchKey', 'name')):
+@@ -238,6 +242,7 @@ class SearchVisitor(NodeVisitor):
+         except InvalidQuery as exc:
+             raise InvalidSearchQuery(exc.message)
+ 
++        # TODO: Handle negations
+         if from_val is not None:
+             operator = '>='
+             search_value = from_val[0]
+@@ -262,6 +267,10 @@ class SearchVisitor(NodeVisitor):
+         except InvalidQuery as exc:
+             raise InvalidSearchQuery(exc.message)
+ 
++        # TODO: Handle negations here. This is tricky because these will be
++        # separate filters, and to negate this range we need (< val or >= val).
++        # We currently AND all filters together, so we'll need extra logic to
++        # handle. Maybe not necessary to allow negations for this.
+         return [
+             SearchFilter(
+                 search_key,
+diff --git a/src/sentry/api/helpers/group_index.py b/src/sentry/api/helpers/group_index.py
+index 88eea9de04..56e15bac9e 100644
+--- a/src/sentry/api/helpers/group_index.py
++++ b/src/sentry/api/helpers/group_index.py
+@@ -29,6 +29,10 @@ from sentry.models import (
+ )
+ from sentry.models.group import looks_like_short_id
+ from sentry.search.utils import InvalidQuery, parse_query
++from sentry.api.issue_search import (
++    convert_query_values,
++    parse_search_query,
++)
+ from sentry.signals import (
+     issue_deleted, issue_ignored, issue_resolved, issue_resolved_in_release,
+     resolved_with_commit
+@@ -67,6 +71,7 @@ def build_query_params_from_request(request, projects):
+         query_kwargs['cursor'] = Cursor.from_string(cursor)
+ 
+     query = request.GET.get('query', 'is:unresolved').strip()
++    use_new_filters = request.GET.get('use_new_filters', '0') == '1'
+     if query:
+         try:
+             query_kwargs.update(parse_query(projects, query, request.user))
+@@ -75,7 +80,23 @@ def build_query_params_from_request(request, projects):
+                 u'Your search query could not be parsed: {}'.format(
+                     e.message)
+             )
+-
++        try:
++            search_filters = convert_query_values(
++                parse_search_query(query),
++                projects,
++                request.user,
++            )
++        except Exception:
++            # TODO: Catch less broad exceptions when we're confident in these
++            # new filters
++            logging.exception('Error occurred while parsing new style search query')
++            search_filters = []
++            # If something goes wrong here we just want to use the working
++            # filters
++            use_new_filters = False
++        query_kwargs['search_filters'] = search_filters
++
++    query_kwargs['use_new_filters'] = use_new_filters
+     return query_kwargs
+ 
+ 
+diff --git a/src/sentry/search/django/backend.py b/src/sentry/search/django/backend.py
+index be2f77940b..b3f5e91d3d 100644
+--- a/src/sentry/search/django/backend.py
++++ b/src/sentry/search/django/backend.py
+@@ -17,6 +17,7 @@ from django.utils import timezone
+ 
+ from sentry import quotas, tagstore
+ from sentry.api.paginator import DateTimePaginator, Paginator, SequencePaginator
++from sentry.api.event_search import InvalidSearchQuery
+ from sentry.search.base import SearchBackend
+ from sentry.search.django.constants import (
+     MSSQL_ENGINES, MSSQL_SORT_CLAUSES, MYSQL_SORT_CLAUSES, ORACLE_SORT_CLAUSES, SORT_CLAUSES,
+@@ -45,6 +46,46 @@ class QuerySetBuilder(object):
+         return queryset
+ 
+ 
++# TODO: Once we've removed the existing `QuerySetBuilder`, rename this to
++# QuerySetBuilder
++class NewQuerySetBuilder(object):
++
++    def __init__(self, conditions):
++        self.conditions = conditions
++
++    def normalize_parameters(self, params):
++        """
++        Converts passed in parameters into a standard format. Allows us to
++        support old/new style parameter being passed in.
++        """
++        for key, value in params.items():
++            yield key, value, None
++
++    def build(self, queryset, parameters):
++        for name, value, search_filter in self.normalize_parameters(parameters):
++            if name in self.conditions:
++                condition = self.conditions[name]
++                if isinstance(condition, ScalarCondition):
++                    # XXX: Gross temporary hack to support old style
++                    # `ScalarCondition`s
++                    # This type of `ScalarCondition` should only ever be called
++                    # with old style parameters
++                    queryset = condition.apply(queryset, name, parameters)
++                else:
++                    queryset = condition.apply(queryset, value, search_filter)
++        return queryset
++
++
++class SearchFilterQuerySetBuilder(NewQuerySetBuilder):
++    def normalize_parameters(self, search_filters):
++        for search_filter in search_filters:
++            yield (
++                search_filter.key.name,
++                search_filter.value.raw_value,
++                search_filter,
++            )
++
++
+ class Condition(object):
+     """\
+     Adds a single filter to a ``QuerySet`` object. Used with
+@@ -63,6 +104,71 @@ class CallbackCondition(Condition):
+         return self.callback(queryset, parameters[name])
+ 
+ 
++class QCallbackCondition(Condition):
++    def __init__(self, callback, skip_if_falsey=False):
++        """
++        :param skip_if_falsey: Skip the condition entirely if the provided
++        value evaluates to False
++        """
++        self.callback = callback
++        self.skip_if_falsey = skip_if_falsey
++
++    def apply(self, queryset, value, search_filter=None):
++        if self.skip_if_falsey and not value:
++            return queryset
++
++        q = self.callback(value)
++        # TODO: Once we're entirely using search filters we can just pass them
++        # in and not have this check. This is to support the old style search
++        # terms.
++        if search_filter:
++            if search_filter.operator not in ('=', '!='):
++                raise InvalidSearchQuery(
++                    u'Operator {} not valid for search {}'.format(
++                        search_filter.operator,
++                        search_filter,
++                    ),
++                )
++            queryset_method = queryset.filter if search_filter.operator == '=' else queryset.exclude
++            queryset = queryset_method(q)
++        else:
++            queryset = queryset.filter(q)
++        return queryset
++
++
++OPERATOR_TO_DJANGO = {
++    '>=': 'gte',
++    '<=': 'lte',
++    '>': 'gt',
++    '<': 'lt',
++}
++
++
++# TODO: Rename this to ScalarCondition once we've removed the existing
++# `ScalarCondition`
++class SearchFilterScalarCondition(Condition):
++    """
++    Adds a scalar filter to a ``QuerySet`` object. Only accepts `SearchFilter`
++    instances
++    """
++
++    def __init__(self, field):
++        self.field = field
++
++    def _get_operator(self, search_filter):
++        django_operator = OPERATOR_TO_DJANGO.get(search_filter.operator, '')
++        if django_operator:
++            django_operator = '__{}'.format(django_operator)
++        return django_operator
++
++    def apply(self, queryset, value, search_filter):
++        django_operator = self._get_operator(search_filter)
++
++        qs_method = queryset.exclude if search_filter.operator == '!=' else queryset.filter
++
++        return qs_method(**{'{}{}'.format(self.field, django_operator): value})
++
++
+ class ScalarCondition(Condition):
+     """\
+     Adds a scalar filter (less than or greater than are supported) to a
+@@ -164,11 +270,11 @@ def get_sort_clause(sort_by):
+         return SORT_CLAUSES[sort_by]
+ 
+ 
+-def assigned_to_filter(queryset, actor, projects):
++def assigned_to_filter(actor, projects):
+     from sentry.models import OrganizationMember, OrganizationMemberTeam, Team
+ 
+     if isinstance(actor, Team):
+-        return queryset.filter(assignee_set__team=actor)
++        return Q(assignee_set__team=actor)
+ 
+     teams = Team.objects.filter(
+         id__in=OrganizationMemberTeam.objects.filter(
+@@ -180,12 +286,24 @@ def assigned_to_filter(queryset, actor, projects):
+         ).values('team')
+     )
+ 
+-    return queryset.filter(
++    return Q(
+         Q(assignee_set__user=actor, assignee_set__project__in=projects) |
+         Q(assignee_set__team__in=teams)
+     )
+ 
+ 
++def unassigned_filter(unassigned, projects):
++    from sentry.models.groupassignee import GroupAssignee
++    query = Q(
++        id__in=GroupAssignee.objects.filter(
++            project_id__in=[p.id for p in projects],
++        ).values_list('group_id', flat=True),
++    )
++    if unassigned:
++        query = ~query
++    return query
++
++
+ def get_latest_release(projects, environments):
+     from sentry.models import Release
+ 
+@@ -209,9 +327,12 @@ def get_latest_release(projects, environments):
+ 
+ class DjangoSearchBackend(SearchBackend):
+     def query(self, projects, tags=None, environments=None, sort_by='date', limit=100,
+-              cursor=None, count_hits=False, paginator_options=None, **parameters):
++              cursor=None, count_hits=False, paginator_options=None, search_filters=None,
++              use_new_filters=False, **parameters):
++
++        from sentry.models import Group, GroupStatus, GroupSubscription, Release
+ 
+-        from sentry.models import Group, GroupAssignee, GroupStatus, GroupSubscription, Release
++        search_filters = search_filters if search_filters is not None else []
+ 
+         # ensure projects are from same org
+         if len({p.organization_id for p in projects}) != 1:
+@@ -233,33 +354,50 @@ class DjangoSearchBackend(SearchBackend):
+             # no matches could possibly be found from this point on
+             return Paginator(Group.objects.none()).get_result()
+ 
+-        group_queryset = QuerySetBuilder({
+-            'query': CallbackCondition(
+-                lambda queryset, query: queryset.filter(
++        group_queryset = Group.objects.filter(project__in=projects).exclude(status__in=[
++            GroupStatus.PENDING_DELETION,
++            GroupStatus.DELETION_IN_PROGRESS,
++            GroupStatus.PENDING_MERGE,
++        ])
++
++        if use_new_filters:
++            query_set_builder_class = SearchFilterQuerySetBuilder
++            query_set_builder_params = search_filters
++        else:
++            query_set_builder_class = NewQuerySetBuilder
++            query_set_builder_params = parameters
++
++        group_queryset = query_set_builder_class({
++            'message': QCallbackCondition(
++                lambda query: Q(
+                     Q(message__icontains=query) | Q(culprit__icontains=query),
+-                ) if query else queryset,
++                ),
++                skip_if_falsey=True,
+             ),
+-            'status': CallbackCondition(
+-                lambda queryset, status: queryset.filter(status=status),
++            # TODO: Remove this once we've stopped using old params
++            'query': QCallbackCondition(
++                lambda query: Q(
++                    Q(message__icontains=query) | Q(culprit__icontains=query),
++                ),
++                skip_if_falsey=True,
++            ),
++            'status': QCallbackCondition(
++                lambda status: Q(status=status),
+             ),
+-            'bookmarked_by': CallbackCondition(
+-                lambda queryset, user: queryset.filter(
++            'bookmarked_by': QCallbackCondition(
++                lambda user: Q(
+                     bookmark_set__project__in=projects,
+                     bookmark_set__user=user,
+                 ),
+             ),
+-            'assigned_to': CallbackCondition(
++            'assigned_to': QCallbackCondition(
+                 functools.partial(assigned_to_filter, projects=projects),
+             ),
+-            'unassigned': CallbackCondition(
+-                lambda queryset, unassigned: (queryset.exclude if unassigned else queryset.filter)(
+-                    id__in=GroupAssignee.objects.filter(
+-                        project_id__in=[p.id for p in projects],
+-                    ).values_list('group_id', flat=True),
+-                ),
++            'unassigned': QCallbackCondition(
++                functools.partial(unassigned_filter, projects=projects),
+             ),
+-            'subscribed_by': CallbackCondition(
+-                lambda queryset, user: queryset.filter(
++            'subscribed_by': QCallbackCondition(
++                lambda user: Q(
+                     id__in=GroupSubscription.objects.filter(
+                         project__in=projects,
+                         user=user,
+@@ -267,16 +405,13 @@ class DjangoSearchBackend(SearchBackend):
+                     ).values_list('group'),
+                 ),
+             ),
++            'active_at': SearchFilterScalarCondition('active_at'),
++            # TODO: These are legacy params. Once we've moved to SearchFilter
++            # entirely then they can be removed, since the `'active_at'`
++            # condition will handle both
+             'active_at_from': ScalarCondition('active_at', 'gt'),
+             'active_at_to': ScalarCondition('active_at', 'lt'),
+-        }).build(
+-            Group.objects.filter(project__in=projects).exclude(status__in=[
+-                GroupStatus.PENDING_DELETION,
+-                GroupStatus.DELETION_IN_PROGRESS,
+-                GroupStatus.PENDING_MERGE,
+-            ]),
+-            parameters,
+-        )
++        }).build(group_queryset, query_set_builder_params)
+ 
+         # filter out groups which are beyond the retention period
+         retention = quotas.get_event_retention(organization=projects[0].organization)
+diff --git a/src/sentry/testutils/cases.py b/src/sentry/testutils/cases.py
+index fcd883b0a4..c64904346d 100644
+--- a/src/sentry/testutils/cases.py
++++ b/src/sentry/testutils/cases.py
+@@ -437,8 +437,17 @@ class APITestCase(BaseTestCase, BaseAPITestCase):
+     def get_response(self, *args, **params):
+         if self.endpoint is None:
+             raise Exception('Implement self.endpoint to use this method.')
++
+         url = reverse(self.endpoint, args=args)
+-        return getattr(self.client, self.method)(
++        # In some cases we want to pass querystring params to put/post, handle
++        # this here.
++        if 'qs_params' in params:
++            query_string = urlencode(params.pop('qs_params'), doseq=True)
++            url = u'{}?{}'.format(url, query_string)
++
++        method = params.pop('method', self.method)
++
++        return getattr(self.client, method)(
+             url,
+             format='json',
+             data=params,
+diff --git a/tests/sentry/search/django/tests.py b/tests/sentry/search/django/tests.py
+index b2fb13a282..a6f5e7e236 100644
+--- a/tests/sentry/search/django/tests.py
++++ b/tests/sentry/search/django/tests.py
+@@ -8,6 +8,10 @@ import pytest
+ from django.conf import settings
+ 
+ from sentry import tagstore
++from sentry.api.issue_search import (
++    convert_query_values,
++    parse_search_query,
++)
+ from sentry.models import (
+     Environment, Event, Group, GroupAssignee, GroupBookmark, GroupEnvironment, GroupStatus,
+     GroupSubscription, Release, ReleaseEnvironment, ReleaseProjectEnvironment
+@@ -18,7 +22,13 @@ from sentry.tagstore.v2.backend import AGGREGATE_ENVIRONMENT_ID
+ from sentry.testutils import TestCase
+ 
+ 
++def date_to_query_format(date):
++    return date.strftime('%Y-%m-%dT%H:%M:%S')
++
++
+ class DjangoSearchBackendTest(TestCase):
++    use_new_filters = False
++
+     def create_backend(self):
+         return DjangoSearchBackend()
+ 
+@@ -172,43 +182,62 @@ class DjangoSearchBackendTest(TestCase):
+                     date_added=event.datetime,
+                 )
+ 
++    def make_query(self, projects=None, search_filter_query=None, **kwargs):
++        search_filters = []
++        if search_filter_query is not None:
++            search_filters = self.build_search_filter(search_filter_query, projects)
++        return self.backend.query(
++            projects if projects is not None else [self.project],
++            use_new_filters=self.use_new_filters,
++            search_filters=search_filters,
++            **kwargs
++        )
++
++    def build_search_filter(self, query, projects=None, user=None):
++        user = user if user is not None else self.user
++        projects = projects if projects is not None else [self.project]
++        return convert_query_values(parse_search_query(query), projects, user)
++
+     def test_query(self):
+-        results = self.backend.query([self.project], query='foo')
++        results = self.make_query(search_filter_query='foo', query='foo')
+         assert set(results) == set([self.group1])
+ 
+-        results = self.backend.query([self.project], query='bar')
++        results = self.make_query(search_filter_query='bar', query='bar')
+         assert set(results) == set([self.group2])
+ 
+     def test_query_with_environment(self):
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+-            query='foo')
++            search_filter_query='foo',
++            query='foo',
++        )
+         assert set(results) == set([self.group1])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+-            query='bar')
++            search_filter_query='bar',
++            query='bar',
++        )
+         assert set(results) == set([])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['staging']],
+-            query='bar')
++            search_filter_query='bar',
++            query='bar',
++        )
+         assert set(results) == set([self.group2])
+ 
+     def test_sort(self):
+-        results = self.backend.query([self.project], sort_by='date')
++        results = self.make_query(sort_by='date')
+         assert list(results) == [self.group1, self.group2]
+ 
+-        results = self.backend.query([self.project], sort_by='new')
++        results = self.make_query(sort_by='new')
+         assert list(results) == [self.group2, self.group1]
+ 
+-        results = self.backend.query([self.project], sort_by='freq')
++        results = self.make_query(sort_by='freq')
+         assert list(results) == [self.group2, self.group1]
+ 
+-        results = self.backend.query([self.project], sort_by='priority')
++        results = self.make_query(sort_by='priority')
+         assert list(results) == [self.group1, self.group2]
+ 
+     def test_sort_with_environment(self):
+@@ -230,124 +259,121 @@ class DjangoSearchBackendTest(TestCase):
+             )
+             self._setup_tags_for_event(event)
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+             sort_by='date',
+         )
+         assert list(results) == [self.group2, self.group1]
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+             sort_by='new',
+         )
+         assert list(results) == [self.group2, self.group1]
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+             sort_by='freq',
+         )
+         assert list(results) == [self.group2, self.group1]
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+             sort_by='priority',
+         )
+         assert list(results) == [self.group2, self.group1]
+ 
+     def test_status(self):
+-        results = self.backend.query([self.project], status=GroupStatus.UNRESOLVED)
++        results = self.make_query(
++            search_filter_query='is:unresolved',
++            status=GroupStatus.UNRESOLVED,
++        )
+         assert set(results) == set([self.group1])
+ 
+-        results = self.backend.query([self.project], status=GroupStatus.RESOLVED)
++        results = self.make_query(
++            search_filter_query='is:resolved',
++            status=GroupStatus.RESOLVED,
++        )
+         assert set(results) == set([self.group2])
+ 
+     def test_status_with_environment(self):
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+-            status=GroupStatus.UNRESOLVED)
++            search_filter_query='is:unresolved',
++            status=GroupStatus.UNRESOLVED,
++        )
+         assert set(results) == set([self.group1])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['staging']],
+-            status=GroupStatus.RESOLVED)
++            search_filter_query='is:resolved',
++            status=GroupStatus.RESOLVED,
++        )
+         assert set(results) == set([self.group2])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+-            status=GroupStatus.RESOLVED)
++            status=GroupStatus.RESOLVED,
++            search_filter_query='is:resolved',
++        )
+         assert set(results) == set([])
+ 
+     def test_tags(self):
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             tags={'environment': 'staging'})
+         assert set(results) == set([self.group2])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             tags={'environment': 'example.com'})
+         assert set(results) == set([])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             tags={'environment': ANY})
+         assert set(results) == set([self.group2, self.group1])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             tags={'environment': 'staging',
+                   'server': 'example.com'})
+         assert set(results) == set([self.group2])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             tags={'environment': 'staging',
+                   'server': ANY})
+         assert set(results) == set([self.group2])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             tags={'environment': 'staging',
+                   'server': 'bar.example.com'})
+         assert set(results) == set([])
+ 
+     def test_environment_tag_not_matching_project(self):
+         project = self.create_project(name='other')
+-        results = self.backend.query(
++        results = self.make_query(
+             [project],
+             environments=[self.environments['production']],
+             tags={'environment': 'production'},
+-            query='')
++            search_filter_query='',
++            query='',
++        )
+         assert set(results) == set([])
+ 
+     def test_tags_with_environment(self):
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+             tags={'server': 'example.com'})
+         assert set(results) == set([self.group1])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['staging']],
+             tags={'server': 'example.com'})
+         assert set(results) == set([self.group2])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['staging']],
+             tags={'server': ANY})
+         assert set(results) == set([self.group2])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['staging']],
+             tags={
+                 'environment': ANY,
+@@ -355,53 +381,55 @@ class DjangoSearchBackendTest(TestCase):
+             })
+         assert set(results) == set([self.group2])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+             tags={'url': 'http://example.com'})
+         assert set(results) == set([])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['staging']],
+             tags={'url': 'http://example.com'})
+         assert set(results) == set([self.group2])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['staging']],
+             tags={'server': 'bar.example.com'})
+         assert set(results) == set([])
+ 
+     def test_bookmarked_by(self):
+-        results = self.backend.query([self.project], bookmarked_by=self.user)
++        results = self.make_query(
++            bookmarked_by=self.user,
++            search_filter_query='bookmarks:%s' % self.user.username,
++        )
+         assert set(results) == set([self.group2])
+ 
+     def test_bookmarked_by_with_environment(self):
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['staging']],
+-            bookmarked_by=self.user)
++            bookmarked_by=self.user,
++            search_filter_query='bookmarks:%s' % self.user.username,
++        )
+         assert set(results) == set([self.group2])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+-            bookmarked_by=self.user)
++            bookmarked_by=self.user,
++            search_filter_query='bookmarks:%s' % self.user.username,
++        )
+         assert set(results) == set([])
+ 
+     def test_project(self):
+-        results = self.backend.query([self.create_project(name='other')])
++        results = self.make_query([self.create_project(name='other')])
+         assert set(results) == set([])
+ 
+     def test_pagination(self):
+-        results = self.backend.query([self.project], limit=1, sort_by='date')
++        results = self.make_query(limit=1, sort_by='date')
+         assert set(results) == set([self.group1])
+ 
+-        results = self.backend.query([self.project], cursor=results.next, limit=1, sort_by='date')
++        results = self.make_query(cursor=results.next, limit=1, sort_by='date')
+         assert set(results) == set([self.group2])
+ 
+-        results = self.backend.query([self.project], cursor=results.next, limit=1, sort_by='date')
++        results = self.make_query(cursor=results.next, limit=1, sort_by='date')
+         assert set(results) == set([])
+ 
+     def test_pagination_with_environment(self):
+@@ -420,8 +448,7 @@ class DjangoSearchBackendTest(TestCase):
+             )
+             self._setup_tags_for_event(event)
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+             sort_by='date',
+             limit=1,
+@@ -430,8 +457,7 @@ class DjangoSearchBackendTest(TestCase):
+         assert list(results) == [self.group2]
+         assert results.hits == 2
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+             sort_by='date',
+             limit=1,
+@@ -441,8 +467,7 @@ class DjangoSearchBackendTest(TestCase):
+         assert list(results) == [self.group1]
+         assert results.hits == 2
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+             sort_by='date',
+             limit=1,
+@@ -452,52 +477,86 @@ class DjangoSearchBackendTest(TestCase):
+         assert list(results) == []
+         assert results.hits == 2
+ 
++    def test_active_at_filter(self):
++        results = self.make_query(
++            active_at_from=self.group2.active_at,
++            active_at_inclusive=True,
++            search_filter_query='activeSince:>=%s' % date_to_query_format(self.group2.active_at),
++        )
++        assert set(results) == set([self.group2])
++
++        results = self.make_query(
++            active_at_to=self.group1.active_at + timedelta(minutes=1),
++            active_at_inclusive=True,
++            search_filter_query='activeSince:<=%s' % date_to_query_format(
++                self.group1.active_at + timedelta(minutes=1),
++            ),
++        )
++        assert set(results) == set([self.group1])
++
++        results = self.make_query(
++            active_at_from=self.group1.active_at,
++            active_at_from_inclusive=True,
++            active_at_to=self.group1.active_at + timedelta(minutes=1),
++            active_at_to_inclusive=True,
++            search_filter_query='activeSince:>=%s activeSince:<=%s' % (
++                date_to_query_format(self.group1.active_at),
++                date_to_query_format(self.group1.active_at + timedelta(minutes=1)),
++            )
++        )
++        assert set(results) == set([self.group1])
++
+     def test_age_filter(self):
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             age_from=self.group2.first_seen,
+             age_from_inclusive=True,
++            search_filter_query='firstSeen:>=%s' % date_to_query_format(self.group2.first_seen),
+         )
+         assert set(results) == set([self.group2])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             age_to=self.group1.first_seen + timedelta(minutes=1),
+             age_to_inclusive=True,
++            search_filter_query='firstSeen:<=%s' % date_to_query_format(
++                self.group1.first_seen + timedelta(minutes=1),
++            ),
+         )
+         assert set(results) == set([self.group1])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             age_from=self.group1.first_seen,
+             age_from_inclusive=True,
+             age_to=self.group1.first_seen + timedelta(minutes=1),
+             age_to_inclusive=True,
++            search_filter_query='firstSeen:>=%s firstSeen:<=%s' % (
++                date_to_query_format(self.group1.first_seen),
++                date_to_query_format(self.group1.first_seen + timedelta(minutes=1)),
++            )
+         )
+         assert set(results) == set([self.group1])
+ 
+     def test_age_filter_with_environment(self):
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+             age_from=self.group1.first_seen,
+             age_from_inclusive=True,
++            search_filter_query='firstSeen:>=%s' % date_to_query_format(self.group1.first_seen),
+         )
+         assert set(results) == set([self.group1])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+             age_to=self.group1.first_seen,
+             age_to_inclusive=True,
++            search_filter_query='firstSeen:<=%s' % date_to_query_format(self.group1.first_seen),
+         )
+         assert set(results) == set([self.group1])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+             age_from=self.group1.first_seen,
+             age_from_inclusive=False,
++            search_filter_query='firstSeen:>%s' % date_to_query_format(self.group1.first_seen),
+         )
+         assert set(results) == set([])
+ 
+@@ -516,68 +575,64 @@ class DjangoSearchBackendTest(TestCase):
+ 
+         self._setup_tags_for_event(event)
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+             age_from=self.group1.first_seen,
+             age_from_inclusive=False,
++            search_filter_query='firstSeen:>%s' % date_to_query_format(self.group1.first_seen),
+         )
+         assert set(results) == set([])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['development']],
+             age_from=self.group1.first_seen,
+             age_from_inclusive=False,
++            search_filter_query='firstSeen:>%s' % date_to_query_format(self.group1.first_seen),
+         )
+         assert set(results) == set([self.group1])
+ 
+     def test_last_seen_filter(self):
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             last_seen_from=self.group1.last_seen,
+             last_seen_from_inclusive=True,
++            search_filter_query='lastSeen:>=%s' % date_to_query_format(self.group1.last_seen),
+         )
+         assert set(results) == set([self.group1])
+ 
+-        results = self.backend.query(
+-            [self.project],
+-            last_seen_to=self.group2.last_seen + timedelta(minutes=1),
+-            last_seen_to_inclusive=True,
+-        )
+-        assert set(results) == set([self.group2])
+-
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             last_seen_from=self.group1.last_seen,
+             last_seen_from_inclusive=True,
+             last_seen_to=self.group1.last_seen + timedelta(minutes=1),
+             last_seen_to_inclusive=True,
++            search_filter_query='lastSeen:>=%s lastSeen:<=%s' % (
++                date_to_query_format(self.group1.last_seen),
++                date_to_query_format(self.group1.last_seen + timedelta(minutes=1)),
++            )
+         )
+         assert set(results) == set([self.group1])
+ 
+     def test_last_seen_filter_with_environment(self):
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+             last_seen_from=self.group1.last_seen,
+             last_seen_from_inclusive=True,
++            search_filter_query='lastSeen:>=%s' % date_to_query_format(self.group1.last_seen),
+         )
+         assert set(results) == set([self.group1])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+             last_seen_to=self.group1.last_seen,
+             last_seen_to_inclusive=True,
++            search_filter_query='lastSeen:<=%s' % date_to_query_format(self.group1.last_seen),
+         )
+         assert set(results) == set([self.group1])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+             last_seen_from=self.group1.last_seen,
+             last_seen_from_inclusive=False,
++            search_filter_query='lastSeen:>%s' % date_to_query_format(self.group1.last_seen),
+         )
+         assert set(results) == set([])
+ 
+@@ -596,39 +651,44 @@ class DjangoSearchBackendTest(TestCase):
+ 
+         self._setup_tags_for_event(event)
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+             last_seen_from=self.group1.last_seen,
+             last_seen_from_inclusive=False,
++            search_filter_query='lastSeen:>%s' % date_to_query_format(self.group1.last_seen),
+         )
+         assert set(results) == set([])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['development']],
+             last_seen_from=self.group1.last_seen,
+             last_seen_from_inclusive=False,
++            search_filter_query='lastSeen:>%s' % date_to_query_format(self.group1.last_seen),
+         )
+         assert set(results) == set([self.group1])
+ 
+     def test_date_filter(self):
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             date_from=self.event2.datetime,
++            search_filter_query='event.timestamp:>=%s' % date_to_query_format(self.event2.datetime),
+         )
+         assert set(results) == set([self.group1, self.group2])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             date_to=self.event1.datetime + timedelta(minutes=1),
++            search_filter_query='event.timestamp:<=%s' % date_to_query_format(
++                self.event1.datetime + timedelta(minutes=1),
++            ),
+         )
+         assert set(results) == set([self.group1])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             date_from=self.event1.datetime,
+             date_to=self.event2.datetime + timedelta(minutes=1),
++            search_filter_query='event.timestamp:>=%s event.timestamp:<=%s' % (
++                date_to_query_format(self.event1.datetime),
++                date_to_query_format(self.event2.datetime + timedelta(minutes=1)),
++            )
+         )
+         assert set(results) == set([self.group1, self.group2])
+ 
+@@ -660,33 +720,45 @@ class DjangoSearchBackendTest(TestCase):
+         assert set(results) == set([self.group2])
+ 
+     def test_unassigned(self):
+-        results = self.backend.query([self.project], unassigned=True)
++        results = self.make_query(
++            unassigned=True,
++            search_filter_query='is:unassigned',
++        )
+         assert set(results) == set([self.group1])
+ 
+-        results = self.backend.query([self.project], unassigned=False)
++        results = self.make_query(
++            unassigned=False,
++            search_filter_query='is:assigned',
++        )
+         assert set(results) == set([self.group2])
+ 
+     def test_unassigned_with_environment(self):
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+-            unassigned=True)
++            unassigned=True,
++            search_filter_query='is:unassigned',
++        )
+         assert set(results) == set([self.group1])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['staging']],
+-            unassigned=False)
++            unassigned=False,
++            search_filter_query='is:assigned',
++        )
+         assert set(results) == set([self.group2])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+-            unassigned=False)
++            unassigned=False,
++            search_filter_query='is:assigned',
++        )
+         assert set(results) == set([])
+ 
+     def test_assigned_to(self):
+-        results = self.backend.query([self.project], assigned_to=self.user)
++        results = self.make_query(
++            assigned_to=self.user,
++            search_filter_query='assigned:%s' % self.user.username,
++        )
+         assert set(results) == set([self.group2])
+ 
+         # test team assignee
+@@ -698,12 +770,18 @@ class DjangoSearchBackendTest(TestCase):
+         ga.update(team=self.team, user=None)
+         assert GroupAssignee.objects.get(id=ga.id).user is None
+ 
+-        results = self.backend.query([self.project], assigned_to=self.user)
++        results = self.make_query(
++            assigned_to=self.user,
++            search_filter_query='assigned:%s' % self.user.username,
++        )
+         assert set(results) == set([self.group2])
+ 
+         # test when there should be no results
+         other_user = self.create_user()
+-        results = self.backend.query([self.project], assigned_to=other_user)
++        results = self.make_query(
++            assigned_to=other_user,
++            search_filter_query='assigned:%s' % other_user.username
++        )
+         assert set(results) == set([])
+ 
+         owner = self.create_user()
+@@ -715,41 +793,49 @@ class DjangoSearchBackendTest(TestCase):
+         )
+ 
+         # test that owners don't see results for all teams
+-        results = self.backend.query([self.project], assigned_to=owner)
++        results = self.make_query(
++            assigned_to=owner,
++            search_filter_query='assigned:%s' % owner.username
++        )
+         assert set(results) == set([])
+ 
+     def test_assigned_to_with_environment(self):
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['staging']],
+-            assigned_to=self.user)
++            assigned_to=self.user,
++            search_filter_query='assigned:%s' % self.user.username
++        )
+         assert set(results) == set([self.group2])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+-            assigned_to=self.user)
++            assigned_to=self.user,
++            search_filter_query='assigned:%s' % self.user.username
++        )
+         assert set(results) == set([])
+ 
+     def test_subscribed_by(self):
+-        results = self.backend.query(
++        results = self.make_query(
+             [self.group1.project],
+             subscribed_by=self.user,
++            search_filter_query='subscribed:%s' % self.user.username
+         )
+         assert set(results) == set([self.group1])
+ 
+     def test_subscribed_by_with_environment(self):
+-        results = self.backend.query(
++        results = self.make_query(
+             [self.group1.project],
+             environments=[self.environments['production']],
+             subscribed_by=self.user,
++            search_filter_query='subscribed:%s' % self.user.username
+         )
+         assert set(results) == set([self.group1])
+ 
+-        results = self.backend.query(
++        results = self.make_query(
+             [self.group1.project],
+             environments=[self.environments['staging']],
+             subscribed_by=self.user,
++            search_filter_query='subscribed:%s' % self.user.username
+         )
+         assert set(results) == set([])
+ 
+@@ -807,3 +893,7 @@ class DjangoSearchBackendTest(TestCase):
+             environment = self.create_environment()
+             result = get_latest_release([self.project], [environment])
+             assert result == new.version
++
++
++class DjangoSearchBackendWithSearchFiltersTest(DjangoSearchBackendTest):
++    use_new_filters = True
+diff --git a/tests/snuba/api/endpoints/test_organization_group_index.py b/tests/snuba/api/endpoints/test_organization_group_index.py
+index 54ba6607f9..36bba156c9 100644
+--- a/tests/snuba/api/endpoints/test_organization_group_index.py
++++ b/tests/snuba/api/endpoints/test_organization_group_index.py
+@@ -18,10 +18,12 @@ from sentry.models import (
+ )
+ from sentry.testutils import APITestCase, SnubaTestCase
+ from sentry.testutils.helpers import parse_link_header
+-from six.moves.urllib.parse import quote
+ 
+ 
+ class GroupListTest(APITestCase, SnubaTestCase):
++    endpoint = 'sentry-api-0-organization-group-index'
++    use_new_filters = False
++
+     def setUp(self):
+         super(GroupListTest, self).setUp()
+         self.min_ago = timezone.now() - timedelta(minutes=1)
+@@ -34,12 +36,14 @@ class GroupListTest(APITestCase, SnubaTestCase):
+             attrs['href'] = url
+         return links
+ 
+-    @fixture
+-    def path(self):
+-        return reverse(
+-            'sentry-api-0-organization-group-index',
+-            args=[self.project.organization.slug]
+-        )
++    def get_response(self, *args, **kwargs):
++        if not args:
++            org = self.project.organization.slug
++        else:
++            org = args[0]
++
++        kwargs['use_new_filters'] = '1' if self.use_new_filters else '0'
++        return super(GroupListTest, self).get_response(org, **kwargs)
+ 
+     def test_sort_by_date_with_tag(self):
+         # XXX(dcramer): this tests a case where an ambiguous column name existed
+@@ -54,11 +58,7 @@ class GroupListTest(APITestCase, SnubaTestCase):
+         )
+         self.login_as(user=self.user)
+ 
+-        response = self.client.get(
+-            u'{}?sort_by=date&query=is:unresolved'.format(self.path),
+-            format='json',
+-        )
+-        assert response.status_code == 200
++        response = self.get_valid_response(sort_by='date', query='is:unresolved')
+         assert len(response.data) == 1
+         assert response.data[0]['id'] == six.text_type(group1.id)
+ 
+@@ -70,10 +70,7 @@ class GroupListTest(APITestCase, SnubaTestCase):
+         )
+         self.login_as(user=self.user)
+ 
+-        response = self.client.get(
+-            u'{}?sort_by=date&query=timesSeen:>1k'.format(self.path),
+-            format='json',
+-        )
++        response = self.get_response(sort_by='date', query='timesSeen:>1k')
+         assert response.status_code == 400
+         assert 'could not' in response.data['detail']
+ 
+@@ -97,11 +94,7 @@ class GroupListTest(APITestCase, SnubaTestCase):
+             datetime=now - timedelta(seconds=1),
+         )
+         self.login_as(user=self.user)
+-        response = self.client.get(
+-            u'{}?sort_by=date&limit=1'.format(self.path),
+-            format='json',
+-        )
+-        assert response.status_code == 200
++        response = self.get_valid_response(sort_by='date', limit=1)
+         assert len(response.data) == 1
+         assert response.data[0]['id'] == six.text_type(group2.id)
+ 
+@@ -135,16 +128,10 @@ class GroupListTest(APITestCase, SnubaTestCase):
+ 
+         self.login_as(user=self.user)
+ 
+-        response = self.client.get(u'{}?groupStatsPeriod=24h'.format(self.path), format='json')
+-        assert response.status_code == 200
+-
+-        response = self.client.get(u'{}?groupStatsPeriod=14d'.format(self.path), format='json')
+-        assert response.status_code == 200
+-
+-        response = self.client.get(u'{}?groupStatsPeriod='.format(self.path), format='json')
+-        assert response.status_code == 200
+-
+-        response = self.client.get(u'{}?groupStatsPeriod=48h'.format(self.path), format='json')
++        self.get_valid_response(groupStatsPeriod='24h')
++        self.get_valid_response(groupStatsPeriod='14d')
++        self.get_valid_response(groupStatsPeriod='')
++        response = self.get_response(groupStatsPeriod='48h')
+         assert response.status_code == 400
+ 
+     def test_environment(self):
+@@ -167,11 +154,10 @@ class GroupListTest(APITestCase, SnubaTestCase):
+ 
+         self.login_as(user=self.user)
+ 
+-        response = self.client.get(self.path + '?environment=production', format='json')
+-        assert response.status_code == 200
++        response = self.get_valid_response(environment='production')
+         assert len(response.data) == 1
+ 
+-        response = self.client.get(self.path + '?environment=garbage', format='json')
++        response = self.get_response(environment='garbage')
+         assert response.status_code == 404
+ 
+     def test_auto_resolved(self):
+@@ -197,8 +183,7 @@ class GroupListTest(APITestCase, SnubaTestCase):
+         )
+ 
+         self.login_as(user=self.user)
+-        response = self.client.get(self.path, format='json')
+-        assert response.status_code == 200
++        response = self.get_valid_response()
+         assert len(response.data) == 1
+         assert response.data[0]['id'] == six.text_type(group2.id)
+ 
+@@ -217,8 +202,7 @@ class GroupListTest(APITestCase, SnubaTestCase):
+ 
+         self.login_as(user=self.user)
+ 
+-        response = self.client.get(u'{}?query={}'.format(self.path, 'c' * 32), format='json')
+-        assert response.status_code == 200
++        response = self.get_valid_response(query='c' * 32)
+         assert response['X-Sentry-Direct-Hit'] == '1'
+         assert len(response.data) == 1
+         assert response.data[0]['id'] == six.text_type(group.id)
+@@ -237,10 +221,7 @@ class GroupListTest(APITestCase, SnubaTestCase):
+         )
+ 
+         self.login_as(user=self.user)
+-        response = self.client.get(
+-            u'{}?query=%20%20{}%20%20'.format(self.path, 'c' * 32), format='json'
+-        )
+-        assert response.status_code == 200
++        response = self.get_valid_response(query='  {}  '.format('c' * 32))
+         assert response['X-Sentry-Direct-Hit'] == '1'
+         assert len(response.data) == 1
+         assert response.data[0]['id'] == six.text_type(group.id)
+@@ -253,8 +234,7 @@ class GroupListTest(APITestCase, SnubaTestCase):
+         self.create_group(checksum='b' * 32)
+ 
+         self.login_as(user=self.user)
+-        response = self.client.get(u'{}?query={}'.format(self.path, 'c' * 32), format='json')
+-        assert response.status_code == 200
++        response = self.get_valid_response(query='c' * 32)
+         assert len(response.data) == 0
+ 
+     def test_lookup_by_short_id(self):
+@@ -262,10 +242,7 @@ class GroupListTest(APITestCase, SnubaTestCase):
+         short_id = group.qualified_short_id
+ 
+         self.login_as(user=self.user)
+-        response = self.client.get(
+-            u'{}?query={}&shortIdLookup=1'.format(
+-                self.path, short_id), format='json')
+-        assert response.status_code == 200
++        response = self.get_valid_response(query=short_id, shortIdLookup=1)
+         assert len(response.data) == 1
+ 
+     def test_lookup_by_short_id_no_perms(self):
+@@ -282,14 +259,7 @@ class GroupListTest(APITestCase, SnubaTestCase):
+ 
+         self.login_as(user=user)
+ 
+-        path = reverse(
+-            'sentry-api-0-organization-group-index',
+-            args=[organization.slug]
+-        )
+-        response = self.client.get(
+-            u'{}?query={}&shortIdLookup=1'.format(
+-                path, short_id), format='json')
+-        assert response.status_code == 200
++        response = self.get_valid_response(organization.slug, query=short_id, shortIdLookup=1)
+         assert len(response.data) == 0
+ 
+     def test_lookup_by_first_release(self):
+@@ -310,10 +280,8 @@ class GroupListTest(APITestCase, SnubaTestCase):
+             group=group2,
+             datetime=now - timedelta(seconds=1),
+         )
+-        url = '%s?query=%s' % (self.path, quote('first-release:"%s"' % release.version))
+-        response = self.client.get(url, format='json')
++        response = self.get_valid_response(**{'first-release': '"%s"' % release.version})
+         issues = json.loads(response.content)
+-        assert response.status_code == 200
+         assert len(issues) == 2
+         assert int(issues[0]['id']) == group2.id
+         assert int(issues[1]['id']) == group.id
+@@ -329,10 +297,8 @@ class GroupListTest(APITestCase, SnubaTestCase):
+             tags={'sentry:release': release.version},
+         )
+ 
+-        url = '%s?query=%s' % (self.path, quote('release:"%s"' % release.version))
+-        response = self.client.get(url, format='json')
++        response = self.get_valid_response(release=release.version)
+         issues = json.loads(response.content)
+-        assert response.status_code == 200
+         assert len(issues) == 1
+         assert int(issues[0]['id']) == self.group.id
+ 
+@@ -375,7 +341,7 @@ class GroupListTest(APITestCase, SnubaTestCase):
+ 
+         self.login_as(user=self.user)
+ 
+-        response = self.client.get(self.path, format='json')
++        response = self.get_valid_response()
+         assert len(response.data) == 1
+         assert response.data[0]['id'] == six.text_type(group2.id)
+ 
+@@ -385,15 +351,14 @@ class GroupListTest(APITestCase, SnubaTestCase):
+         self.create_group(last_seen=timezone.now() - timedelta(days=2))
+ 
+         with self.options({'system.event-retention-days': 1}):
+-            response = self.client.get(self.path)
++            response = self.get_valid_response()
+ 
+-        assert response.status_code == 200, response.content
+         assert len(response.data) == 0
+ 
+     def test_token_auth(self):
+         token = ApiToken.objects.create(user=self.user, scope_list=['org:read'])
+         response = self.client.get(
+-            self.path,
++            reverse('sentry-api-0-organization-group-index', args=[self.project.organization.slug]),
+             format='json',
+             HTTP_AUTHORIZATION='Bearer %s' %
+             token.token)
+@@ -415,32 +380,36 @@ class GroupListTest(APITestCase, SnubaTestCase):
+             )
+             self.login_as(user=self.user)
+ 
+-            response = self.client.get(
+-                '%s?statsPeriod=6h' % (self.path,),
+-                format='json',
+-            )
++            response = self.get_valid_response(statsPeriod='6h')
+             assert len(response.data) == 1
+             assert response.data[0]['id'] == six.text_type(group.id)
+ 
+-            response = self.client.get(
+-                '%s?statsPeriod=1h' % (self.path,),
+-                format='json',
+-            )
+-
++            response = self.get_valid_response(statsPeriod='1h')
+             assert len(response.data) == 0
+ 
+ 
++class GroupListTestWithSearchFilters(GroupListTest):
++    use_new_filters = True
++
++
+ class GroupUpdateTest(APITestCase, SnubaTestCase):
++    endpoint = 'sentry-api-0-organization-group-index'
++    method = 'put'
++    use_new_filters = False
++
+     def setUp(self):
+         super(GroupUpdateTest, self).setUp()
+         self.min_ago = timezone.now() - timedelta(minutes=1)
+ 
+-    @fixture
+-    def path(self):
+-        return reverse(
+-            'sentry-api-0-organization-group-index',
+-            args=[self.project.organization.slug]
+-        )
++    def get_response(self, *args, **kwargs):
++        if not args:
++            org = self.project.organization.slug
++        else:
++            org = args[0]
++
++        qs_params = kwargs.get('qs_params', {})
++        qs_params['use_new_filters'] = '1' if self.use_new_filters else '0'
++        return super(GroupUpdateTest, self).get_response(org, **kwargs)
+ 
+     def assertNoResolution(self, group):
+         assert not GroupResolution.objects.filter(
+@@ -458,14 +427,10 @@ class GroupUpdateTest(APITestCase, SnubaTestCase):
+         )
+ 
+         self.login_as(user=self.user)
+-        response = self.client.put(
+-            u'{}?status=unresolved&project={}'.format(self.path, self.project.id),
+-            data={
+-                'status': 'resolved',
+-            },
+-            format='json',
++        response = self.get_valid_response(
++            qs_params={'status': 'unresolved', 'project': self.project.id},
++            status='resolved',
+         )
+-        assert response.status_code == 200, response.data
+         assert response.data == {
+             'status': 'resolved',
+             'statusDetails': {},
+@@ -526,31 +491,27 @@ class GroupUpdateTest(APITestCase, SnubaTestCase):
+                 datetime=self.min_ago - timedelta(seconds=i),
+             )
+ 
+-        response = self.client.get(
+-            u'{}?sort_by=date&query=is:unresolved'.format(self.path),
+-            format='json',
++        response = self.get_valid_response(
++            query='is:unresolved',
++            sort_by='date',
++            method='get',
+         )
+-
+         assert len(response.data) == 100
+ 
+-        response = self.client.put(
+-            u'{}?status=unresolved'.format(self.path),
+-            data={
+-                'status': 'resolved',
+-            },
+-            format='json',
++        response = self.get_valid_response(
++            qs_params={'status': 'unresolved'},
++            status='resolved',
+         )
+-        assert response.status_code == 200, response.data
+-
+         assert response.data == {
+             'status': 'resolved',
+             'statusDetails': {},
+         }
+-        response = self.client.get(
+-            u'{}?sort_by=date&query=is:unresolved'.format(self.path),
+-            format='json',
+-        )
+ 
++        response = self.get_valid_response(
++            query='is:unresolved',
++            sort_by='date',
++            method='get',
++        )
+         assert len(response.data) == 0
+ 
+     @patch('sentry.integrations.example.integration.ExampleIntegration.sync_status_outbound')
+@@ -597,26 +558,17 @@ class GroupUpdateTest(APITestCase, SnubaTestCase):
+             relationship=GroupLink.Relationship.references,
+         )[0]
+ 
+-        response = self.client.get(
+-            u'{}?sort_by=date&query=is:unresolved'.format(self.path),
+-            format='json',
+-        )
+-
++        response = self.get_valid_response(sort_by='date', query='is:unresolved', method='get')
+         assert len(response.data) == 1
+ 
+         with self.tasks():
+             with self.feature({
+                 'organizations:integrations-issue-sync': True,
+             }):
+-                response = self.client.put(
+-                    u'{}?status=unresolved'.format(self.path),
+-                    data={
+-                        'status': 'resolved',
+-                    },
+-                    format='json',
++                response = self.get_valid_response(
++                    qs_params={'status': 'unresolved'},
++                    status='resolved',
+                 )
+-                assert response.status_code == 200, response.data
+-
+                 group = Group.objects.get(id=group.id)
+                 assert group.status == GroupStatus.RESOLVED
+ 
+@@ -628,10 +580,7 @@ class GroupUpdateTest(APITestCase, SnubaTestCase):
+                     external_issue, True, group.project_id
+                 )
+ 
+-        response = self.client.get(
+-            u'{}?sort_by=date&query=is:unresolved'.format(self.path),
+-            format='json',
+-        )
++        response = self.get_valid_response(sort_by='date', query='is:unresolved', method='get')
+         assert len(response.data) == 0
+ 
+     @patch('sentry.integrations.example.integration.ExampleIntegration.sync_status_outbound')
+@@ -676,19 +625,13 @@ class GroupUpdateTest(APITestCase, SnubaTestCase):
+ 
+         self.login_as(user=self.user)
+ 
+-        url = u'{url}?id={group.id}'.format(
+-            url=self.path,
+-            group=group,
+-        )
+-
+         with self.tasks():
+             with self.feature({
+                 'organizations:integrations-issue-sync': True,
+             }):
+-                response = self.client.put(
+-                    url, data={
+-                        'status': 'unresolved',
+-                    }, format='json'
++                response = self.get_valid_response(
++                    qs_params={'id': group.id},
++                    status='unresolved',
+                 )
+                 assert response.status_code == 200
+                 assert response.data == {
+@@ -717,16 +660,10 @@ class GroupUpdateTest(APITestCase, SnubaTestCase):
+         uo1 = UserOption.objects.create(key='self_assign_issue', value='1', project=None, user=user)
+ 
+         self.login_as(user=user)
+-        url = u'{url}?id={group.id}'.format(url=self.path, group=group)
+-        response = self.client.put(
+-            url,
+-            data={
+-                'status': 'resolved',
+-            },
+-            format='json',
++        response = self.get_valid_response(
++            qs_params={'id': group.id},
++            status='resolved',
+         )
+-
+-        assert response.status_code == 200, response.data
+         assert response.data['assignedTo']['id'] == six.text_type(user.id)
+         assert response.data['assignedTo']['type'] == 'user'
+         assert response.data['status'] == 'resolved'
+@@ -756,16 +693,10 @@ class GroupUpdateTest(APITestCase, SnubaTestCase):
+ 
+         self.login_as(user=self.user)
+ 
+-        url = u'{url}?id={group.id}'.format(
+-            url=self.path,
+-            group=group,
++        response = self.get_valid_response(
++            qs_params={'id': group.id},
++            status='resolvedInNextRelease',
+         )
+-        response = self.client.put(
+-            url, data={
+-                'status': 'resolvedInNextRelease',
+-            }, format='json'
+-        )
+-        assert response.status_code == 200
+         assert response.data['status'] == 'resolved'
+         assert response.data['statusDetails']['inNextRelease']
+         assert response.data['assignedTo']['id'] == six.text_type(self.user.id)
+@@ -803,18 +734,10 @@ class GroupUpdateTest(APITestCase, SnubaTestCase):
+         )
+ 
+         self.login_as(user=self.user)
+-        url = u'{url}?id={group1.id}&id={group2.id}&group4={group4.id}'.format(
+-            url=self.path,
+-            group1=group1,
+-            group2=group2,
+-            group4=group4,
++        response = self.get_valid_response(
++            qs_params={'id': [group1.id, group2.id], 'group4': group4.id},
++            status='resolved',
+         )
+-        response = self.client.put(
+-            url, data={
+-                'status': 'resolved',
+-            }, format='json'
+-        )
+-        assert response.status_code == 200
+         assert response.data == {
+             'status': 'resolved',
+             'statusDetails': {},
+@@ -853,21 +776,11 @@ class GroupUpdateTest(APITestCase, SnubaTestCase):
+ 
+         self.login_as(user=self.user)
+ 
+-        url = u'{url}?id={group.id}'.format(
+-            url=self.path,
+-            group=group,
+-        )
+-        response = self.client.put(
+-            url,
+-            data={
+-                'status': 'resolved',
+-                'statusDetails': {
+-                    'inRelease': 'latest',
+-                },
+-            },
+-            format='json'
++        response = self.get_valid_response(
++            qs_params={'id': group.id},
++            status='resolved',
++            statusDetails={'inRelease': 'latest'},
+         )
+-        assert response.status_code == 200
+         assert response.data['status'] == 'resolved'
+         assert response.data['statusDetails']['inRelease'] == release.version
+         assert response.data['statusDetails']['actor']['id'] == six.text_type(self.user.id)
+@@ -908,21 +821,11 @@ class GroupUpdateTest(APITestCase, SnubaTestCase):
+ 
+         self.login_as(user=self.user)
+ 
+-        url = u'{url}?id={group.id}'.format(
+-            url=self.path,
+-            group=group,
++        response = self.get_valid_response(
++            qs_params={'id': group.id},
++            status='resolved',
++            statusDetails={'inRelease': release.version},
+         )
+-        response = self.client.put(
+-            url,
+-            data={
+-                'status': 'resolved',
+-                'statusDetails': {
+-                    'inRelease': release.version,
+-                },
+-            },
+-            format='json'
+-        )
+-        assert response.status_code == 200
+         assert response.data['status'] == 'resolved'
+         assert response.data['statusDetails']['inRelease'] == release.version
+         assert response.data['statusDetails']['actor']['id'] == six.text_type(self.user.id)
+@@ -961,21 +864,11 @@ class GroupUpdateTest(APITestCase, SnubaTestCase):
+ 
+         self.login_as(user=self.user)
+ 
+-        url = u'{url}?id={group.id}'.format(
+-            url=self.path,
+-            group=group,
+-        )
+-        response = self.client.put(
+-            url,
+-            data={
+-                'status': 'resolved',
+-                'statusDetails': {
+-                    'inNextRelease': True,
+-                },
+-            },
+-            format='json'
++        response = self.get_valid_response(
++            qs_params={'id': group.id},
++            status='resolved',
++            statusDetails={'inNextRelease': True},
+         )
+-        assert response.status_code == 200
+         assert response.data['status'] == 'resolved'
+         assert response.data['statusDetails']['inNextRelease']
+         assert response.data['statusDetails']['actor']['id'] == six.text_type(self.user.id)
+@@ -1014,16 +907,10 @@ class GroupUpdateTest(APITestCase, SnubaTestCase):
+ 
+         self.login_as(user=self.user)
+ 
+-        url = u'{url}?id={group.id}'.format(
+-            url=self.path,
+-            group=group,
+-        )
+-        response = self.client.put(
+-            url, data={
+-                'status': 'resolvedInNextRelease',
+-            }, format='json'
++        response = self.get_valid_response(
++            qs_params={'id': group.id},
++            status='resolvedInNextRelease',
+         )
+-        assert response.status_code == 200
+         assert response.data['status'] == 'resolved'
+         assert response.data['statusDetails']['inNextRelease']
+         assert response.data['statusDetails']['actor']['id'] == six.text_type(self.user.id)
+@@ -1067,24 +954,11 @@ class GroupUpdateTest(APITestCase, SnubaTestCase):
+ 
+         self.login_as(user=self.user)
+ 
+-        url = u'{url}?id={group.id}'.format(
+-            url=self.path,
+-            group=group,
++        response = self.get_valid_response(
++            qs_params={'id': group.id},
++            status='resolved',
++            statusDetails={'inCommit': {'commit': commit.key, 'repository': repo.name}},
+         )
+-        response = self.client.put(
+-            url,
+-            data={
+-                'status': 'resolved',
+-                'statusDetails': {
+-                    'inCommit': {
+-                        'commit': commit.key,
+-                        'repository': repo.name,
+-                    },
+-                },
+-            },
+-            format='json'
+-        )
+-        assert response.status_code == 200
+         assert response.data['status'] == 'resolved'
+         assert response.data['statusDetails']['inCommit']['id'] == commit.key
+         assert response.data['statusDetails']['actor']['id'] == six.text_type(self.user.id)
+@@ -1130,24 +1004,11 @@ class GroupUpdateTest(APITestCase, SnubaTestCase):
+ 
+         self.login_as(user=self.user)
+ 
+-        url = u'{url}?id={group.id}'.format(
+-            url=self.path,
+-            group=group,
+-        )
+-        response = self.client.put(
+-            url,
+-            data={
+-                'status': 'resolved',
+-                'statusDetails': {
+-                    'inCommit': {
+-                        'commit': commit.key,
+-                        'repository': repo.name,
+-                    },
+-                },
+-            },
+-            format='json'
++        response = self.get_valid_response(
++            qs_params={'id': group.id},
++            status='resolved',
++            statusDetails={'inCommit': {'commit': commit.key, 'repository': repo.name}},
+         )
+-        assert response.status_code == 200
+         assert response.data['status'] == 'resolved'
+         assert response.data['statusDetails']['inCommit']['id'] == commit.key
+         assert response.data['statusDetails']['actor']['id'] == six.text_type(self.user.id)
+@@ -1191,22 +1052,10 @@ class GroupUpdateTest(APITestCase, SnubaTestCase):
+ 
+         self.login_as(user=self.user)
+ 
+-        url = u'{url}?id={group.id}'.format(
+-            url=self.path,
+-            group=group,
+-        )
+-        response = self.client.put(
+-            url,
+-            data={
+-                'status': 'resolved',
+-                'statusDetails': {
+-                    'inCommit': {
+-                        'commit': 'a' * 40,
+-                        'repository': repo.name,
+-                    },
+-                },
+-            },
+-            format='json'
++        response = self.get_response(
++            qs_params={'id': group.id},
++            status='resolved',
++            statusDetails={'inCommit': {'commit': 'a' * 40, 'repository': repo.name}},
+         )
+         assert response.status_code == 400
+         assert response.data['statusDetails'][0]['inCommit'][0]['commit']
+@@ -1221,16 +1070,7 @@ class GroupUpdateTest(APITestCase, SnubaTestCase):
+ 
+         self.login_as(user=self.user)
+ 
+-        url = u'{url}?id={group.id}'.format(
+-            url=self.path,
+-            group=group,
+-        )
+-        response = self.client.put(
+-            url, data={
+-                'status': 'unresolved',
+-            }, format='json'
+-        )
+-        assert response.status_code == 200
++        response = self.get_valid_response(qs_params={'id': group.id}, status='unresolved')
+         assert response.data == {
+             'status': 'unresolved',
+             'statusDetails': {},
+@@ -1257,16 +1097,7 @@ class GroupUpdateTest(APITestCase, SnubaTestCase):
+ 
+         self.login_as(user=self.user)
+ 
+-        url = u'{url}?id={group.id}'.format(
+-            url=self.path,
+-            group=group,
+-        )
+-        response = self.client.put(
+-            url, data={
+-                'status': 'unresolved',
+-            }, format='json'
+-        )
+-        assert response.status_code == 200
++        response = self.get_valid_response(qs_params={'id': group.id}, status='unresolved')
+         assert response.data == {
+             'status': 'unresolved',
+             'statusDetails': {},
+@@ -1285,18 +1116,7 @@ class GroupUpdateTest(APITestCase, SnubaTestCase):
+ 
+         self.login_as(user=self.user)
+ 
+-        url = u'{url}?id={group.id}'.format(
+-            url=self.path,
+-            group=group,
+-        )
+-        response = self.client.put(
+-            url, data={
+-                'status': 'ignored',
+-            }, format='json'
+-        )
+-
+-        assert response.status_code == 200
+-
++        response = self.get_valid_response(qs_params={'id': group.id}, status='ignored')
+         # existing snooze objects should be cleaned up
+         assert not GroupSnooze.objects.filter(id=snooze.id).exists()
+ 
+@@ -1313,19 +1133,11 @@ class GroupUpdateTest(APITestCase, SnubaTestCase):
+ 
+         self.login_as(user=self.user)
+ 
+-        url = u'{url}?id={group.id}'.format(
+-            url=self.path,
+-            group=group,
++        response = self.get_valid_response(
++            qs_params={'id': group.id},
++            status='ignored',
++            ignoreDuration=30,
+         )
+-        response = self.client.put(
+-            url, data={
+-                'status': 'ignored',
+-                'ignoreDuration': 30,
+-            }, format='json'
+-        )
+-
+-        assert response.status_code == 200
+-
+         snooze = GroupSnooze.objects.get(group=group)
+         snooze.until = snooze.until.replace(microsecond=0)
+ 
+@@ -1362,19 +1174,11 @@ class GroupUpdateTest(APITestCase, SnubaTestCase):
+ 
+         self.login_as(user=self.user)
+ 
+-        url = u'{url}?id={group.id}'.format(
+-            url=self.path,
+-            group=group,
++        response = self.get_valid_response(
++            qs_params={'id': group.id},
++            status='ignored',
++            ignoreCount=100,
+         )
+-        response = self.client.put(
+-            url, data={
+-                'status': 'ignored',
+-                'ignoreCount': 100,
+-            }, format='json'
+-        )
+-
+-        assert response.status_code == 200
+-
+         snooze = GroupSnooze.objects.get(group=group)
+         assert snooze.count == 100
+         assert snooze.until is None
+@@ -1408,19 +1212,11 @@ class GroupUpdateTest(APITestCase, SnubaTestCase):
+ 
+         self.login_as(user=self.user)
+ 
+-        url = u'{url}?id={group.id}'.format(
+-            url=self.path,
+-            group=group,
++        response = self.get_valid_response(
++            qs_params={'id': group.id},
++            status='ignored',
++            ignoreUserCount=100,
+         )
+-        response = self.client.put(
+-            url, data={
+-                'status': 'ignored',
+-                'ignoreUserCount': 100,
+-            }, format='json'
+-        )
+-
+-        assert response.status_code == 200
+-
+         snooze = GroupSnooze.objects.get(group=group)
+         assert snooze.count is None
+         assert snooze.until is None
+@@ -1448,18 +1244,10 @@ class GroupUpdateTest(APITestCase, SnubaTestCase):
+         )
+ 
+         self.login_as(user=self.user)
+-        url = u'{url}?id={group1.id}&id={group2.id}&group4={group4.id}'.format(
+-            url=self.path,
+-            group1=group1,
+-            group2=group2,
+-            group4=group4,
+-        )
+-        response = self.client.put(
+-            url, data={
+-                'isBookmarked': 'true',
+-            }, format='json'
++        response = self.get_valid_response(
++            qs_params={'id': [group1.id, group2.id], 'group4': group4.id},
++            isBookmarked='true',
+         )
+-        assert response.status_code == 200
+         assert response.data == {
+             'isBookmarked': True,
+         }
+@@ -1495,18 +1283,10 @@ class GroupUpdateTest(APITestCase, SnubaTestCase):
+         group4 = self.create_group(project=self.create_project(slug='foo'), checksum='b' * 32)
+ 
+         self.login_as(user=self.user)
+-        url = u'{url}?id={group1.id}&id={group2.id}&group4={group4.id}'.format(
+-            url=self.path,
+-            group1=group1,
+-            group2=group2,
+-            group4=group4,
++        response = self.get_valid_response(
++            qs_params={'id': [group1.id, group2.id], 'group4': group4.id},
++            isSubscribed='true',
+         )
+-        response = self.client.put(
+-            url, data={
+-                'isSubscribed': 'true',
+-            }, format='json'
+-        )
+-        assert response.status_code == 200
+         assert response.data == {
+             'isSubscribed': True,
+             'subscriptionDetails': {
+@@ -1541,17 +1321,10 @@ class GroupUpdateTest(APITestCase, SnubaTestCase):
+         group2 = self.create_group(checksum='b' * 32)
+ 
+         self.login_as(user=self.user)
+-        url = u'{url}?id={group1.id}&id={group2.id}'.format(
+-            url=self.path,
+-            group1=group1,
+-            group2=group2,
+-        )
+-        response = self.client.put(
+-            url, data={
+-                'isPublic': 'true',
+-            }, format='json'
++        response = self.get_valid_response(
++            qs_params={'id': [group1.id, group2.id]},
++            isPublic='true',
+         )
+-        assert response.status_code == 200
+         assert response.data['isPublic'] is True
+         assert 'shareId' in response.data
+ 
+@@ -1574,17 +1347,10 @@ class GroupUpdateTest(APITestCase, SnubaTestCase):
+             assert bool(g.get_share_id())
+ 
+         self.login_as(user=self.user)
+-        url = u'{url}?id={group1.id}&id={group2.id}'.format(
+-            url=self.path,
+-            group1=group1,
+-            group2=group2,
+-        )
+-        response = self.client.put(
+-            url, data={
+-                'isPublic': 'false',
+-            }, format='json'
++        response = self.get_valid_response(
++            qs_params={'id': [group1.id, group2.id]},
++            isPublic='false',
+         )
+-        assert response.status_code == 200
+         assert response.data == {
+             'isPublic': False,
+         }
+@@ -1606,18 +1372,10 @@ class GroupUpdateTest(APITestCase, SnubaTestCase):
+         )
+ 
+         self.login_as(user=self.user)
+-        url = u'{url}?id={group1.id}&id={group2.id}&group4={group4.id}'.format(
+-            url=self.path,
+-            group1=group1,
+-            group2=group2,
+-            group4=group4,
+-        )
+-        response = self.client.put(
+-            url, data={
+-                'hasSeen': 'true',
+-            }, format='json'
++        response = self.get_valid_response(
++            qs_params={'id': [group1.id, group2.id], 'group4': group4.id},
++            hasSeen='true',
+         )
+-        assert response.status_code == 200
+         assert response.data == {
+             'hasSeen': True,
+         }
+@@ -1651,18 +1409,10 @@ class GroupUpdateTest(APITestCase, SnubaTestCase):
+         self.create_group(checksum='d' * 32)
+ 
+         self.login_as(user=self.user)
+-        url = u'{url}?id={group1.id}&id={group2.id}&id={group3.id}'.format(
+-            url=self.path,
+-            group1=group1,
+-            group2=group2,
+-            group3=group3,
++        response = self.get_valid_response(
++            qs_params={'id': [group1.id, group2.id, group3.id]},
++            merge='1',
+         )
+-        response = self.client.put(
+-            url, data={
+-                'merge': '1',
+-            }, format='json'
+-        )
+-        assert response.status_code == 200
+         assert response.data['merge']['parent'] == six.text_type(group2.id)
+         assert sorted(response.data['merge']['children']) == sorted(
+             [
+@@ -1688,17 +1438,10 @@ class GroupUpdateTest(APITestCase, SnubaTestCase):
+         user = self.user
+ 
+         self.login_as(user=user)
+-        url = u'{url}?id={group1.id}'.format(
+-            url=self.path,
+-            group1=group1,
++        response = self.get_valid_response(
++            qs_params={'id': group1.id},
++            assignedTo=user.username,
+         )
+-        response = self.client.put(
+-            url, data={
+-                'assignedTo': user.username,
+-            }
+-        )
+-
+-        assert response.status_code == 200
+         assert response.data['assignedTo']['id'] == six.text_type(user.id)
+         assert response.data['assignedTo']['type'] == 'user'
+         assert GroupAssignee.objects.filter(group=group1, user=user).exists()
+@@ -1717,13 +1460,10 @@ class GroupUpdateTest(APITestCase, SnubaTestCase):
+             is_active=True,
+         ).exists()
+ 
+-        response = self.client.put(
+-            url, data={
+-                'assignedTo': '',
+-            }, format='json'
++        response = self.get_valid_response(
++            qs_params={'id': group1.id},
++            assignedTo='',
+         )
+-
+-        assert response.status_code == 200, response.content
+         assert response.data['assignedTo'] is None
+ 
+         assert not GroupAssignee.objects.filter(group=group1, user=user).exists()
+@@ -1735,16 +1475,10 @@ class GroupUpdateTest(APITestCase, SnubaTestCase):
+ 
+         self.login_as(user=member)
+ 
+-        url = u'{url}?id={group.id}'.format(
+-            url=self.path,
+-            group=group,
+-        )
+-        response = self.client.put(
+-            url, data={
+-                'assignedTo': non_member.username,
+-            }, format='json'
++        response = self.get_response(
++            qs_params={'id': group.id},
++            assignedTo=non_member.username,
+         )
+-
+         assert response.status_code == 400, response.content
+ 
+     def test_assign_team(self):
+@@ -1758,17 +1492,10 @@ class GroupUpdateTest(APITestCase, SnubaTestCase):
+ 
+         group.project.add_team(team)
+ 
+-        url = u'{url}?id={group.id}'.format(
+-            url=self.path,
+-            group=group,
+-        )
+-        response = self.client.put(
+-            url, data={
+-                'assignedTo': u'team:{}'.format(team.id),
+-            }
++        response = self.get_valid_response(
++            qs_params={'id': group.id},
++            assignedTo=u'team:{}'.format(team.id),
+         )
+-
+-        assert response.status_code == 200
+         assert response.data['assignedTo']['id'] == six.text_type(team.id)
+         assert response.data['assignedTo']['type'] == 'team'
+         assert GroupAssignee.objects.filter(group=group, team=team).exists()
+@@ -1783,13 +1510,10 @@ class GroupUpdateTest(APITestCase, SnubaTestCase):
+             is_active=True,
+         ).count() == 2
+ 
+-        response = self.client.put(
+-            url, data={
+-                'assignedTo': '',
+-            }, format='json'
++        response = self.get_valid_response(
++            qs_params={'id': group.id},
++            assignedTo='',
+         )
+-
+-        assert response.status_code == 200, response.content
+         assert response.data['assignedTo'] is None
+ 
+     def test_discard(self):
+@@ -1803,16 +1527,11 @@ class GroupUpdateTest(APITestCase, SnubaTestCase):
+         user = self.user
+ 
+         self.login_as(user=user)
+-        url = u'{url}?id={group1.id}'.format(
+-            url=self.path,
+-            group1=group1,
+-        )
+         with self.tasks():
+             with self.feature('projects:discard-groups'):
+-                response = self.client.put(
+-                    url, data={
+-                        'discard': True,
+-                    }
++                response = self.get_response(
++                    qs_params={'id': group1.id},
++                    discard=True,
+                 )
+ 
+         assert response.status_code == 204
+@@ -1834,13 +1553,31 @@ class GroupUpdateTest(APITestCase, SnubaTestCase):
+         assert tombstone.data == group1.data
+ 
+ 
++class GroupUpdateTestWithSelectFilters(GroupUpdateTest):
++    use_new_filters = True
++
++
+ class GroupDeleteTest(APITestCase, SnubaTestCase):
++    endpoint = 'sentry-api-0-organization-group-index'
++    method = 'delete'
++    use_new_filters = False
++
+     @fixture
+     def path(self):
+         return u'/api/0/organizations/{}/issues/'.format(
+             self.project.organization.slug,
+         )
+ 
++    def get_response(self, *args, **kwargs):
++        if not args:
++            org = self.project.organization.slug
++        else:
++            org = args[0]
++
++        qs_params = kwargs.get('qs_params', {})
++        qs_params['use_new_filters'] = '1' if self.use_new_filters else '0'
++        return super(GroupDeleteTest, self).get_response(org, **kwargs)
++
+     @patch('sentry.api.helpers.group_index.eventstream')
+     @patch('sentry.eventstream')
+     def test_delete_by_id(self, mock_eventstream_task, mock_eventstream_api):
+@@ -1867,15 +1604,10 @@ class GroupDeleteTest(APITestCase, SnubaTestCase):
+             )
+ 
+         self.login_as(user=self.user)
+-        url = u'{url}?id={group1.id}&id={group2.id}&group4={group4.id}'.format(
+-            url=self.path,
+-            group1=group1,
+-            group2=group2,
+-            group4=group4,
++        response = self.get_response(
++            qs_params={'id': [group1.id, group2.id], 'group4': group4.id},
+         )
+ 
+-        response = self.client.delete(url, format='json')
+-
+         mock_eventstream_api.start_delete_groups.assert_called_once_with(
+             group1.project_id, [group1.id, group2.id])
+ 
+@@ -1896,7 +1628,9 @@ class GroupDeleteTest(APITestCase, SnubaTestCase):
+         Group.objects.filter(id__in=(group1.id, group2.id)).update(status=GroupStatus.UNRESOLVED)
+ 
+         with self.tasks():
+-            response = self.client.delete(url, format='json')
++            response = self.get_response(
++                qs_params={'id': [group1.id, group2.id], 'group4': group4.id},
++            )
+ 
+         mock_eventstream_task.end_delete_groups.assert_called_once_with(eventstream_state)
+ 
+@@ -1936,9 +1670,7 @@ class GroupDeleteTest(APITestCase, SnubaTestCase):
+         self.login_as(user=self.user)
+ 
+         # if query is '' it defaults to is:unresolved
+-        url = self.path + '?query='
+-        response = self.client.delete(url, format='json')
+-
++        response = self.get_response(qs_params={'query': ''})
+         assert response.status_code == 204
+ 
+         for group in groups:
+@@ -1951,10 +1683,14 @@ class GroupDeleteTest(APITestCase, SnubaTestCase):
+             status=GroupStatus.UNRESOLVED)
+ 
+         with self.tasks():
+-            response = self.client.delete(url, format='json')
++            response = self.get_response(qs_params={'query': ''})
+ 
+         assert response.status_code == 204
+ 
+         for group in groups:
+             assert not Group.objects.filter(id=group.id).exists()
+             assert not GroupHash.objects.filter(group_id=group.id).exists()
++
++
++class GroupDeleteTestWithSelectFilters(GroupDeleteTest):
++    use_new_filters = True

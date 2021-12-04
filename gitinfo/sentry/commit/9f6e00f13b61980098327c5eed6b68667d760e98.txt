@@ -1,0 +1,1485 @@
+commit 9f6e00f13b61980098327c5eed6b68667d760e98
+Author: ted kaemming <t.kaemming+github@gmail.com>
+Date:   Tue Aug 9 11:02:05 2016 -0700
+
+    Basic report implementation. (#3836)
+    
+    This is a work in progress, and isn't configured as part of the Celery schedule accordingly.
+
+diff --git a/src/sentry/conf/server.py b/src/sentry/conf/server.py
+index 68f44e0164..00e3c5396d 100644
+--- a/src/sentry/conf/server.py
++++ b/src/sentry/conf/server.py
+@@ -380,34 +380,37 @@ CELERY_IMPORTS = (
+     'sentry.tasks.auth',
+     'sentry.tasks.auto_resolve_issues',
+     'sentry.tasks.beacon',
+-    'sentry.tasks.clear_expired_snoozes',
+     'sentry.tasks.check_auth',
++    'sentry.tasks.clear_expired_snoozes',
+     'sentry.tasks.collect_project_platforms',
+     'sentry.tasks.deletion',
+     'sentry.tasks.digests',
+     'sentry.tasks.dsymcache',
+     'sentry.tasks.email',
+     'sentry.tasks.merge',
+-    'sentry.tasks.store',
+     'sentry.tasks.options',
+     'sentry.tasks.ping',
+     'sentry.tasks.post_process',
+     'sentry.tasks.process_buffer',
++    'sentry.tasks.reports',
++    'sentry.tasks.store',
+ )
+ CELERY_QUEUES = [
+-    Queue('default', routing_key='default'),
+     Queue('alerts', routing_key='alerts'),
+     Queue('auth', routing_key='auth'),
+     Queue('cleanup', routing_key='cleanup'),
+-    Queue('merge', routing_key='merge'),
+-    Queue('search', routing_key='search'),
+-    Queue('events', routing_key='events'),
+-    Queue('update', routing_key='update'),
+-    Queue('email', routing_key='email'),
+-    Queue('options', routing_key='options'),
++    Queue('default', routing_key='default'),
+     Queue('digests.delivery', routing_key='digests.delivery'),
+     Queue('digests.scheduling', routing_key='digests.scheduling'),
++    Queue('email', routing_key='email'),
++    Queue('events', routing_key='events'),
++    Queue('merge', routing_key='merge'),
++    Queue('options', routing_key='options'),
++    Queue('reports.deliver', routing_key='reports.deliver'),
++    Queue('reports.prepare', routing_key='reports.prepare'),
++    Queue('search', routing_key='search'),
+     Queue('stats', routing_key='stats'),
++    Queue('update', routing_key='update'),
+ ]
+ 
+ for queue in CELERY_QUEUES:
+diff --git a/src/sentry/features/__init__.py b/src/sentry/features/__init__.py
+index c3f734233c..3407dce532 100644
+--- a/src/sentry/features/__init__.py
++++ b/src/sentry/features/__init__.py
+@@ -13,11 +13,12 @@ default_manager.add('organizations:sso', OrganizationFeature)  # NOQA
+ default_manager.add('organizations:onboarding', OrganizationFeature)  # NOQA
+ default_manager.add('organizations:callsigns', OrganizationFeature)  # NOQA
+ default_manager.add('organizations:new-tracebacks', OrganizationFeature)  # NOQA
++default_manager.add('organizations:reports:prepare', OrganizationFeature)  # NOQA
++default_manager.add('organizations:reports:deliver', OrganizationFeature)  # NOQA
+ default_manager.add('projects:global-events', ProjectFeature)  # NOQA
+ default_manager.add('projects:quotas', ProjectFeature)  # NOQA
+ default_manager.add('projects:plugins', ProjectPluginFeature)  # NOQA
+ 
+-
+ # expose public api
+ add = default_manager.add
+ get = default_manager.get
+diff --git a/src/sentry/static/sentry/images/email/arrow-decrease.png b/src/sentry/static/sentry/images/email/arrow-decrease.png
+new file mode 100644
+index 0000000000..4e95e77c77
+Binary files /dev/null and b/src/sentry/static/sentry/images/email/arrow-decrease.png differ
+diff --git a/src/sentry/static/sentry/images/email/arrow-increase.png b/src/sentry/static/sentry/images/email/arrow-increase.png
+new file mode 100644
+index 0000000000..f4fd7a63d2
+Binary files /dev/null and b/src/sentry/static/sentry/images/email/arrow-increase.png differ
+diff --git a/src/sentry/static/sentry/images/email/circle-bg.png b/src/sentry/static/sentry/images/email/circle-bg.png
+new file mode 100644
+index 0000000000..67e60ead31
+Binary files /dev/null and b/src/sentry/static/sentry/images/email/circle-bg.png differ
+diff --git a/src/sentry/tasks/reports.py b/src/sentry/tasks/reports.py
+new file mode 100644
+index 0000000000..456972a2a8
+--- /dev/null
++++ b/src/sentry/tasks/reports.py
+@@ -0,0 +1,452 @@
++from __future__ import absolute_import
++
++import functools
++import itertools
++import logging
++import operator
++from collections import namedtuple
++from datetime import timedelta
++
++from django.utils import timezone
++
++from sentry import features
++from sentry.app import tsdb
++from sentry.models import (
++    Activity, Group, GroupStatus, Organization, OrganizationStatus, Project,
++    Team, User
++)
++from sentry.tasks.base import instrumented_task
++from sentry.utils.dates import floor_to_utc_day, to_datetime, to_timestamp
++from sentry.utils.email import MessageBuilder
++from sentry.utils.math import mean
++
++
++logger = logging.getLogger(__name__)
++
++
++def _get_organization_queryset():
++    return Organization.objects.filter(
++        status=OrganizationStatus.VISIBLE,
++    )
++
++
++def _fill_default_parameters(timestamp=None, rollup=None):
++    if timestamp is None:
++        timestamp = to_timestamp(floor_to_utc_day(timezone.now()))
++
++    if rollup is None:
++        rollup = 60 * 60 * 24 * 7
++
++    return (timestamp, rollup)
++
++
++def _to_interval(timestamp, duration):
++    return (
++        to_datetime(timestamp - duration),
++        to_datetime(timestamp),
++    )
++
++
++def change(value, reference):
++    """
++    Calculate the relative change between a value and a reference point.
++    """
++    if not reference:  # handle both None and divide by zero case
++        return None
++
++    return ((value or 0) - reference) / float(reference)
++
++
++def clean_series(start, stop, rollup, series):
++    """
++    Validate a series, ensuring that it follows the specified rollup and
++    boundaries. The start bound is inclusive, while the stop bound is
++    exclusive (similar to the slice operation.)
++    """
++    start_timestamp = to_timestamp(start)
++    stop_timestamp = to_timestamp(stop)
++
++    result = []
++    for i, (timestamp, value) in enumerate(series):
++        assert timestamp == start_timestamp + rollup * i
++        if timestamp >= stop_timestamp:
++            break
++
++        result.append((timestamp, value))
++
++    return result
++
++
++def merge_sequences(target, other, function=operator.add):
++    """
++    Merge two sequences into a single sequence. The length of the two
++    sequences must be equal.
++    """
++    assert len(target) == len(other), 'sequence lengths must match'
++    return type(target)([function(x, y) for x, y in zip(target, other)])
++
++
++def merge_mappings(target, other, function=lambda x, y: x + y):
++    """
++    Merge two mappings into a single mapping. The set of keys in both
++    mappings must be equal.
++    """
++    assert set(target) == set(other), 'keys must match'
++    return {k: function(v, other[k]) for k, v in target.items()}
++
++
++def merge_series(target, other, function=operator.add):
++    """
++    Merge two series into a single series. Both series must have the same
++    start and end points as well as the same resolution.
++    """
++    missing = object()
++    results = []
++    for x, y in itertools.izip_longest(target, other, fillvalue=missing):
++        assert x is not missing and y is not missing, 'series must be same length'
++        assert x[0] == y[0], 'series timestamps must match'
++        results.append((x[0], function(x[1], y[1])))
++    return results
++
++
++def prepare_project_series((start, stop), project, rollup=60 * 60 * 24):
++    resolution, series = tsdb.get_optimal_rollup_series(start, stop, rollup)
++    assert resolution == rollup, 'resolution does not match requested value'
++    clean = functools.partial(clean_series, start, stop, rollup)
++    return merge_series(
++        reduce(
++            merge_series,
++            map(
++                clean,
++                tsdb.get_range(
++                    tsdb.models.group,
++                    project.group_set.filter(
++                        status=GroupStatus.RESOLVED,
++                        resolved_at__gte=start,
++                        resolved_at__lt=stop,
++                    ).values_list('id', flat=True),
++                    start,
++                    stop,
++                    rollup=rollup,
++                ).values(),
++            ),
++            clean([(timestamp, 0) for timestamp in series]),
++        ),
++        clean(
++            tsdb.get_range(
++                tsdb.models.project,
++                [project.id],
++                start,
++                stop,
++                rollup=rollup,
++            )[project.id],
++        ),
++        lambda resolved, total: (
++            resolved,
++            total - resolved,  # unresolved
++        ),
++    )
++
++
++def prepare_project_aggregates((start, stop), project):
++    # TODO: This needs to return ``None`` for periods that don't have any data
++    # (because the project is not old enough) and possibly extrapolate for
++    # periods that only have partial periods.
++    period = timedelta(days=7 * 4)
++    start = stop - period
++
++    resolutions = project.group_set.filter(
++        status=GroupStatus.RESOLVED,
++        resolved_at__gte=start,
++        resolved_at__lt=stop,
++    ).values_list('resolved_at', flat=True)
++
++    periods = [0] * 4
++    for resolution in resolutions:
++        periods[int((resolution - start).total_seconds() / period.total_seconds())] += 1
++
++    return periods
++
++
++def trim_issue_list(value):
++    return sorted(
++        value,
++        key=lambda (id, statistics): statistics,
++        reverse=True,
++    )[:5]
++
++
++def prepare_project_issue_list((start, stop), queryset, rollup=60 * 60 * 24):
++    issue_ids = list(queryset.values_list('id', flat=True))
++
++    events = tsdb.get_sums(
++        tsdb.models.group,
++        issue_ids,
++        start,
++        stop,
++        rollup=rollup,
++    )
++
++    users = tsdb.get_distinct_counts_totals(
++        tsdb.models.users_affected_by_group,
++        issue_ids,
++        start,
++        stop,
++        rollup=rollup,
++    )
++
++    return (
++        len(issue_ids),
++        trim_issue_list([(id, (events[id], users[id])) for id in issue_ids]),
++    )
++
++
++def prepare_project_issue_lists(interval, project):
++    start, stop = interval
++    queryset = project.group_set.exclude(status=GroupStatus.MUTED)
++    return (
++        prepare_project_issue_list(
++            interval,
++            queryset.filter(
++                first_seen__gte=start,
++                first_seen__lt=stop,
++            ),
++        ),
++        prepare_project_issue_list(
++            interval,
++            queryset.filter(
++                status=GroupStatus.UNRESOLVED,
++                resolved_at__gte=start,
++                resolved_at__lt=stop,
++            ),
++        ),
++        prepare_project_issue_list(
++            interval,
++            queryset.filter(
++                last_seen__gte=start,
++                last_seen__lt=stop,
++            ),
++        ),
++    )
++
++
++def merge_issue_lists(target, other):
++    return (
++        target[0] + other[0],
++        trim_issue_list(target[1] + other[1]),
++    )
++
++
++def prepare_project_report(interval, project):
++    return (
++        prepare_project_series(interval, project),
++        prepare_project_aggregates(interval, project),
++        prepare_project_issue_lists(interval, project),
++    )
++
++
++def safe_add(x, y):
++    if x is not None and y is not None:
++        return x + y
++    elif x is not None:
++        return x
++    elif y is not None:
++        return y
++    else:
++        return None
++
++
++def merge_reports(target, other):
++    return (
++        merge_series(
++            target[0],
++            other[0],
++            merge_sequences,
++        ),
++        merge_sequences(
++            target[1],
++            other[1],
++            safe_add,
++        ),
++        merge_sequences(
++            target[2],
++            other[2],
++            merge_issue_lists,
++        ),
++    )
++
++
++@instrumented_task(
++    name='sentry.tasks.reports.prepare_reports',
++    queue='reports.prepare')
++def prepare_reports(*args, **kwargs):
++    timestamp, duration = _fill_default_parameters(*args, **kwargs)
++
++    organization_ids = _get_organization_queryset().values_list('id', flat=True)
++    for organization_id in organization_ids:
++        prepare_organization_report.delay(timestamp, duration, organization_id)
++
++
++@instrumented_task(
++    name='sentry.tasks.reports.prepare_organization_report',
++    queue='reports.prepare')
++def prepare_organization_report(timestamp, duration, organization_id):
++    organization = _get_organization_queryset().get(id=organization_id)
++
++    if not features.has('organizations:reports:prepare', organization):
++        return
++
++    # TODO: Build and store project reports here.
++
++    for user_id in organization.member_set.values_list('user_id', flat=True):
++        deliver_organization_user_report.delay(
++            timestamp,
++            duration,
++            organization_id,
++            user_id,
++        )
++
++
++def fetch_personal_statistics((start, stop), organization, user):
++    resolved_issue_ids = Activity.objects.filter(
++        project__organization_id=organization.id,
++        user_id=user.id,
++        type__in=(
++            Activity.SET_RESOLVED,
++            Activity.SET_RESOLVED_IN_RELEASE,
++        ),
++        datetime__gte=start,
++        datetime__lt=stop,
++        group__status=GroupStatus.RESOLVED,  # only count if the issue is still resolved
++    ).values_list('group_id', flat=True)
++    return {
++        'resolved': len(resolved_issue_ids),
++        'users': tsdb.get_distinct_counts_union(
++            tsdb.models.users_affected_by_group,
++            resolved_issue_ids,
++            start,
++            stop,
++            60 * 60 * 24,
++        ),
++    }
++
++
++def build_message(interval, organization, user, report):
++    start, stop = interval
++
++    message = MessageBuilder(
++        subject=u'Sentry Report for {}'.format(organization.name),
++        template='sentry/emails/reports/body.txt',
++        html_template='sentry/emails/reports/body.html',
++        type='report.organization',
++        context={
++            'interval': {
++                'start': start,
++                'stop': stop,
++            },
++            'organization': organization,
++            'personal': fetch_personal_statistics(
++                interval,
++                organization,
++                user,
++            ),
++            'report': to_context(report),
++            'user': user,
++        },
++    )
++
++    message.add_users((user.id,))
++
++    return message
++
++
++@instrumented_task(
++    name='sentry.tasks.reports.deliver_organization_user_report',
++    queue='reports.deliver')
++def deliver_organization_user_report(timestamp, duration, organization_id, user_id):
++    organization = _get_organization_queryset().get(id=organization_id)
++    user = User.objects.get(id=user_id)
++
++    projects = set()
++    for team in Team.objects.get_for_user(organization, user):
++        projects.update(
++            Project.objects.get_for_user(team, user, _skip_team_check=True),
++        )
++
++    if not projects:
++        return
++
++    interval = _to_interval(timestamp, duration)
++
++    def fetch_report(project):
++        # TODO: Fetch reports from storage, rather than building on demand.
++        return prepare_project_report(
++            interval,
++            project,
++        )
++
++    report = reduce(
++        merge_reports,
++        map(
++            fetch_report,
++            projects,
++        ),
++    )
++
++    message = build_message(interval, organization, user, report)
++
++    if features.has('organizations:reports:deliver', organization):
++        message.send()
++
++
++IssueList = namedtuple('IssueList', 'count issues')
++IssueStatistics = namedtuple('IssueStatistics', 'events users')
++
++
++def rewrite_issue_list((count, issues), fetch_groups=None):
++    # XXX: This only exists for removing data dependency in tests.
++    if fetch_groups is None:
++        fetch_groups = Group.objects.in_bulk
++
++    instances = fetch_groups([id for id, _ in issues])
++
++    def rewrite((id, statistics)):
++        instance = instances.get(id)
++        if instance is None:
++            logger.debug("Could not retrieve group with key %r, skipping...", id)
++            return None
++        return (instance, IssueStatistics(*statistics))
++
++    return IssueList(
++        count,
++        filter(None, map(rewrite, issues)),
++    )
++
++
++Point = namedtuple('Point', 'resolved unresolved')
++
++
++def to_context(report, fetch_groups=None):
++    series, aggregates, issue_lists = report
++    series = [(timestamp, Point(*values)) for timestamp, values in series]
++
++    return {
++        'series': {
++            'points': series,
++            'maximum': max(sum(point) for timestamp, point in series),
++            'all': sum([sum(point) for timestamp, point in series]),
++            'resolved': sum([point.resolved for timestamp, point in series]),
++        },
++        'comparisons': [
++            ('last week', change(aggregates[-1], aggregates[-2])),
++            ('last month', change(
++                aggregates[-1],
++                mean(aggregates) if all(v is not None for v in aggregates) else None,
++            )),
++        ],
++        'issues': (
++            ('New Issues', rewrite_issue_list(issue_lists[0], fetch_groups)),
++            ('Reintroduced Issues', rewrite_issue_list(issue_lists[1], fetch_groups)),
++            ('Most Frequently Seen Issues', rewrite_issue_list(issue_lists[2], fetch_groups)),
++        ),
++    }
+diff --git a/src/sentry/templates/sentry/debug/mail/preview.html b/src/sentry/templates/sentry/debug/mail/preview.html
+index c584cb7131..910adee1a8 100644
+--- a/src/sentry/templates/sentry/debug/mail/preview.html
++++ b/src/sentry/templates/sentry/debug/mail/preview.html
+@@ -27,6 +27,9 @@
+         <option value="mail/access-approved/">Access Approved</option>
+         <option value="mail/invitation/">Membership Invite</option>
+       </optgroup>
++      <optgroup label="Reports">
++        <option value="mail/report/">Weekly Report</option>
++      </optgroup>
+     </select>
+ 
+     <label for="format" style="margin-right: 10px">Format:</label>
+diff --git a/src/sentry/templates/sentry/emails/email-styles.html b/src/sentry/templates/sentry/emails/email-styles.html
+index fc87244984..ffee124b09 100644
+--- a/src/sentry/templates/sentry/emails/email-styles.html
++++ b/src/sentry/templates/sentry/emails/email-styles.html
+@@ -16,7 +16,7 @@
+   .main {
+     max-width: 700px;
+     box-shadow: 0 1px 3px rgba(0,0,0, .1);
+-    margin: 10px auto;
++    margin: 15px auto;
+     border-radius: 4px;
+     border: 1px solid #c7d0d4;
+     border-collapse: separate;
+@@ -40,7 +40,7 @@
+     white-space: pre;
+     white-space: pre-wrap;
+     margin-bottom: 15px;
+-    background: #F4F5F6;
++    background-color: #F4F5F6;
+     color: #3D4649;
+     padding: 15px;
+     border-radius: 4px;
+@@ -51,6 +51,10 @@
+     color: #838c99;
+   }
+ 
++  .align-right {
++    text-align: right;
++  }
++
+   pre, blockquote, table {
+     margin-bottom: 20px;
+   }
+@@ -78,7 +82,7 @@
+ 
+   .btn, p .btn {
+     color: #fff;
+-    background: #15A7F6;
++    background-color: #15A7F6;
+     padding: 8px 15px;
+     line-height: 18px;
+     font-weight: normal;
+@@ -108,6 +112,10 @@
+     border-bottom: 1px solid #dee7eb;
+   }
+ 
++  .header table {
++    margin-bottom: 0;
++  }
++
+   .header .btn {
+     float: right;
+     margin: -3px 0 0 0;
+@@ -127,6 +135,17 @@
+     color: #ccc;
+     font-weight: normal;
+   }
++
++  .unsubscribe-box {
++    background-color: #FDFDFE;
++    border: 1px solid #D6DBE4;
++    border-radius: 3px;
++    padding: 15px;
++    text-align: center;
++    margin-bottom: 30px;
++    font-size: 15px;
++  }
++
+   .footer {
+     border-top: 1px solid #E7EBEE;
+     padding: 35px 0;
+@@ -147,7 +166,7 @@
+   }
+ 
+   h2 .highlight {
+-    background: #f6f7f8;
++    background-color: #f6f7f8;
+     padding: 0 6px;
+     border-radius: 3px;
+     font-weight: 500;
+@@ -159,8 +178,20 @@
+     margin: 0 0 20px;
+   }
+ 
++  h4 {
++    font-size: 18px;
++    font-weight: 700;
++    margin: 20px 0;
++  }
++
++  h5 {
++    font-size: 16px;
++    font-weight: 700;
++    margin: 0 0 4px;
++  }
++
+   .inner {
+-    background: #fff;
++    background-color: #fff;
+     padding: 30px 0 20px;
+   }
+ 
+@@ -205,7 +236,7 @@
+   }
+ 
+   .inner .interface table td {
+-    background: #f4f5f6;
++    background-color: #f4f5f6;
+     padding: 5px 10px;
+     border-radius: 3px;
+     margin-bottom: 5px;
+@@ -231,7 +262,7 @@
+     margin-right: 5px;
+     margin-bottom: 10px;
+     border-radius: 3px;
+-    background: #F4F5F6;
++    background-color: #F4F5F6;
+   }
+   .tag-list li strong {
+     font-weight: 200;
+@@ -245,7 +276,7 @@
+   }
+ 
+   .notice {
+-    background: #FBFAF4;
++    background-color: #FBFAF4;
+     color: #866938;
+     border: 1px solid #E2D2AD;
+     padding: 15px;
+@@ -341,11 +372,11 @@
+     font-size: 16px;
+     text-transform: capitalize;
+   }
+-  .level-info { background: #2788ce; }
+-  .level-debug { background: #9BA5A9; }
+-  .level-warning { background: #f18500; }
+-  .level-error { background: #f43f20; }
+-  .level-fatal { background: #d20f2a; }
++  .level-info { background-color: #2788ce; }
++  .level-debug { background-color: #9BA5A9; }
++  .level-warning { background-color: #f18500; }
++  .level-error { background-color: #f43f20; }
++  .level-fatal { background-color: #d20f2a; }
+   .event .count .span {
+     position: absolute;
+     left: 0;
+@@ -358,6 +389,10 @@
+ 
+   /* Issue */
+ 
++  .issue {
++    line-height: 24px;
++  }
++
+   .issue h3 {
+     line-height: 24px;
+     margin: 0;
+@@ -392,7 +427,7 @@
+     padding: 0;
+   }
+   .inner .note-body {
+-    background: #F4F5F6;
++    background-color: #F4F5F6;
+     padding: 12px 20px;
+     border-radius: 3px;
+   }
+@@ -450,7 +485,7 @@
+   }
+ 
+   .inner table.reset > tr > td {
+-    background: #fff;
++    background-color: #fff;
+     padding: 0;
+     padding-top: 0;
+   }
+@@ -466,7 +501,7 @@
+   }
+ 
+   .digest .rule {
+-    background: #F6F7F8;
++    background-color: #F6F7F8;
+     padding: 8px;
+     font-size: 14px;
+     border-left: 10px solid #15A7F6;
+@@ -540,6 +575,159 @@
+     font-size: 14px;
+   }
+ 
++  .weekly-report .container {
++    padding-top: 10px;
++    padding-bottom: 10px;
++  }
++
++  .weekly-report .header td {
++    text-align: right;
++    font-size: 14px;
++  }
++
++  .weekly-report td, .weekly-report th {
++    text-align: left;
++  }
++
++  .weekly-report .issue-table {
++    margin-bottom: 40px;
++  }
++
++  .weekly-report .issue-table th {
++    border-bottom: 1px solid #EAEDF1;
++  }
++
++  .weekly-report .issue-table th h4 {
++    margin: 0 0 15px;
++  }
++
++  .weekly-report .issue-table td {
++    border-bottom: 1px solid #EAEDF1;
++    padding: 12px 0;
++  }
++
++  .weekly-report .issue-table .issue small a {
++    color: #687276;
++  }
++
++  .weekly-report .issue-table .issue-meta {
++    font-size: 14px;
++    line-height: 24px;
++  }
++
++  .weekly-report .issue-table td.empty {
++    text-align: center;
++    background-color: #FBFCFD;
++    border: 1px solid #EAEDF1;
++    font-size: 14px;
++  }
++
++  .weekly-report .issue-table .narrow-column {
++    width: 60px;
++    text-align: center;
++    padding-left: 20px;
++    color: #687276;
++  }
++
++  .weekly-report .issue-table th.narrow-column {
++    text-transform: uppercase;
++    font-size: 14px;
++    color: #8794A8;
++    padding-bottom: 15px;
++    font-weight: 500;
++  }
++
++  .weekly-report .issue-table td.narrow-column {
++    font-size: 18px;
++  }
++
++  .weekly-report .legend {
++    font-size: 14px;
++    text-align: right;
++  }
++
++  .weekly-report .legend span {
++    display: inline-block;
++    padding: 3px 7px;
++    margin: 0 10px 0 5px;
++    border-radius: 3px;
++    color: #fff;
++  }
++
++  .weekly-report .legend span.resolved {
++    margin-right: 0;
++  }
++
++  .weekly-report .legend .all,
++  .weekly-report .issue-graph-bar .all {
++    background-color: #D6DBE4;
++  }
++
++  .weekly-report .legend .resolved,
++  .weekly-report .issue-graph-bar .resolved {
++    background-color: #A290D1;
++  }
++  .weekly-report .issues-resolved {
++    margin-bottom: 30px;
++  }
++
++  .weekly-report .issues-resolved .issues-resolved-column {
++    width: 33.3%;
++    text-align: right;
++  }
++
++  .weekly-report .issues-resolved .empty {
++    display: block;
++    text-align: center;
++  }
++
++  .weekly-report .issues-resolved .issues-resolved-column-left {
++    padding-right: 15px;
++    vertical-align: bottom;
++  }
++
++  .weekly-report .issues-resolved .issues-resolved-column-middle {
++    padding-left: 20px;
++    padding-right: 20px;
++    border-left: 1px solid #D6DBE4;
++    border-right: 1px solid #D6DBE4;
++  }
++
++  .weekly-report .issues-resolved .issues-resolved-column .stat {
++    font-size: 30px;
++    margin-bottom: 5px;
++  }
++
++  .weekly-report .issues-resolved .issues-resolved-column .stat img {
++    vertical-align: middle;
++  }
++
++  .weekly-report .issue-graph, .weekly-report .issue-graph-bar {
++    margin-bottom: 0;
++  }
++
++  .weekly-report .issue-graph-bar td {
++    font-size: 0;
++  }
++
++  .weekly-report .user-impact {}
++
++  .weekly-report .user-impact-stat {
++    width: 90px;
++    height: 90px;
++    vertical-align: middle;
++    text-align: center;
++    font-size: 32px;
++    color: #836CC2;
++    background-size: 90px 90px;
++    background-image: url("{% absolute_asset_url 'sentry' 'images/email/circle-bg.png' %}");
++  }
++
++  .weekly-report .user-impact-text {
++    font-size: 18px;
++    padding-left: 12px;
++    padding-right: 15px;
++  }
+ 
+   @media only screen and (max-device-width: 480px) {
+     /* mobile-specific CSS styles */
+diff --git a/src/sentry/templates/sentry/emails/reports/body.html b/src/sentry/templates/sentry/emails/reports/body.html
+new file mode 100644
+index 0000000000..32295248ab
+--- /dev/null
++++ b/src/sentry/templates/sentry/emails/reports/body.html
+@@ -0,0 +1,158 @@
++{% extends "sentry/emails/base.html" %}
++
++{% load sentry_helpers %}
++{% load sentry_assets %}
++
++{% block bodyclass %}weekly-report{% endblock %}
++
++{% block header %}
++  <table>
++    <tr>
++      <td width="125px">
++        <h1>
++          <a href="{% absolute_uri %}"><img src="{% absolute_asset_url 'sentry' 'images/email/sentry_logo_full.png' %}" width="125px" height="29px" alt="Sentry"></a>
++        </h1>
++      </td>
++      <td class="align-right">
++        <strong>Weekly Update for {{ organization.name }}</strong><br />
++        {# Note: This assumes we're always sending email on day boundaries. #}
++        {{ interval.start|date:"F j, Y" }} &ndash; {{ interval.stop|date:"F j, Y" }}
++      </td>
++    </tr>
++  </table>
++{% endblock %}
++
++{% block content %}
++
++<div class="container">
++  <table style="margin-bottom: 10px">
++    <tr>
++      <td>
++        <h4>Issues resolved in the past week</h4>
++      </td>
++      <td class="legend">
++          All <span class="all">{{ report.series.all|small_count }}</span>
++          Resolved <span class="resolved">{{ report.series.resolved|small_count }}</span>
++      </td>
++    </tr>
++  </table>
++
++  <table class="issues-resolved">
++    <tr>
++      <td class="issues-resolved-column issues-resolved-column-left">
++        <table class="issue-graph">
++          <tr>
++          {% with report.series.maximum as max %}
++          {% for timestamp, metrics in report.series.points %}
++            <td valign="bottom" style="padding-right: 5px;">
++              <table class="issue-graph-bar">
++                {% if metrics.resolved and metrics.unresolved %}
++                  <tr>
++                    <td class="all" height="{% widthratio metrics.unresolved max 56 %}px" title="{{ metrics.unresolved }}">&nbsp;</td>
++                  </tr>
++                  <tr>
++                    <td class="resolved" height="{% widthratio metrics.resolved max 56 %}px" title="{{ metrics.resolved }}">&nbsp;</td>
++                  </tr>
++                {% else %}
++                  <tr><td></td></tr>
++                  <tr><td class="all baseline" height="1px">&nbsp;</td>
++                {% endif %}
++              </table>
++            </td>
++          {% endfor %}
++          {% endwith %}
++          </tr>
++        </table>
++      </td>
++      {% for label, change in report.comparisons %}
++      <td class="issues-resolved-column {% if not forloop.last %}issues-resolved-column-middle{% endif %}">
++          {% if change %}
++            <div class="stat">
++            {% if change >= 0 %}
++                <img src="{% absolute_asset_url 'sentry' 'images/email/arrow-increase.png' %}" width="20px" height="10px">
++            {% else %}
++                <img src="{% absolute_asset_url 'sentry' 'images/email/arrow-decrease.png' %}" width="20px" height="10px">
++            {% endif %}
++            {{ change|multiply:"100"|absolute_value|floatformat:"-1" }}%
++            </div>
++            <small>{% if change >= 0 %}more{% else %}less{% endif %} than {{ label }}</small>
++          {% else %}
++            <small class="empty">There is not enough data to compare to {{ label }}.</small>
++          {% endif %}
++      </td>
++      {% endfor %}
++    </tr>
++  </table>
++
++  {% for label, issues in report.issues %}
++    <table class="issue-table">
++      <thead>
++        <tr>
++          <th>
++            <h4>{{ label }} ({{ issues.count }})</h4>
++          </th>
++          <th class="narrow-column">Events</th>
++          <th class="narrow-column">Users</th>
++        </tr>
++      </thead>
++      <tbody>
++        {% for group, statistics in issues.issues %}
++          <tr>
++            <td class="issue">
++              {% include "sentry/emails/_group.html" %}
++              <small>
++                Last seen at {{ group.last_seen }}
++                in <a href="{% absolute_uri project_link %}" class="issue-project">{{ group.project.name }}</a>
++              </small>
++            </td>
++            <td class="narrow-column">{{ statistics.events|small_count }}</td>
++            <td class="narrow-column">{{ statistics.users|small_count }}</td>
++          </tr>
++        {% empty %}
++          <tr>
++            <td class="empty" colspan="3">
++              {# TODO: This is probably not the best way to articulate this. #}
++              There were no issues this period.
++            </td>
++          </tr>
++        {% endfor %}
++      </tbody>
++    </table>
++  {% endfor %}
++
++  {% if personal.resolved or personal.users %}
++    <h4>Your impact</h4>
++    <table class="user-impact">
++      <tr>
++        <td width="50%">
++          <table>
++            <tr>
++              <td class="user-impact-stat">{{ personal.resolved|small_count:0 }}</td>
++              <td class="user-impact-text">Issue{{ personal.resolved|pluralize }} resolved this week by you.</td>
++            </tr>
++          </table>
++        </td>
++        <td width="50%">
++          <table>
++            <tr>
++              <td class="user-impact-stat">{{ personal.users|small_count:0 }}</td>
++              <td class="user-impact-text">User{{ personal.users|pluralize }} rejoicing because of it.</td>
++            </tr>
++          </table>
++        </td>
++      </tr>
++    </table>
++  {% endif %}
++
++  <div class="unsubscribe-box">
++    Not enjoying these? <a>Click to unsubscribe</a>.
++  </div>
++</div>
++<div class="footer">
++  <div class="container">
++    <a href="{% absolute_uri %}" style="float:right">Home</a>
++    {% url 'sentry-account-settings-notifications' as settings_link %}
++    <a href="{% absolute_uri settings_link %}">Notification Settings</a>
++  </div>
++</div>
++{% endblock %}
+diff --git a/src/sentry/templates/sentry/emails/reports/body.txt b/src/sentry/templates/sentry/emails/reports/body.txt
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/src/sentry/templatetags/sentry_helpers.py b/src/sentry/templatetags/sentry_helpers.py
+index 0cd918dcac..e9775b6316 100644
+--- a/src/sentry/templatetags/sentry_helpers.py
++++ b/src/sentry/templatetags/sentry_helpers.py
+@@ -59,6 +59,18 @@ truncatechars.is_safe = True
+ register.filter(to_json)
+ 
+ 
++@register.filter
++def multiply(x, y):
++    def coerce(value):
++        if isinstance(value, (int, long, float)):
++            return value
++        try:
++            return int(value)
++        except ValueError:
++            return float(value)
++    return coerce(x) * coerce(y)
++
++
+ @register.simple_tag
+ def absolute_uri(path='', *args):
+     from sentry.utils.http import absolute_uri
+@@ -95,6 +107,11 @@ def subtract(value, amount):
+     return int(value) - int(amount)
+ 
+ 
++@register.filter
++def absolute_value(value):
++    return abs(int(value) if isinstance(value, (int, long)) else float(value))
++
++
+ @register.filter
+ def has_charts(group):
+     from sentry.utils.db import has_charts
+@@ -111,7 +128,7 @@ def as_sorted(value):
+ 
+ 
+ @register.filter
+-def small_count(v):
++def small_count(v, precision=1):
+     if not v:
+         return 0
+     z = [
+@@ -125,7 +142,7 @@ def small_count(v):
+         if o:
+             if len(six.text_type(o)) > 2 or not p:
+                 return '%d%s' % (o, y)
+-            return '%.1f%s' % (v / float(x), y)
++            return ('%.{}f%s'.format(precision)) % (v / float(x), y)
+     return v
+ 
+ 
+diff --git a/src/sentry/utils/dates.py b/src/sentry/utils/dates.py
+index e4045889b3..476db59e96 100644
+--- a/src/sentry/utils/dates.py
++++ b/src/sentry/utils/dates.py
+@@ -54,6 +54,18 @@ def to_datetime(value):
+     return epoch + timedelta(seconds=value)
+ 
+ 
++def floor_to_utc_day(value):
++    """
++    Floors a given datetime to UTC midnight.
++    """
++    return value.astimezone(pytz.utc).replace(
++        hour=0,
++        minute=0,
++        second=0,
++        microsecond=0,
++    )
++
++
+ def get_sql_date_trunc(col, db='default', grouper='hour'):
+     conn = connections[db]
+ 
+diff --git a/src/sentry/web/frontend/debug/mail.py b/src/sentry/web/frontend/debug/mail.py
+index e4400a3188..38198d1af8 100644
+--- a/src/sentry/web/frontend/debug/mail.py
++++ b/src/sentry/web/frontend/debug/mail.py
+@@ -370,6 +370,123 @@ def digest(request):
+     ).render(request)
+ 
+ 
++@login_required
++def report(request):
++    from sentry.tasks import reports
++
++    random = get_random(request)
++
++    rollup = 60 * 60 * 24 * 7
++    timestamp = random.randint(
++        to_timestamp(datetime(2016, 6, 1, 0, 0, 0, tzinfo=timezone.utc)),
++        to_timestamp(datetime(2016, 7, 1, 0, 0, 0, tzinfo=timezone.utc)),
++    )
++
++    organization = Organization(
++        id=1,
++        slug='example',
++        name='Example',
++    )
++
++    team = Team(
++        id=1,
++        slug='example',
++        name='Example',
++        organization=organization,
++    )
++
++    project = Project(
++        id=1,
++        organization=organization,
++        team=team,
++        slug='project',
++        name='My Project',
++    )
++
++    start, stop = reports._to_interval(timestamp, rollup)
++
++    group_instances = {}
++
++    def fetch_group_instances(id_list):
++        results = {}
++        for id in id_list:
++            instance = group_instances.get(id)
++            if instance is not None:
++                results[id] = instance
++        return results
++
++    group_generator = make_group_generator(random, project)
++
++    def make_group_id_generator():
++        while True:
++            group = next(group_generator)
++            if random.random() < 0.95:
++                group_instances[group.id] = group
++            yield group.id
++
++    group_id_sequence = make_group_id_generator()
++
++    def build_issue_list():
++        count = random.randint(0, int(random.paretovariate(0.4)))
++        return count, [(
++            next(group_id_sequence),
++            (
++                int(random.paretovariate(0.3)),
++                int(random.paretovariate(0.3)),
++            ),
++        ) for _ in xrange(0, min(count, 5))]
++
++    def build_report():
++        daily_maximum = random.randint(1000, 10000)
++
++        series = [(
++            timestamp + (i * rollup),
++            (random.randint(0, daily_maximum), random.randint(0, daily_maximum))
++        ) for i in xrange(0, 7)]
++
++        aggregates = [
++            random.randint(0, daily_maximum * 7) if random.random() < 0.9 else None for _ in xrange(0, 4)
++        ]
++
++        issue_lists = [build_issue_list() for _ in range(0, 3)]
++
++        return series, aggregates, issue_lists
++
++    report = reduce(
++        reports.merge_reports,
++        [build_report() for _ in xrange(0, random.randint(1, 3))]
++    )
++
++    if random.random() < 0.85:
++        personal = {
++            'resolved': random.randint(0, 100),
++            'users': int(random.paretovariate(0.2)),
++        }
++    else:
++        personal = {
++            'resolved': 0,
++            'users': 0,
++        }
++
++    return MailPreview(
++        html_template='sentry/emails/reports/body.html',
++        text_template='sentry/emails/reports/body.txt',
++        context={
++            'interval': {
++                'start': start,
++                'stop': stop,
++            },
++            'report': reports.to_context(
++                report,
++                fetch_group_instances,
++            ),
++            'organization': organization,
++            'personal': personal,
++            'user': request.user,
++        },
++    ).render(request)
++
++
+ @login_required
+ def request_access(request):
+     org = Organization(
+diff --git a/src/sentry/web/urls.py b/src/sentry/web/urls.py
+index ac36f4bb39..3758612bcc 100644
+--- a/src/sentry/web/urls.py
++++ b/src/sentry/web/urls.py
+@@ -147,6 +147,8 @@ if getattr(settings, 'DEBUG_VIEWS', settings.DEBUG):
+             DebugSelfAssignedEmailView.as_view()),
+         url(r'^debug/mail/digest/$',
+             sentry.web.frontend.debug.mail.digest),
++        url(r'^debug/mail/report/$',
++            sentry.web.frontend.debug.mail.report),
+         url(r'^debug/mail/regression/$',
+             DebugRegressionEmailView.as_view()),
+         url(r'^debug/mail/regression/release/$',
+diff --git a/tests/acceptance/test_emails.py b/tests/acceptance/test_emails.py
+index 1b588039db..cd5379d527 100644
+--- a/tests/acceptance/test_emails.py
++++ b/tests/acceptance/test_emails.py
+@@ -129,3 +129,8 @@ class EmailTestCase(AcceptanceTestCase):
+         self.browser.get(self.build_url('/debug/mail/digest/', 'txt'))
+         self.browser.wait_until('#preview')
+         self.browser.snapshot('digest email txt')
++
++    def test_report_html(self):
++        self.browser.get(self.build_url('/debug/mail/report/'))
++        self.browser.wait_until('#preview')
++        self.browser.snapshot('report email html')
+diff --git a/tests/sentry/tasks/test_reports.py b/tests/sentry/tasks/test_reports.py
+new file mode 100644
+index 0000000000..7cd3387867
+--- /dev/null
++++ b/tests/sentry/tasks/test_reports.py
+@@ -0,0 +1,177 @@
++from __future__ import absolute_import
++
++import pytest
++import mock
++from django.core import mail
++
++from sentry.models import Project
++from sentry.tasks.reports import (
++    change, clean_series, merge_mappings, merge_sequences, merge_series,
++    safe_add, prepare_reports,
++)
++from sentry.testutils.cases import TestCase
++from sentry.utils.dates import to_datetime
++
++
++def test_change():
++    assert change(1, 0) is None
++    assert change(10, 5) == 1.00  # 100% increase
++    assert change(50, 100) == -0.50   # 50% decrease
++    assert change(None, 100) == -1.00  # 100% decrease
++    assert change(50, None) is None
++
++
++def test_safe_add():
++    assert safe_add(1, 1) == 2
++    assert safe_add(None, 1) == 1
++    assert safe_add(1, None) == 1
++    assert safe_add(None, None) is None
++
++
++def test_merge_mappings():
++    assert merge_mappings(
++        {'a': 1, 'b': 2, 'c': 3},
++        {'a': 0, 'b': 1, 'c': 2},
++    ) == {'a': 1, 'b': 3, 'c': 5}
++
++
++def test_merge_mappings_custom_operator():
++    assert merge_mappings(
++        {
++            'a': {'x': 1, 'y': 1},
++            'b': {'x': 2, 'y': 2},
++        },
++        {
++            'a': {'x': 1, 'y': 1},
++            'b': {'x': 2, 'y': 2},
++        },
++        lambda left, right: merge_mappings(left, right),
++    ) == {
++        'a': {'x': 2, 'y': 2},
++        'b': {'x': 4, 'y': 4},
++    }
++
++
++def test_merge_mapping_different_keys():
++    with pytest.raises(AssertionError):
++        merge_mappings({'a': 1}, {'b': 2})
++
++
++def test_merge_sequences():
++    assert merge_sequences(
++        range(0, 4),
++        range(0, 4),
++    ) == [i * 2 for i in xrange(0, 4)]
++
++
++def test_merge_sequences_custom_operator():
++    assert merge_sequences(
++        [{chr(65 + i): i} for i in xrange(0, 26)],
++        [{chr(65 + i): i} for i in xrange(0, 26)],
++        merge_mappings,
++    ) == [{chr(65 + i): i * 2} for i in xrange(0, 26)]
++
++
++def test_merge_series():
++    assert merge_series(
++        [(i, i) for i in xrange(0, 10)],
++        [(i, i) for i in xrange(0, 10)],
++    ) == [(i, i * 2) for i in xrange(0, 10)]
++
++
++def test_merge_series_custom_operator():
++    assert merge_series(
++        [(i, {chr(65 + i): i}) for i in xrange(0, 26)],
++        [(i, {chr(65 + i): i}) for i in xrange(0, 26)],
++        merge_mappings,
++    ) == [(i, {chr(65 + i): i * 2}) for i in xrange(0, 26)]
++
++
++def test_merge_series_offset_timestamps():
++    with pytest.raises(AssertionError):
++        merge_series(
++            [(i, i) for i in xrange(0, 10)],
++            [(i + 1, i) for i in xrange(0, 10)],
++        )
++
++
++def test_merge_series_different_lengths():
++    with pytest.raises(AssertionError):
++        merge_series(
++            [(i, i) for i in xrange(0, 1)],
++            [(i, i) for i in xrange(0, 10)],
++        )
++
++    with pytest.raises(AssertionError):
++        merge_series(
++            [(i, i) for i in xrange(0, 10)],
++            [(i, i) for i in xrange(0, 1)],
++        )
++
++
++def test_clean_series():
++    rollup = 60
++    n = 5
++    start = to_datetime(rollup * 0)
++    stop = to_datetime(rollup * n)
++    series = [(rollup * i, i) for i in xrange(0, n)]
++    assert clean_series(
++        start,
++        stop,
++        rollup,
++        series,
++    ) == series
++
++
++def test_clean_series_trims_extra():
++    rollup = 60
++    n = 5
++    start = to_datetime(rollup * 0)
++    stop = to_datetime(rollup * n)
++    series = [(rollup * i, i) for i in xrange(0, n + 1)]
++    assert clean_series(
++        start,
++        stop,
++        rollup,
++        series,
++    ) == series[:n]
++
++
++def test_clean_series_rejects_offset_timestamp():
++    rollup = 60
++    n = 5
++    start = to_datetime(rollup * 0)
++    stop = to_datetime(rollup * n)
++    series = [(rollup * (i * 1.1), i) for i in xrange(0, n)]
++    with pytest.raises(AssertionError):
++        clean_series(
++            start,
++            stop,
++            rollup,
++            series,
++        )
++
++
++class ReportTestCase(TestCase):
++    @mock.patch('sentry.features.has')
++    def test_integration(self, has_feature):
++        Project.objects.all().delete()
++
++        has_feature.side_effect = lambda name, *a, **k: {
++            'organizations:reports:deliver': True,
++            'organizations:reports:prepare': True,
++        }.get(name, False)
++
++        project = self.create_project(
++            organization=self.organization,
++            team=self.team,
++        )
++
++        member_set = set(project.team.member_set.all())
++
++        with self.tasks():
++            prepare_reports()
++            assert len(mail.outbox) == len(member_set) == 1
++
++            message = mail.outbox[0]
++            assert self.organization.name in message.subject

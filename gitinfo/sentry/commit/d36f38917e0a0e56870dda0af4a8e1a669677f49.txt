@@ -1,0 +1,462 @@
+commit d36f38917e0a0e56870dda0af4a8e1a669677f49
+Author: Alex Hofsteede <alex@hofsteede.com>
+Date:   Mon Apr 29 13:21:03 2019 -0700
+
+    feat: Publish outcome stats to kafka (#12950)
+    
+    Publish one message to kafka for each incoming event with the overall outcome of processing that event (rejected, filtered, invalid, accepted, etc.) This should eventually be able to replace all of the existing TSDB metrics.
+
+diff --git a/src/sentry/conf/server.py b/src/sentry/conf/server.py
+index 39a455d466..55fa2ae3db 100644
+--- a/src/sentry/conf/server.py
++++ b/src/sentry/conf/server.py
+@@ -1580,6 +1580,7 @@ KAFKA_PREPROCESS = 'events-preprocess'
+ KAFKA_PROCESS = 'events-process'
+ KAFKA_SAVE = 'events-save'
+ KAFKA_EVENTS = 'events'
++KAFKA_OUTCOMES = 'outcomes'
+ 
+ KAFKA_TOPICS = {
+     KAFKA_PREPROCESS: {
+@@ -1598,4 +1599,8 @@ KAFKA_TOPICS = {
+         'cluster': 'default',
+         'topic': KAFKA_EVENTS,
+     },
++    KAFKA_OUTCOMES: {
++        'cluster': 'default',
++        'topic': KAFKA_OUTCOMES,
++    },
+ }
+diff --git a/src/sentry/event_manager.py b/src/sentry/event_manager.py
+index 45af3ad316..6cdc18c422 100644
+--- a/src/sentry/event_manager.py
++++ b/src/sentry/event_manager.py
+@@ -6,9 +6,11 @@ sentry.event_manager
+ """
+ from __future__ import absolute_import, print_function
+ 
++import jsonschema
+ import logging
++import random
+ import six
+-import jsonschema
++import time
+ 
+ from datetime import datetime, timedelta
+ from django.conf import settings
+@@ -16,7 +18,7 @@ from django.db import connection, IntegrityError, router, transaction
+ from django.utils import timezone
+ from django.utils.encoding import force_text
+ 
+-from sentry import buffer, eventtypes, eventstream, features, tagstore, tsdb, filters
++from sentry import buffer, eventtypes, eventstream, features, tagstore, tsdb, filters, options
+ from sentry.constants import (
+     LOG_LEVELS, LOG_LEVELS_MAP, VALID_PLATFORMS, MAX_TAG_VALUE_LENGTH,
+ )
+@@ -42,21 +44,23 @@ from sentry.models import (
+ from sentry.plugins import plugins
+ from sentry.signals import event_discarded, event_saved, first_event_received
+ from sentry.tasks.integrations import kick_off_status_syncs
+-from sentry.utils import metrics
++from sentry.utils import json, metrics
+ from sentry.utils.cache import default_cache
+ from sentry.utils.canonical import CanonicalKeyDict
++from sentry.utils.contexts_normalization import normalize_user_agent
+ from sentry.utils.data_filters import (
+     is_valid_ip,
+     is_valid_release,
+     is_valid_error_message,
+     FilterStatKeys,
++    FILTER_STAT_KEYS_TO_VALUES
+ )
+-from sentry.utils.dates import to_timestamp
++from sentry.utils.dates import to_timestamp, to_datetime
+ from sentry.utils.db import is_postgres
+-from sentry.utils.safe import safe_execute, trim, get_path, setdefault_path
+ from sentry.utils.geo import rust_geoip
++from sentry.utils.pubsub import QueuedPublisherService, KafkaPublisher
++from sentry.utils.safe import safe_execute, trim, get_path, setdefault_path
+ from sentry.utils.validators import is_float
+-from sentry.utils.contexts_normalization import normalize_user_agent
+ from sentry.stacktraces import normalize_stacktraces_for_grouping
+ from sentry.culprit import generate_culprit
+ 
+@@ -325,6 +329,76 @@ def _decode_event(data, content_encoding):
+     return CanonicalKeyDict(data)
+ 
+ 
++outcomes = settings.KAFKA_TOPICS[settings.KAFKA_OUTCOMES]
++outcomes_publisher = None
++
++
++def track_outcome(org_id, project_id, key_id, outcome, reason=None, timestamp=None):
++    """
++    This is a central point to track org/project counters per incoming event.
++    NB: This should only ever be called once per incoming event, which means
++    it should only be called at the point we know the final outcome for the
++    event (invalid, rate_limited, accepted, discarded, etc.)
++
++    This increments all the relevant legacy RedisTSDB counters, as well as
++    sending a single metric event to Kafka which can be used to reconstruct the
++    counters with SnubaTSDB.
++    """
++    global outcomes_publisher
++    if outcomes_publisher is None:
++        outcomes_publisher = QueuedPublisherService(
++            KafkaPublisher(
++                settings.KAFKA_CLUSTERS[outcomes['cluster']]
++            )
++        )
++
++    timestamp = timestamp or to_datetime(time.time())
++    increment_list = []
++    if outcome != 'invalid':
++        # This simply preserves old behavior. We never counted invalid events
++        # (too large, duplicate, CORS) toward regular `received` counts.
++        increment_list.extend([
++            (tsdb.models.project_total_received, project_id),
++            (tsdb.models.organization_total_received, org_id),
++            (tsdb.models.key_total_received, key_id),
++        ])
++
++    if outcome == 'filtered':
++        increment_list.extend([
++            (tsdb.models.project_total_blacklisted, project_id),
++            (tsdb.models.organization_total_blacklisted, org_id),
++            (tsdb.models.key_total_blacklisted, key_id),
++        ])
++    elif outcome == 'rate_limited':
++        increment_list.extend([
++            (tsdb.models.project_total_rejected, project_id),
++            (tsdb.models.organization_total_rejected, org_id),
++            (tsdb.models.key_total_rejected, key_id),
++        ])
++
++    if reason in FILTER_STAT_KEYS_TO_VALUES:
++        increment_list.append((FILTER_STAT_KEYS_TO_VALUES[reason], project_id))
++
++    tsdb.incr_multi(
++        [(model, key) for model, key in increment_list if key is not None],
++        timestamp=timestamp,
++    )
++
++    # Send a snuba metrics payload.
++    if random.random() <= options.get('snuba.track-outcomes-sample-rate'):
++        outcomes_publisher.publish(
++            outcomes['topic'],
++            json.dumps({
++                'timestamp': timestamp,
++                'org_id': org_id,
++                'project_id': project_id,
++                'key_id': key_id,
++                'outcome': outcome,
++                'reason': reason,
++            })
++        )
++
++
+ class EventManager(object):
+     """
+     Handles normalization in both the store endpoint and the save task. The
+diff --git a/src/sentry/tasks/store.py b/src/sentry/tasks/store.py
+index ce4d615c6a..a3ccd69729 100644
+--- a/src/sentry/tasks/store.py
++++ b/src/sentry/tasks/store.py
+@@ -24,6 +24,7 @@ from sentry.utils import json, kafka, metrics
+ from sentry.utils.safe import safe_execute
+ from sentry.stacktraces import process_stacktraces, \
+     should_process_for_stacktraces
++from sentry.utils.data_filters import FilterStatKeys
+ from sentry.utils.canonical import CanonicalKeyDict, CANONICAL_TYPES
+ from sentry.utils.dates import to_datetime
+ from sentry.utils.sdk import configure_scope
+@@ -434,8 +435,8 @@ def _do_save_event(cache_key=None, data=None, start_time=None, event_id=None,
+     """
+     Saves an event to the database.
+     """
+-    from sentry.event_manager import HashDiscarded, EventManager
+-    from sentry import quotas, tsdb
++    from sentry.event_manager import HashDiscarded, EventManager, track_outcome
++    from sentry import quotas
+     from sentry.models import ProjectKey
+ 
+     if cache_key and data is None:
+@@ -452,6 +453,9 @@ def _do_save_event(cache_key=None, data=None, start_time=None, event_id=None,
+     if project_id is None:
+         project_id = data.pop('project')
+ 
++    key_id = data.get('key_id')
++    timestamp = to_datetime(start_time) if start_time is not None else None
++
+     delete_raw_event(project_id, event_id, allow_hint_clear=True)
+ 
+     # This covers two cases: where data is None because we did not manage
+@@ -488,40 +492,27 @@ def _do_save_event(cache_key=None, data=None, start_time=None, event_id=None,
+             for attachment in attachments:
+                 save_attachment(event, attachment)
+ 
+-    except HashDiscarded:
+-        increment_list = [
+-            (tsdb.models.project_total_received_discarded, project_id),
+-        ]
++        # This is where we can finally say that we have accepted the event.
++        track_outcome(
++            event.project.organization_id,
++            event.project.id,
++            key_id,
++            'accepted',
++            None,
++            timestamp)
+ 
++    except HashDiscarded:
++        project = Project.objects.get_from_cache(id=project_id)
++        reason = FilterStatKeys.DISCARDED_HASH
++        project_key = None
+         try:
+-            project = Project.objects.get_from_cache(id=project_id)
+-        except Project.DoesNotExist:
++            if key_id is not None:
++                project_key = ProjectKey.objects.get_from_cache(id=key_id)
++        except ProjectKey.DoesNotExist:
+             pass
+-        else:
+-            increment_list.extend([
+-                (tsdb.models.project_total_blacklisted, project.id),
+-                (tsdb.models.organization_total_blacklisted, project.organization_id),
+-            ])
+-
+-            project_key = None
+-            if data.get('key_id') is not None:
+-                try:
+-                    project_key = ProjectKey.objects.get_from_cache(id=data['key_id'])
+-                except ProjectKey.DoesNotExist:
+-                    pass
+-                else:
+-                    increment_list.append((tsdb.models.key_total_blacklisted, project_key.id))
+-
+-            quotas.refund(
+-                project,
+-                key=project_key,
+-                timestamp=start_time,
+-            )
+-
+-        tsdb.incr_multi(
+-            increment_list,
+-            timestamp=to_datetime(start_time) if start_time is not None else None,
+-        )
++
++        quotas.refund(project, key=project_key, timestamp=start_time)
++        track_outcome(project.organization_id, project_id, key_id, 'filtered', reason, timestamp)
+ 
+     finally:
+         if cache_key:
+diff --git a/src/sentry/utils/pubsub.py b/src/sentry/utils/pubsub.py
+index 4e5607a6d1..e544b12711 100644
+--- a/src/sentry/utils/pubsub.py
++++ b/src/sentry/utils/pubsub.py
+@@ -32,9 +32,9 @@ class QueuedPublisherService(object):
+                 (channel, key, value) = q.get()
+                 try:
+                     self.publisher.publish(channel, key=key, value=value)
+-                except Exception:
++                except Exception as e:
+                     logger = logging.getLogger('sentry.errors')
+-                    logger.debug('could not submit event to pubsub')
++                    logger.debug('could not submit event to pubsub: %s' % e)
+                 finally:
+                     q.task_done()
+ 
+diff --git a/src/sentry/web/api.py b/src/sentry/web/api.py
+index a9fa35ab3a..e6c61cd749 100644
+--- a/src/sentry/web/api.py
++++ b/src/sentry/web/api.py
+@@ -28,13 +28,13 @@ from functools import wraps
+ from querystring_parser import parser
+ from symbolic import ProcessMinidumpError, Unreal4Error
+ 
+-from sentry import features, quotas, tsdb, options
++from sentry import features, quotas, options
+ from sentry.attachments import CachedAttachment
+ from sentry.coreapi import (
+     Auth, APIError, APIForbidden, APIRateLimited, ClientApiHelper, ClientAuthHelper,
+     SecurityAuthHelper, MinidumpAuthHelper, safely_load_json_string, logger as api_logger
+ )
+-from sentry.event_manager import EventManager
++from sentry.event_manager import EventManager, track_outcome
+ from sentry.interfaces import schemas
+ from sentry.interfaces.base import get_interface
+ from sentry.lang.native.unreal import process_unreal_crash, merge_apple_crash_report, \
+@@ -46,9 +46,8 @@ from sentry.signals import (
+     event_accepted, event_dropped, event_filtered, event_received)
+ from sentry.quotas.base import RateLimit
+ from sentry.utils import json, metrics
+-from sentry.utils.data_filters import FILTER_STAT_KEYS_TO_VALUES
++from sentry.utils.data_filters import FilterStatKeys
+ from sentry.utils.data_scrubber import SensitiveDataFilter
+-from sentry.utils.dates import to_datetime
+ from sentry.utils.http import (
+     is_valid_origin,
+     get_origins,
+@@ -98,31 +97,9 @@ def process_event(event_manager, project, key, remote_addr, helper, attachments)
+     event_received.send_robust(ip=remote_addr, project=project, sender=process_event)
+ 
+     start_time = time()
+-    tsdb_start_time = to_datetime(start_time)
+     should_filter, filter_reason = event_manager.should_filter()
+     if should_filter:
+-        increment_list = [
+-            (tsdb.models.project_total_received, project.id),
+-            (tsdb.models.project_total_blacklisted, project.id),
+-            (tsdb.models.organization_total_received,
+-                project.organization_id),
+-            (tsdb.models.organization_total_blacklisted,
+-                project.organization_id),
+-            (tsdb.models.key_total_received, key.id),
+-            (tsdb.models.key_total_blacklisted, key.id),
+-        ]
+-        try:
+-            increment_list.append(
+-                (FILTER_STAT_KEYS_TO_VALUES[filter_reason], project.id))
+-        # should error when filter_reason does not match a key in FILTER_STAT_KEYS_TO_VALUES
+-        except KeyError:
+-            pass
+-
+-        tsdb.incr_multi(
+-            increment_list,
+-            timestamp=tsdb_start_time,
+-        )
+-
++        track_outcome(project.organization_id, project.id, key.id, 'filtered', filter_reason)
+         metrics.incr(
+             'events.blacklisted', tags={'reason': filter_reason}, skip_internal=False
+         )
+@@ -145,44 +122,24 @@ def process_event(event_manager, project, key, remote_addr, helper, attachments)
+     if rate_limit is None or rate_limit.is_limited:
+         if rate_limit is None:
+             api_logger.debug('Dropped event due to error with rate limiter')
+-        tsdb.incr_multi(
+-            [
+-                (tsdb.models.project_total_received, project.id),
+-                (tsdb.models.project_total_rejected, project.id),
+-                (tsdb.models.organization_total_received,
+-                    project.organization_id),
+-                (tsdb.models.organization_total_rejected,
+-                    project.organization_id),
+-                (tsdb.models.key_total_received, key.id),
+-                (tsdb.models.key_total_rejected, key.id),
+-            ],
+-            timestamp=tsdb_start_time,
+-        )
++
++        reason = rate_limit.reason_code if rate_limit else None
++        track_outcome(project.organization_id, project.id, key.id, 'rate_limited', reason)
+         metrics.incr(
+             'events.dropped',
+             tags={
+-                'reason': rate_limit.reason_code if rate_limit else 'unknown',
++                'reason': reason or 'unknown',
+             },
+             skip_internal=False,
+         )
+         event_dropped.send_robust(
+             ip=remote_addr,
+             project=project,
+-            reason_code=rate_limit.reason_code if rate_limit else None,
++            reason_code=reason,
+             sender=process_event,
+         )
+         if rate_limit is not None:
+             raise APIRateLimited(rate_limit.retry_after)
+-    else:
+-        tsdb.incr_multi(
+-            [
+-                (tsdb.models.project_total_received, project.id),
+-                (tsdb.models.organization_total_received,
+-                    project.organization_id),
+-                (tsdb.models.key_total_received, key.id),
+-            ],
+-            timestamp=tsdb_start_time,
+-        )
+ 
+     org_options = OrganizationOption.objects.get_all_values(
+         project.organization_id)
+@@ -197,6 +154,7 @@ def process_event(event_manager, project, key, remote_addr, helper, attachments)
+     cache_key = 'ev:%s:%s' % (project.id, event_id, )
+ 
+     if cache.get(cache_key) is not None:
++        track_outcome(project.organization_id, project.id, key.id, 'invalid', 'duplicate')
+         raise APIForbidden(
+             'An event with the same ID already exists (%s)' % (event_id, ))
+ 
+@@ -407,8 +365,12 @@ class APIView(BaseView):
+             if not project:
+                 raise APIError('Client must be upgraded for CORS support')
+             if not is_valid_origin(origin, project):
+-                tsdb.incr(tsdb.models.project_total_received_cors,
+-                          project.id)
++                track_outcome(
++                    project.organization_id,
++                    project.id,
++                    None,
++                    'invalid',
++                    FilterStatKeys.CORS)
+                 raise APIForbidden('Invalid origin: %s' % (origin, ))
+ 
+         # XXX: It seems that the OPTIONS call does not always include custom headers
+@@ -557,6 +519,7 @@ class StoreView(APIView):
+ 
+         if data_size > 10000000:
+             metrics.timing('events.size.rejected', data_size)
++            track_outcome(project.organization_id, project.id, key.id, 'invalid', 'too_large')
+             raise APIForbidden("Event size exceeded 10MB after normalization.")
+ 
+         metrics.timing(
+@@ -893,7 +856,7 @@ class SecurityReportView(StoreView):
+             request=request, project=project, auth=auth, helper=helper, key=key, **kwargs
+         )
+ 
+-    def post(self, request, project, helper, **kwargs):
++    def post(self, request, project, helper, key, **kwargs):
+         json_body = safely_load_json_string(request.body)
+         report_type = self.security_report_type(json_body)
+         if report_type is None:
+@@ -909,7 +872,12 @@ class SecurityReportView(StoreView):
+         origin = instance.get_origin()
+         if not is_valid_origin(origin, project):
+             if project:
+-                tsdb.incr(tsdb.models.project_total_received_cors, project.id)
++                track_outcome(
++                    project.organization_id,
++                    project.id,
++                    key.id,
++                    'invalid',
++                    FilterStatKeys.CORS)
+             raise APIForbidden('Invalid origin')
+ 
+         data = {
+@@ -919,7 +887,7 @@ class SecurityReportView(StoreView):
+             'environment': request.GET.get('sentry_environment'),
+         }
+ 
+-        self.process(request, project=project, helper=helper, data=data, **kwargs)
++        self.process(request, project=project, helper=helper, data=data, key=key, **kwargs)
+         return HttpResponse(content_type='application/javascript', status=201)
+ 
+     def security_report_type(self, body):
+diff --git a/tests/sentry/tasks/test_store.py b/tests/sentry/tasks/test_store.py
+index fdf23ada3d..a8e568883b 100644
+--- a/tests/sentry/tasks/test_store.py
++++ b/tests/sentry/tasks/test_store.py
+@@ -210,9 +210,11 @@ class StoreTasksTest(PluginTestCase):
+         with mock.patch.object(EventManager, 'save', mock_save):
+             save_event(data=data, start_time=now)
+             mock_incr.assert_called_with([
+-                (tsdb.models.project_total_received_discarded, project.id),
++                (tsdb.models.project_total_received, project.id),
++                (tsdb.models.organization_total_received, project.organization.id),
+                 (tsdb.models.project_total_blacklisted, project.id),
+                 (tsdb.models.organization_total_blacklisted, project.organization_id),
++                (tsdb.models.project_total_received_discarded, project.id),
+             ],
+                 timestamp=to_datetime(now),
+             )

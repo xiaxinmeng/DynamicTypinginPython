@@ -1,0 +1,330 @@
+commit 1bc24e5c56de1b912465ec427d8db09a5bcad683
+Author: Dan Fuller <dfuller@sentry.io>
+Date:   Tue Feb 26 19:23:46 2019 -0800
+
+    feat(api): Allow metacharacters to be escaped in event/issue searching (SEN-153)
+    
+    `fnmatch.translate` doesn't currently support escaping metacharacters. Found some discussion about
+    this and a simple patch to allow escaping.
+    
+    As part of testing that this works as expected, also found that `positionCaseInsensitive` only
+    accepts a needle (basically a string) to search for. This means that wildcard matching is doesn't
+    work for message in both issue and event search. Converted it over to use `match`, and retained
+    case insensitivity by using (?i) to set the case insensitive flag. Also added this to matching for
+    other values.
+    
+    Also found that the handling of `message` in postgres also did not support regex matching. Switched
+    over to using it for wildcard matches, but only when using postgres. Use the normal `contains`
+    matching for non-wild card as usual.
+    
+    I also added a hack in to both postgres and snuba to strip the `^$` characters from the
+    beginning/end of the regex, since I assume it makes sense to search for the regex all throughout
+    the message. Not sure if this is required for other fields, if not we could just remove it from
+    `translate` in general.
+
+diff --git a/src/sentry/api/event_search.py b/src/sentry/api/event_search.py
+index 4c9c86cc3e..7bda5c503d 100644
+--- a/src/sentry/api/event_search.py
++++ b/src/sentry/api/event_search.py
+@@ -24,7 +24,6 @@ WILDCARD_CHARS = re.compile(r'[\*\[\]\?]')
+ 
+ def translate(pat):
+     """Translate a shell PATTERN to a regular expression.
+-    There is no way to quote meta-characters.
+     modified from: https://github.com/python/cpython/blob/2.7/Lib/fnmatch.py#L85
+     """
+ 
+@@ -33,7 +32,13 @@ def translate(pat):
+     while i < n:
+         c = pat[i]
+         i = i + 1
+-        if c == '*':
++        # fnmatch.translate has no way to handle escaping metacharacters.
++        # Applied this basic patch to handle it:
++        # https://bugs.python.org/file27570/issue8402.1.patch
++        if c == '\\':
++            res += re.escape(pat[i])
++            i += 1
++        elif c == '*':
+             res = res + '.*'
+         elif c == '?':
+             res = res + '.'
+@@ -427,12 +432,19 @@ def convert_search_filter_to_snuba_query(search_filter):
+         return env_conditions
+ 
+     elif snuba_name == 'message':
+-        # https://clickhouse.yandex/docs/en/query_language/functions/string_search_functions/#position-haystack-needle
+-        # positionCaseInsensitive returns 0 if not found and an index of 1 or more if found
+-        # so we should flip the operator here
+-        operator = '=' if search_filter.operator == '!=' else '!='
+-        # make message search case insensitive
+-        return [['positionCaseInsensitive', ['message', "'%s'" % (value,)]], operator, 0]
++        if search_filter.value.is_wildcard():
++            # XXX: We don't want the '^$' values at the beginning and end of
++            # the regex since we want to find the pattern anywhere in the
++            # message. Strip off here
++            value = search_filter.value.value[1:-1]
++            return [['match', ['message', "'(?i)%s'" % (value,)]], search_filter.operator, 1]
++        else:
++            # https://clickhouse.yandex/docs/en/query_language/functions/string_search_functions/#position-haystack-needle
++            # positionCaseInsensitive returns 0 if not found and an index of 1 or more if found
++            # so we should flip the operator here
++            operator = '=' if search_filter.operator == '!=' else '!='
++            # make message search case insensitive
++            return [['positionCaseInsensitive', ['message', "'%s'" % (value,)]], operator, 0]
+ 
+     else:
+         value = int(to_timestamp(value)) * 1000 if isinstance(value,
+@@ -449,7 +461,7 @@ def convert_search_filter_to_snuba_query(search_filter):
+             snuba_name = ['ifNull', [snuba_name, "''"]]
+ 
+         if search_filter.value.is_wildcard():
+-            return [['match', [snuba_name, "'%s'" % (value,)]], search_filter.operator, 1]
++            return [['match', [snuba_name, "'(?i)%s'" % (value,)]], search_filter.operator, 1]
+         else:
+             return [snuba_name, search_filter.operator, value]
+ 
+diff --git a/src/sentry/search/django/backend.py b/src/sentry/search/django/backend.py
+index ca44fb5ab8..12980ebfeb 100644
+--- a/src/sentry/search/django/backend.py
++++ b/src/sentry/search/django/backend.py
+@@ -24,7 +24,7 @@ from sentry.search.django.constants import (
+     SQLITE_SORT_CLAUSES
+ )
+ from sentry.utils.dates import to_timestamp
+-from sentry.utils.db import get_db_engine
++from sentry.utils.db import get_db_engine, is_postgres
+ 
+ 
+ class QuerySetBuilder(object):
+@@ -105,18 +105,10 @@ class CallbackCondition(Condition):
+ 
+ 
+ class QCallbackCondition(Condition):
+-    def __init__(self, callback, skip_if_falsey=False):
+-        """
+-        :param skip_if_falsey: Skip the condition entirely if the provided
+-        value evaluates to False
+-        """
++    def __init__(self, callback):
+         self.callback = callback
+-        self.skip_if_falsey = skip_if_falsey
+ 
+     def apply(self, queryset, value, search_filter=None):
+-        if self.skip_if_falsey and not value:
+-            return queryset
+-
+         q = self.callback(value)
+         # TODO: Once we're entirely using search filters we can just pass them
+         # in and not have this check. This is to support the old style search
+@@ -304,6 +296,19 @@ def unassigned_filter(unassigned, projects):
+     return query
+ 
+ 
++def message_regex_filter(queryset, message):
++    operator = ('!' if message.operator == '!=' else '') + '~*'
++
++    # XXX: We translate these to a regex like '^<pattern>$'. Since we want to
++    # search anywhere in the string, drop those characters.
++    message_value = message.value.value[1:-1]
++
++    return queryset.extra(
++        where=['message {0} %s OR view {0} %s'.format(operator)],
++        params=[message_value, message_value],
++    )
++
++
+ class DjangoSearchBackend(SearchBackend):
+     def query(self, projects, tags=None, environments=None, sort_by='date', limit=100,
+               cursor=None, count_hits=False, paginator_options=None, search_filters=None,
+@@ -329,13 +334,7 @@ class DjangoSearchBackend(SearchBackend):
+             GroupStatus.PENDING_MERGE,
+         ])
+ 
+-        group_queryset = SearchFilterQuerySetBuilder({
+-            'message': QCallbackCondition(
+-                lambda message: Q(
+-                    Q(message__icontains=message) | Q(culprit__icontains=message),
+-                ),
+-                skip_if_falsey=True,
+-            ),
++        qs_builder_conditions = {
+             'status': QCallbackCondition(
+                 lambda status: Q(status=status),
+             ),
+@@ -361,8 +360,29 @@ class DjangoSearchBackend(SearchBackend):
+                 ),
+             ),
+             'active_at': SearchFilterScalarCondition('active_at'),
+-        }).build(group_queryset, search_filters)
++        }
++
++        message = [
++            search_filter for search_filter in search_filters
++            if search_filter.key.name == 'message'
++        ]
++        if message and message[0].value.raw_value:
++            message = message[0]
++            # We only support full wildcard matching in postgres
++            if is_postgres() and message.value.is_wildcard():
++                group_queryset = message_regex_filter(group_queryset, message)
++            else:
++                # Otherwise, use the standard LIKE query
++                qs_builder_conditions['message'] = QCallbackCondition(
++                    lambda message: Q(
++                        Q(message__icontains=message) | Q(culprit__icontains=message),
++                    ),
++                )
+ 
++        group_queryset = SearchFilterQuerySetBuilder(qs_builder_conditions).build(
++            group_queryset,
++            search_filters,
++        )
+         # filter out groups which are beyond the retention period
+         retention = quotas.get_event_retention(organization=projects[0].organization)
+         if retention:
+diff --git a/src/sentry/testutils/skips.py b/src/sentry/testutils/skips.py
+index d252b7ddfe..db013f006f 100644
+--- a/src/sentry/testutils/skips.py
++++ b/src/sentry/testutils/skips.py
+@@ -7,6 +7,7 @@ sentry.testutils.skips
+ """
+ from __future__ import absolute_import
+ 
++import os
+ import socket
+ import pytest
+ 
+@@ -35,3 +36,12 @@ def cassandra_is_available():
+ requires_cassandra = pytest.mark.skipif(
+     not cassandra_is_available(), reason="requires cassandra server running"
+ )
++
++
++def xfail_if_not_postgres(reason):
++    def decorator(function):
++        return pytest.mark.xfail(
++            os.environ.get('TEST_SUITE') != 'postgres',
++            reason=reason,
++        )(function)
++    return decorator
+diff --git a/tests/sentry/api/test_event_search.py b/tests/sentry/api/test_event_search.py
+index 7b84a47e98..e35bd97253 100644
+--- a/tests/sentry/api/test_event_search.py
++++ b/tests/sentry/api/test_event_search.py
+@@ -483,8 +483,8 @@ class GetSnubaQueryArgsTest(TestCase):
+     def test_wildcard(self):
+         assert get_snuba_query_args('release:3.1.* user.email:*@example.com') == {
+             'conditions': [
+-                [['match', ['tags[sentry:release]', "'^3\\.1\\..*$'"]], '=', 1],
+-                [['match', ['email', "'^.*\\@example\\.com$'"]], '=', 1],
++                [['match', ['tags[sentry:release]', "'(?i)^3\\.1\\..*$'"]], '=', 1],
++                [['match', ['email', "'(?i)^.*\\@example\\.com$'"]], '=', 1],
+             ],
+             'filter_keys': {},
+         }
+@@ -492,8 +492,30 @@ class GetSnubaQueryArgsTest(TestCase):
+     def test_negated_wildcard(self):
+         assert get_snuba_query_args('!release:3.1.* user.email:*@example.com') == {
+             'conditions': [
+-                [['match', [['ifNull', ['tags[sentry:release]', "''"]], "'^3\\.1\\..*$'"]], '!=', 1],
+-                [['match', ['email', "'^.*\\@example\\.com$'"]], '=', 1],
++                [['match', [['ifNull', ['tags[sentry:release]', "''"]],
++                            "'(?i)^3\\.1\\..*$'"]], '!=', 1],
++                [['match', ['email', "'(?i)^.*\\@example\\.com$'"]], '=', 1],
++            ],
++            'filter_keys': {},
++        }
++
++    def test_escaped_wildcard(self):
++        assert get_snuba_query_args('release:3.1.\\* user.email:\\*@example.com') == {
++            'conditions': [
++                [['match', ['tags[sentry:release]', "'(?i)^3\\.1\\.\\*$'"]], '=', 1],
++                [['match', ['email', "'(?i)^\*\\@example\\.com$'"]], '=', 1],
++            ],
++            'filter_keys': {},
++        }
++        assert get_snuba_query_args('release:\\\\\\*') == {
++            'conditions': [
++                [['match', ['tags[sentry:release]', "'(?i)^\\\\\\*$'"]], '=', 1],
++            ],
++            'filter_keys': {},
++        }
++        assert get_snuba_query_args('release:\\\\*') == {
++            'conditions': [
++                [['match', ['tags[sentry:release]', "'(?i)^\\\\.*$'"]], '=', 1],
+             ],
+             'filter_keys': {},
+         }
+diff --git a/tests/snuba/search/test_backend.py b/tests/snuba/search/test_backend.py
+index 0ef8252964..472fddf0d0 100644
+--- a/tests/snuba/search/test_backend.py
++++ b/tests/snuba/search/test_backend.py
+@@ -19,7 +19,10 @@ from sentry.models import (
+ )
+ from sentry.search.base import ANY
+ from sentry.search.snuba.backend import SnubaSearchBackend
+-from sentry.testutils import SnubaTestCase
++from sentry.testutils import (
++    SnubaTestCase,
++    xfail_if_not_postgres,
++)
+ 
+ 
+ def date_to_query_format(date):
+@@ -1252,3 +1255,55 @@ class SnubaSearchTest(SnubaTestCase):
+             search_filter_query='first_release:%s' % release.version,
+         )
+         assert set(results) == set([self.group1])
++
++    @xfail_if_not_postgres('Wildcard searching only supported in Postgres')
++    def test_wildcard(self):
++        escaped_event = self.store_event(
++            data={
++                'fingerprint': ['hello-there'],
++                'event_id': 'f' * 32,
++                'message': 'somet[hing]',
++                'environment': 'production',
++                'tags': {
++                    'server': 'example.com',
++                },
++                'timestamp': self.base_datetime.isoformat()[:19],
++                'stacktrace': {
++                    'frames': [{
++                        'module': 'group1'
++                    }]
++                },
++            },
++            project_id=self.project.id,
++        )
++        # Note: Adding in `environment:production` so that we make sure we query
++        # in both snuba and postgres
++        results = self.make_query(
++            search_filter_query='environment:production so*t',
++        )
++        assert set(results) == set([escaped_event.group])
++        # Make sure it's case insensitive
++        results = self.make_query(
++            search_filter_query='environment:production SO*t',
++        )
++        assert set(results) == set([escaped_event.group])
++        results = self.make_query(
++            search_filter_query='environment:production so*zz',
++        )
++        assert set(results) == set()
++        results = self.make_query(
++            search_filter_query='environment:production \[hing\]',
++        )
++        assert set(results) == set([escaped_event.group])
++        results = self.make_query(
++            search_filter_query='environment:production s*\]',
++        )
++        assert set(results) == set([escaped_event.group])
++        results = self.make_query(
++            search_filter_query='environment:production [s][of][mz]',
++        )
++        assert set(results) == set([escaped_event.group])
++        results = self.make_query(
++            search_filter_query='environment:production [z][of][mz]',
++        )
++        assert set(results) == set()

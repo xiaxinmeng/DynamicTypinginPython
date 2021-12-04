@@ -1,0 +1,1655 @@
+commit f86ce0975d8496b61ed6e2206cab917d0779cec9
+Author: Toshio Kuratomi <a.badger@gmail.com>
+Date:   Mon May 8 22:19:54 2017 -0700
+
+    Add a directory walker to copy
+    
+    * We need a directory walker that can handle symlinks, empty directories,
+      and some other odd needs.  This commit contains a directory walker that
+      can do all that.  The walker returns information about the files in the
+      directories that we can then use to implement different strategies for
+      copying the files to the remote machines.
+    * Add local_follow parameter to copy that follows local symlinks (follow
+      is for remote symlinks)
+    * Refactor the copying of files out of run into its own method
+    * Add new integration tests for copy
+    
+    Fixes #24949
+    Fixes #21513
+
+diff --git a/lib/ansible/modules/files/copy.py b/lib/ansible/modules/files/copy.py
+index 7187571057..33c37afed7 100644
+--- a/lib/ansible/modules/files/copy.py
++++ b/lib/ansible/modules/files/copy.py
+@@ -96,7 +96,14 @@ options:
+     choices: [ "yes", "no" ]
+     version_added: "1.8"
+     description:
+-      - 'This flag indicates that filesystem links, if they exist, should be followed.'
++      - 'This flag indicates that filesystem links in the destination, if they exist, should be followed.'
++  local_follow:
++    required: false
++    default: "yes"
++    choices: [ "yes", "no" ]
++    version_added: "2.4"
++    description:
++      - 'This flag indicates that filesystem links in the source tree, if they exist, should be followed.'
+ extends_documentation_fragment:
+     - files
+     - validate
+@@ -273,6 +280,7 @@ def main():
+             validate          = dict(required=False, type='str'),
+             directory_mode    = dict(required=False, type='raw'),
+             remote_src        = dict(required=False, type='bool'),
++            local_follow      = dict(required=False, type='bool'),
+         ),
+         add_file_common_args=True,
+         supports_check_mode=True,
+diff --git a/lib/ansible/parsing/dataloader.py b/lib/ansible/parsing/dataloader.py
+index 27d624bf1d..93ed129e7b 100644
+--- a/lib/ansible/parsing/dataloader.py
++++ b/lib/ansible/parsing/dataloader.py
+@@ -29,7 +29,7 @@ from yaml import YAMLError
+ from ansible.errors import AnsibleFileNotFound, AnsibleParserError
+ from ansible.errors.yaml_strings import YAML_SYNTAX_ERROR
+ from ansible.module_utils.basic import is_executable
+-from ansible.module_utils.six import text_type, string_types
++from ansible.module_utils.six import binary_type, text_type
+ from ansible.module_utils._text import to_bytes, to_native, to_text
+ from ansible.parsing.vault import VaultLib, b_HEADER, is_encrypted, is_encrypted_file
+ from ansible.parsing.quoting import unquote
+@@ -184,7 +184,7 @@ class DataLoader:
+         Reads the file contents from the given file name, and will decrypt them
+         if they are found to be vault-encrypted.
+         '''
+-        if not file_name or not isinstance(file_name, string_types):
++        if not file_name or not isinstance(file_name, (binary_type, text_type)):
+             raise AnsibleParserError("Invalid filename: '%s'" % str(file_name))
+ 
+         b_file_name = to_bytes(file_name)
+@@ -380,7 +380,7 @@ class DataLoader:
+                     break
+ 
+         if result is None:
+-            raise AnsibleFileNotFound(file_name=source, paths=search)
++            raise AnsibleFileNotFound(file_name=source, paths=[to_text(p) for p in search])
+ 
+         return result
+ 
+@@ -405,7 +405,7 @@ class DataLoader:
+         Temporary files are cleanup in the destructor
+         """
+ 
+-        if not file_path or not isinstance(file_path, string_types):
++        if not file_path or not isinstance(file_path, (binary_type, text_type)):
+             raise AnsibleParserError("Invalid filename: '%s'" % to_native(file_path))
+ 
+         b_file_path = to_bytes(file_path, errors='surrogate_or_strict')
+diff --git a/lib/ansible/plugins/action/copy.py b/lib/ansible/plugins/action/copy.py
+index 7d45196acb..412ef54bd9 100644
+--- a/lib/ansible/plugins/action/copy.py
++++ b/lib/ansible/plugins/action/copy.py
+@@ -1,4 +1,5 @@
+ # (c) 2012-2014, Michael DeHaan <michael.dehaan@gmail.com>
++# (c) 2017 Toshio Kuratomi <tkuraotmi@ansible.com>
+ #
+ # This file is part of Ansible
+ #
+@@ -21,8 +22,11 @@ __metaclass__ = type
+ 
+ import json
+ import os
++import os.path
+ import stat
+ import tempfile
++import traceback
++from itertools import chain
+ 
+ from ansible.errors import AnsibleError, AnsibleFileNotFound
+ from ansible.module_utils._text import to_bytes, to_native, to_text
+@@ -31,8 +35,364 @@ from ansible.plugins.action import ActionBase
+ from ansible.utils.hashing import checksum
+ 
+ 
++def _walk_dirs(topdir, base_path=None, local_follow=False, trailing_slash_detector=None):
++    """
++    Walk a filesystem tree returning enough information to copy the files
++
++    :arg topdir: The directory that the filesystem tree is rooted at
++    :kwarg base_path: The initial directory structure to strip off of the
++        files for the destination directory.  If this is None (the default),
++        the base_path is set to ``top_dir``.
++    :kwarg local_follow: Whether to follow symlinks on the source.  When set
++        to False, no symlinks are dereferenced.  When set to True (the
++        default), the code will dereference most symlinks.  However, symlinks
++        can still be present if needed to break a circular link.
++    :kwarg trailing_slash_detector: Function to determine if a path has
++        a trailing directory separator. Only needed when dealing with paths on
++        a remote machine (in which case, pass in a function that is aware of the
++        directory separator conventions on the remote machine).
++    :returns: dictionary of tuples.  All of the path elements in the structure are text strings.
++            This separates all the files, directories, and symlinks along with
++            important information about each::
++
++                { 'files': [('/absolute/path/to/copy/from', 'relative/path/to/copy/to'), ...],
++                  'directories': [('/absolute/path/to/copy/from', 'relative/path/to/copy/to'), ...],
++                  'symlinks': [('/symlink/target/path', 'relative/path/to/copy/to'), ...],
++                }
++
++        The ``symlinks`` field is only populated if ``local_follow`` is set to False
++        *or* a circular symlink cannot be dereferenced.
++
++    """
++    # Convert the path segments into byte strings
++
++    r_files = {'files': [], 'directories': [], 'symlinks': []}
++
++    def _recurse(topdir, rel_offset, parent_dirs, rel_base=u''):
++        """
++        This is a closure (function utilizing variables from it's parent
++        function's scope) so that we only need one copy of all the containers.
++        Note that this function uses side effects (See the Variables used from
++        outer scope).
++
++        :arg topdir: The directory we are walking for files
++        :arg rel_offset: Integer defining how many characters to strip off of
++            the beginning of a path
++        :arg parent_dirs: Directories that we're copying that this directory is in.
++        :kwarg rel_base: String to prepend to the path after ``rel_offset`` is
++            applied to form the relative path.
++
++        Variables used from the outer scope
++        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++        :r_files: Dictionary of files in the hierarchy.  See the return value
++            for :func:`walk` for the structure of this dictionary.
++        :local_follow: Read-only inside of :func:`_recurse`. Whether to follow symlinks
++        """
++        for base_path, sub_folders, files in os.walk(topdir):
++            for filename in files:
++                filepath = os.path.join(base_path, filename)
++                dest_filepath = os.path.join(rel_base, filepath[rel_offset:])
++
++                if os.path.islink(filepath):
++                    # Dereference the symlnk
++                    real_file = os.path.realpath(filepath)
++                    if local_follow and os.path.isfile(real_file):
++                        # Add the file pointed to by the symlink
++                        r_files['files'].append((real_file, dest_filepath))
++                    else:
++                        # Mark this file as a symlink to copy
++                        r_files['symlinks'].append((os.readlink(filepath), dest_filepath))
++                else:
++                    # Just a normal file
++                    r_files['files'].append((filepath, dest_filepath))
++
++            for dirname in sub_folders:
++                dirpath = os.path.join(base_path, dirname)
++                dest_dirpath = os.path.join(rel_base, dirpath[rel_offset:])
++                real_dir = os.path.realpath(dirpath)
++                dir_stats = os.stat(real_dir)
++
++                if os.path.islink(dirpath):
++                    if local_follow:
++                        if (dir_stats.st_dev, dir_stats.st_ino) in parent_dirs:
++                            # Just insert the symlink if the target directory
++                            # exists inside of the copy already
++                            r_files['symlinks'].append((os.readlink(dirpath), dest_dirpath))
++                        else:
++                            # Walk the dirpath to find all parent directories.
++                            new_parents = set()
++                            parent_dir_list = os.path.dirname(dirpath).split(os.path.sep)
++                            for parent in range(len(parent_dir_list), 0, -1):
++                                parent_stat = os.stat(u'/'.join(parent_dir_list[:parent]))
++                                if (parent_stat.st_dev, parent_stat.st_ino) in parent_dirs:
++                                    # Reached the point at which the directory
++                                    # tree is already known.  Don't add any
++                                    # more or we might go to an ancestor that
++                                    # isn't being copied.
++                                    break
++                                new_parents.add((parent_stat.st_dev, parent_stat.st_ino))
++
++                            if (dir_stats.st_dev, dir_stats.st_ino) in new_parents:
++                                # This was a a circular symlink.  So add it as
++                                # a symlink
++                                r_files['symlinks'].append((os.readlink(dirpath), dest_dirpath))
++                            else:
++                                # Walk the directory pointed to by the symlink
++                                r_files['directories'].append((real_dir, dest_dirpath))
++                                offset = len(real_dir) + 1
++                                _recurse(real_dir, offset, parent_dirs.union(new_parents), rel_base=dest_dirpath)
++                    else:
++                        # Add the symlink to the destination
++                        r_files['symlinks'].append((os.readlink(dirpath), dest_dirpath))
++                else:
++                    # Just a normal directory
++                    r_files['directories'].append((dirpath, dest_dirpath))
++
++    # Check if the source ends with a "/" so that we know which directory
++    # level to work at (similar to rsync)
++    source_trailing_slash = False
++    if trailing_slash_detector:
++        source_trailing_slash = trailing_slash_detector(topdir)
++    else:
++        source_trailing_slash = topdir.endswith(os.path.sep)
++
++    # Calculate the offset needed to strip the base_path to make relative
++    # paths
++    if base_path is None:
++        base_path = topdir
++    if not source_trailing_slash:
++        base_path = os.path.dirname(base_path)
++    if topdir.startswith(base_path):
++        offset = len(base_path)
++
++    # Make sure we're making the new paths relative
++    if trailing_slash_detector and not trailing_slash_detector(base_path):
++        offset += 1
++    elif not base_path.endswith(os.path.sep):
++        offset += 1
++
++    if os.path.islink(topdir) and not local_follow:
++        r_files['symlinks'] = (os.readlink(topdir), os.path.basename(topdir))
++        return r_files
++
++    dir_stats = os.stat(topdir)
++    parents = frozenset(((dir_stats.st_dev, dir_stats.st_ino),))
++    # Actually walk the directory hierarchy
++    _recurse(topdir, offset, parents)
++
++    return r_files
++
++
+ class ActionModule(ActionBase):
+ 
++    def _copy_file(self, source_full, source_rel, content, content_tempfile,
++                   dest, task_vars, tmp, delete_remote_tmp):
++        decrypt = boolean(self._task.args.get('decrypt', True), strict=False)
++        follow = boolean(self._task.args.get('follow', False), strict=False)
++        force = boolean(self._task.args.get('force', 'yes'), strict=False)
++        raw = boolean(self._task.args.get('raw', 'no'), strict=False)
++
++        result = {}
++        result['diff'] = []
++
++        # If the local file does not exist, get_real_file() raises AnsibleFileNotFound
++        try:
++            source_full = self._loader.get_real_file(source_full, decrypt=decrypt)
++        except AnsibleFileNotFound as e:
++            result['failed'] = True
++            result['msg'] = "could not find src=%s, %s" % (source_full, to_text(e))
++            self._remove_tmp_path(tmp)
++            return result
++
++        # Get the local mode and set if user wanted it preserved
++        # https://github.com/ansible/ansible-modules-core/issues/1124
++        lmode = None
++        if self._task.args.get('mode', None) == 'preserve':
++            lmode = '0%03o' % stat.S_IMODE(os.stat(source_full).st_mode)
++
++        # This is kind of optimization - if user told us destination is
++        # dir, do path manipulation right away, otherwise we still check
++        # for dest being a dir via remote call below.
++        if self._connection._shell.path_has_trailing_slash(dest):
++            dest_file = self._connection._shell.join_path(dest, source_rel)
++        else:
++            dest_file = self._connection._shell.join_path(dest)
++
++        # Attempt to get remote file info
++        dest_status = self._execute_remote_stat(dest_file, all_vars=task_vars, follow=follow, tmp=tmp, checksum=force)
++
++        if dest_status['exists'] and dest_status['isdir']:
++            # The dest is a directory.
++            if content is not None:
++                # If source was defined as content remove the temporary file and fail out.
++                self._remove_tempfile_if_content_defined(content, content_tempfile)
++                self._remove_tmp_path(tmp)
++                result['failed'] = True
++                result['msg'] = "can not use content with a dir as dest"
++                return result
++            else:
++                # Append the relative source location to the destination and get remote stats again
++                dest_file = self._connection._shell.join_path(dest, source_rel)
++                dest_status = self._execute_remote_stat(dest_file, all_vars=task_vars, follow=follow, tmp=tmp, checksum=force)
++
++        if dest_status['exists'] and not force:
++            # remote_file exists so continue to next iteration.
++            return None
++
++        # Generate a hash of the local file.
++        local_checksum = checksum(source_full)
++
++        if local_checksum != dest_status['checksum']:
++            # The checksums don't match and we will change or error out.
++
++            # Create a tmp path if missing only if this is not recursive.
++            # If this is recursive we already have a tmp path.
++            if delete_remote_tmp:
++                if tmp is None or "-tmp-" not in tmp:
++                    tmp = self._make_tmp_path()
++
++            if self._play_context.diff and not raw:
++                result['diff'].append(self._get_diff_data(dest_file, source_full, task_vars))
++
++            if self._play_context.check_mode:
++                self._remove_tempfile_if_content_defined(content, content_tempfile)
++                module_return = dict(changed=True)
++                return module_return
++
++            # Define a remote directory that we will copy the file to.
++            tmp_src = self._connection._shell.join_path(tmp, 'source')
++
++            remote_path = None
++
++            if not raw:
++                remote_path = self._transfer_file(source_full, tmp_src)
++            else:
++                self._transfer_file(source_full, dest_file)
++
++            # We have copied the file remotely and no longer require our content_tempfile
++            self._remove_tempfile_if_content_defined(content, content_tempfile)
++            self._loader.cleanup_tmp_file(source_full)
++
++            # fix file permissions when the copy is done as a different user
++            if remote_path:
++                self._fixup_perms2((tmp, remote_path))
++
++            if raw:
++                # Continue to next iteration if raw is defined.
++                return None
++
++            # Run the copy module
++
++            # src and dest here come after original and override them
++            # we pass dest only to make sure it includes trailing slash in case of recursive copy
++            new_module_args = self._task.args.copy()
++            new_module_args.update(
++                dict(
++                    src=tmp_src,
++                    dest=dest,
++                    original_basename=source_rel,
++                )
++            )
++            if lmode:
++                new_module_args['mode'] = lmode
++
++            # remove action plugin only keys
++            for key in ('content', 'decrypt'):
++                if key in new_module_args:
++                    del new_module_args[key]
++
++            module_return = self._execute_module(module_name='copy',
++                                                 module_args=new_module_args, task_vars=task_vars,
++                                                 tmp=tmp, delete_remote_tmp=delete_remote_tmp)
++
++        else:
++            # no need to transfer the file, already correct hash, but still need to call
++            # the file module in case we want to change attributes
++            self._remove_tempfile_if_content_defined(content, content_tempfile)
++            self._loader.cleanup_tmp_file(source_full)
++
++            if raw:
++                # Continue to next iteration if raw is defined.
++                self._remove_tmp_path(tmp)
++                return None
++
++            # Fix for https://github.com/ansible/ansible-modules-core/issues/1568.
++            # If checksums match, and follow = True, find out if 'dest' is a link. If so,
++            # change it to point to the source of the link.
++            if follow:
++                dest_status_nofollow = self._execute_remote_stat(dest_file, all_vars=task_vars, follow=False)
++                if dest_status_nofollow['islnk'] and 'lnk_source' in dest_status_nofollow.keys():
++                    dest = dest_status_nofollow['lnk_source']
++
++            # Build temporary module_args.
++            new_module_args = self._task.args.copy()
++            new_module_args.update(
++                dict(
++                    src=source_rel,
++                    dest=dest,
++                    original_basename=source_rel
++                )
++            )
++            if lmode:
++                new_module_args['mode'] = lmode
++
++            # Execute the file module.
++            module_return = self._execute_module(module_name='file',
++                                                 module_args=new_module_args, task_vars=task_vars,
++                                                 tmp=tmp, delete_remote_tmp=delete_remote_tmp)
++
++        if not module_return.get('checksum'):
++            module_return['checksum'] = local_checksum
++
++        return module_return
++
++    def _get_file_args(self):
++        new_module_args = {'recurse': False}
++
++        if 'attributes' in self._task.args:
++            new_module_args['attributes'] = self._task.args['attributes']
++        if 'follow' in self._task.args:
++            new_module_args['follow'] = self._task.args['follow']
++        if 'force' in self._task.args:
++            new_module_args['force'] = self._task.args['force']
++        if 'group' in self._task.args:
++            new_module_args['group'] = self._task.args['group']
++        if 'mode' in self._task.args:
++            new_module_args['mode'] = self._task.args['mode']
++        if 'owner' in self._task.args:
++            new_module_args['owner'] = self._task.args['owner']
++        if 'selevel' in self._task.args:
++            new_module_args['selevel'] = self._task.args['selevel']
++        if 'serole' in self._task.args:
++            new_module_args['serole'] = self._task.args['serole']
++        if 'setype' in self._task.args:
++            new_module_args['setype'] = self._task.args['setype']
++        if 'seuser' in self._task.args:
++            new_module_args['seuser'] = self._task.args['seuser']
++        if 'unsafe_writes' in self._task.args:
++            new_module_args['unsafe_writes'] = self._task.args['unsafe_writes']
++
++        return new_module_args
++
++    def _create_content_tempfile(self, content):
++        ''' Create a tempfile containing defined content '''
++        fd, content_tempfile = tempfile.mkstemp()
++        f = os.fdopen(fd, 'wb')
++        content = to_bytes(content)
++        try:
++            f.write(content)
++        except Exception as err:
++            os.remove(content_tempfile)
++            raise Exception(err)
++        finally:
++            f.close()
++        return content_tempfile
++
++    def _remove_tempfile_if_content_defined(self, content, content_tempfile):
++        if content is not None:
++            os.remove(content_tempfile)
++
+     def run(self, tmp=None, task_vars=None):
+         ''' handler for file transfer operations '''
+         if task_vars is None:
+@@ -43,11 +403,8 @@ class ActionModule(ActionBase):
+         source = self._task.args.get('src', None)
+         content = self._task.args.get('content', None)
+         dest = self._task.args.get('dest', None)
+-        raw = boolean(self._task.args.get('raw', 'no'), strict=False)
+-        force = boolean(self._task.args.get('force', 'yes'), strict=False)
+         remote_src = boolean(self._task.args.get('remote_src', False), strict=False)
+-        follow = boolean(self._task.args.get('follow', False), strict=False)
+-        decrypt = boolean(self._task.args.get('decrypt', True), strict=False)
++        local_follow = boolean(self._task.args.get('local_follow', True), strict=False)
+ 
+         result['failed'] = True
+         if (source is None and content is None) or dest is None:
+@@ -62,11 +419,6 @@ class ActionModule(ActionBase):
+         if result.get('failed'):
+             return result
+ 
+-        # Check if the source ends with a "/"
+-        source_trailing_slash = False
+-        if source:
+-            source_trailing_slash = self._connection._shell.path_has_trailing_slash(source)
+-
+         # Define content_tempfile in case we set it after finding content populated.
+         content_tempfile = None
+ 
+@@ -96,38 +448,27 @@ class ActionModule(ActionBase):
+             except AnsibleError as e:
+                 result['failed'] = True
+                 result['msg'] = to_text(e)
++                result['exception'] = traceback.format_exc()
+                 return result
+ 
+         # A list of source file tuples (full_path, relative_path) which will try to copy to the destination
+-        source_files = []
++        source_files = {'files': [], 'directories': [], 'symlinks': []}
+ 
+         # If source is a directory populate our list else source is a file and translate it to a tuple.
+         if os.path.isdir(to_bytes(source, errors='surrogate_or_strict')):
+-            # Get the amount of spaces to remove to get the relative path.
+-            if source_trailing_slash:
+-                sz = len(source)
+-            else:
+-                sz = len(source.rsplit('/', 1)[0]) + 1
+-
+-            # Walk the directory and append the file tuples to source_files.
+-            for base_path, sub_folders, files in os.walk(to_bytes(source)):
+-                for file in files:
+-                    full_path = to_text(os.path.join(base_path, file), errors='surrogate_or_strict')
+-                    rel_path = full_path[sz:]
+-                    if rel_path.startswith('/'):
+-                        rel_path = rel_path[1:]
+-                    source_files.append((full_path, rel_path))
+-
+-                # recurse into subdirs
+-                for sf in sub_folders:
+-                    source_files += self._get_recursive_files(os.path.join(source, to_text(sf)), sz=sz)
++            # Get a list of the files we want to replicate on the remote side
++            source_files = _walk_dirs(source, local_follow=local_follow,
++                                      trailing_slash_detector=self._connection._shell.path_has_trailing_slash)
+ 
+             # If it's recursive copy, destination is always a dir,
+             # explicitly mark it so (note - copy module relies on this).
+             if not self._connection._shell.path_has_trailing_slash(dest):
+                 dest = self._connection._shell.join_path(dest, '')
++            # FIXME: Can we optimize cases where there's only one file, no
++            # symlinks and any number of directories?  In the original code,
++            # empty directories are not copied....
+         else:
+-            source_files.append((source, os.path.basename(source)))
++            source_files['files'] = [(source, os.path.basename(source))]
+ 
+         changed = False
+         module_return = dict(changed=False)
+@@ -136,8 +477,13 @@ class ActionModule(ActionBase):
+         # Used to cut down on command calls when not recursive.
+         module_executed = False
+ 
+-        # Tell _execute_module to delete the file if there is one file.
+-        delete_remote_tmp = (len(source_files) == 1)
++        # Optimization: Can delete remote_tmp on the first call if we're only
++        # copying a single file.  Otherwise we keep the remote_tmp until it
++        # is no longer needed.
++        delete_remote_tmp = False
++        if sum(len(f) for f in chain(source_files.values())) == 1:
++            # Tell _execute_module to delete the file if there is one file.
++            delete_remote_tmp = True
+ 
+         # If this is a recursive action create a tmp path that we can share as the _exec_module create is too late.
+         if not delete_remote_tmp:
+@@ -147,220 +493,76 @@ class ActionModule(ActionBase):
+         # expand any user home dir specifier
+         dest = self._remote_expand_user(dest)
+ 
+-        # Keep original value for mode parameter
+-        mode_value = self._task.args.get('mode', None)
+-
+-        diffs = []
+-        for source_full, source_rel in source_files:
+-
+-            # If the local file does not exist, get_real_file() raises AnsibleFileNotFound
+-            try:
+-                source_full = self._loader.get_real_file(source_full, decrypt=decrypt)
+-            except AnsibleFileNotFound as e:
+-                result['failed'] = True
+-                result['msg'] = "could not find src=%s, %s" % (source_full, e)
+-                self._remove_tmp_path(tmp)
+-                return result
+-
+-            # Get the local mode and set if user wanted it preserved
+-            # https://github.com/ansible/ansible-modules-core/issues/1124
+-            if self._task.args.get('mode', None) == 'preserve':
+-                lmode = '0%03o' % stat.S_IMODE(os.stat(source_full).st_mode)
+-                self._task.args['mode'] = lmode
+-
+-            # This is kind of optimization - if user told us destination is
+-            # dir, do path manipulation right away, otherwise we still check
+-            # for dest being a dir via remote call below.
+-            if self._connection._shell.path_has_trailing_slash(dest):
+-                dest_file = self._connection._shell.join_path(dest, source_rel)
+-            else:
+-                dest_file = self._connection._shell.join_path(dest)
+-
+-            # Attempt to get remote file info
+-            dest_status = self._execute_remote_stat(dest_file, all_vars=task_vars, follow=follow, tmp=tmp, checksum=force)
+-
+-            if dest_status['exists'] and dest_status['isdir']:
+-                # The dest is a directory.
+-                if content is not None:
+-                    # If source was defined as content remove the temporary file and fail out.
+-                    self._remove_tempfile_if_content_defined(content, content_tempfile)
+-                    self._remove_tmp_path(tmp)
+-                    result['failed'] = True
+-                    result['msg'] = "can not use content with a dir as dest"
+-                    return result
+-                else:
+-                    # Append the relative source location to the destination and get remote stats again
+-                    dest_file = self._connection._shell.join_path(dest, source_rel)
+-                    dest_status = self._execute_remote_stat(dest_file, all_vars=task_vars, follow=follow, tmp=tmp, checksum=force)
+-
+-            if dest_status['exists'] and not force:
+-                # remote_file exists so continue to next iteration.
++        implicit_directories = set()
++        for source_full, source_rel in source_files['files']:
++            # copy files over.  This happens first as directories that have
++            # a file do not need to be created later
++            module_return = self._copy_file(source_full, source_rel, content, content_tempfile,
++                                            dest, task_vars, tmp, delete_remote_tmp)
++            if module_return is None:
+                 continue
+ 
+-            # Generate a hash of the local file.
+-            local_checksum = checksum(source_full)
+-
+-            if local_checksum != dest_status['checksum']:
+-                # The checksums don't match and we will change or error out.
+-                changed = True
+-
+-                # Create a tmp path if missing only if this is not recursive.
+-                # If this is recursive we already have a tmp path.
+-                if delete_remote_tmp:
+-                    if tmp is None or "-tmp-" not in tmp:
+-                        tmp = self._make_tmp_path()
+-
+-                if self._play_context.diff and not raw:
+-                    diffs.append(self._get_diff_data(dest_file, source_full, task_vars))
+-
+-                if self._play_context.check_mode:
+-                    self._remove_tempfile_if_content_defined(content, content_tempfile)
+-                    changed = True
+-                    module_return = dict(changed=True)
+-                    continue
+-
+-                # Define a remote directory that we will copy the file to.
+-                tmp_src = self._connection._shell.join_path(tmp, 'source')
+-
+-                remote_path = None
+-
+-                if not raw:
+-                    remote_path = self._transfer_file(source_full, tmp_src)
+-                else:
+-                    self._transfer_file(source_full, dest_file)
+-
+-                # We have copied the file remotely and no longer require our content_tempfile
+-                self._remove_tempfile_if_content_defined(content, content_tempfile)
+-                self._loader.cleanup_tmp_file(source_full)
+-
+-                # fix file permissions when the copy is done as a different user
+-                if remote_path:
+-                    self._fixup_perms2((tmp, remote_path))
+-
+-                if raw:
+-                    # Continue to next iteration if raw is defined.
+-                    continue
+-
+-                # Run the copy module
+-
+-                # src and dest here come after original and override them
+-                # we pass dest only to make sure it includes trailing slash in case of recursive copy
+-                new_module_args = self._task.args.copy()
+-                new_module_args.update(
+-                    dict(
+-                        src=tmp_src,
+-                        dest=dest,
+-                        original_basename=source_rel,
+-                    )
+-                )
+-
+-                # remove action plugin only keys
+-                for key in ('content', 'decrypt'):
+-                    if key in new_module_args:
+-                        del new_module_args[key]
+-
+-                module_return = self._execute_module(module_name='copy',
+-                                                     module_args=new_module_args, task_vars=task_vars,
+-                                                     tmp=tmp, delete_remote_tmp=delete_remote_tmp)
+-                module_executed = True
+-
+-            else:
+-                # no need to transfer the file, already correct hash, but still need to call
+-                # the file module in case we want to change attributes
+-                self._remove_tempfile_if_content_defined(content, content_tempfile)
+-                self._loader.cleanup_tmp_file(source_full)
+-
+-                if raw:
+-                    # Continue to next iteration if raw is defined.
+-                    self._remove_tmp_path(tmp)
+-                    continue
+-
+-                # Fix for https://github.com/ansible/ansible-modules-core/issues/1568.
+-                # If checksums match, and follow = True, find out if 'dest' is a link. If so,
+-                # change it to point to the source of the link.
+-                if follow:
+-                    dest_status_nofollow = self._execute_remote_stat(dest_file, all_vars=task_vars, follow=False)
+-                    if dest_status_nofollow['islnk'] and 'lnk_source' in dest_status_nofollow.keys():
+-                        dest = dest_status_nofollow['lnk_source']
+-
+-                # Build temporary module_args.
+-                new_module_args = self._task.args.copy()
+-                new_module_args.update(
+-                    dict(
+-                        src=source_rel,
+-                        dest=dest,
+-                        original_basename=source_rel
+-                    )
+-                )
++            paths = os.path.split(source_rel)
++            dir_path = ''
++            for dir_component in paths:
++                os.path.join(dir_path, dir_component)
++                implicit_directories.add(dir_path)
++            if 'diff' in result and not result['diff']:
++                del result['diff']
++            module_executed = True
++            changed = changed or module_return.get('changed', False)
++
++        for src, dest_path in source_files['directories']:
++            # Find directories that are leaves as they might not have been
++            # created yet.
++            if dest_path in implicit_directories:
++                continue
+ 
+-                # Execute the file module.
+-                module_return = self._execute_module(module_name='file',
+-                                                     module_args=new_module_args, task_vars=task_vars,
+-                                                     tmp=tmp, delete_remote_tmp=delete_remote_tmp)
+-                module_executed = True
++            # Use file module to create these
++            new_module_args = self._get_file_args()
++            new_module_args['path'] = os.path.join(dest, dest_path)
++            new_module_args['state'] = 'directory'
++            new_module_args['mode'] = self._task.args.get('directory_mode', None)
++
++            module_return = self._execute_module(module_name='file',
++                                                 module_args=new_module_args, task_vars=task_vars,
++                                                 tmp=tmp, delete_remote_tmp=delete_remote_tmp)
++            module_executed = True
++            changed = changed or module_return.get('changed', False)
++
++        for target_path, dest_path in source_files['symlinks']:
++            # Copy symlinks over
++            new_module_args = self._get_file_args()
++            new_module_args['path'] = os.path.join(dest, dest_path)
++            new_module_args['src'] = target_path
++            new_module_args['state'] = 'link'
++            new_module_args['force'] = True
++
++            module_return = self._execute_module(module_name='file',
++                                                 module_args=new_module_args, task_vars=task_vars,
++                                                 tmp=tmp, delete_remote_tmp=delete_remote_tmp)
++            module_executed = True
+ 
+-            if not module_return.get('checksum'):
+-                module_return['checksum'] = local_checksum
+             if module_return.get('failed'):
+                 result.update(module_return)
+                 if not delete_remote_tmp:
+                     self._remove_tmp_path(tmp)
+                 return result
+-            if module_return.get('changed'):
+-                changed = True
++
++            changed = changed or module_return.get('changed', False)
+ 
+             # the file module returns the file path as 'path', but
+             # the copy module uses 'dest', so add it if it's not there
+             if 'path' in module_return and 'dest' not in module_return:
+                 module_return['dest'] = module_return['path']
+ 
+-            # reset the mode
+-            self._task.args['mode'] = mode_value
+-
+         # Delete tmp path if we were recursive or if we did not execute a module.
+         if not delete_remote_tmp or (delete_remote_tmp and not module_executed):
+             self._remove_tmp_path(tmp)
+ 
+-        if module_executed and len(source_files) == 1:
++        if module_executed and len(source_files['files']) == 1:
+             result.update(module_return)
+         else:
+             result.update(dict(dest=dest, src=source, changed=changed))
+ 
+-        if diffs:
+-            result['diff'] = diffs
+-
+         return result
+-
+-    def _get_recursive_files(self, topdir, sz=0):
+-        ''' Recursively create file tuples for sub folders '''
+-        r_files = []
+-        for base_path, sub_folders, files in os.walk(to_bytes(topdir)):
+-            for fname in files:
+-                full_path = to_text(os.path.join(base_path, fname), errors='surrogate_or_strict')
+-                rel_path = full_path[sz:]
+-                if rel_path.startswith('/'):
+-                    rel_path = rel_path[1:]
+-                r_files.append((full_path, rel_path))
+-
+-                for sf in sub_folders:
+-                    r_files += self._get_recursive_files(os.path.join(topdir, to_text(sf)), sz=sz)
+-
+-        return r_files
+-
+-    def _create_content_tempfile(self, content):
+-        ''' Create a tempfile containing defined content '''
+-        fd, content_tempfile = tempfile.mkstemp()
+-        f = os.fdopen(fd, 'wb')
+-        content = to_bytes(content)
+-        try:
+-            f.write(content)
+-        except Exception as err:
+-            os.remove(content_tempfile)
+-            raise Exception(err)
+-        finally:
+-            f.close()
+-        return content_tempfile
+-
+-    def _remove_tempfile_if_content_defined(self, content, content_tempfile):
+-        if content is not None:
+-            os.remove(content_tempfile)
+diff --git a/test/integration/targets/copy/files/subdir/subdir1/ansible-test-abs-link b/test/integration/targets/copy/files/subdir/subdir1/ansible-test-abs-link
+new file mode 120000
+index 0000000000..94491ad891
+--- /dev/null
++++ b/test/integration/targets/copy/files/subdir/subdir1/ansible-test-abs-link
+@@ -0,0 +1 @@
++/tmp/ansible-test-abs-link
+\ No newline at end of file
+diff --git a/test/integration/targets/copy/files/subdir/subdir1/ansible-test-abs-link-dir b/test/integration/targets/copy/files/subdir/subdir1/ansible-test-abs-link-dir
+new file mode 120000
+index 0000000000..f5eccbbf28
+--- /dev/null
++++ b/test/integration/targets/copy/files/subdir/subdir1/ansible-test-abs-link-dir
+@@ -0,0 +1 @@
++/tmp/ansible-test-abs-link-dir
+\ No newline at end of file
+diff --git a/test/integration/targets/copy/files/subdir/subdir1/bar.txt b/test/integration/targets/copy/files/subdir/subdir1/bar.txt
+new file mode 120000
+index 0000000000..315e865d2b
+--- /dev/null
++++ b/test/integration/targets/copy/files/subdir/subdir1/bar.txt
+@@ -0,0 +1 @@
++../bar.txt
+\ No newline at end of file
+diff --git a/test/integration/targets/copy/files/subdir/subdir1/circles b/test/integration/targets/copy/files/subdir/subdir1/circles
+new file mode 120000
+index 0000000000..b870225aa0
+--- /dev/null
++++ b/test/integration/targets/copy/files/subdir/subdir1/circles
+@@ -0,0 +1 @@
++../
+\ No newline at end of file
+diff --git a/test/integration/targets/copy/files/subdir/subdir1/invalid b/test/integration/targets/copy/files/subdir/subdir1/invalid
+new file mode 120000
+index 0000000000..e466dcbd8e
+--- /dev/null
++++ b/test/integration/targets/copy/files/subdir/subdir1/invalid
+@@ -0,0 +1 @@
++invalid
+\ No newline at end of file
+diff --git a/test/integration/targets/copy/files/subdir/subdir1/invalid2 b/test/integration/targets/copy/files/subdir/subdir1/invalid2
+new file mode 120000
+index 0000000000..e1b2509c07
+--- /dev/null
++++ b/test/integration/targets/copy/files/subdir/subdir1/invalid2
+@@ -0,0 +1 @@
++../invalid
+\ No newline at end of file
+diff --git a/test/integration/targets/copy/files/subdir/subdir1/out_of_tree_circle b/test/integration/targets/copy/files/subdir/subdir1/out_of_tree_circle
+new file mode 120000
+index 0000000000..218b55eabb
+--- /dev/null
++++ b/test/integration/targets/copy/files/subdir/subdir1/out_of_tree_circle
+@@ -0,0 +1 @@
++/tmp/ansible-test-link-dir/out_of_tree_circle
+\ No newline at end of file
+diff --git a/test/integration/targets/copy/files/subdir/subdir1/subdir3 b/test/integration/targets/copy/files/subdir/subdir1/subdir3
+new file mode 120000
+index 0000000000..15b47586b5
+--- /dev/null
++++ b/test/integration/targets/copy/files/subdir/subdir1/subdir3
+@@ -0,0 +1 @@
++../subdir2/subdir3
+\ No newline at end of file
+diff --git a/test/integration/targets/copy/tasks/main.yml b/test/integration/targets/copy/tasks/main.yml
+index af95facfbe..9041ff3a26 100644
+--- a/test/integration/targets/copy/tasks/main.yml
++++ b/test/integration/targets/copy/tasks/main.yml
+@@ -1,20 +1,9 @@
+ # test code for the copy module and action plugin
+ # (c) 2014, Michael DeHaan <michael.dehaan@gmail.com>
+-
+-# This file is part of Ansible
+-#
+-# Ansible is free software: you can redistribute it and/or modify
+-# it under the terms of the GNU General Public License as published by
+-# the Free Software Foundation, either version 3 of the License, or
+-# (at your option) any later version.
++# (c) 2017, Ansible Project
+ #
+-# Ansible is distributed in the hope that it will be useful,
+-# but WITHOUT ANY WARRANTY; without even the implied warranty of
+-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+-# GNU General Public License for more details.
++# GNU General Public License v3 or later (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt )
+ #
+-# You should have received a copy of the GNU General Public License
+-# along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
+ 
+ - name: record the output directory
+   set_fact: output_file={{output_dir}}/foo.txt
+@@ -36,9 +25,12 @@
+     that:
+       - "file_result_check.mode == '0444'"
+ 
++#- debug:
++#    var: copy_result
++
+ - name: assert basic copy worked
+-  assert: 
+-    that: 
++  assert:
++    that:
+       - "'changed' in copy_result"
+       - "'dest' in copy_result"
+       - "'group' in copy_result"
+@@ -71,10 +63,10 @@
+   stat: path={{output_file}}
+   register: stat_results
+ 
+-- debug: var=stat_results
++#- debug: var=stat_results
+ 
+ - name: assert the stat results are correct
+-  assert: 
++  assert:
+     that:
+       - "stat_results.stat.exists == true"
+       - "stat_results.stat.isblk == false"
+@@ -94,21 +86,117 @@
+   register: copy_result2
+ 
+ - name: assert that the file was not changed
+-  assert: 
+-    that: 
++  assert:
++    that:
+       - "not copy_result2|changed"
+ 
+ - name: overwrite the file using the content system
+   copy: content="modified" dest={{output_file}}
+   register: copy_result3
+ 
++- name: check the stat results of the file
++  stat: path={{output_file}}
++  register: stat_results
++
++#- debug: var=stat_results
++
+ - name: assert that the file has changed
+-  assert: 
+-     that: 
++  assert:
++     that:
+        - "copy_result3|changed"
+        - "'content' not in copy_result3"
++       - "stat_results.stat.checksum == '99db324742823c55d975b605e1fc22f4253a9b7d'"
++       - "stat_results.stat.mode != '0700'"
++
++- name: overwrite the file again using the content system, also passing along file params
++  copy: content="modified" dest={{output_file}} mode=0700
++  register: copy_result4
++
++- name: check the stat results of the file
++  stat: path={{output_file}}
++  register: stat_results
+ 
+-# test recursive copy
++#- debug: var=stat_results
++
++- name: assert that the file has changed
++  assert:
++     that:
++       - "copy_result3|changed"
++       - "'content' not in copy_result3"
++       - "stat_results.stat.checksum == '99db324742823c55d975b605e1fc22f4253a9b7d'"
++       - "stat_results.stat.mode == '0700'"
++
++- name: try invalid copy input location fails
++  copy: src=invalid_file_location_does_not_exist dest={{output_dir}}/file.txt
++  ignore_errors: True
++  register: failed_copy
++
++- name: assert that invalid source failed
++  assert:
++    that:
++      - "failed_copy.failed"
++      - "'invalid_file_location_does_not_exist' in failed_copy.msg"
++
++- name: Clean up
++  file:
++    path: "{{ output_file }}"
++    state: absent
++
++- name: Copy source file to destination directory with mode
++  copy:
++    src: foo.txt
++    dest: "{{ output_dir }}"
++    mode: 0500
++  register: copy_results
++
++- name: check the stat results of the file
++  stat:
++    path: '{{ output_file }}'
++  register: stat_results
++
++#- debug: var=stat_results
++
++- name: assert that the file has changed
++  assert:
++     that:
++       - "copy_results|changed"
++       - "stat_results.stat.checksum == 'c79a6506c1c948be0d456ab5104d5e753ab2f3e6'"
++       - "stat_results.stat.mode == '0500'"
++
++# Test copy with mode=preserve
++- name: Set file perms to an odd value
++  file:
++    path: '{{ output_file }}'
++    mode: 0547
++
++- name: Copy with mode=preserve
++  copy:
++    src: '{{ output_file }}'
++    dest: '{{ output_dir }}/copy-foo.txt'
++    mode: preserve
++  register: copy_results
++
++- name: check the stat results of the file
++  stat:
++    path: '{{ output_dir }}/copy-foo.txt'
++  register: stat_results
++
++- name: assert that the file has changed and has correct mode
++  assert:
++     that:
++       - "copy_results|changed"
++       - "copy_results.mode == '0547'"
++       - "stat_results.stat.checksum == 'c79a6506c1c948be0d456ab5104d5e753ab2f3e6'"
++       - "stat_results.stat.mode == '0547'"
++
++#
++# test recursive copy local_follow=False, no trailing slash
++#
++
++- name: Create empty directory in the role we're copying from (git can't store empty dirs)
++  file:
++    path: '{{ role_path }}/files/subdir/subdira'
++    state: directory
+ 
+ - name: set the output subdirectory
+   set_fact: output_subdir={{output_dir}}/sub
+@@ -116,11 +204,17 @@
+ - name: make an output subdirectory
+   file: name={{output_subdir}} state=directory
+ 
+-- name: test recursive copy to directory
+-  copy: src=subdir dest={{output_subdir}} directory_mode=0700
++- name: setup link target for absolute link
++  copy: dest=/tmp/ansible-test-abs-link content=target
++
++- name: setup link target dir for absolute link
++  file: dest=/tmp/ansible-test-abs-link-dir state=directory
++
++- name: test recursive copy to directory no trailing slash, local_follow=False
++  copy: src=subdir dest={{output_subdir}} directory_mode=0700 local_follow=False
+   register: recursive_copy_result
+ 
+-- debug: var=recursive_copy_result
++#- debug: var=recursive_copy_result
+ - name: assert that the recursive copy did something
+   assert:
+     that:
+@@ -131,58 +225,435 @@
+   register: stat_bar
+ 
+ - name: check that a file in a deeper directory was transferred
+-  stat: path={{output_dir}}/sub/subdir/subdir2/baz.txt 
++  stat: path={{output_dir}}/sub/subdir/subdir2/baz.txt
+   register: stat_bar2
+ 
+ - name: check that a file in a directory whose parent contains a directory alone was transferred
+   stat: path={{output_dir}}/sub/subdir/subdir2/subdir3/subdir4/qux.txt
+   register: stat_bar3
+ 
+-- name: assert recursive copy things
++- name: assert recursive copy files
+   assert:
+     that:
+       - "stat_bar.stat.exists"
+       - "stat_bar2.stat.exists"
+       - "stat_bar3.stat.exists"
+ 
++- name: check symlink to absolute path
++  stat:
++    path: '{{ output_dir }}/sub/subdir/subdir1/ansible-test-abs-link'
++  register: stat_abs_link
++
++- name: check symlink to relative path
++  stat:
++    path: '{{ output_dir }}/sub/subdir/subdir1/bar.txt'
++  register: stat_relative_link
++
++- name: check symlink to self
++  stat:
++    path: '{{ output_dir }}/sub/subdir/subdir1/invalid'
++  register: stat_self_link
++
++- name: check symlink to nonexistent file
++  stat:
++    path: '{{ output_dir }}/sub/subdir/subdir1/invalid2'
++  register: stat_invalid_link
++
++- name: check symlink to directory in copy
++  stat:
++   path: '{{ output_dir }}/sub/subdir/subdir1/subdir3'
++  register: stat_dir_in_copy_link
++
++- name: check symlink to directory outside of copy
++  stat:
++    path: '{{ output_dir }}/sub/subdir/subdir1/ansible-test-abs-link-dir'
++  register: stat_dir_outside_copy_link
++
++- name: assert recursive copy symlinks local_follow=False
++  assert:
++    that:
++      - "stat_abs_link.stat.exists"
++      - "stat_abs_link.stat.islnk"
++      - "'/tmp/ansible-test-abs-link' == stat_abs_link.stat.lnk_target"
++      - "stat_relative_link.stat.exists"
++      - "stat_relative_link.stat.islnk"
++      - "'../bar.txt' == stat_relative_link.stat.lnk_target"
++      - "stat_self_link.stat.exists"
++      - "stat_self_link.stat.islnk"
++      - "'invalid' in stat_self_link.stat.lnk_target"
++      - "stat_invalid_link.stat.exists"
++      - "stat_invalid_link.stat.islnk"
++      - "'../invalid' in stat_invalid_link.stat.lnk_target"
++      - "stat_dir_in_copy_link.stat.exists"
++      - "stat_dir_in_copy_link.stat.islnk"
++      - "'../subdir2/subdir3' in stat_dir_in_copy_link.stat.lnk_target"
++      - "stat_dir_outside_copy_link.stat.exists"
++      - "stat_dir_outside_copy_link.stat.islnk"
++      - "'/tmp/ansible-test-abs-link-dir' == stat_dir_outside_copy_link.stat.lnk_target"
++
+ - name: stat the recursively copied directories
+   stat: path={{output_dir}}/sub/{{item}}
+   register: dir_stats
+   with_items:
+     - "subdir"
++    - "subdir/subdira"
++    - "subdir/subdir1"
+     - "subdir/subdir2"
+     - "subdir/subdir2/subdir3"
+     - "subdir/subdir2/subdir3/subdir4"
+ 
++#- debug: var=dir_stats
+ - name: assert recursive copied directories mode
+   assert:
+     that:
+       - "item.stat.mode == '0700'"
+   with_items: "{{dir_stats.results}}"
+ 
++- name: test recursive copy to directory no trailing slash, local_follow=False second time
++  copy: src=subdir dest={{output_subdir}} directory_mode=0700 local_follow=False
++  register: recursive_copy_result
+ 
+-# errors on this aren't presently ignored so this test is commented out.  But it would be nice to fix.
++- name: assert that the second copy did not change anything
++  assert:
++    that:
++      - "not recursive_copy_result|changed"
++
++- name: cleanup the recursive copy subdir
++  file: name={{output_subdir}} state=absent
++
++#
++# Recursive copy with local_follow=False, trailing slash
+ #
+ 
+-- name: overwrite the file again using the content system, also passing along file params
+-  copy: content="modified" dest={{output_file}} 
+-  register: copy_result4
+-  
+-#- name: assert invalid copy input location fails
+-#  copy: src=invalid_file_location_does_not_exist dest={{output_dir}}/file.txt
+-#  ignore_errors: True
+-#  register: failed_copy
++- name: set the output subdirectory
++  set_fact: output_subdir={{output_dir}}/sub
++
++- name: make an output subdirectory
++  file: name={{output_subdir}} state=directory
++
++- name: setup link target for absolute link
++  copy: dest=/tmp/ansible-test-abs-link content=target
++
++- name: setup link target dir for absolute link
++  file: dest=/tmp/ansible-test-abs-link-dir state=directory
+ 
+-- name: copy already copied directory again
+-  copy: src=subdir dest={{output_subdir | expanduser}} owner={{ansible_ssh_user|default(omit)}}
+-  register: copy_result5
++- name: test recursive copy to directory trailing slash, local_follow=False
++  copy: src=subdir/ dest={{output_subdir}} directory_mode=0700 local_follow=False
++  register: recursive_copy_result
+ 
+-- name: assert that the directory was not changed
++#- debug: var=recursive_copy_result
++- name: assert that the recursive copy did something
+   assert:
+     that:
+-      - "not copy_result5|changed"
++      - "recursive_copy_result|changed"
++
++- name: check that a file in a directory was transferred
++  stat: path={{output_dir}}/sub/bar.txt
++  register: stat_bar
+ 
++- name: check that a file in a deeper directory was transferred
++  stat: path={{output_dir}}/sub/subdir2/baz.txt
++  register: stat_bar2
++
++- name: check that a file in a directory whose parent contains a directory alone was transferred
++  stat: path={{output_dir}}/sub/subdir2/subdir3/subdir4/qux.txt
++  register: stat_bar3
++
++- name: assert recursive copy files
++  assert:
++    that:
++      - "stat_bar.stat.exists"
++      - "stat_bar2.stat.exists"
++      - "stat_bar3.stat.exists"
++
++- name: check symlink to absolute path
++  stat:
++    path: '{{ output_dir }}/sub/subdir1/ansible-test-abs-link'
++  register: stat_abs_link
++
++- name: check symlink to relative path
++  stat:
++    path: '{{ output_dir }}/sub/subdir1/bar.txt'
++  register: stat_relative_link
++
++- name: check symlink to self
++  stat:
++    path: '{{ output_dir }}/sub/subdir1/invalid'
++  register: stat_self_link
++
++- name: check symlink to nonexistent file
++  stat:
++    path: '{{ output_dir }}/sub/subdir1/invalid2'
++  register: stat_invalid_link
++
++- name: check symlink to directory in copy
++  stat:
++    path: '{{ output_dir }}/sub/subdir1/subdir3'
++  register: stat_dir_in_copy_link
++
++- name: check symlink to directory outside of copy
++  stat:
++    path: '{{ output_dir }}/sub/subdir1/ansible-test-abs-link-dir'
++  register: stat_dir_outside_copy_link
++
++- name: assert recursive copy symlinks local_follow=False trailing slash
++  assert:
++    that:
++      - "stat_abs_link.stat.exists"
++      - "stat_abs_link.stat.islnk"
++      - "'/tmp/ansible-test-abs-link' == stat_abs_link.stat.lnk_target"
++      - "stat_relative_link.stat.exists"
++      - "stat_relative_link.stat.islnk"
++      - "'../bar.txt' == stat_relative_link.stat.lnk_target"
++      - "stat_self_link.stat.exists"
++      - "stat_self_link.stat.islnk"
++      - "'invalid' in stat_self_link.stat.lnk_target"
++      - "stat_invalid_link.stat.exists"
++      - "stat_invalid_link.stat.islnk"
++      - "'../invalid' in stat_invalid_link.stat.lnk_target"
++      - "stat_dir_in_copy_link.stat.exists"
++      - "stat_dir_in_copy_link.stat.islnk"
++      - "'../subdir2/subdir3' in stat_dir_in_copy_link.stat.lnk_target"
++      - "stat_dir_outside_copy_link.stat.exists"
++      - "stat_dir_outside_copy_link.stat.islnk"
++      - "'/tmp/ansible-test-abs-link-dir' == stat_dir_outside_copy_link.stat.lnk_target"
++
++- name: stat the recursively copied directories
++  stat: path={{output_dir}}/sub/{{item}}
++  register: dir_stats
++  with_items:
++    - "subdira"
++    - "subdir1"
++    - "subdir2"
++    - "subdir2/subdir3"
++    - "subdir2/subdir3/subdir4"
++
++#- debug: var=dir_stats
++- name: assert recursive copied directories mode
++  assert:
++    that:
++      - "item.stat.mode == '0700'"
++  with_items: "{{dir_stats.results}}"
++
++- name: test recursive copy to directory trailing slash, local_follow=False second time
++  copy: src=subdir/ dest={{output_subdir}} directory_mode=0700 local_follow=False
++  register: recursive_copy_result
++
++- name: assert that the second copy did not change anything
++  assert:
++    that:
++      - "not recursive_copy_result|changed"
++
++- name: cleanup the recursive copy subdir
++  file: name={{output_subdir}} state=absent
++
++#
++# test recursive copy local_follow=True, no trailing slash
++#
++
++- name: set the output subdirectory
++  set_fact: output_subdir={{output_dir}}/sub
++
++- name: make an output subdirectory
++  file: name={{output_subdir}} state=directory
++
++- name: setup link target for absolute link
++  copy: dest=/tmp/ansible-test-abs-link content=target
++
++- name: setup link target dir for absolute link
++  file: dest=/tmp/ansible-test-abs-link-dir state=directory
++
++- name: test recursive copy to directory no trailing slash, local_follow=True
++  copy: src=subdir dest={{output_subdir}} directory_mode=0700 local_follow=True
++  register: recursive_copy_result
++
++#- debug: var=recursive_copy_result
++- name: assert that the recursive copy did something
++  assert:
++    that:
++      - "recursive_copy_result|changed"
++
++- name: check that a file in a directory was transferred
++  stat: path={{output_dir}}/sub/subdir/bar.txt
++  register: stat_bar
++
++- name: check that a file in a deeper directory was transferred
++  stat: path={{output_dir}}/sub/subdir/subdir2/baz.txt
++  register: stat_bar2
++
++- name: check that a file in a directory whose parent contains a directory alone was transferred
++  stat: path={{output_dir}}/sub/subdir/subdir2/subdir3/subdir4/qux.txt
++  register: stat_bar3
++
++- name: check that a file in a directory whose parent is a symlink was transferred
++  stat: path={{output_dir}}/sub/subdir/subdir1/subdir3/subdir4/qux.txt
++  register: stat_bar4
++
++- name: assert recursive copy files
++  assert:
++    that:
++      - "stat_bar.stat.exists"
++      - "stat_bar2.stat.exists"
++      - "stat_bar3.stat.exists"
++      - "stat_bar4.stat.exists"
++
++- name: check symlink to absolute path
++  stat:
++    path: '{{ output_dir }}/sub/subdir/subdir1/ansible-test-abs-link'
++  register: stat_abs_link
++
++- name: check symlink to relative path
++  stat:
++    path: '{{ output_dir }}/sub/subdir/subdir1/bar.txt'
++  register: stat_relative_link
++
++- name: check symlink to self
++  stat:
++    path: '{{ output_dir }}/sub/subdir/subdir1/invalid'
++  register: stat_self_link
++
++- name: check symlink to nonexistent file
++  stat:
++    path: '{{ output_dir }}/sub/subdir/subdir1/invalid2'
++  register: stat_invalid_link
++
++- name: check symlink to directory in copy
++  stat:
++    path: '{{ output_dir }}/sub/subdir/subdir1/subdir3'
++  register: stat_dir_in_copy_link
++
++- name: check symlink to directory outside of copy
++  stat:
++    path: '{{ output_dir }}/sub/subdir/subdir1/ansible-test-abs-link-dir'
++  register: stat_dir_outside_copy_link
++
++- name: assert recursive copy symlinks local_follow=True
++  assert:
++    that:
++      - "stat_abs_link.stat.exists"
++      - "not stat_abs_link.stat.islnk"
++      - "stat_abs_link.stat.checksum == '0e8a3ad980ec179856012b7eecf4327e99cd44cd'"
++      - "stat_relative_link.stat.exists"
++      - "not stat_relative_link.stat.islnk"
++      - "stat_relative_link.stat.checksum == '6eadeac2dade6347e87c0d24fd455feffa7069f0'"
++      - "stat_self_link.stat.exists"
++      - "stat_self_link.stat.islnk"
++      - "'invalid' in stat_self_link.stat.lnk_target"
++      - "stat_invalid_link.stat.exists"
++      - "stat_invalid_link.stat.islnk"
++      - "'../invalid' in stat_invalid_link.stat.lnk_target"
++      - "stat_dir_in_copy_link.stat.exists"
++      - "not stat_dir_in_copy_link.stat.islnk"
++      - "stat_dir_in_copy_link.stat.isdir"
++      -
++      - "stat_dir_outside_copy_link.stat.exists"
++      - "not stat_dir_outside_copy_link.stat.islnk"
++      - "stat_dir_outside_copy_link.stat.isdir"
++
++- name: stat the recursively copied directories
++  stat: path={{output_dir}}/sub/{{item}}
++  register: dir_stats
++  with_items:
++    - "subdir"
++    - "subdir/subdira"
++    - "subdir/subdir1"
++    - "subdir/subdir1/subdir3"
++    - "subdir/subdir1/subdir3/subdir4"
++    - "subdir/subdir2"
++    - "subdir/subdir2/subdir3"
++    - "subdir/subdir2/subdir3/subdir4"
++
++#- debug: var=dir_stats
++- name: assert recursive copied directories mode
++  assert:
++    that:
++      - "item.stat.mode == '0700'"
++  with_items: "{{dir_stats.results}}"
++
++- name: test recursive copy to directory no trailing slash, local_follow=True second time
++  copy: src=subdir dest={{output_subdir}} directory_mode=0700 local_follow=True
++  register: recursive_copy_result
++
++- name: assert that the second copy did not change anything
++  assert:
++    that:
++      - "not recursive_copy_result|changed"
++
++- name: cleanup the recursive copy subdir
++  file: name={{output_subdir}} state=absent
++
++#
++# Recursive copy of tricky symlinks
++#
++- name: Create a directory to copy from
++  file:
++    path: '{{ output_dir }}/source1'
++    state: directory
++
++- name: Create a directory outside of the tree
++  file:
++    path: '{{ output_dir }}/source2'
++    state: directory
++
++- name: Create a symlink to a directory outside of the tree
++  file:
++    path: '{{ output_dir }}/source1/link'
++    src: '{{ output_dir }}/source2'
++    state: link
++
++- name: Create a circular link back to the tree
++  file:
++    path: '{{ output_dir }}/source2/circle'
++    src: '../source1'
++    state: link
++
++- name: Create output directory
++  file:
++    path: '{{ output_dir }}/dest1'
++    state: directory
++
++- name: Recursive copy the source
++  copy:
++    src: '{{ output_dir }}/source1'
++    dest: '{{ output_dir }}/dest1'
++    local_follow: True
++  register: copy_result
++
++- name: Check that the tree link is now a directory
++  stat:
++    path: '{{ output_dir }}/dest1/source1/link'
++  register: link_result
++
++- name: Check that the out of tree link is still a link
++  stat:
++    path: '{{ output_dir }}/dest1/source1/link/circle'
++  register: circle_result
++
++- name: Verify that the recursive copy worked
++  assert:
++    that:
++      - 'copy_result.changed'
++      - 'link_result.stat.isdir'
++      - 'not link_result.stat.islnk'
++      - 'circle_result.stat.islnk'
++      - '"../source1" == circle_result.stat.lnk_target'
++
++- name: Recursive copy the source a second time
++  copy:
++    src: '{{ output_dir }}/source1'
++    dest: '{{ output_dir }}/dest1'
++    local_follow: True
++  register: copy_result
++
++- name: Verify that the recursive copy made no changes
++  assert:
++    that:
++      - 'not copy_result.changed'
++
++#
+ # issue 8394
++#
++
+ - name: create a file with content and a literal multiline block
+   copy: |
+     content='this is the first line
+@@ -194,7 +665,7 @@
+     dest={{output_dir}}/multiline.txt
+   register: copy_result6
+ 
+-- debug: var=copy_result6
++#- debug: var=copy_result6
+ 
+ - name: assert the multiline file was created correctly
+   assert:
+@@ -258,3 +729,97 @@
+   assert:
+     that:
+     - replace_follow_result.checksum == target_file_result.stdout
++
++- name: update the test file using follow=False to overwrite the link
++  copy:
++    dest: '{{ output_dir }}/follow_link'
++    content: 'modified'
++    follow: False
++  register: copy_results
++
++- name: check the stat results of the file
++  stat:
++    path: '{{output_dir}}/follow_link'
++  register: stat_results
++
++#- debug: var=stat_results
++
++- name: assert that the file has changed and is not a link
++  assert:
++     that:
++       - "copy_results|changed"
++       - "'content' not in copy_results"
++       - "stat_results.stat.checksum == '99db324742823c55d975b605e1fc22f4253a9b7d'"
++       - "not stat_results.stat.islnk"
++
++#
++# I believe the below section is now covered in the recursive copying section.
++# Hold on for now as an original test case but delete once confirmed that
++# everything is passing
++
++#
++# Recursive copying with symlinks tests
++#
++- name: create a test dir to copy
++  file:
++    path: '{{ output_dir }}/top_dir'
++    state: directory
++
++- name: create a test dir to symlink to
++  file:
++    path: '{{ output_dir }}/linked_dir'
++    state: directory
++
++- name: create a file in the test dir
++  copy:
++    dest: '{{ output_dir }}/linked_dir/file1'
++    content: 'hello world'
++
++- name: create a link to the test dir
++  file:
++    path: '{{ output_dir }}/top_dir/follow_link_dir'
++    src: '{{ output_dir }}/linked_dir'
++    state: link
++
++- name: create a circular subdir
++  file:
++    path: '{{ output_dir }}/top_dir/subdir'
++    state: directory
++
++### FIXME:  Also add a test for a relative symlink
++- name: create a circular symlink
++  file:
++    path: '{{ output_dir }}/top_dir/subdir/circle'
++    src: '{{ output_dir }}/top_dir/'
++    state: link
++
++- name: copy the directory's link
++  copy:
++    src: '{{ output_dir }}/top_dir'
++    dest: '{{ output_dir }}/new_dir'
++    local_follow: True
++
++- name: stat the copied path
++  stat:
++    path: '{{ output_dir }}/new_dir/top_dir/follow_link_dir'
++  register: stat_dir_result
++
++- name: stat the copied file
++  stat:
++    path: '{{ output_dir }}/new_dir/top_dir/follow_link_dir/file1'
++  register: stat_file_in_dir_result
++
++- name: stat the circular symlink
++  stat:
++    path: '{{ output_dir }}/top_dir/subdir/circle'
++  register: stat_circular_symlink_result
++
++- name: assert that the directory exists
++  assert:
++    that:
++    - stat_dir_result.stat.exists
++    - stat_dir_result.stat.isdir
++    - stat_file_in_dir_result.stat.exists
++    - stat_file_in_dir_result.stat.isreg
++    - stat_circular_symlink_result.stat.exists
++    - stat_circular_symlink_result.stat.islnk

@@ -1,0 +1,1284 @@
+commit e7b9228da10a6171e316d5019c93145121b4448d
+Author: Jan Michael Auer <account@jauer.org>
+Date:   Tue Apr 16 14:27:07 2019 +0200
+
+    ref(native): Separate in_app logic from native plugin (#12735)
+    
+    Moves the generation of `in_app` flags on frames completely out of the native
+    plugin into grouping code. Effectively, this fully separates `in_app` from
+    processing. Ultimately, this prepares the complete separation of:
+    
+    1. Deciding which symbols need to go through the iOS symbol server (which will
+       be replaced down the road)
+    2. Deciding which symbols are required for reprocessing, i.e. are "user fixable"
+    3. Deciding which frames are `in_app` for native
+
+diff --git a/src/sentry/grouping/enhancement-configs/common:2019-03-23.txt b/src/sentry/grouping/enhancement-configs/common:2019-03-23.txt
+index 890c7c0d00..7fa82a60b5 100644
+--- a/src/sentry/grouping/enhancement-configs/common:2019-03-23.txt
++++ b/src/sentry/grouping/enhancement-configs/common:2019-03-23.txt
+@@ -30,3 +30,13 @@ family:native function:_mh_execute_header                         -group -app
+ family:native function:google_breakpad::*                         -app -group
+ family:native function:google_breakpad::ExceptionHandler::SignalHandler ^-group -group
+ family:native function:google_breakpad::ExceptionHandler::WriteMinidumpWithException ^-group -group
++
++# Sentry internal functions in Cocoa SDK
++family:native function:kscm_*                                     -app -group
++family:native function:sentrycrashcm_*                            -app -group
++family:native function:kscrash_*                                  -app -group
++family:native function:sentrycrash_*                              -app -group
++family:native function:"?[KSCrash *"                              -app -group
++family:native function:"?[SentryCrash *"                          -app -group
++family:native function:"?[SentryClient *"                         -app -group
++family:native function:"?[RNSentry *"                             -app -group
+diff --git a/src/sentry/grouping/enhancement-configs/legacy:2019-03-12.txt b/src/sentry/grouping/enhancement-configs/legacy:2019-03-12.txt
+index 395eb8cae5..9ccc46a24b 100644
+--- a/src/sentry/grouping/enhancement-configs/legacy:2019-03-12.txt
++++ b/src/sentry/grouping/enhancement-configs/legacy:2019-03-12.txt
+@@ -1 +1,8 @@
+-## * completely empty enhancement configs for legacy grouping
++## * The default configuration of stacktrace grouping enhancers
++
++# Sentry internal functions in Cocoa SDK
++family:native function:kscm_*                                     -app -group
++family:native function:kscrash_*                                  -app -group
++family:native function:"?[KSCrash *"                              -app -group
++family:native function:"?[SentryClient *"                         -app -group
++family:native function:"?[RNSentry *"                             -app -group
+diff --git a/src/sentry/lang/native/plugin.py b/src/sentry/lang/native/plugin.py
+index 1cfeeae56c..6b95df9132 100644
+--- a/src/sentry/lang/native/plugin.py
++++ b/src/sentry/lang/native/plugin.py
+@@ -19,6 +19,7 @@ from sentry.lang.native.utils import get_sdk_from_event, cpu_name_from_data, \
+ from sentry.lang.native.systemsymbols import lookup_system_symbols
+ from sentry.models.eventerror import EventError
+ from sentry.utils import metrics
++from sentry.utils.in_app import is_known_third_party, is_optional_package
+ from sentry.utils.safe import get_path
+ from sentry.stacktraces import StacktraceProcessor
+ from sentry.reprocessing import report_processing_issue
+@@ -180,7 +181,7 @@ class NativeStacktraceProcessor(StacktraceProcessor):
+         )
+ 
+         if options.get('symbolserver.enabled'):
+-            self.fetch_system_symbols(processing_task)
++            self.fetch_ios_system_symbols(processing_task)
+ 
+         if self.use_symbolicator:
+             self.run_symbolicator(processing_task)
+@@ -263,7 +264,11 @@ class NativeStacktraceProcessor(StacktraceProcessor):
+             if status in ('found', 'unused'):
+                 continue
+             elif status == 'missing_debug_file':
+-                error = SymbolicationFailed(type=EventError.NATIVE_MISSING_DSYM)
++                if is_optional_package(fetched_debug_file.get('code_file')):
++                    error = SymbolicationFailed(
++                        type=EventError.NATIVE_MISSING_OPTIONALLY_BUNDLED_DSYM)
++                else:
++                    error = SymbolicationFailed(type=EventError.NATIVE_MISSING_DSYM)
+             elif status == 'malformed_debug_file':
+                 error = SymbolicationFailed(type=EventError.NATIVE_BAD_DSYM)
+             elif status == 'too_large':
+@@ -293,13 +298,17 @@ class NativeStacktraceProcessor(StacktraceProcessor):
+                 pf = pf_list[symbolicated_frame['original_index']]
+                 pf.data['symbolicator_match'].append(symbolicated_frame)
+ 
+-    def fetch_system_symbols(self, processing_task):
++    def fetch_ios_system_symbols(self, processing_task):
+         to_lookup = []
+         pf_list = []
+         for pf in processing_task.iter_processable_frames(self):
++            if pf.cache_value is not None:
++                continue
++
+             obj = pf.data['obj']
+-            if pf.cache_value is not None or obj is None or \
+-               self.sym.is_image_from_app_bundle(obj):
++            package = obj and obj.code_file
++            # TODO(ja): This should check for iOS specifically
++            if not package or not is_known_third_party(package):
+                 continue
+ 
+             # We can only look up objects in the symbol server that have a
+@@ -313,7 +322,7 @@ class NativeStacktraceProcessor(StacktraceProcessor):
+             to_lookup.append(
+                 {
+                     'object_uuid': obj.debug_id,
+-                    'object_name': obj.name or '<unknown>',
++                    'object_name': obj.code_file or '<unknown>',
+                     'addr': '0x%x' % rebase_addr(pf.data['instruction_addr'], obj)
+                 }
+             )
+@@ -363,21 +372,16 @@ class NativeStacktraceProcessor(StacktraceProcessor):
+         raw_frame = dict(frame)
+         errors = []
+ 
++        # Ensure that package is set in the raw frame, mapped from the
++        # debug_images array in the payload. Grouping and UI can use this path
++        # to infer in_app and exclude frames from grouping.
++        if raw_frame.get('package') is None:
++            raw_frame['package'] = processable_frame.data['obj'].code_file
++
+         if processable_frame.cache_value is None:
+             # Construct a raw frame that is used by the symbolizer
+             # backend.  We only assemble the bare minimum we need here.
+             instruction_addr = processable_frame.data['instruction_addr']
+-            in_app = self.sym.is_in_app(
+-                instruction_addr,
+-                sdk_info=self.sdk_info
+-            )
+-
+-            if in_app and raw_frame.get('function') is not None:
+-                in_app = not self.sym.is_internal_function(
+-                    raw_frame['function'])
+-
+-            if raw_frame.get('in_app') is None:
+-                raw_frame['in_app'] = in_app
+ 
+             debug_id = processable_frame.data['debug_id']
+             if debug_id is not None:
+@@ -400,15 +404,15 @@ class NativeStacktraceProcessor(StacktraceProcessor):
+                 errors = self._handle_symbolication_failed(e)
+                 return [raw_frame], [raw_frame], errors
+ 
+-            processable_frame.set_cache_value([in_app, symbolicated_frames])
++            _ignored = None  # Used to be in_app
++            processable_frame.set_cache_value([_ignored, symbolicated_frames])
+ 
+         else:  # processable_frame.cache_value is present
+-            in_app, symbolicated_frames = processable_frame.cache_value
+-            raw_frame['in_app'] = in_app
++            _ignored, symbolicated_frames = processable_frame.cache_value
+ 
+         new_frames = []
+         for sfrm in symbolicated_frames:
+-            new_frame = dict(frame)
++            new_frame = dict(raw_frame)
+             new_frame['function'] = sfrm['function']
+             if sfrm.get('symbol'):
+                 new_frame['symbol'] = sfrm['symbol']
+@@ -420,12 +424,8 @@ class NativeStacktraceProcessor(StacktraceProcessor):
+                 new_frame['lineno'] = sfrm['lineno']
+             if sfrm.get('colno'):
+                 new_frame['colno'] = sfrm['colno']
+-            if sfrm.get('package') or processable_frame.data['obj'] is not None:
+-                new_frame['package'] = sfrm.get(
+-                    'package', processable_frame.data['obj'].name)
+-            if new_frame.get('in_app') is None:
+-                new_frame['in_app'] = in_app and \
+-                    not self.sym.is_internal_function(new_frame['function'])
++            if sfrm.get('package'):
++                new_frame['package'] = sfrm['package']
+             new_frames.append(new_frame)
+ 
+         return new_frames, [raw_frame], []
+diff --git a/src/sentry/lang/native/symbolizer.py b/src/sentry/lang/native/symbolizer.py
+index e32937f488..9575743c1b 100644
+--- a/src/sentry/lang/native/symbolizer.py
++++ b/src/sentry/lang/native/symbolizer.py
+@@ -1,6 +1,5 @@
+ from __future__ import absolute_import
+ 
+-import re
+ import six
+ 
+ from symbolic import SymbolicError, ObjectLookup, LineInfo, parse_addr
+@@ -9,52 +8,25 @@ from sentry.utils.safe import trim
+ from sentry.utils.compat import implements_to_string
+ from sentry.models import EventError, ProjectDebugFile
+ from sentry.lang.native.utils import image_name, rebase_addr
+-from sentry.constants import MAX_SYM, NATIVE_UNKNOWN_STRING
++from sentry.utils.in_app import is_known_third_party, is_optional_package
++from sentry.constants import MAX_SYM
++
++FATAL_ERRORS = (
++    EventError.NATIVE_MISSING_DSYM,
++    EventError.NATIVE_BAD_DSYM,
++    EventError.NATIVE_SYMBOLICATOR_FAILED,
++)
+ 
+-FATAL_ERRORS = (EventError.NATIVE_MISSING_DSYM, EventError.NATIVE_BAD_DSYM,
+-                EventError.NATIVE_SYMBOLICATOR_FAILED)
+ USER_FIXABLE_ERRORS = (
+-    EventError.NATIVE_MISSING_DSYM, EventError.NATIVE_MISSING_OPTIONALLY_BUNDLED_DSYM,
+-    EventError.NATIVE_BAD_DSYM, EventError.NATIVE_MISSING_SYMBOL,
++    EventError.NATIVE_MISSING_DSYM,
++    EventError.NATIVE_MISSING_OPTIONALLY_BUNDLED_DSYM,
++    EventError.NATIVE_BAD_DSYM,
++    EventError.NATIVE_MISSING_SYMBOL,
+ 
+     # XXX: user can't fix this, but they should see it regardless to see it's
+     # not their fault. Also better than silently creating an unsymbolicated event
+-    EventError.NATIVE_SYMBOLICATOR_FAILED
+-)
+-APP_BUNDLE_PATHS = (
+-    '/var/containers/Bundle/Application/', '/private/var/containers/Bundle/Application/',
+-)
+-_sim_platform_re = re.compile(r'/\w+?Simulator\.platform/')
+-_support_framework = re.compile(
+-    r'''(?x)
+-    /Frameworks/(
+-            libswift([a-zA-Z0-9]+)\.dylib$
+-        |   (KSCrash|SentrySwift|Sentry)\.framework/
+-    )
+-'''
++    EventError.NATIVE_SYMBOLICATOR_FAILED,
+ )
+-SIM_PATH = '/Developer/CoreSimulator/Devices/'
+-SIM_APP_PATH = '/Containers/Bundle/Application/'
+-MAC_OS_PATHS = (
+-    '.app/Contents/',
+-    '/Users/',
+-    '/usr/local/',
+-)
+-LINUX_SYS_PATHS = (
+-    '/lib/',
+-    '/usr/lib/',
+-    'linux-gate.so',
+-)
+-WINDOWS_SYS_PATH = re.compile(r'^[a-z]:\\windows', re.IGNORECASE)
+-
+-_internal_function_re = re.compile(
+-    r'(kscm_|kscrash_|KSCrash |SentryClient |RNSentry )')
+-
+-KNOWN_GARBAGE_SYMBOLS = set([
+-    '_mh_execute_header',
+-    '<redacted>',
+-    NATIVE_UNKNOWN_STRING,
+-])
+ 
+ 
+ @implements_to_string
+@@ -154,78 +126,6 @@ class Symbolizer(object):
+ 
+         return frame
+ 
+-    def is_image_from_app_bundle(self, obj, sdk_info=None):
+-        obj_path = obj.name
+-        if not obj_path:
+-            return False
+-
+-        if obj_path.startswith(APP_BUNDLE_PATHS):
+-            return True
+-
+-        if SIM_PATH in obj_path and SIM_APP_PATH in obj_path:
+-            return True
+-
+-        sdk_name = sdk_info['sdk_name'].lower() if sdk_info else ''
+-        if sdk_name == 'macos' and any(p in obj_path for p in MAC_OS_PATHS):
+-            return True
+-        if sdk_name == 'linux' and not obj_path.startswith(LINUX_SYS_PATHS):
+-            return True
+-        if sdk_name == 'windows' and not WINDOWS_SYS_PATH.match(obj_path):
+-            return True
+-
+-        return False
+-
+-    def _is_support_framework(self, obj):
+-        """True if the frame is from a framework that is known and app
+-        bundled.  Those are frameworks which are specifically not frameworks
+-        that are ever in_app.
+-        """
+-        return obj.name and _support_framework.search(obj.name) is not None
+-
+-    def _is_app_bundled_framework(self, obj):
+-        fn = obj.name
+-        return fn and fn.startswith(APP_BUNDLE_PATHS) and '/Frameworks/' in fn
+-
+-    def _is_app_frame(self, instruction_addr, obj, sdk_info=None):
+-        """Given a frame derives the value of `in_app` by discarding the
+-        original value of the frame.
+-        """
+-        # Anything that is outside the app bundle is definitely not a
+-        # frame from out app.
+-        if not self.is_image_from_app_bundle(obj, sdk_info=sdk_info):
+-            return False
+-
+-        # We also do not consider known support frameworks to be part of
+-        # the app
+-        if self._is_support_framework(obj):
+-            return False
+-
+-        # Otherwise, yeah, let's just say it's in_app
+-        return True
+-
+-    def _is_optional_dif(self, obj, sdk_info=None):
+-        """Checks if this is an optional debug information file."""
+-        # Frames that are not in the app are not considered optional.  In
+-        # theory we should never reach this anyways.
+-        if not self.is_image_from_app_bundle(obj, sdk_info=sdk_info):
+-            return False
+-
+-        # If we're dealing with an app bundled framework that is also
+-        # considered optional.
+-        if self._is_app_bundled_framework(obj):
+-            return True
+-
+-        # Frameworks that are known to sentry and bundled helpers are always
+-        # optional for now.  In theory this should always be False here
+-        # because we should catch it with the last branch already.
+-        if self._is_support_framework(obj):
+-            return True
+-
+-        return False
+-
+-    def _is_simulator_frame(self, frame, obj):
+-        return obj.name and _sim_platform_re.search(obj.name) is not None
+-
+     def _symbolize_app_frame(self, instruction_addr, obj, sdk_info=None, trust=None):
+         symcache = self.symcaches.get(obj.debug_id)
+         if symcache is None:
+@@ -237,10 +137,12 @@ class Symbolizer(object):
+                     type=EventError.NATIVE_BAD_DSYM,
+                     obj=obj
+                 )
+-            if self._is_optional_dif(obj, sdk_info=sdk_info):
++
++            if is_optional_package(obj.code_file, sdk_info=sdk_info):
+                 type = EventError.NATIVE_MISSING_OPTIONALLY_BUNDLED_DSYM
+             else:
+                 type = EventError.NATIVE_MISSING_DSYM
++
+             raise SymbolicationFailed(type=type, obj=obj)
+ 
+         try:
+@@ -254,7 +156,7 @@ class Symbolizer(object):
+             # For some frameworks we are willing to ignore missing symbol
+             # errors. Also, ignore scanned stack frames when symbols are
+             # available to complete breakpad's stack scanning heuristics.
+-            if trust == 'scan' or self._is_optional_dif(obj, sdk_info=sdk_info):
++            if trust == 'scan' or is_optional_package(obj.code_file, sdk_info=sdk_info):
+                 return []
+             raise SymbolicationFailed(
+                 type=EventError.NATIVE_MISSING_SYMBOL, obj=obj)
+@@ -335,14 +237,7 @@ class Symbolizer(object):
+         # that just did not return any results but without error.
+         if app_err is not None \
+                 and not match \
+-                and self.is_image_from_app_bundle(obj, sdk_info=sdk_info):
++                and not is_known_third_party(obj.code_file, sdk_info=sdk_info):
+             raise app_err
+ 
+         return match
+-
+-    def is_in_app(self, instruction_addr, sdk_info=None):
+-        obj = self.object_lookup.find_object(instruction_addr)
+-        return obj is not None and self._is_app_frame(instruction_addr, obj, sdk_info=sdk_info)
+-
+-    def is_internal_function(self, function):
+-        return _internal_function_re.search(function) is not None
+diff --git a/src/sentry/lang/native/utils.py b/src/sentry/lang/native/utils.py
+index 20610c56e0..bb845a0c80 100644
+--- a/src/sentry/lang/native/utils.py
++++ b/src/sentry/lang/native/utils.py
+@@ -12,10 +12,10 @@ from sentry.utils.safe import get_path
+ 
+ logger = logging.getLogger(__name__)
+ 
+-# Regular expression to parse OS versions from a minidump OS string
++# Regex to parse OS versions from a minidump OS string.
+ VERSION_RE = re.compile(r'(\d+\.\d+\.\d+)\s+(.*)')
+ 
+-# Regular expression to guess whether we're dealing with Windows or Unix paths
++# Regex to guess whether we're dealing with Windows or Unix paths.
+ WINDOWS_PATH_RE = re.compile(r'^([a-z]:\\|\\\\)', re.IGNORECASE)
+ 
+ AppInfo = namedtuple('AppInfo', ['id', 'version', 'build', 'name'])
+diff --git a/src/sentry/stacktraces.py b/src/sentry/stacktraces.py
+index f579c0ff98..2a94088bf0 100644
+--- a/src/sentry/stacktraces.py
++++ b/src/sentry/stacktraces.py
+@@ -8,6 +8,8 @@ from django.utils import timezone
+ from collections import namedtuple, OrderedDict
+ 
+ from sentry.models import Project, Release
++from sentry.grouping.utils import get_grouping_family_for_platform
++from sentry.utils.in_app import is_known_third_party
+ from sentry.utils.cache import cache
+ from sentry.utils.hashlib import hash_values
+ from sentry.utils.safe import get_path, safe_execute
+@@ -197,13 +199,51 @@ def find_stacktraces_in_data(data, include_raw=False):
+     return rv
+ 
+ 
++def _has_system_frames(frames):
++    """
++    Determines whether there are any frames in the stacktrace with in_app=false.
++    """
++
++    system_frames = 0
++    for frame in frames:
++        if not frame.get('in_app'):
++            system_frames += 1
++    return bool(system_frames) and len(frames) != system_frames
++
++
++def _normalize_in_app(stacktrace, platform=None, sdk_info=None):
++    """
++    Ensures consistent values of in_app across a stacktrace.
++    """
++    # Native frames have special rules regarding in_app. Apply them before other
++    # normalization, just like grouping enhancers.
++    # TODO(ja): Clean up those rules and put them in enhancers instead
++    for frame in stacktrace:
++        if frame.get('in_app') is not None:
++            continue
++
++        family = get_grouping_family_for_platform(frame.get('platform') or platform)
++        if family == 'native':
++            frame_package = frame.get('package')
++            frame['in_app'] = bool(frame_package) and \
++                not is_known_third_party(frame_package, sdk_info=sdk_info)
++
++    has_system_frames = _has_system_frames(stacktrace)
++    for frame in stacktrace:
++        # If all frames are in_app, flip all of them. This is expected by the UI
++        if not has_system_frames:
++            frame['in_app'] = False
++
++        # Default to false in all cases where processors or grouping enhancers
++        # have not yet set in_app.
++        elif frame.get('in_app') is None:
++            frame['in_app'] = False
++
++
+ def normalize_stacktraces_for_grouping(data, grouping_config=None):
+-    def _has_system_frames(frames):
+-        system_frames = 0
+-        for frame in frames:
+-            if not frame.get('in_app'):
+-                system_frames += 1
+-        return bool(system_frames) and len(frames) != system_frames
++    """
++    Applies grouping enhancement rules and ensure in_app is set on all frames.
++    """
+ 
+     stacktraces = []
+ 
+@@ -216,19 +256,14 @@ def normalize_stacktraces_for_grouping(data, grouping_config=None):
+         return
+ 
+     # If a grouping config is available, run grouping enhancers
++    platform = data.get('platform')
+     if grouping_config is not None:
+-        platform = data.get('platform')
+         for frames in stacktraces:
+             grouping_config.enhancements.apply_modifications_to_frame(frames, platform)
+ 
+     # normalize in-app
+-    for frames in stacktraces:
+-        has_system_frames = _has_system_frames(frames)
+-        for frame in frames:
+-            if not has_system_frames:
+-                frame['in_app'] = False
+-            elif frame.get('in_app') is None:
+-                frame['in_app'] = False
++    for stacktrace in stacktraces:
++        _normalize_in_app(stacktrace, platform=platform)
+ 
+ 
+ def should_process_for_stacktraces(data):
+@@ -311,6 +346,9 @@ def process_single_stacktrace(processing_task, stacktrace_info, processable_fram
+         if expand_processed is not None:
+             processed_frames.extend(expand_processed)
+             changed_processed = True
++        elif expand_raw:  # is not empty
++            processed_frames.extend(expand_raw)
++            changed_processed = True
+         else:
+             processed_frames.append(processable_frame.frame)
+ 
+diff --git a/src/sentry/utils/in_app.py b/src/sentry/utils/in_app.py
+new file mode 100644
+index 0000000000..856bb6e0da
+--- /dev/null
++++ b/src/sentry/utils/in_app.py
+@@ -0,0 +1,102 @@
++from __future__ import absolute_import
++
++import re
++
++
++# Absolute paths where iOS mounts application files.
++IOS_APP_PATHS = (
++    '/var/containers/Bundle/Application/',
++    '/private/var/containers/Bundle/Application/',
++)
++
++# Locations which usually contain MacOS apps.
++MACOS_APP_PATHS = (
++    '.app/Contents/',
++    '/Users/',
++    '/usr/local/',
++)
++
++# Paths which usually contain linux system or third party libraries.
++LINUX_SYS_PATHS = (
++    '/lib/',
++    '/usr/lib/',
++    'linux-gate.so',
++)
++
++# Regex matching the Windows folder on any drive.
++WINDOWS_SYS_PATH_RE = re.compile(r'^[a-z]:\\windows', re.IGNORECASE)
++
++# Regex matching well-known iOS and macOS frameworks (and our own).
++SUPPORT_FRAMEWORK_RE = re.compile(
++    r'''(?x)
++    /Frameworks/(
++            libswift([a-zA-Z0-9]+)\.dylib$
++        |   (KSCrash|SentrySwift|Sentry)\.framework/
++    )
++    '''
++)
++
++
++def _is_support_framework(package):
++    return SUPPORT_FRAMEWORK_RE.search(package) is not None
++
++
++# TODO(ja): Translate these rules to grouping enhancers
++def is_known_third_party(package, sdk_info=None):
++    """
++    Checks whether this package matches one of the well-known system image
++    locations across platforms. The given package must not be ``None``.
++    """
++
++    # Check for common iOS and MacOS support frameworks, like Swift.
++    if _is_support_framework(package):
++        return True
++
++    # Check for iOS app bundles in well known locations. These are definitely
++    # not third-party, as they contain the application.
++    if package.startswith(IOS_APP_PATHS):
++        return False
++
++    # Check for app locations in the iOS simulator
++    if '/Developer/CoreSimulator/Devices/' in package \
++            and '/Containers/Bundle/Application/' in package:
++        return False
++
++    # Check for OS-specific rules
++    sdk_name = sdk_info['sdk_name'].lower() if sdk_info else ''
++    if sdk_name == 'macos':
++        return not any(p in package for p in MACOS_APP_PATHS)
++    if sdk_name == 'linux':
++        return package.startswith(LINUX_SYS_PATHS)
++    if sdk_name == 'windows':
++        return WINDOWS_SYS_PATH_RE.match(package) is not None
++
++    # Everything else we don't know is considered third_party
++    return True
++
++
++# TODO(ja): Improve reprocessing heuristics
++def is_optional_package(package, sdk_info=None):
++    """
++    Determines whether the given package is considered optional.
++
++    This indicates that no error should be emitted if this package is missing
++    during symbolication. Also, reprocessing should not block for this image.
++    """
++
++    if not package:
++        return True
++
++    # Support frameworks have been bundled with iOS apps at times. These are
++    # considered optional.
++    if _is_support_framework(package):
++        return True
++
++    # Bundled frameworks on iOS are considered optional, even though they live
++    # in the application folder. They are not considered third party, however.
++    if package.startswith(IOS_APP_PATHS) and '/Frameworks/' in package:
++        return True
++
++    # All other images, whether from the app bundle or not, are considered
++    # required.
++    return False
+diff --git a/tests/sentry/lang/native/test_processor.py b/tests/sentry/lang/native/test_processor.py
+index 48cd8943d9..414ab84cb9 100644
+--- a/tests/sentry/lang/native/test_processor.py
++++ b/tests/sentry/lang/native/test_processor.py
+@@ -3,7 +3,6 @@ from __future__ import absolute_import
+ from mock import patch
+ 
+ from sentry.lang.native.plugin import NativeStacktraceProcessor
+-from sentry.lang.native.symbolizer import Symbolizer
+ from sentry.stacktraces import process_stacktraces
+ from sentry.testutils import TestCase
+ 
+@@ -12,16 +11,6 @@ OBJECT_NAME = (
+     "SentryTest.app/SentryTest"
+ )
+ 
+-FRAMEWORK_OBJECT_NAME = (
+-    "/var/containers/Bundle/Application/B33C37A8-F933-4B6B-9FFA-152282BFDF13/"
+-    "SentryTest.app/Frameworks/foo.dylib"
+-)
+-
+-SWIFT_OBJECT_NAME = (
+-    "/var/containers/Bundle/Application/B33C37A8-F933-4B6B-9FFA-152282BFDF13/"
+-    "SentryTest.app/Frameworks/libswiftCore.dylib"
+-)
+-
+ SDK_INFO = {"sdk_name": "iOS", "version_major": 9,
+             "version_minor": 3, "version_patchlevel": 0}
+ 
+@@ -195,62 +184,3 @@ class BasicResolvingFileTest(TestCase):
+         assert frames[2]['function'] == 'whatever_system'
+         assert frames[2]['package'] == '/usr/lib/whatever.dylib'
+         assert frames[2]['instruction_addr'] == 6020
+-
+-
+-class BasicInAppTest(TestCase):
+-    def test_in_app_detection(self):
+-        sym = Symbolizer(
+-            self.project, [
+-                {
+-                    "type": "apple",
+-                    "cpu_subtype": 0,
+-                    "uuid": "C05B4DDD-69A7-3840-A649-32180D341587",
+-                    "image_vmaddr": 4294967296,
+-                    "image_addr": 4295121760,
+-                    "cpu_type": 16777228,
+-                    "image_size": 32768,
+-                    "name": OBJECT_NAME,
+-                }, {
+-                    "type": "apple",
+-                    "cpu_subtype": 0,
+-                    "uuid": "619FA17B-124F-4CBF-901F-6CE88B52B0BF",
+-                    "image_vmaddr": 4295000064,
+-                    "image_addr": 4295154528,
+-                    "cpu_type": 16777228,
+-                    "image_size": 32768,
+-                    "name": FRAMEWORK_OBJECT_NAME,
+-                }, {
+-                    "type": "apple",
+-                    "cpu_subtype": 0,
+-                    "uuid": "2DA67FF5-2643-44D6-8FFF-1B6BC78C9912",
+-                    "image_vmaddr": 4295032832,
+-                    "image_addr": 4295187296,
+-                    "cpu_type": 16777228,
+-                    "image_size": 32768,
+-                    "name": SWIFT_OBJECT_NAME,
+-                }, {
+-                    "type": "apple",
+-                    "cpu_subtype": 0,
+-                    "cpu_type": 16777228,
+-                    "uuid": "B78CB4FB-3A90-4039-9EFD-C58932803AE5",
+-                    "image_vmaddr": 0,
+-                    "image_addr": 6000,
+-                    "cpu_type": 16777228,
+-                    "image_size": 32768,
+-                    'name': '/usr/lib/whatever.dylib',
+-                }
+-            ],
+-            referenced_images=set(
+-                [
+-                    'C05B4DDD-69A7-3840-A649-32180D341587',
+-                    'B78CB4FB-3A90-4039-9EFD-C58932803AE5',
+-                    '619FA17B-124F-4CBF-901F-6CE88B52B0BF',
+-                    '2DA67FF5-2643-44D6-8FFF-1B6BC78C9912',
+-                ]
+-            ),
+-        )
+-
+-        assert sym.is_in_app(4295121764)
+-        assert not sym.is_in_app(6042)
+-        assert sym.is_in_app(4295154570)
+-        assert not sym.is_in_app(4295032874)
+diff --git a/tests/sentry/test_stacktraces.py b/tests/sentry/test_stacktraces.py
+index 59855a11b5..1e9d1aae1a 100644
+--- a/tests/sentry/test_stacktraces.py
++++ b/tests/sentry/test_stacktraces.py
+@@ -1,5 +1,6 @@
+ from __future__ import absolute_import
+ 
++from sentry.grouping.api import get_default_grouping_config_dict, load_grouping_config
+ from sentry.stacktraces import find_stacktraces_in_data, normalize_stacktraces_for_grouping
+ from sentry.testutils import TestCase
+ 
+@@ -209,3 +210,156 @@ class NormalizeInApptest(TestCase):
+         normalize_stacktraces_for_grouping(data)
+         assert data['stacktrace']['frames'][1]['in_app'] is False
+         assert data['stacktrace']['frames'][2]['in_app'] is False
++
++    def test_ios_package_in_app_detection(self):
++        data = {
++            'platform': 'native',
++            'stacktrace': {
++                'frames': [
++                    {
++                        'package': '/var/containers/Bundle/Application/B33C37A8-F933-4B6B-9FFA-152282BFDF13/SentryTest.app/SentryTest',
++                        'instruction_addr': '0x1000'
++                    },
++                    {
++                        'package': '/var/containers/Bundle/Application/B33C37A8-F933-4B6B-9FFA-152282BFDF13/SentryTest.app/Frameworks/foo.dylib',
++                        'instruction_addr': '0x2000'
++                    },
++                    {
++                        'package': '/var/containers/Bundle/Application/B33C37A8-F933-4B6B-9FFA-152282BFDF13/SentryTest.app/Frameworks/libswiftCore.dylib',
++                        'instruction_addr': '0x3000'
++                    },
++                    {
++                        'package': '/usr/lib/whatever.dylib',
++                        'instruction_addr': '0x4000'
++                    },
++                ]
++            }
++        }
++
++        config = load_grouping_config(get_default_grouping_config_dict())
++        normalize_stacktraces_for_grouping(data, grouping_config=config)
++
++        # App object should be in_app
++        assert data['stacktrace']['frames'][0]['in_app'] is True
++        # Framework should be in app (but optional)
++        assert data['stacktrace']['frames'][1]['in_app'] is True
++        # libswift should not be system
++        assert data['stacktrace']['frames'][2]['in_app'] is False
++        # Unknown object should default to not in_app
++        assert data['stacktrace']['frames'][3]['in_app'] is False
++
++    def tes_macos_package_in_app_detection(self):
++        data = {
++            "platform": "cocoa",
++            "debug_meta": {
++                "images": []  # omitted
++            },
++            "exception": {
++                "values": [
++                    {
++                        "stacktrace": {
++                            "frames": [
++                                {
++                                    "function": "-[CRLCrashAsyncSafeThread crash]",
++                                    "package": "/Users/haza/Library/Developer/Xcode/Archives/2017-06-19/CrashProbe 19-06-2017, 08.53.xcarchive/Products/Applications/CrashProbe.app/Contents/Frameworks/CrashLib.framework/Versions/A/CrashLib",
++                                    "instruction_addr": 4295098388
++                                },
++                                {
++                                    "function": "[KSCrash ]",
++                                    "package": "/usr/lib/system/libdyld.dylib",
++                                    "instruction_addr": 4295098388,
++                                },
++                            ]
++                        },
++                        "type": "NSRangeException",
++                    }
++                ]
++            },
++            "contexts": {
++                "os": {
++                    "version": "10.12.5",
++                    "type": "os",
++                    "name": "macOS"
++                }
++            },
++        }
++
++        config = load_grouping_config(get_default_grouping_config_dict())
++        normalize_stacktraces_for_grouping(data, grouping_config=config)
++
++        frames = data['exception']['values'][0]['stacktrace']['frames']
++        assert frames[0]['in_app'] is True
++        assert frames[1]['in_app'] is False
++
++    def test_ios_function_name_in_app_detection(self):
++        data = {
++            "platform": "cocoa",
++            "debug_meta": {
++                "images": []  # omitted
++            },
++            "exception": {
++                "values": [
++                    {
++                        "stacktrace": {
++                            "frames": [
++                                {
++                                    "function": "+[RNSentry ]",
++                                    "package": "/var/containers/Bundle/Application/B33C37A8-F933-4B6B-9FFA-152282BFDF13/SentryTest.app/SentryTest",
++                                    "instruction_addr": 4295098388,
++                                },
++                                {
++                                    "function": "+[SentryClient ]",
++                                    "package": "/var/containers/Bundle/Application/B33C37A8-F933-4B6B-9FFA-152282BFDF13/SentryTest.app/SentryTest",
++                                    "instruction_addr": 4295098388,
++                                },
++                                {
++                                    "function": "kscrash_foobar",
++                                    "package": "/var/containers/Bundle/Application/B33C37A8-F933-4B6B-9FFA-152282BFDF13/SentryTest.app/SentryTest",
++                                    "instruction_addr": 4295098388,
++                                },
++                                {
++                                    "function": "kscm_foobar",
++                                    "package": "/var/containers/Bundle/Application/B33C37A8-F933-4B6B-9FFA-152282BFDF13/SentryTest.app/SentryTest",
++                                    "instruction_addr": 4295098388,
++                                },
++                                {
++                                    "function": "+[KSCrash ]",
++                                    "package": "/var/containers/Bundle/Application/B33C37A8-F933-4B6B-9FFA-152282BFDF13/SentryTest.app/SentryTest",
++                                    "instruction_addr": 4295098388,
++                                },
++                                {
++                                    "function": "+[KSCrash]",
++                                    "package": "/var/containers/Bundle/Application/B33C37A8-F933-4B6B-9FFA-152282BFDF13/SentryTest.app/SentryTest",
++                                    "instruction_addr": 4295098388,
++                                },
++                                {
++                                    "function": "+[KSCrashy]",
++                                    "package": "/var/containers/Bundle/Application/B33C37A8-F933-4B6B-9FFA-152282BFDF13/SentryTest.app/SentryTest",
++                                    "instruction_addr": 4295098388,
++                                },
++                            ]
++                        },
++                        "type": "NSRangeException",
++                    }
++                ]
++            },
++            "contexts": {
++                "os": {
++                    "version": "9.3.2",
++                    "type": "os",
++                    "name": "iOS"
++                }
++            }
++        }
++
++        config = load_grouping_config(get_default_grouping_config_dict())
++        normalize_stacktraces_for_grouping(data, grouping_config=config)
++
++        frames = data['exception']['values'][0]['stacktrace']['frames']
++        assert frames[0]['in_app'] is False
++        assert frames[1]['in_app'] is False
++        assert frames[2]['in_app'] is False
++        assert frames[3]['in_app'] is False
++        assert frames[4]['in_app'] is False
++        assert frames[5]['in_app'] is True
++        assert frames[6]['in_app'] is True
+diff --git a/tests/symbolicator/snapshots/SymbolicResolvingIntegrationTest/test_debug_id_resolving.pysnap b/tests/symbolicator/snapshots/SymbolicResolvingIntegrationTest/test_debug_id_resolving.pysnap
+index 523f0d75b5..cc7141008f 100644
+--- a/tests/symbolicator/snapshots/SymbolicResolvingIntegrationTest/test_debug_id_resolving.pysnap
++++ b/tests/symbolicator/snapshots/SymbolicResolvingIntegrationTest/test_debug_id_resolving.pysnap
+@@ -1,5 +1,5 @@
+ ---
+-created: '2019-04-15T09:43:14.321187Z'
++created: '2019-04-16T08:02:50.732813Z'
+ creator: sentry
+ source: tests/symbolicator/test_native_plugin.py
+ ---
+@@ -19,6 +19,7 @@ debug_meta:
+     image_addr: '0x2a0000'
+     image_size: 36864
+     type: symbolic
++errors: null
+ exception:
+   values:
+   - raw_stacktrace:
+diff --git a/tests/symbolicator/snapshots/SymbolicResolvingIntegrationTest/test_missing_dsym.pysnap b/tests/symbolicator/snapshots/SymbolicResolvingIntegrationTest/test_missing_dsym.pysnap
+index 0bb6408211..dbbec9f2de 100644
+--- a/tests/symbolicator/snapshots/SymbolicResolvingIntegrationTest/test_missing_dsym.pysnap
++++ b/tests/symbolicator/snapshots/SymbolicResolvingIntegrationTest/test_missing_dsym.pysnap
+@@ -1,5 +1,5 @@
+ ---
+-created: '2019-04-15T09:43:15.116901Z'
++created: '2019-04-16T08:02:51.650477Z'
+ creator: sentry
+ source: tests/symbolicator/test_native_plugin.py
+ ---
+@@ -18,6 +18,12 @@ debug_meta:
+     version_major: 10
+     version_minor: 12
+     version_patchlevel: 4
++errors:
++- image_arch: x86_64
++  image_path: Foo.app/Contents/Foo
++  image_uuid: 502fc0a5-1ec1-3e47-9998-684fa139dca7
++  message: None
++  type: native_missing_dsym
+ exception:
+   values:
+   - raw_stacktrace:
+@@ -26,6 +32,7 @@ exception:
+         function: unknown
+         in_app: false
+         instruction_addr: '0x100000fa0'
++        package: Foo.app/Contents/Foo
+     stacktrace:
+       frames:
+       - *id001
+diff --git a/tests/symbolicator/snapshots/SymbolicResolvingIntegrationTest/test_real_resolving.pysnap b/tests/symbolicator/snapshots/SymbolicResolvingIntegrationTest/test_real_resolving.pysnap
+index e2888c5f1a..f959c91a3c 100644
+--- a/tests/symbolicator/snapshots/SymbolicResolvingIntegrationTest/test_real_resolving.pysnap
++++ b/tests/symbolicator/snapshots/SymbolicResolvingIntegrationTest/test_real_resolving.pysnap
+@@ -1,5 +1,5 @@
+ ---
+-created: '2019-04-15T09:43:15.764548Z'
++created: '2019-04-16T08:02:52.259172Z'
+ creator: sentry
+ source: tests/symbolicator/test_native_plugin.py
+ ---
+@@ -18,6 +18,7 @@ debug_meta:
+     version_major: 10
+     version_minor: 12
+     version_patchlevel: 4
++errors: null
+ exception:
+   values:
+   - raw_stacktrace:
+@@ -25,6 +26,7 @@ exception:
+       - function: unknown
+         in_app: false
+         instruction_addr: '0x100000fa0'
++        package: Foo.app/Contents/Foo
+     stacktrace:
+       frames:
+       - abs_path: /tmp/hello.c
+diff --git a/tests/symbolicator/snapshots/SymbolicatorResolvingIntegrationTest/test_missing_dsym.pysnap b/tests/symbolicator/snapshots/SymbolicatorResolvingIntegrationTest/test_missing_dsym.pysnap
+index c5391a5070..c84b4d95d1 100644
+--- a/tests/symbolicator/snapshots/SymbolicatorResolvingIntegrationTest/test_missing_dsym.pysnap
++++ b/tests/symbolicator/snapshots/SymbolicatorResolvingIntegrationTest/test_missing_dsym.pysnap
+@@ -1,5 +1,5 @@
+ ---
+-created: '2019-04-15T11:04:03.933068Z'
++created: '2019-04-16T08:02:55.584738Z'
+ creator: sentry
+ source: tests/symbolicator/test_native_plugin.py
+ ---
+@@ -28,14 +28,14 @@ exception:
+   values:
+   - raw_stacktrace:
+       frames:
+-      - function: unknown
++      - &id001
++        function: unknown
+         in_app: false
+         instruction_addr: '0x100000fa0'
++        package: Foo.app/Contents/Foo
+     stacktrace:
+       frames:
+-      - function: unknown
+-        in_app: false
+-        instruction_addr: '0x100000fa0'
++      - *id001
+     type: Fail
+     value: fail
+ stacktrace: null
+diff --git a/tests/symbolicator/snapshots/SymbolicatorResolvingIntegrationTest/test_real_resolving.pysnap b/tests/symbolicator/snapshots/SymbolicatorResolvingIntegrationTest/test_real_resolving.pysnap
+index cd941985a4..9dd7e93a8e 100644
+--- a/tests/symbolicator/snapshots/SymbolicatorResolvingIntegrationTest/test_real_resolving.pysnap
++++ b/tests/symbolicator/snapshots/SymbolicatorResolvingIntegrationTest/test_real_resolving.pysnap
+@@ -26,6 +26,7 @@ exception:
+       - function: unknown
+         in_app: false
+         instruction_addr: '0x100000fa0'
++        package: Foo.app/Contents/Foo
+     stacktrace:
+       frames:
+       - abs_path: /tmp/hello.c
+diff --git a/tests/symbolicator/snapshots/SymbolicatorResolvingIntegrationTest/test_real_resolving_with_multiple_requests.pysnap b/tests/symbolicator/snapshots/SymbolicatorResolvingIntegrationTest/test_real_resolving_with_multiple_requests.pysnap
+index 5be344a7fb..bda4b1d551 100644
+--- a/tests/symbolicator/snapshots/SymbolicatorResolvingIntegrationTest/test_real_resolving_with_multiple_requests.pysnap
++++ b/tests/symbolicator/snapshots/SymbolicatorResolvingIntegrationTest/test_real_resolving_with_multiple_requests.pysnap
+@@ -27,6 +27,7 @@ exception:
+       - function: unknown
+         in_app: false
+         instruction_addr: '0x100000fa0'
++        package: Foo.app/Contents/Foo
+     stacktrace:
+       frames:
+       - abs_path: /tmp/hello.c
+diff --git a/tests/symbolicator/test_native_plugin.py b/tests/symbolicator/test_native_plugin.py
+index ae95a1362c..2a10d697f6 100644
+--- a/tests/symbolicator/test_native_plugin.py
++++ b/tests/symbolicator/test_native_plugin.py
+@@ -784,162 +784,6 @@ class InAppHonoringResolvingIntegrationTest(TestCase):
+         assert long_frames[1]['instructionAddr'] == '0x100020014'
+         assert long_frames[2]['instructionAddr'] == '0x10002001c'
+ 
+-    @patch.object(Symbolizer, '_symbolize_app_frame', sym_app_frame)
+-    def test_in_app_function_name(self):
+-        object_name = (
+-            "/var/containers/Bundle/Application/"
+-            "B33C37A8-F933-4B6B-9FFA-152282BFDF13/"
+-            "SentryTest.app/SentryTest"
+-        )
+-        # '/var/containers/Bundle/Application/',
+-        # '/private/var/containers/Bundle/Application/',
+-        # (kscm_|kscrash_|KSCrash |SentryClient |RNSentry )
+-        event_data = {
+-            "user": {
+-                "ip_address": "31.172.207.97"
+-            },
+-            "extra": {},
+-            "project": self.project.id,
+-            "platform": "cocoa",
+-            "debug_meta": {
+-                "images": [
+-                    {
+-                        "type": "apple",
+-                        "cpu_subtype": 0,
+-                        "uuid": "C05B4DDD-69A7-3840-A649-32180D341587",
+-                        "image_vmaddr": 4294967296,
+-                        "image_addr": 4295098368,
+-                        "cpu_type": 16777228,
+-                        "image_size": 32768,
+-                        "name": object_name,
+-                    }
+-                ]
+-            },
+-            "exception": {
+-                "values": [
+-                    {
+-                        "stacktrace": {
+-                            "frames": [
+-                                {
+-                                    "function": "[RNSentry ]",
+-                                    "abs_path": None,
+-                                    "package": "/usr/lib/system/libdyld.dylib",
+-                                    "filename": None,
+-                                    "symbol_addr": "0x002ac28b4",
+-                                    "lineno": None,
+-                                    "instruction_addr": 4295098388,
+-                                },
+-                                {
+-                                    "function": "[SentryClient ]",
+-                                    "abs_path": None,
+-                                    "package": "/usr/lib/system/libdyld.dylib",
+-                                    "filename": None,
+-                                    "symbol_addr": "0x002ac28b4",
+-                                    "lineno": None,
+-                                    "instruction_addr": 4295098388,
+-                                },
+-                                {
+-                                    "function": "[kscrash_]",
+-                                    "abs_path": None,
+-                                    "package": "/usr/lib/system/libdyld.dylib",
+-                                    "filename": None,
+-                                    "symbol_addr": "0x002ac28b4",
+-                                    "lineno": None,
+-                                    "instruction_addr": 4295098388,
+-                                },
+-                                {
+-                                    "function": "[kscm_]",
+-                                    "abs_path": None,
+-                                    "package": "/usr/lib/system/libdyld.dylib",
+-                                    "filename": None,
+-                                    "symbol_addr": "0x002ac28b4",
+-                                    "lineno": None,
+-                                    "instruction_addr": 4295098388,
+-                                },
+-                                {
+-                                    "function": "[KSCrash ]",
+-                                    "abs_path": None,
+-                                    "package": "/usr/lib/system/libdyld.dylib",
+-                                    "filename": None,
+-                                    "symbol_addr": "0x002ac28b4",
+-                                    "lineno": None,
+-                                    "instruction_addr": 4295098388,
+-                                },
+-                                {
+-                                    "function": "[KSCrash]",
+-                                    "abs_path": None,
+-                                    "package": "/usr/lib/system/libdyld.dylib",
+-                                    "filename": None,
+-                                    "symbol_addr": "0x002ac28b4",
+-                                    "lineno": None,
+-                                    "instruction_addr": 4295098388,
+-                                },
+-                                {
+-                                    "function": "[KSCrashy]",
+-                                    "abs_path": None,
+-                                    "package": "/usr/lib/system/libdyld.dylib",
+-                                    "filename": None,
+-                                    "symbol_addr": "0x002ac28b4",
+-                                    "lineno": None,
+-                                    "instruction_addr": 4295098388,
+-                                },
+-                            ]
+-                        },
+-                        "type": "NSRangeException",
+-                        "mechanism": {
+-                            "type": "mach",
+-                            "meta": {
+-                                "signal": {
+-                                    "number": 6,
+-                                    "code": 0,
+-                                    "name": "SIGABRT",
+-                                    "code_name": None
+-                                },
+-                                "mach_exception": {
+-                                    "subcode": 0,
+-                                    "code": 0,
+-                                    "exception": 10,
+-                                    "name": "EXC_CRASH"
+-                                }
+-                            }
+-                        },
+-                        "value": (
+-                            "*** -[__NSArray0 objectAtIndex:]: index 3 "
+-                            "beyond bounds for empty NSArray"
+-                        )
+-                    }
+-                ]
+-            },
+-            "contexts": {
+-                "device": {
+-                    "model_id": "N102AP",
+-                    "model": "iPod7,1",
+-                    "arch": "arm64",
+-                    "family": "iPod"
+-                },
+-                "os": {
+-                    "version": "9.3.2",
+-                    "rooted": False,
+-                    "build": "13F69",
+-                    "name": "iOS"
+-                }
+-            }
+-        }
+-        resp = self._postWithHeader(event_data)
+-        assert resp.status_code == 200
+-
+-        event = Event.objects.get()
+-
+-        bt = event.interfaces['exception'].values[0].stacktrace
+-        frames = bt.frames
+-        assert not frames[0].in_app
+-        assert not frames[1].in_app
+-        assert not frames[2].in_app
+-        assert not frames[3].in_app
+-        assert not frames[4].in_app
+-        assert frames[5].in_app
+-        assert frames[6].in_app
+-
+     def sym_mac_app_frame(self, instruction_addr, img, sdk_info=None, trust=None):
+         object_name = (
+             "/Users/haza/Library/Developer/Xcode/Archives/2017-06-19/"
+@@ -969,126 +813,6 @@ class InAppHonoringResolvingIntegrationTest(TestCase):
+             "instruction_addr": '0x100026330',
+         }]
+ 
+-    @patch.object(Symbolizer, '_symbolize_app_frame', sym_mac_app_frame)
+-    def test_in_app_macos(self):
+-        object_name = (
+-            "/Users/haza/Library/Developer/Xcode/Archives/2017-06-19/"
+-            "CrashProbe 19-06-2017, 08.53.xcarchive/Products/Applications/"
+-            "CrashProbe.app/Contents/Frameworks/"
+-            "CrashLib.framework/Versions/A/CrashLib"
+-        )
+-        event_data = {
+-            "user": {
+-                "ip_address": "31.172.207.97"
+-            },
+-            "extra": {},
+-            "project": self.project.id,
+-            "platform": "cocoa",
+-            "debug_meta": {
+-                "images": [
+-                    {
+-                        "type": "apple",
+-                        "cpu_subtype": 0,
+-                        "uuid": "C05B4DDD-69A7-3840-A649-32180D341587",
+-                        "image_vmaddr": 4294967296,
+-                        "image_addr": 4295098368,
+-                        "cpu_type": 16777228,
+-                        "image_size": 32768,
+-                        "name": object_name,
+-                    }
+-                ]
+-            },
+-            "exception": {
+-                "values": [
+-                    {
+-                        "stacktrace": {
+-                            "frames": [
+-                                {
+-                                    "function": "-[CRLCrashAsyncSafeThread crash]",
+-                                    "abs_path": "/Users/haza/Projects/getsentry-CrashProbe/CrashProbe/CRLCrashAsyncSafeThread.m",
+-                                    "package": "/Users/haza/Library/Developer/Xcode/Archives/2017-06-19/CrashProbe 19-06-2017, 08.53.xcarchive/Products/Applications/CrashProbe.app/Contents/Frameworks/CrashLib.framework/Versions/A/CrashLib",
+-                                    "image_addr": "0x110121000",
+-                                    "symbol_addr": "0x110122303",
+-                                    "instruction_addr": 4295098388
+-                                },
+-                                {
+-                                    "function": "[KSCrash ]",
+-                                    "abs_path": None,
+-                                    "package": "/usr/lib/system/libdyld.dylib",
+-                                    "filename": None,
+-                                    "symbol_addr": "0x002ac28b4",
+-                                    "lineno": None,
+-                                    "instruction_addr": 4295098388,
+-                                },
+-                            ]
+-                        },
+-                        "type": "NSRangeException",
+-                        "mechanism": {
+-                            "type": "mach",
+-                            "meta": {
+-                                "signal": {
+-                                    "number": 6,
+-                                    "code": 0,
+-                                    "name": "SIGABRT",
+-                                    "code_name": None
+-                                },
+-                                "mach_exception": {
+-                                    "subcode": 0,
+-                                    "code": 0,
+-                                    "exception": 10,
+-                                    "name": "EXC_CRASH"
+-                                }
+-                            }
+-                        },
+-                        "value": (
+-                            "*** -[__NSArray0 objectAtIndex:]: index 3 "
+-                            "beyond bounds for empty NSArray"
+-                        )
+-                    }
+-                ]
+-            },
+-            "contexts": {
+-                "device": {
+-                    "family": "macOS",
+-                    "type": "device",
+-                    "storage_size": 498954403840,
+-                    "free_memory": 415174656,
+-                    "memory_size": 17179869184,
+-                    "boot_time": "2017-06-18T07:10:05Z",
+-                    "model": "MacBookPro13,1",
+-                    "usable_memory": 15204716544,
+-                    "arch": "x86"
+-                },
+-                "app": {
+-                    "app_version": "1.0",
+-                    "app_name": "CrashProbe",
+-                    "device_app_hash": "75e22adcce6cb4c81db7c7e623c2f2721616d2c8",
+-                    "executable_path": "/Users/haza/Library/Developer/Xcode/Archives/2017-06-19/CrashProbe 19-06-2017, 08.53.xcarchive/Products/Applications/CrashProbe.app/CrashProbe",
+-                    "build_type": "unknown",
+-                    "app_start_time": "2017-06-19T07:19:02Z",
+-                    "app_identifier": "net.hockeyapp.CrashProbe",
+-                    "type": "app",
+-                    "app_build": "1"
+-                },
+-                "os": {
+-                    "rooted": False,
+-                    "kernel_version": "Darwin Kernel Version 16.6.0: Fri Apr 14 16:21:16 PDT 2017; root:xnu-3789.60.24~6/RELEASE_X86_64",
+-                    "version": "10.12.5",
+-                    "build": "16F73",
+-                    "type": "os",
+-                    "name": "macOS"
+-                }
+-            },
+-        }
+-        resp = self._postWithHeader(event_data)
+-        assert resp.status_code == 200
+-
+-        event = Event.objects.get()
+-
+-        bt = event.interfaces['exception'].values[0].stacktrace
+-        frames = bt.frames
+-        assert frames[0].in_app
+-
+ 
+ class ResolvingIntegrationTestBase(object):
+     def snapshot_stacktrace_data(self, event):

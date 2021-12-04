@@ -1,0 +1,506 @@
+commit b9ad20a75bfa31224b00027b11a67f7d4a2e1d08
+Author: jbrockmendel <jbrockmendel@gmail.com>
+Date:   Tue May 19 06:16:14 2020 -0700
+
+    PERF: block-wise arithmetic for frame-with-frame (#32779)
+
+diff --git a/asv_bench/benchmarks/arithmetic.py b/asv_bench/benchmarks/arithmetic.py
+index 8aa294685..08a11ba26 100644
+--- a/asv_bench/benchmarks/arithmetic.py
++++ b/asv_bench/benchmarks/arithmetic.py
+@@ -101,6 +101,59 @@ class MixedFrameWithSeriesAxis:
+         getattr(operator, opname)(self.df, self.ser)
+ 
+ 
++class FrameWithFrameWide:
++    # Many-columns, mixed dtypes
++
++    params = [
++        [
++            # GH#32779 has discussion of which operators are included here
++            operator.add,
++            operator.floordiv,
++            operator.gt,
++        ]
++    ]
++    param_names = ["op"]
++
++    def setup(self, op):
++        # we choose dtypes so as to make the blocks
++        #  a) not perfectly match between right and left
++        #  b) appreciably bigger than single columns
++        n_cols = 2000
++        n_rows = 500
++
++        # construct dataframe with 2 blocks
++        arr1 = np.random.randn(n_rows, int(n_cols / 2)).astype("f8")
++        arr2 = np.random.randn(n_rows, int(n_cols / 2)).astype("f4")
++        df = pd.concat(
++            [pd.DataFrame(arr1), pd.DataFrame(arr2)], axis=1, ignore_index=True,
++        )
++        # should already be the case, but just to be sure
++        df._consolidate_inplace()
++
++        # TODO: GH#33198 the setting here shoudlnt need two steps
++        arr1 = np.random.randn(n_rows, int(n_cols / 4)).astype("f8")
++        arr2 = np.random.randn(n_rows, int(n_cols / 2)).astype("i8")
++        arr3 = np.random.randn(n_rows, int(n_cols / 4)).astype("f8")
++        df2 = pd.concat(
++            [pd.DataFrame(arr1), pd.DataFrame(arr2), pd.DataFrame(arr3)],
++            axis=1,
++            ignore_index=True,
++        )
++        # should already be the case, but just to be sure
++        df2._consolidate_inplace()
++
++        self.left = df
++        self.right = df2
++
++    def time_op_different_blocks(self, op):
++        # blocks (and dtypes) are not aligned
++        op(self.left, self.right)
++
++    def time_op_same_blocks(self, op):
++        # blocks (and dtypes) are aligned
++        op(self.left, self.left)
++
++
+ class Ops:
+ 
+     params = [[True, False], ["default", 1]]
+diff --git a/doc/source/whatsnew/v1.1.0.rst b/doc/source/whatsnew/v1.1.0.rst
+index ed5d26aee..4605c1464 100644
+--- a/doc/source/whatsnew/v1.1.0.rst
++++ b/doc/source/whatsnew/v1.1.0.rst
+@@ -611,7 +611,7 @@ Performance improvements
+   and :meth:`~pandas.core.groupby.groupby.Groupby.last` (:issue:`34178`)
+ - Performance improvement in :func:`factorize` for nullable (integer and boolean) dtypes (:issue:`33064`).
+ - Performance improvement in reductions (sum, prod, min, max) for nullable (integer and boolean) dtypes (:issue:`30982`, :issue:`33261`, :issue:`33442`).
+-
++- Performance improvement in arithmetic operations between two :class:`DataFrame` objects (:issue:`32779`)
+ 
+ .. ---------------------------------------------------------------------------
+ 
+diff --git a/pandas/_libs/internals.pyx b/pandas/_libs/internals.pyx
+index 1aa95e92b..db452cb0f 100644
+--- a/pandas/_libs/internals.pyx
++++ b/pandas/_libs/internals.pyx
+@@ -49,7 +49,7 @@ cdef class BlockPlacement:
+         else:
+             # Cython memoryview interface requires ndarray to be writeable.
+             arr = np.require(val, dtype=np.int64, requirements='W')
+-            assert arr.ndim == 1
++            assert arr.ndim == 1, arr.shape
+             self._as_array = arr
+             self._has_array = True
+ 
+diff --git a/pandas/core/arrays/datetimelike.py b/pandas/core/arrays/datetimelike.py
+index 708b0ea4d..9121e00b3 100644
+--- a/pandas/core/arrays/datetimelike.py
++++ b/pandas/core/arrays/datetimelike.py
+@@ -98,6 +98,10 @@ def _datetimelike_array_cmp(cls, op):
+ 
+     @unpack_zerodim_and_defer(opname)
+     def wrapper(self, other):
++        if self.ndim > 1 and getattr(other, "shape", None) == self.shape:
++            # TODO: handle 2D-like listlikes
++            return op(self.ravel(), other.ravel()).reshape(self.shape)
++
+         try:
+             other = _validate_comparison_value(self, other)
+         except InvalidComparison:
+@@ -1308,10 +1312,12 @@ class DatetimeLikeArrayMixin(
+         """
+         assert op in [operator.add, operator.sub]
+         if len(other) == 1:
++            # If both 1D then broadcasting is unambiguous
++            # TODO(EA2D): require self.ndim == other.ndim here
+             return op(self, other[0])
+ 
+         warnings.warn(
+-            "Adding/subtracting array of DateOffsets to "
++            "Adding/subtracting object-dtype array to "
+             f"{type(self).__name__} not vectorized",
+             PerformanceWarning,
+         )
+@@ -1319,7 +1325,7 @@ class DatetimeLikeArrayMixin(
+         # Caller is responsible for broadcasting if necessary
+         assert self.shape == other.shape, (self.shape, other.shape)
+ 
+-        res_values = op(self.astype("O"), np.array(other))
++        res_values = op(self.astype("O"), np.asarray(other))
+         result = array(res_values.ravel())
+         result = extract_array(result, extract_numpy=True).reshape(self.shape)
+         return result
+diff --git a/pandas/core/frame.py b/pandas/core/frame.py
+index 31015e309..f2d8e38df 100644
+--- a/pandas/core/frame.py
++++ b/pandas/core/frame.py
+@@ -455,6 +455,7 @@ class DataFrame(NDFrame):
+             mgr = self._init_mgr(
+                 data, axes=dict(index=index, columns=columns), dtype=dtype, copy=copy
+             )
++
+         elif isinstance(data, dict):
+             mgr = init_dict(data, index, columns, dtype=dtype)
+         elif isinstance(data, ma.MaskedArray):
+@@ -5754,10 +5755,11 @@ class DataFrame(NDFrame):
+         -------
+         DataFrame
+         """
+-        out = self._constructor(result, index=self.index, copy=False)
++        out = self._constructor(result, copy=False)
+         # Pin columns instead of passing to constructor for compat with
+         #  non-unique columns case
+         out.columns = self.columns
++        out.index = self.index
+         return out
+ 
+     def combine(
+diff --git a/pandas/core/internals/managers.py b/pandas/core/internals/managers.py
+index 4f6d84e52..590b92481 100644
+--- a/pandas/core/internals/managers.py
++++ b/pandas/core/internals/managers.py
+@@ -1269,12 +1269,22 @@ class BlockManager(PandasObject):
+ 
+         return type(self).from_blocks(new_blocks, new_axes)
+ 
+-    def _slice_take_blocks_ax0(self, slice_or_indexer, fill_value=lib.no_default):
++    def _slice_take_blocks_ax0(
++        self, slice_or_indexer, fill_value=lib.no_default, only_slice: bool = False
++    ):
+         """
+         Slice/take blocks along axis=0.
+ 
+         Overloaded for SingleBlock
+ 
++        Parameters
++        ----------
++        slice_or_indexer : slice, ndarray[bool], or list-like of ints
++        fill_value : scalar, default lib.no_default
++        only_slice : bool, default False
++            If True, we always return views on existing arrays, never copies.
++            This is used when called from ops.blockwise.operate_blockwise.
++
+         Returns
+         -------
+         new_blocks : list of Block
+@@ -1298,14 +1308,23 @@ class BlockManager(PandasObject):
+                 if allow_fill and fill_value is None:
+                     _, fill_value = maybe_promote(blk.dtype)
+ 
+-                return [
+-                    blk.take_nd(
+-                        slobj,
+-                        axis=0,
+-                        new_mgr_locs=slice(0, sllen),
+-                        fill_value=fill_value,
+-                    )
+-                ]
++                if not allow_fill and only_slice:
++                    # GH#33597 slice instead of take, so we get
++                    #  views instead of copies
++                    blocks = [
++                        blk.getitem_block([ml], new_mgr_locs=i)
++                        for i, ml in enumerate(slobj)
++                    ]
++                    return blocks
++                else:
++                    return [
++                        blk.take_nd(
++                            slobj,
++                            axis=0,
++                            new_mgr_locs=slice(0, sllen),
++                            fill_value=fill_value,
++                        )
++                    ]
+ 
+         if sl_type in ("slice", "mask"):
+             blknos = self.blknos[slobj]
+@@ -1342,11 +1361,25 @@ class BlockManager(PandasObject):
+                         blocks.append(newblk)
+ 
+                 else:
+-                    blocks.append(
+-                        blk.take_nd(
+-                            blklocs[mgr_locs.indexer], axis=0, new_mgr_locs=mgr_locs,
+-                        )
+-                    )
++                    # GH#32779 to avoid the performance penalty of copying,
++                    #  we may try to only slice
++                    taker = blklocs[mgr_locs.indexer]
++                    max_len = max(len(mgr_locs), taker.max() + 1)
++                    if only_slice:
++                        taker = lib.maybe_indices_to_slice(taker, max_len)
++
++                    if isinstance(taker, slice):
++                        nb = blk.getitem_block(taker, new_mgr_locs=mgr_locs)
++                        blocks.append(nb)
++                    elif only_slice:
++                        # GH#33597 slice instead of take, so we get
++                        #  views instead of copies
++                        for i, ml in zip(taker, mgr_locs):
++                            nb = blk.getitem_block([i], new_mgr_locs=ml)
++                            blocks.append(nb)
++                    else:
++                        nb = blk.take_nd(taker, axis=0, new_mgr_locs=mgr_locs)
++                        blocks.append(nb)
+ 
+         return blocks
+ 
+diff --git a/pandas/core/ops/__init__.py b/pandas/core/ops/__init__.py
+index da1caea13..585e6d0eb 100644
+--- a/pandas/core/ops/__init__.py
++++ b/pandas/core/ops/__init__.py
+@@ -26,6 +26,7 @@ from pandas.core.ops.array_ops import (
+     logical_op,
+ )
+ from pandas.core.ops.array_ops import comp_method_OBJECT_ARRAY  # noqa:F401
++from pandas.core.ops.blockwise import operate_blockwise
+ from pandas.core.ops.common import unpack_zerodim_and_defer
+ from pandas.core.ops.dispatch import should_series_dispatch
+ from pandas.core.ops.docstrings import (
+@@ -325,8 +326,9 @@ def dispatch_to_series(left, right, func, str_rep=None, axis=None):
+     elif isinstance(right, ABCDataFrame):
+         assert right._indexed_same(left)
+ 
+-        def column_op(a, b):
+-            return {i: func(a.iloc[:, i], b.iloc[:, i]) for i in range(len(a.columns))}
++        array_op = get_array_op(func, str_rep=str_rep)
++        bm = operate_blockwise(left, right, array_op)
++        return type(left)(bm)
+ 
+     elif isinstance(right, ABCSeries) and axis == "columns":
+         # We only get here if called via _combine_series_frame,
+diff --git a/pandas/core/ops/array_ops.py b/pandas/core/ops/array_ops.py
+index 59ac2a207..eef42592d 100644
+--- a/pandas/core/ops/array_ops.py
++++ b/pandas/core/ops/array_ops.py
+@@ -6,6 +6,7 @@ from datetime import timedelta
+ from functools import partial
+ import operator
+ from typing import Any, Optional, Tuple
++import warnings
+ 
+ import numpy as np
+ 
+@@ -120,7 +121,7 @@ def masked_arith_op(x: np.ndarray, y, op):
+     return result
+ 
+ 
+-def define_na_arithmetic_op(op, str_rep: str):
++def define_na_arithmetic_op(op, str_rep: Optional[str]):
+     def na_op(x, y):
+         return na_arithmetic_op(x, y, op, str_rep)
+ 
+@@ -191,7 +192,8 @@ def arithmetic_op(left: ArrayLike, right: Any, op, str_rep: str):
+     # NB: We assume that extract_array has already been called
+     #  on `left` and `right`.
+     lvalues = maybe_upcast_datetimelike_array(left)
+-    rvalues = maybe_upcast_for_op(right, lvalues.shape)
++    rvalues = maybe_upcast_datetimelike_array(right)
++    rvalues = maybe_upcast_for_op(rvalues, lvalues.shape)
+ 
+     if should_extension_dispatch(lvalues, rvalues) or isinstance(rvalues, Timedelta):
+         # Timedelta is included because numexpr will fail on it, see GH#31457
+@@ -254,8 +256,13 @@ def comparison_op(
+         res_values = comp_method_OBJECT_ARRAY(op, lvalues, rvalues)
+ 
+     else:
+-        with np.errstate(all="ignore"):
+-            res_values = na_arithmetic_op(lvalues, rvalues, op, str_rep, is_cmp=True)
++        with warnings.catch_warnings():
++            # suppress warnings from numpy about element-wise comparison
++            warnings.simplefilter("ignore", DeprecationWarning)
++            with np.errstate(all="ignore"):
++                res_values = na_arithmetic_op(
++                    lvalues, rvalues, op, str_rep, is_cmp=True
++                )
+ 
+     return res_values
+ 
+diff --git a/pandas/core/ops/blockwise.py b/pandas/core/ops/blockwise.py
+new file mode 100644
+index 000000000..f41a30b13
+--- /dev/null
++++ b/pandas/core/ops/blockwise.py
+@@ -0,0 +1,102 @@
++from typing import TYPE_CHECKING, List, Tuple
++
++import numpy as np
++
++from pandas._typing import ArrayLike
++
++if TYPE_CHECKING:
++    from pandas.core.internals.blocks import Block  # noqa:F401
++
++
++def operate_blockwise(left, right, array_op):
++    # At this point we have already checked
++    #  assert right._indexed_same(left)
++
++    res_blks: List["Block"] = []
++    rmgr = right._mgr
++    for n, blk in enumerate(left._mgr.blocks):
++        locs = blk.mgr_locs
++        blk_vals = blk.values
++
++        left_ea = not isinstance(blk_vals, np.ndarray)
++
++        rblks = rmgr._slice_take_blocks_ax0(locs.indexer, only_slice=True)
++
++        # Assertions are disabled for performance, but should hold:
++        # if left_ea:
++        #    assert len(locs) == 1, locs
++        #    assert len(rblks) == 1, rblks
++        #    assert rblks[0].shape[0] == 1, rblks[0].shape
++
++        for k, rblk in enumerate(rblks):
++            right_ea = not isinstance(rblk.values, np.ndarray)
++
++            lvals, rvals = _get_same_shape_values(blk, rblk, left_ea, right_ea)
++
++            res_values = array_op(lvals, rvals)
++            if left_ea and not right_ea and hasattr(res_values, "reshape"):
++                res_values = res_values.reshape(1, -1)
++            nbs = rblk._split_op_result(res_values)
++
++            # Assertions are disabled for performance, but should hold:
++            # if right_ea or left_ea:
++            #    assert len(nbs) == 1
++            # else:
++            #    assert res_values.shape == lvals.shape, (res_values.shape, lvals.shape)
++
++            _reset_block_mgr_locs(nbs, locs)
++
++            res_blks.extend(nbs)
++
++    # Assertions are disabled for performance, but should hold:
++    #  slocs = {y for nb in res_blks for y in nb.mgr_locs.as_array}
++    #  nlocs = sum(len(nb.mgr_locs.as_array) for nb in res_blks)
++    #  assert nlocs == len(left.columns), (nlocs, len(left.columns))
++    #  assert len(slocs) == nlocs, (len(slocs), nlocs)
++    #  assert slocs == set(range(nlocs)), slocs
++
++    new_mgr = type(rmgr)(res_blks, axes=rmgr.axes, do_integrity_check=False)
++    return new_mgr
++
++
++def _reset_block_mgr_locs(nbs: List["Block"], locs):
++    """
++    Reset mgr_locs to correspond to our original DataFrame.
++    """
++    for nb in nbs:
++        nblocs = locs.as_array[nb.mgr_locs.indexer]
++        nb.mgr_locs = nblocs
++        # Assertions are disabled for performance, but should hold:
++        #  assert len(nblocs) == nb.shape[0], (len(nblocs), nb.shape)
++        #  assert all(x in locs.as_array for x in nb.mgr_locs.as_array)
++
++
++def _get_same_shape_values(
++    lblk: "Block", rblk: "Block", left_ea: bool, right_ea: bool
++) -> Tuple[ArrayLike, ArrayLike]:
++    """
++    Slice lblk.values to align with rblk.  Squeeze if we have EAs.
++    """
++    lvals = lblk.values
++    rvals = rblk.values
++
++    # Require that the indexing into lvals be slice-like
++    assert rblk.mgr_locs.is_slice_like, rblk.mgr_locs
++
++    # TODO(EA2D): with 2D EAs pnly this first clause would be needed
++    if not (left_ea or right_ea):
++        lvals = lvals[rblk.mgr_locs.indexer, :]
++        assert lvals.shape == rvals.shape, (lvals.shape, rvals.shape)
++    elif left_ea and right_ea:
++        assert lvals.shape == rvals.shape, (lvals.shape, rvals.shape)
++    elif right_ea:
++        # lvals are 2D, rvals are 1D
++        lvals = lvals[rblk.mgr_locs.indexer, :]
++        assert lvals.shape[0] == 1, lvals.shape
++        lvals = lvals[0, :]
++    else:
++        # lvals are 1D, rvals are 2D
++        assert rvals.shape[0] == 1, rvals.shape
++        rvals = rvals[0, :]
++
++    return lvals, rvals
+diff --git a/pandas/tests/arithmetic/common.py b/pandas/tests/arithmetic/common.py
+index ccc49adc5..755fbd0d9 100644
+--- a/pandas/tests/arithmetic/common.py
++++ b/pandas/tests/arithmetic/common.py
+@@ -70,7 +70,14 @@ def assert_invalid_comparison(left, right, box):
+     result = right != left
+     tm.assert_equal(result, ~expected)
+ 
+-    msg = "Invalid comparison between|Cannot compare type|not supported between"
++    msg = "|".join(
++        [
++            "Invalid comparison between",
++            "Cannot compare type",
++            "not supported between",
++            "invalid type promotion",
++        ]
++    )
+     with pytest.raises(TypeError, match=msg):
+         left < right
+     with pytest.raises(TypeError, match=msg):
+diff --git a/pandas/tests/arithmetic/test_datetime64.py b/pandas/tests/arithmetic/test_datetime64.py
+index 8c480faa4..b3f4d5f5d 100644
+--- a/pandas/tests/arithmetic/test_datetime64.py
++++ b/pandas/tests/arithmetic/test_datetime64.py
+@@ -962,7 +962,9 @@ class TestDatetime64Arithmetic:
+         obj = tm.box_expected(dti, box_with_array)
+         expected = tm.box_expected(expected, box_with_array)
+ 
+-        warn = PerformanceWarning if box_with_array is not pd.DataFrame else None
++        warn = None
++        if box_with_array is not pd.DataFrame or tz_naive_fixture is None:
++            warn = PerformanceWarning
+         with tm.assert_produces_warning(warn):
+             result = obj - obj.astype(object)
+         tm.assert_equal(result, expected)
+@@ -1465,7 +1467,7 @@ class TestDatetime64DateOffsetArithmetic:
+             other = tm.box_expected(other, box_with_array)
+ 
+         warn = PerformanceWarning
+-        if box_with_array is pd.DataFrame and not (tz is None and not box_other):
++        if box_with_array is pd.DataFrame and tz is not None:
+             warn = None
+         with tm.assert_produces_warning(warn):
+             res = op(dtarr, other)
+diff --git a/pandas/tests/arithmetic/test_timedelta64.py b/pandas/tests/arithmetic/test_timedelta64.py
+index 65e3c6a07..904846c5f 100644
+--- a/pandas/tests/arithmetic/test_timedelta64.py
++++ b/pandas/tests/arithmetic/test_timedelta64.py
+@@ -552,8 +552,7 @@ class TestTimedelta64ArithmeticUnsorted:
+         obj = tm.box_expected(tdi, box)
+         other = tm.box_expected(dti, box)
+ 
+-        warn = PerformanceWarning if box is not pd.DataFrame else None
+-        with tm.assert_produces_warning(warn):
++        with tm.assert_produces_warning(PerformanceWarning):
+             result = obj + other.astype(object)
+         tm.assert_equal(result, other)
+ 
+diff --git a/pandas/tests/frame/test_arithmetic.py b/pandas/tests/frame/test_arithmetic.py
+index b9102b1f8..5cb27c697 100644
+--- a/pandas/tests/frame/test_arithmetic.py
++++ b/pandas/tests/frame/test_arithmetic.py
+@@ -49,9 +49,11 @@ class TestFrameComparisons:
+                 )
+                 tm.assert_frame_equal(result, expected)
+ 
+-                msg = re.escape(
+-                    "Invalid comparison between dtype=datetime64[ns] and ndarray"
+-                )
++                msgs = [
++                    r"Invalid comparison between dtype=datetime64\[ns\] and ndarray",
++                    "invalid type promotion",
++                ]
++                msg = "|".join(msgs)
+                 with pytest.raises(TypeError, match=msg):
+                     x >= y
+                 with pytest.raises(TypeError, match=msg):

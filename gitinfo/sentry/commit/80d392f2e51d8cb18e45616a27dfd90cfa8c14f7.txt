@@ -1,0 +1,715 @@
+commit 80d392f2e51d8cb18e45616a27dfd90cfa8c14f7
+Author: Armin Ronacher <armin.ronacher@active-4.com>
+Date:   Thu Apr 14 15:15:51 2016 +0200
+
+    Refactored system symbol code and optimized storage in postres
+
+diff --git a/setup.py b/setup.py
+index a90a59b78a..df8d548e9c 100755
+--- a/setup.py
++++ b/setup.py
+@@ -135,7 +135,7 @@ install_requires = [
+ ]
+ 
+ dsym_requires = [
+-    'symsynd>=0.5.2,<1.0.0',
++    'symsynd>=0.6.0,<1.0.0',
+ ]
+ 
+ 
+diff --git a/src/sentry/lang/native/symbolizer.py b/src/sentry/lang/native/symbolizer.py
+index 4752a86848..c3d4b5b2b3 100644
+--- a/src/sentry/lang/native/symbolizer.py
++++ b/src/sentry/lang/native/symbolizer.py
+@@ -7,101 +7,31 @@ try:
+ except ImportError:
+     have_symsynd = False
+ 
+-from django.db import connection
+ from sentry import options
+ from sentry.lang.native.dsymcache import dsymcache
+ from sentry.utils.safe import trim
+-
+-
+-SDK_MAPPING = {
+-    'iPhone OS': 'iOS',
+-}
++from sentry.models import DSymSymbol
++from sentry.models.dsymfile import MAX_SYM
+ 
+ 
+ def trim_frame(frame):
+     # This matches what's in stacktrace.py
+-    frame['symbol_name'] = trim(frame.get('symbol_name'), 256)
++    frame['symbol_name'] = trim(frame.get('symbol_name'), MAX_SYM)
+     frame['filename'] = trim(frame.get('filename'), 256)
+     return frame
+ 
+ 
+-def get_sdk_from_system_info(info):
+-    if not info:
+-        return None
+-    try:
+-        sdk_name = SDK_MAPPING[info['system_name']]
+-        system_version = tuple(int(x) for x in (
+-            info['system_version'] + '.0' * 3).split('.')[:3])
+-    except LookupError:
+-        return None
+-
+-    return {
+-        'dsym_type': 'macho',
+-        'sdk_name': sdk_name,
+-        'version_major': system_version[0],
+-        'version_minor': system_version[1],
+-        'version_patchlevel': system_version[2],
+-    }
+-
+-
+ def find_system_symbol(img, instruction_addr, system_info=None):
+     """Finds a system symbol."""
+-    addr = instruction_addr - img['image_addr']
+-
+-    uuid = img['uuid'].lower()
+-    cur = connection.cursor()
+-    try:
+-        # First try: exact match on uuid
+-        cur.execute('''
+-            select symbol
+-              from sentry_dsymsymbol s,
+-                   sentry_dsymobject o
+-             where o.uuid = %s and
+-                   s.object_id = o.id and
+-                   s.address <= o.vmaddr + %s and
+-                   s.address >= o.vmaddr
+-          order by address desc
+-             limit 1;
+-        ''', [uuid, addr])
+-        rv = cur.fetchone()
+-        if rv:
+-            return rv[0]
+-
+-        # Second try: exact match on path and arch
+-        cpu_name = get_cpu_name(img['cpu_type'],
+-                                img['cpu_subtype'])
+-        sdk_info = get_sdk_from_system_info(system_info)
+-        if sdk_info is None or cpu_name is None:
+-            return
+-
+-        cur.execute('''
+-            select symbol
+-              from sentry_dsymsymbol s,
+-                   sentry_dsymobject o,
+-                   sentry_dsymsdk k,
+-                   sentry_dsymbundle b
+-             where b.sdk_id = k.id and
+-                   b.object_id = o.id and
+-                   s.object_id = o.id and
+-                   k.sdk_name = %s and
+-                   k.dsym_type = %s and
+-                   k.version_major = %s and
+-                   k.version_minor = %s and
+-                   k.version_patchlevel = %s and
+-                   o.cpu_name = %s and
+-                   o.object_path = %s and
+-                   s.address <= o.vmaddr + %s and
+-                   s.address >= o.vmaddr
+-          order by address desc
+-             limit 1;
+-        ''', [sdk_info['sdk_name'], sdk_info['dsym_type'],
+-              sdk_info['version_major'], sdk_info['version_minor'],
+-              sdk_info['version_patchlevel'], cpu_name, img['name'], addr])
+-        rv = cur.fetchone()
+-        if rv:
+-            return rv[0]
+-    finally:
+-        cur.close()
++    return DSymSymbol.objects.lookup_symbol(
++        instruction_addr=instruction_addr,
++        image_addr=img['image_addr'],
++        uuid=img['uuid'],
++        cpu_name=get_cpu_name(img['cpu_type'],
++                              img['cpu_subtype']),
++        object_path=img['name'],
++        system_info=system_info
++    )
+ 
+ 
+ def make_symbolizer(project, binary_images, threads=None):
+diff --git a/src/sentry/models/dsymfile.py b/src/sentry/models/dsymfile.py
+index 2b14bac3ea..34b6c11053 100644
+--- a/src/sentry/models/dsymfile.py
++++ b/src/sentry/models/dsymfile.py
+@@ -12,7 +12,7 @@ import os
+ import shutil
+ import hashlib
+ import tempfile
+-from django.db import models, transaction, IntegrityError
++from django.db import models, transaction, connection, IntegrityError
+ 
+ try:
+     from symsynd.macho.arch import get_macho_uuids
+@@ -21,39 +21,87 @@ except ImportError:
+     have_symsynd = False
+ 
+ from sentry.db.models import FlexibleForeignKey, Model, BoundedBigIntegerField, \
+-    sane_repr
++    sane_repr, BaseManager
+ from sentry.models.file import File
+ from sentry.utils.zip import safe_extract_zip
+ 
+ 
++MAX_SYM = 256
+ KNOWN_DSYM_TYPES = {
+     'application/x-mach-binary': 'macho'
+ }
+ 
++SDK_MAPPING = {
++    'iPhone OS': 'iOS',
++}
+ 
+-'''
+-system symbols:
+-
+-  architecture   VARCHAR(20)
+-  sdk-version    MAJOR.MINOR.PATCHLEVEL-BUILD
+-  uuid           UUID
+-  path           VARCHAR(255)
+-  address        BIGINT
+-  symbol         TEXT
+-
+-lookup logic:
+ 
+-  primary lookup:
+-    uuid -> exact match
+-    address -> lower than or equal to reference address
+-      limit 1
++def get_sdk_from_system_info(info):
++    if not info:
++        return None
++    try:
++        sdk_name = SDK_MAPPING[info['system_name']]
++        system_version = tuple(int(x) for x in (
++            info['system_version'] + '.0' * 3).split('.')[:3])
++    except LookupError:
++        return None
+ 
+-  secondary lookup:
+-    path -> exact match
+-    sdk-version -> fuzzy match
+-    address -> lower than or equal to reference address
+-      limit 1
+-'''
++    return {
++        'dsym_type': 'macho',
++        'sdk_name': sdk_name,
++        'version_major': system_version[0],
++        'version_minor': system_version[1],
++        'version_patchlevel': system_version[2],
++    }
++
++
++class DSymSDKManager(BaseManager):
++
++    def enumerate_sdks(self, sdk=None, version=None):
++        """Return a grouped list of SDKs."""
++        filter = ''
++        args = []
++        if version is not None:
++            for col, val in zip(['major', 'minor', 'patchlevel'],
++                                version.split('.')):
++                if not val.isdigit():
++                    return []
++                filter += ' and k.version_%s = %d' % (
++                    col,
++                    int(val)
++                )
++        if sdk is not None:
++            filter += ' and k.sdk_name = %s'
++            args.append(sdk)
++        cur = connection.cursor()
++        cur.execute('''
++   select distinct k.*, count(b.*) as bundle_count, o.cpu_name
++              from sentry_dsymsdk k,
++                   sentry_dsymbundle b,
++                   sentry_dsymobject o
++             where b.sdk_id = k.id and
++                   b.object_id = o.id %s
++          group by k.id, k.sdk_name, o.cpu_name
++        ''' % filter, args)
++        rv = []
++        for row in cur.fetchall():
++            row = dict(zip([x[0] for x in cur.description], row))
++            ver = '%s.%s.%s' % (
++                row['version_major'],
++                row['version_minor'],
++                row['version_patchlevel']
++            )
++            rv.append({
++                'sdk_name': row['sdk_name'],
++                'version': ver,
++                'build': row['version_build'],
++                'bundle_count': row['bundle_count'],
++                'cpu_name': row['cpu_name'],
++            })
++        return sorted(rv, key=lambda x: (x['sdk_name'],
++                                         x['version'],
++                                         x['build'],
++                                         x['cpu_name']))
+ 
+ 
+ class DSymSDK(Model):
+@@ -65,6 +113,8 @@ class DSymSDK(Model):
+     version_patchlevel = models.IntegerField()
+     version_build = models.CharField(max_length=40)
+ 
++    objects = DSymSDKManager()
++
+     class Meta:
+         app_label = 'sentry'
+         db_table = 'sentry_dsymsdk'
+@@ -97,12 +147,77 @@ class DSymBundle(Model):
+         db_table = 'sentry_dsymbundle'
+ 
+ 
++class DSymSymbolManager(BaseManager):
++
++    def lookup_symbol(self, instruction_addr, image_addr, uuid,
++                      cpu_name=None, object_path=None, system_info=None):
++        """Finds a system symbol."""
++        addr = instruction_addr - image_addr
++
++        uuid = str(uuid).lower()
++        cur = connection.cursor()
++        try:
++            # First try: exact match on uuid
++            cur.execute('''
++                select symbol
++                  from sentry_dsymsymbol s,
++                       sentry_dsymobject o
++                 where o.uuid = %s and
++                       s.object_id = o.id and
++                       s.address <= o.vmaddr + %s and
++                       s.address >= o.vmaddr
++              order by address desc
++                 limit 1;
++            ''', [uuid, addr])
++            rv = cur.fetchone()
++            if rv:
++                return rv[0]
++
++            # Second try: exact match on path and arch
++            sdk_info = get_sdk_from_system_info(system_info)
++            if sdk_info is None or \
++               cpu_name is None or \
++               object_path is None:
++                return
++
++            cur.execute('''
++                select symbol
++                  from sentry_dsymsymbol s,
++                       sentry_dsymobject o,
++                       sentry_dsymsdk k,
++                       sentry_dsymbundle b
++                 where b.sdk_id = k.id and
++                       b.object_id = o.id and
++                       s.object_id = o.id and
++                       k.sdk_name = %s and
++                       k.dsym_type = %s and
++                       k.version_major = %s and
++                       k.version_minor = %s and
++                       k.version_patchlevel = %s and
++                       o.cpu_name = %s and
++                       o.object_path = %s and
++                       s.address <= o.vmaddr + %s and
++                       s.address >= o.vmaddr
++              order by address desc
++                 limit 1;
++            ''', [sdk_info['sdk_name'], sdk_info['dsym_type'],
++                  sdk_info['version_major'], sdk_info['version_minor'],
++                  sdk_info['version_patchlevel'], cpu_name, object_path, addr])
++            rv = cur.fetchone()
++            if rv:
++                return rv[0]
++        finally:
++            cur.close()
++
++
+ class DSymSymbol(Model):
+     __core__ = False
+     object = FlexibleForeignKey('sentry.DSymObject')
+     address = BoundedBigIntegerField(db_index=True)
+     symbol = models.TextField()
+ 
++    objects = DSymSymbolManager()
++
+     class Meta:
+         app_label = 'sentry'
+         db_table = 'sentry_dsymsymbol'
+diff --git a/src/sentry/runner/__init__.py b/src/sentry/runner/__init__.py
+index 97d2f46e82..e2ce1f0130 100755
+--- a/src/sentry/runner/__init__.py
++++ b/src/sentry/runner/__init__.py
+@@ -61,7 +61,7 @@ map(lambda cmd: cli.add_command(import_string(cmd)), (
+     'sentry.runner.commands.start.start',
+     'sentry.runner.commands.tsdb.tsdb',
+     'sentry.runner.commands.upgrade.upgrade',
+-    'sentry.runner.commands.import_system_symbols.import_system_symbols',
++    'sentry.runner.commands.dsym.dsym',
+ ))
+ 
+ 
+diff --git a/src/sentry/runner/commands/dsym.py b/src/sentry/runner/commands/dsym.py
+new file mode 100644
+index 0000000000..8228ed0188
+--- /dev/null
++++ b/src/sentry/runner/commands/dsym.py
+@@ -0,0 +1,207 @@
++"""
++sentry.runner.commands.dsym
++~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++:copyright: (c) 2015 by the Sentry Team, see AUTHORS for more details.
++:license: BSD, see LICENSE for more details.
++"""
++from __future__ import absolute_import
++
++import uuid
++import json
++import click
++import threading
++
++from django.db import connection
++
++from sentry.runner.decorators import configuration
++
++
++SHUTDOWN = object()
++
++
++def load_bundle(q, uuid, data, sdk_info, trim_symbols, demangle):
++    from sentry.models import DSymBundle, DSymObject, DSymSDK
++    from sentry.models.dsymfile import MAX_SYM
++    from symsynd.demangle import demangle_symbol
++
++    def _process_symbol(sym):
++        too_long = trim_symbols and len(sym) > MAX_SYM
++        if demangle or too_long:
++            new_sym = demangle_symbol(sym)
++            if new_sym is not None and (len(new_sym) < sym or too_long):
++                sym = new_sym
++        if trim_symbols:
++            sym = sym[:MAX_SYM]
++        return sym
++
++    sdk = DSymSDK.objects.get_or_create(
++        dsym_type=sdk_info['dsym_type'],
++        sdk_name=sdk_info['sdk_name'],
++        version_major=sdk_info['version_major'],
++        version_minor=sdk_info['version_minor'],
++        version_patchlevel=sdk_info['version_patchlevel'],
++        version_build=sdk_info['version_build'],
++    )[0]
++
++    obj = DSymObject.objects.get_or_create(
++        cpu_name=data['arch'],
++        object_path='/' + data['image'].strip('/'),
++        uuid=str(uuid),
++        vmaddr=data['vmaddr'],
++        vmsize=data['vmsize'],
++    )[0]
++
++    DSymBundle.objects.get_or_create(
++        sdk=sdk,
++        object=obj
++    )[0]
++
++    step = 4000
++    symbols = data['symbols']
++    for idx in xrange(0, len(symbols) + step, step):
++        end_idx = min(idx + step, len(symbols))
++        batch = {}
++        for x in xrange(idx, end_idx):
++            addr = symbols[x][0]
++            batch[obj.id, addr] = {
++                'object_id': obj.id,
++                'address': addr,
++                'symbol': _process_symbol(symbols[x][1]),
++            }
++        yield sorted(batch.values(), key=lambda x: x['address'])
++
++
++def process_archive(members, zip, sdk_info, threads=8, trim_symbols=False,
++                    demangle=True):
++    import Queue
++    q = Queue.Queue(threads)
++
++    def process_items():
++        cur = connection.cursor()
++        cur.execute('begin')
++        cur.execute('''
++            prepare add_sym(bigint, bigint, text) as
++                insert into sentry_dsymsymbol (object_id, address, symbol)
++                select $1, $2, $3
++                where not exists (select 1 from sentry_dsymsymbol
++                    where object_id = $1 and address = $2);
++        ''')
++        while 1:
++            items = q.get()
++            if items is SHUTDOWN:
++                break
++            cur.executemany('''
++                execute add_sym(%(object_id)s, %(address)s, %(symbol)s);
++            ''', items)
++        cur.execute('commit')
++
++    pool = []
++    for x in xrange(threads):
++        t = threading.Thread(target=process_items)
++        t.setDaemon(True)
++        t.start()
++        pool.append(t)
++
++    for member in members:
++        try:
++            id = uuid.UUID(member)
++        except ValueError:
++            continue
++        for chunk in load_bundle(q.put, id, json.load(zip.open(member)),
++                                 sdk_info, trim_symbols, demangle):
++            q.put(chunk)
++
++    for t in pool:
++        q.put(SHUTDOWN)
++    for t in pool:
++        t.join()
++
++
++@click.group(name='dsym')
++def dsym():
++    """Manage system symbols in Sentry.
++
++    This allows you to import and manage globally shared system symbols in
++    the Sentry installation.  In particular this is useful for iOS where
++    system symbols need to be ingested before stacktraces can be fully
++    symbolized due to device optimizations.
++    """
++
++
++@dsym.command(name='import-system-symbols',
++              short_help='Import system debug symbols.')
++@click.argument('bundles', type=click.Path(), nargs=-1)
++@click.option('--threads', default=8, help='The number of threads to use')
++@click.option('--trim-symbols', is_flag=True,
++              help='If enabled symbols are trimmed before storing. '
++              'This reduces the database size but means that symbols are '
++              'already trimmed on the way to the database.')
++@click.option('--no-demangle', is_flag=True,
++              help='If this is set to true symbols are never demangled. '
++              'By default symbols are demangled if they are trimmed or '
++              'demangled symbols are shorter than mangled ones. Enabling '
++              'this option speeds up importing slightly.')
++@configuration
++def import_system_symbols(bundles, threads, trim_symbols, no_demangle):
++    """Imports system symbols from preprocessed zip files into Sentry.
++
++    It takes a list of zip files as arguments that contain preprocessed
++    system symbol information.  These zip files contain JSON dumps.  The
++    actual zipped up dsym files cannot be used here, they need to be
++    preprocessed.
++    """
++    import zipfile
++    for path in bundles:
++        with zipfile.ZipFile(path) as f:
++            sdk_info = json.load(f.open('sdk_info'))
++            label = ('%s.%s.%s (%s)' % (
++                sdk_info['version_major'],
++                sdk_info['version_minor'],
++                sdk_info['version_patchlevel'],
++                sdk_info['version_build'],
++            )).ljust(18)
++            with click.progressbar(f.namelist(), label=label) as bar:
++                process_archive(bar, f, sdk_info, threads,
++                                trim_symbols=trim_symbols,
++                                demangle=not no_demangle)
++
++
++@dsym.command(name='sdks', short_help='List SDKs')
++@click.option('--sdk', help='Only include the given SDK instead of all.')
++@click.option('--version', help='Optionally a version filter.  For instance '
++              '9 returns all versions 9.*, 9.1 returns 9.1.* etc.')
++@configuration
++def sdks(sdk, version):
++    """Print a list of all installed SDKs and a breakdown of the symbols
++    contained within.  This queries the system symbol database and reports
++    all SDKs and versions that symbols exist for.  The output is broken down
++    by minor versions, builds and cpu architectures.  For each of those a
++    count of the stored bundles is returned.  (A bundle in this case is a
++    single binary)
++    """
++    from sentry.models import DSymSDK
++    last_prefix = None
++    click.secho('  %-8s  %-10s  %-12s %-8s %s' % (
++        'SDK',
++        'Version',
++        'Build',
++        'CPU',
++        'Bundles',
++    ), fg='cyan')
++    click.secho('-' * click.get_terminal_size()[0], fg='yellow')
++    for sdk in DSymSDK.objects.enumerate_sdks(sdk=sdk, version=version):
++        prefix = '  %-8s  %-10s  ' % (
++            sdk['sdk_name'],
++            sdk['version']
++        )
++        if prefix == last_prefix:
++            prefix = ' ' * len(prefix)
++        else:
++            last_prefix = prefix
++        click.echo('%s%-12s %-8s %d' % (
++            prefix,
++            sdk['build'],
++            sdk['cpu_name'],
++            sdk['bundle_count'],
++        ))
+diff --git a/src/sentry/runner/commands/import_system_symbols.py b/src/sentry/runner/commands/import_system_symbols.py
+deleted file mode 100644
+index b43af35014..0000000000
+--- a/src/sentry/runner/commands/import_system_symbols.py
++++ /dev/null
+@@ -1,136 +0,0 @@
+-"""
+-sentry.runner.commands.import_system_symbols
+-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+-
+-:copyright: (c) 2015 by the Sentry Team, see AUTHORS for more details.
+-:license: BSD, see LICENSE for more details.
+-"""
+-from __future__ import absolute_import
+-
+-import uuid
+-import json
+-import click
+-import threading
+-from django.db import connection, IntegrityError
+-from sentry.runner.decorators import configuration
+-
+-
+-SHUTDOWN = object()
+-
+-
+-def load_bundle(q, uuid, data, sdk_info):
+-    from sentry.models import DSymBundle, DSymObject, DSymSDK
+-
+-    sdk = DSymSDK.objects.get_or_create(
+-        dsym_type=sdk_info['dsym_type'],
+-        sdk_name=sdk_info['sdk_name'],
+-        version_major=sdk_info['version_major'],
+-        version_minor=sdk_info['version_minor'],
+-        version_patchlevel=sdk_info['version_patchlevel'],
+-        version_build=sdk_info['version_build'],
+-    )[0]
+-
+-    obj = DSymObject.objects.get_or_create(
+-        cpu_name=data['arch'],
+-        object_path='/' + data['image'].strip('/'),
+-        uuid=str(uuid),
+-        vmaddr=data['vmaddr'],
+-        vmsize=data['vmsize'],
+-    )[0]
+-
+-    DSymBundle.objects.get_or_create(
+-        sdk=sdk,
+-        object=obj
+-    )[0]
+-
+-    step = 4000
+-    symbols = data['symbols']
+-    for idx in xrange(0, len(symbols) + step, step):
+-        end_idx = min(idx + step, len(symbols))
+-        yield [{
+-            'object_id': obj.id,
+-            'address': symbols[x][0],
+-            'symbol': symbols[x][1],
+-        } for x in xrange(idx, end_idx)]
+-
+-
+-def process_archive(members, zip, sdk_info, threads):
+-    import Queue
+-    q = Queue.Queue(threads)
+-
+-    def process_items():
+-        cur = connection.cursor()
+-        cur.execute('begin')
+-        cur.execute('''
+-            prepare add_sym(bigint, bigint, text) as
+-                insert into sentry_dsymsymbol (object_id, address, symbol)
+-                select $1, $2, $3
+-                where not exists (select 1 from sentry_dsymsymbol
+-                    where object_id = $1 and address = $2);
+-        ''')
+-        while 1:
+-            items = q.get()
+-            if items is SHUTDOWN:
+-                break
+-            while 1:
+-                try:
+-                    cur.executemany('''
+-                        execute add_sym(%(object_id)s, %(address)s, %(symbol)s);
+-                    ''', items)
+-                except IntegrityError:
+-                    connection.rollback()
+-                    continue
+-                break
+-        cur.execute('commit')
+-
+-    pool = []
+-    for x in xrange(threads):
+-        t = threading.Thread(target=process_items)
+-        t.setDaemon(True)
+-        t.start()
+-        pool.append(t)
+-
+-    for member in members:
+-        try:
+-            id = uuid.UUID(member)
+-        except ValueError:
+-            continue
+-        for chunk in load_bundle(q.put, id, json.load(zip.open(member)),
+-                                 sdk_info):
+-            q.put(chunk)
+-
+-    for t in pool:
+-        q.put(SHUTDOWN)
+-    for t in pool:
+-        t.join()
+-
+-
+-@click.command(name='import-system-symbols',
+-               short_help='Import system debug symbols.')
+-@click.argument('bundles', type=click.Path(), nargs=-1)
+-@click.option('--sdk', default='iOS', help='The SDK identifier')
+-@click.option('--dsym-type', default='macho', help='The type of the symbol')
+-@click.option('--threads', default=8, help='The number of threads to use')
+-@configuration
+-def import_system_symbols(bundles, sdk, dsym_type, threads):
+-    """Imports system symbols from preprocessed zip files into Sentry.
+-
+-    It takes a list of zip files as arguments that contain preprocessed
+-    system symbol information.  These zip files contain JSON dumps.  The
+-    actual zipped up dsym files cannot be used here, they need to be
+-    preprocessed.
+-    """
+-    import zipfile
+-    for path in bundles:
+-        with zipfile.ZipFile(path) as f:
+-            sdk_info = json.load(f.open('sdk_info'))
+-            sdk_info['sdk_name'] = sdk
+-            sdk_info['dsym_type'] = dsym_type
+-            label = ('%s.%s.%s (%s)' % (
+-                sdk_info['version_major'],
+-                sdk_info['version_minor'],
+-                sdk_info['version_patchlevel'],
+-                sdk_info['version_build'],
+-            )).ljust(18)
+-            with click.progressbar(f.namelist(), label=label) as bar:
+-                process_archive(bar, f, sdk_info, threads)

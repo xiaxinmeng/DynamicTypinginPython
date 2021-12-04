@@ -1,0 +1,265 @@
+commit dc8ed7ead77328893b7077410da24bb4d0fd29a1
+Author: David Cramer <dcramer@gmail.com>
+Date:   Wed Nov 25 13:46:55 2015 -0800
+
+    Improve handling of release resolution
+    
+    This resolves two cases:
+    
+    - Creation of a release object before code is synchronously running a new release
+    - Multiple releases being active
+    
+    It will now maintain GroupResolution and only regress the group if the GroupResolution row becomes invalidated.
+
+diff --git a/src/sentry/api/endpoints/project_group_index.py b/src/sentry/api/endpoints/project_group_index.py
+index 8a02422238..800334b091 100644
+--- a/src/sentry/api/endpoints/project_group_index.py
++++ b/src/sentry/api/endpoints/project_group_index.py
+@@ -332,26 +332,29 @@ class ProjectGroupIndexEndpoint(ProjectEndpoint):
+             for group in group_list:
+                 try:
+                     with transaction.atomic():
+-                        GroupResolution.objects.create(
++                        resolution, created = GroupResolution.objects.create(
+                             group=group,
+                             release=release,
+-                        )
++                        ), True
+                 except IntegrityError:
+-                    pass
++                    resolution, created = GroupResolution.objects.get(
++                        group=group,
++                    ), False
+ 
+-                happened = Group.objects.filter(
++                Group.objects.filter(
+                     id=group.id,
+                 ).update(
+                     status=GroupStatus.RESOLVED,
+                     resolved_at=now,
+                 )
+ 
+-                if happened:
++                if created:
+                     activity = Activity.objects.create(
+                         project=group.project,
+                         group=group,
+                         type=Activity.SET_RESOLVED_IN_RELEASE,
+                         user=acting_user,
++                        ident=resolution.id,
+                         data={
+                             # no version yet
+                             'version': '',
+diff --git a/src/sentry/event_manager.py b/src/sentry/event_manager.py
+index e656103e14..e41c1f6cf7 100644
+--- a/src/sentry/event_manager.py
++++ b/src/sentry/event_manager.py
+@@ -635,6 +635,9 @@ class EventManager(object):
+             if has_resolution:
+                 return
+ 
++        else:
++            has_resolution = False
++
+         if not plugin_is_regression(group, event):
+             return
+ 
+@@ -660,36 +663,47 @@ class EventManager(object):
+         group.active_at = date
+         group.status = GroupStatus.UNRESOLVED
+ 
+-        # this technically could be missing a release, but
+-        # really we wouldn't want to take this path if it was. It's a bit odd
+-        # that it wouldn't be taken care of it, but the only case this should
+-        # be possible is if you usually send a Release and then you stopped.
+         if is_regression and release:
+-            # delete() API does not return affected rows
+-            cursor = connection.cursor()
+-            # TODO(dcramer): this could be more precise by including the filters
+-            # present in the ``has_resolution`` check above
+-            cursor.execute("DELETE FROM sentry_groupresolution WHERE group_id = %s", [group.id])
+-            affected = cursor.rowcount > 0
++            # resolutions are only valid if the state of the group is still
++            # resolved -- if it were to change the resolution should get removed
++            try:
++                resolution = GroupResolution.objects.get(
++                    group=group,
++                )
++            except GroupResolution.DoesNotExist:
++                affected = False
++            else:
++                cursor = connection.cursor()
++                # delete() API does not return affected rows
++                cursor.execute("DELETE FROM sentry_groupresolution WHERE id = %s", [resolution.id])
++                affected = cursor.rowcount > 0
+ 
+             if affected:
+                 # if we had to remove the GroupResolution (i.e. we beat the
+                 # the queue to handling this) then we need to also record
+                 # the corresponding event
+-                activity = Activity.objects.filter(
+-                    group=group,
+-                    type=Activity.SET_RESOLVED_IN_RELEASE,
+-                ).order_by('-datetime')[0]
+-
+-                activity.update(data={
+-                    'version': release.version,
+-                })
++                try:
++                    activity = Activity.objects.filter(
++                        group=group,
++                        type=Activity.SET_RESOLVED_IN_RELEASE,
++                        ident=resolution.id,
++                    ).order_by('-datetime')[0]
++                except IndexError:
++                    # XXX: handle missing data, as its not overly important
++                    pass
++                else:
++                    activity.update(data={
++                        'version': release.version,
++                    })
+ 
+         if is_regression:
+             Activity.objects.create(
+                 project=group.project,
+                 group=group,
+                 type=Activity.SET_REGRESSION,
++                data={
++                    'version': release.version if release else '',
++                }
+             )
+ 
+         return is_regression
+diff --git a/src/sentry/static/sentry/app/views/groupActivity/index.jsx b/src/sentry/static/sentry/app/views/groupActivity/index.jsx
+index 8805791689..30a390fa35 100644
+--- a/src/sentry/static/sentry/app/views/groupActivity/index.jsx
++++ b/src/sentry/static/sentry/app/views/groupActivity/index.jsx
+@@ -36,7 +36,11 @@ let formatActivity = function(item) {
+     case 'set_private':
+       return 'made this issue private';
+     case 'set_regression':
+-      return 'marked this issue as a regression';
++      return (data.version ?
++        `marked this issue as a regression in ${data.version}`
++      :
++        'marked this issue as a regression'
++      );
+     case 'create_issue':
+       return <span>created an issue on {data.provider} titled <a href={data.location}>{data.title}</a></span>;
+     case 'first_seen':
+diff --git a/src/sentry/tasks/clear_expired_resolutions.py b/src/sentry/tasks/clear_expired_resolutions.py
+index 2bc55c7eac..68fef8da64 100644
+--- a/src/sentry/tasks/clear_expired_resolutions.py
++++ b/src/sentry/tasks/clear_expired_resolutions.py
+@@ -1,10 +1,7 @@
+ from __future__ import absolute_import, print_function
+ 
+-from django.db import connection
+-from django.db.models import Q
+-
+ from sentry.models import (
+-    Activity, Group, GroupResolution, GroupStatus, Project, Release
++    Activity, GroupResolution, Project, Release
+ )
+ from sentry.tasks.base import instrumented_task
+ 
+@@ -37,27 +34,12 @@ def clear_expired_resolutions(release_id):
+     )
+ 
+     for resolution in resolution_list:
+-        cursor = connection.cursor()
+-        cursor.execute("DELETE FROM sentry_groupresolution WHERE id = %s", [resolution.id])
+-        affected = cursor.rowcount > 0
+-
+-        if not affected:
+-            continue
+-
+-        Group.objects.filter(
+-            Q(active_at__lte=release.date_added) | Q(active_at__isnull=True),
+-            id=resolution.group_id,
+-            status=GroupStatus.UNRESOLVED,
+-        ).update(
+-            status=GroupStatus.RESOLVED,
+-        )
+-
+-        if affected:
+-            activity = Activity.objects.filter(
+-                group=resolution.group_id,
+-                type=Activity.SET_RESOLVED_IN_RELEASE,
+-            ).order_by('-datetime')[0]
+-
+-            activity.update(data={
+-                'version': release.version,
+-            })
++        activity = Activity.objects.filter(
++            group=resolution.group_id,
++            type=Activity.SET_RESOLVED_IN_RELEASE,
++            ident=resolution.id,
++        ).order_by('-datetime')[0]
++
++        activity.update(data={
++            'version': release.version,
++        })
+diff --git a/tests/sentry/tasks/test_clear_expired_resolutions.py b/tests/sentry/tasks/test_clear_expired_resolutions.py
+index 939fd9e7b2..338908ddf2 100644
+--- a/tests/sentry/tasks/test_clear_expired_resolutions.py
++++ b/tests/sentry/tasks/test_clear_expired_resolutions.py
+@@ -22,10 +22,10 @@ class ClearExpiredResolutionsTest(TestCase):
+ 
+         group1 = self.create_group(
+             project=project,
+-            status=GroupStatus.UNRESOLVED,
++            status=GroupStatus.RESOLVED,
+             active_at=timezone.now(),
+         )
+-        GroupResolution.objects.create(
++        resolution1 = GroupResolution.objects.create(
+             group=group1,
+             release=old_release,
+         )
+@@ -33,6 +33,7 @@ class ClearExpiredResolutionsTest(TestCase):
+             group=group1,
+             project=project,
+             type=Activity.SET_RESOLVED_IN_RELEASE,
++            ident=resolution1.id,
+             data={'version': ''},
+         )
+ 
+@@ -46,7 +47,7 @@ class ClearExpiredResolutionsTest(TestCase):
+             status=GroupStatus.UNRESOLVED,
+             active_at=timezone.now(),
+         )
+-        GroupResolution.objects.create(
++        resolution2 = GroupResolution.objects.create(
+             group=group2,
+             release=new_release,
+         )
+@@ -54,6 +55,7 @@ class ClearExpiredResolutionsTest(TestCase):
+             group=group2,
+             project=project,
+             type=Activity.SET_RESOLVED_IN_RELEASE,
++            ident=resolution2.id,
+             data={'version': ''},
+         )
+ 
+diff --git a/tests/sentry/test_event_manager.py b/tests/sentry/test_event_manager.py
+index 59c1501990..bc00468a2a 100644
+--- a/tests/sentry/test_event_manager.py
++++ b/tests/sentry/test_event_manager.py
+@@ -269,7 +269,7 @@ class EventManagerTest(TransactionTestCase):
+ 
+         group.update(status=GroupStatus.RESOLVED)
+ 
+-        GroupResolution.objects.create(
++        resolution = GroupResolution.objects.create(
+             release=old_release,
+             group=group,
+         )
+@@ -277,6 +277,7 @@ class EventManagerTest(TransactionTestCase):
+             group=group,
+             project=group.project,
+             type=Activity.SET_RESOLVED_IN_RELEASE,
++            ident=resolution.id,
+             data={'version': ''},
+         )
+ 

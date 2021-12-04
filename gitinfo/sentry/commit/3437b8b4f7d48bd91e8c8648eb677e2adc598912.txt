@@ -1,0 +1,414 @@
+commit 3437b8b4f7d48bd91e8c8648eb677e2adc598912
+Author: Dan Fuller <dfuller@sentry.io>
+Date:   Thu Jun 6 17:02:09 2019 -0700
+
+    feat(api): Add url unfurls for incidents to slack integration (SEN-566)
+    
+    Abstracted the unfurling code a little so that we can handle different types.
+
+diff --git a/src/sentry/integrations/slack/action_endpoint.py b/src/sentry/integrations/slack/action_endpoint.py
+index e9146c2efd..ae42a1a752 100644
+--- a/src/sentry/integrations/slack/action_endpoint.py
++++ b/src/sentry/integrations/slack/action_endpoint.py
+@@ -9,7 +9,7 @@ from sentry.utils import json
+ 
+ from .link_identity import build_linking_url
+ from .requests import SlackActionRequest, SlackRequestError
+-from .utils import build_attachment, logger
++from .utils import build_group_attachment, logger
+ 
+ LINK_IDENTITY_MESSAGE = "Looks like you haven't linked your Sentry account with your Slack identity yet! <{associate_url}|Link your identity now> to perform actions in Sentry through Slack."
+ 
+@@ -223,7 +223,7 @@ class SlackActionEndpoint(Endpoint):
+                 return self.api_error(e)
+ 
+             group = Group.objects.get(id=group.id)
+-            attachment = build_attachment(group, identity=identity, actions=[action])
++            attachment = build_group_attachment(group, identity=identity, actions=[action])
+ 
+             body = self.construct_reply(
+                 attachment,
+@@ -269,7 +269,7 @@ class SlackActionEndpoint(Endpoint):
+         # Reload group as it may have been mutated by the action
+         group = Group.objects.get(id=group.id)
+ 
+-        attachment = build_attachment(group, identity=identity, actions=action_list)
++        attachment = build_group_attachment(group, identity=identity, actions=action_list)
+         body = self.construct_reply(attachment, is_message=self.is_message(data))
+ 
+         return self.respond(body)
+diff --git a/src/sentry/integrations/slack/event_endpoint.py b/src/sentry/integrations/slack/event_endpoint.py
+index 8c20b7464a..f737d3c627 100644
+--- a/src/sentry/integrations/slack/event_endpoint.py
++++ b/src/sentry/integrations/slack/event_endpoint.py
+@@ -3,35 +3,98 @@ from __future__ import absolute_import
+ import json
+ import re
+ import six
++from collections import defaultdict
+ 
+ from django.conf import settings
++from django.db.models import Q
+ 
+ from sentry import http
+ from sentry.api.base import Endpoint
++from sentry.incidents.models import Incident
+ from sentry.models import Group, Project
+ 
+-from .utils import build_attachment, logger
+ from .requests import SlackEventRequest, SlackRequestError
++from .utils import (
++    build_group_attachment,
++    build_incident_attachment,
++    logger,
++)
+ 
+ # XXX(dcramer): this could be more tightly bound to our configured domain,
+ # but slack limits what we can unfurl anyways so its probably safe
+-_link_regexp = re.compile(r'^https?\://[^/]+/[^/]+/[^/]+/issues/(\d+)')
++_link_regexp = re.compile(r'^https?\://[^/]+/[^/]+/[^/]+/(issues|incidents)/(\d+)')
++_org_slug_regexp = re.compile(r'^https?\://[^/]+/organizations/([^/]+)/')
++
++
++def unfurl_issues(integration, issue_map):
++    results = {
++        g.id: g for g in Group.objects.filter(
++            id__in=set(issue_map.keys()),
++            project__in=Project.objects.filter(
++                organization__in=integration.organizations.all(),
++            )
++        )
++    }
++    if not results:
++        return {}
++
++    return {
++        v: build_group_attachment(results[k]) for k, v in six.iteritems(issue_map)
++        if k in results
++    }
++
++
++def unfurl_incidents(integration, incident_map):
++    filter_query = Q()
++    # Since we don't have real ids here, we have to also extract the org slug
++    # from the url so that we can make sure the identifiers correspond to the
++    # correct organization.
++    for identifier, url in six.iteritems(incident_map):
++        org_slug = _org_slug_regexp.match(url).group(1)
++        filter_query |= Q(identifier=identifier, organization__slug=org_slug)
++
++    results = {
++        i.identifier: i for i in Incident.objects.filter(
++            filter_query,
++            # Filter by integration organization here as well to make sure that
++            # we have permission to access these incidents.
++            organization__in=integration.organizations.all(),
++        )
++    }
++    if not results:
++        return {}
++
++    return {
++        v: build_incident_attachment(results[k]) for k, v in six.iteritems(incident_map)
++        if k in results
++    }
+ 
+ 
+ # XXX(dcramer): a lot of this is copied from sentry-plugins right now, and will
+ # need refactored
+ class SlackEventEndpoint(Endpoint):
++    event_handlers = {
++        'issues': unfurl_issues,
++        'incidents': unfurl_incidents,
++    }
++
+     authentication_classes = ()
+     permission_classes = ()
+ 
+-    def _parse_issue_id_from_url(self, link):
++    def _parse_url(self, link):
++        """
++        Extracts event type and id from a url.
++        :param link: Url to parse to information from
++        :return: If successful, a tuple containing the event_type and id. If we
++        were unsuccessful at matching, a tuple containing two None values
++        """
+         match = _link_regexp.match(link)
+         if not match:
+-            return
++            return None, None
+         try:
+-            return int(match.group(1))
++            return match.group(1), int(match.group(2))
+         except (TypeError, ValueError):
+-            return
++            return None, None
+ 
+     def on_url_verification(self, request, data):
+         return self.respond({
+@@ -39,45 +102,33 @@ class SlackEventEndpoint(Endpoint):
+         })
+ 
+     def on_link_shared(self, request, integration, token, data):
+-        issue_map = {}
++        parsed_events = defaultdict(dict)
+         for item in data['links']:
+-            issue_id = self._parse_issue_id_from_url(item['url'])
+-            if not issue_id:
++            event_type, instance_id = self._parse_url(item['url'])
++            if not instance_id:
+                 continue
+-            issue_map[issue_id] = item['url']
++            parsed_events[event_type][instance_id] = item['url']
+ 
+-        if not issue_map:
++        if not parsed_events:
+             return
+ 
+-        results = {
+-            g.id: g for g in Group.objects.filter(
+-                id__in=set(issue_map.keys()),
+-                project__in=Project.objects.filter(
+-                    organization__in=integration.organizations.all(),
+-                )
+-            )
+-        }
++        results = {}
++        for event_type, instance_map in parsed_events.items():
++            results.update(self.event_handlers[event_type](integration, instance_map))
++
+         if not results:
+             return
+ 
+         if settings.SLACK_INTEGRATION_USE_WST:
+-            access_token = integration.metadata['access_token'],
++            access_token = integration.metadata['access_token']
+         else:
+-            access_token = integration.metadata['user_access_token'],
++            access_token = integration.metadata['user_access_token']
+ 
+         payload = {
+             'token': access_token,
+             'channel': data['channel'],
+             'ts': data['message_ts'],
+-            'unfurls': json.dumps({
+-                v: build_attachment(results[k])
+-                for k, v in six.iteritems(issue_map)
+-                if k in results
+-            }),
+-            # 'user_auth_required': False,
+-            # 'user_auth_message': 'You can enable automatic unfurling of Sentry URLs by having a Sentry admin configure the Slack integration.',
+-            # we dont have a generic URL that this will work for your
+-            # 'user_auth_url': '...',
++            'unfurls': json.dumps(results),
+         }
+ 
+         session = http.build_session()
+diff --git a/src/sentry/integrations/slack/notify_action.py b/src/sentry/integrations/slack/notify_action.py
+index 1602c4e573..3d76dd72cd 100644
+--- a/src/sentry/integrations/slack/notify_action.py
++++ b/src/sentry/integrations/slack/notify_action.py
+@@ -8,7 +8,7 @@ from sentry.rules.actions.base import EventAction
+ from sentry.utils import metrics, json
+ from sentry.models import Integration
+ 
+-from .utils import build_attachment
++from .utils import build_group_attachment
+ 
+ MEMBER_PREFIX = '@'
+ CHANNEL_PREFIX = '#'
+@@ -106,7 +106,7 @@ class SlackNotifyServiceAction(EventAction):
+ 
+         def send_notification(event, futures):
+             rules = [f.rule for f in futures]
+-            attachment = build_attachment(event.group, event=event, tags=tags, rules=rules)
++            attachment = build_group_attachment(event.group, event=event, tags=tags, rules=rules)
+ 
+             payload = {
+                 'token': integration.metadata['access_token'],
+diff --git a/src/sentry/integrations/slack/utils.py b/src/sentry/integrations/slack/utils.py
+index 6878519c98..618d95e6e0 100644
+--- a/src/sentry/integrations/slack/utils.py
++++ b/src/sentry/integrations/slack/utils.py
+@@ -2,8 +2,12 @@ from __future__ import absolute_import
+ 
+ import logging
+ 
++from django.core.urlresolvers import reverse
++
+ from sentry import tagstore
+ from sentry.api.fields.actor import Actor
++from sentry.incidents.logic import get_incident_aggregates
++from sentry.incidents.models import IncidentStatus
+ from sentry.utils import json
+ from sentry.utils.assets import get_asset_url
+ from sentry.utils.dates import to_timestamp
+@@ -148,7 +152,7 @@ def build_action_text(group, identity, action):
+     )
+ 
+ 
+-def build_attachment(group, event=None, tags=None, identity=None, actions=None, rules=None):
++def build_group_attachment(group, event=None, tags=None, identity=None, actions=None, rules=None):
+     # XXX(dcramer): options are limited to 100 choices, even when nested
+     status = group.get_status()
+ 
+@@ -286,3 +290,38 @@ def build_attachment(group, event=None, tags=None, identity=None, actions=None,
+         'color': color,
+         'actions': payload_actions,
+     }
++
++
++def build_incident_attachment(incident):
++    logo_url = absolute_uri(get_asset_url('sentry', 'images/sentry-email-avatar.png'))
++
++    aggregates = get_incident_aggregates(incident)
++    status = 'Closed' if incident.status == IncidentStatus.CLOSED.value else 'Open'
++
++    fields = [
++        {'title': 'Status', 'value': status, 'short': True},
++        {'title': 'Events', 'value': aggregates['count'], 'short': True},
++        {'title': 'Users', 'value': aggregates['unique_users'], 'short': True},
++    ]
++
++    ts = incident.date_started
++
++    return {
++        'fallback': u'{} (#{})'.format(incident.title, incident.identifier),
++        'title': u'{} (#{})'.format(incident.title, incident.identifier),
++        'title_link': absolute_uri(reverse(
++            'sentry-incident',
++            kwargs={
++                'organization_slug': incident.organization.slug,
++                'incident_id': incident.identifier,
++            },
++        )),
++        'text': ' ',
++        'fields': fields,
++        'mrkdwn_in': ['text'],
++        'footer_icon': logo_url,
++        'footer': 'Sentry Incident',
++        'ts': to_timestamp(ts),
++        'color': LEVEL_TO_COLOR['error'],
++        'actions': [],
++    }
+diff --git a/tests/sentry/integrations/slack/test_event_endpoint.py b/tests/sentry/integrations/slack/test_event_endpoint.py
+index 92c2ed0cc3..b0e5317b7b 100644
+--- a/tests/sentry/integrations/slack/test_event_endpoint.py
++++ b/tests/sentry/integrations/slack/test_event_endpoint.py
+@@ -1,10 +1,16 @@
+ from __future__ import absolute_import
+ 
+ import json
++
+ import responses
++from six.moves.urllib.parse import parse_qsl
+ from django.test.utils import override_settings
+ 
+ from sentry import options
++from sentry.integrations.slack.utils import (
++    build_group_attachment,
++    build_incident_attachment,
++)
+ from sentry.models import Integration, OrganizationIntegration
+ from sentry.testutils import APITestCase
+ 
+@@ -23,15 +29,19 @@ LINK_SHARED_EVENT = """{
+         },
+         {
+             "domain": "example.com",
+-            "url": "http://testserver/organizations/sentry/issues/%(group1)s/"
++            "url": "http://testserver/organizations/%(org1)s/issues/%(group1)s/"
++        },
++        {
++            "domain": "example.com",
++            "url": "http://testserver/organizations/%(org2)s/issues/%(group2)s/bar/"
+         },
+         {
+             "domain": "example.com",
+-            "url": "http://testserver/organizations/sentry/issues/%(group2)s/bar/"
++            "url": "http://testserver/organizations/%(org1)s/issues/%(group1)s/bar/"
+         },
+         {
+             "domain": "example.com",
+-            "url": "http://testserver/organizations/sentry/issues/%(group1)s/bar/"
++            "url": "http://testserver/organizations/%(org1)s/incidents/%(incident)s/"
+         },
+         {
+             "domain": "another-example.com",
+@@ -119,8 +129,27 @@ class LinkSharedEventTest(BaseEventTest):
+         project2 = self.create_project(organization=org2)
+         group1 = self.create_group(project=project1)
+         group2 = self.create_group(project=project2)
++        incident = self.create_incident(organization=self.org, projects=[project1])
++        incident.update(identifier=123)
+         resp = self.post_webhook(event_data=json.loads(LINK_SHARED_EVENT % {
+             'group1': group1.id,
+             'group2': group2.id,
++            'incident': incident.identifier,
++            'org1': self.org.slug,
++            'org2': org2.slug,
+         }))
+         assert resp.status_code == 200, resp.content
++        data = dict(parse_qsl(responses.calls[0].request.body))
++        unfurls = json.loads(data['unfurls'])
++        issue_url = 'http://testserver/organizations/%s/issues/%s/bar/' % (
++            self.org.slug,
++            group1.id,
++        )
++        incident_url = 'http://testserver/organizations/%s/incidents/%s/' % (
++            self.org.slug,
++            incident.identifier,
++        )
++        assert unfurls == {
++            issue_url: build_group_attachment(group1),
++            incident_url: build_incident_attachment(incident),
++        }
+diff --git a/tests/sentry/integrations/slack/test_utils.py b/tests/sentry/integrations/slack/test_utils.py
+new file mode 100644
+index 0000000000..c063d99e5d
+--- /dev/null
++++ b/tests/sentry/integrations/slack/test_utils.py
+@@ -0,0 +1,43 @@
++from __future__ import absolute_import
++
++from django.core.urlresolvers import reverse
++
++from sentry.integrations.slack.utils import (
++    build_incident_attachment,
++    LEVEL_TO_COLOR,
++)
++from sentry.testutils import TestCase
++from sentry.utils.assets import get_asset_url
++from sentry.utils.dates import to_timestamp
++from sentry.utils.http import absolute_uri
++
++
++class BuildIncidentAttachmentTest(TestCase):
++    def test_simple(self):
++        logo_url = absolute_uri(get_asset_url('sentry', 'images/sentry-email-avatar.png'))
++
++        incident = self.create_incident()
++        title = '{} (#{})'.format(incident.title, incident.identifier)
++        assert build_incident_attachment(incident) == {
++            'fallback': title,
++            'title': title,
++            'title_link': absolute_uri(reverse(
++                'sentry-incident',
++                kwargs={
++                    'organization_slug': incident.organization.slug,
++                    'incident_id': incident.identifier,
++                },
++            )),
++            'text': ' ',
++            'fields': [
++                {'title': 'Status', 'value': 'Open', 'short': True},
++                {'title': 'Events', 'value': 0, 'short': True},
++                {'title': 'Users', 'value': 0, 'short': True},
++            ],
++            'mrkdwn_in': ['text'],
++            'footer_icon': logo_url,
++            'footer': 'Sentry Incident',
++            'ts': to_timestamp(incident.date_started),
++            'color': LEVEL_TO_COLOR['error'],
++            'actions': [],
++        }

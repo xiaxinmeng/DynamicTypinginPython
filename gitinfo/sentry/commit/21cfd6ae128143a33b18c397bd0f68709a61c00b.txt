@@ -1,0 +1,391 @@
+commit 21cfd6ae128143a33b18c397bd0f68709a61c00b
+Author: David Cramer <dcramer@gmail.com>
+Date:   Wed Jun 24 11:50:44 2015 -0700
+
+    Optimize cleanup task to perform bulk deletes where possible
+    
+    This pulls in code from getsentry to do more efficient bulk deletes given a Postgres backend on various models.
+
+diff --git a/CHANGES b/CHANGES
+index 02dde0307a..456fcfbb83 100644
+--- a/CHANGES
++++ b/CHANGES
+@@ -9,6 +9,7 @@ This releases entirely removes Access Groups. If you're upgrading form an instal
+ - The legacy (unused) search tables have been removed.
+ - Upgrades must now be applied manually via ``sentry upgrade`` or with ``sentry start --upgrade``.
+ - ``Event.checksum`` and ``Group.checksum`` have been removed.
++- The ``cleanup`` task has been removed (the command is still available).
+ 
+ Version 7.5.4
+ -------------
+diff --git a/src/sentry/conf/server.py b/src/sentry/conf/server.py
+index 1c107475a8..2667d7a5aa 100644
+--- a/src/sentry/conf/server.py
++++ b/src/sentry/conf/server.py
+@@ -361,7 +361,6 @@ CELERY_CREATE_MISSING_QUEUES = True
+ CELERY_IMPORTS = (
+     'sentry.tasks.beacon',
+     'sentry.tasks.check_auth',
+-    'sentry.tasks.cleanup',
+     'sentry.tasks.deletion',
+     'sentry.tasks.email',
+     'sentry.tasks.index',
+diff --git a/src/sentry/management/commands/cleanup.py b/src/sentry/management/commands/cleanup.py
+index c98a615536..027c7af165 100644
+--- a/src/sentry/management/commands/cleanup.py
++++ b/src/sentry/management/commands/cleanup.py
+@@ -7,9 +7,24 @@ sentry.management.commands.cleanup
+ """
+ from __future__ import absolute_import, print_function
+ 
++from datetime import timedelta
+ from django.core.management.base import BaseCommand
++from django.db import connections
++from django.utils import timezone
++from nydus.utils import ThreadPool
+ from optparse import make_option
+ 
++from sentry.app import nodestore
++from sentry.models import (
++    Activity, Alert, Event, EventMapping, Group, GroupRuleStatus, GroupTagValue,
++    LostPasswordHash, TagValue
++)
++from sentry.utils import db
++
++
++def delete_object(item):
++    item.delete()
++
+ 
+ class Command(BaseCommand):
+     help = 'Deletes a portion of trailing data based on creation date'
+@@ -20,16 +35,136 @@ class Command(BaseCommand):
+         make_option('--concurrency', type=int, default=1, help='The number of concurrent workers to run.'),
+     )
+ 
++    # these models should be safe to delete without cascades, in order
++    BULK_DELETES = (
++        (GroupRuleStatus, 'date_added'),
++        (GroupTagValue, 'last_seen'),
++        (Activity, 'datetime'),
++        (TagValue, 'last_seen'),
++        (Alert, 'datetime'),
++    )
++
++    GENERIC_DELETES = (
++        (Event, 'datetime'),
++        (Group, 'last_seen'),
++    )
++
++    def _postgres_bulk_speed_delete(self, model, dtfield, days=None,
++                                    chunk_size=100000):
++        """
++        Cleanup models which we know dont need expensive (in-app) cascades or
++        cache handling.
++
++        This chunks up delete statements but still does them in bulk.
++        """
++        cursor = connections['default'].cursor()
++        quote_name = connections['default'].ops.quote_name
++
++        if days is None:
++            days = self.days
++
++        if self.project:
++            where_extra = 'and project = %(project)d'
++        else:
++            where_extra = ''
++
++        self.stdout.write(">> Cleaning up %s\n" % (model.__name__,))
++        keep_it_going = True
++        while keep_it_going:
++            cursor.execute("""
++            delete from %(table)s
++            where id = any(array(
++                select id
++                from %(table)s
++                where %(dtfield)s < now() - interval '%(days)d days'
++                %(where_extra)s
++                limit %(chunk_size)d
++            ));
++            """ % dict(
++                table=model._meta.db_table,
++                dtfield=quote_name(dtfield),
++                days=days,
++                where_extra=where_extra,
++                project=self.project,
++                chunk_size=chunk_size,
++            ))
++            keep_it_going = cursor.rowcount > 0
++
++    def bulk_delete(self, model, dtfield, days=None):
++        if db.is_postgres():
++            self._postgres_bulk_speed_delete(model, dtfield, days=days)
++        else:
++            self.generic_delete(model, dtfield, days=days)
++
++    def generic_delete(self, model, dtfield, days=None, chunk_size=1000):
++        if days is None:
++            days = self.days
++
++        cutoff = timezone.now() - timedelta(days=days)
++
++        qs = model.objects.filter(**{'%s__lte' % (dtfield,): cutoff})
++        if self.project:
++            qs = qs.filter(project=self.project)
++
++        # XXX: we step through because the deletion collector will pull all
++        # relations into memory
++        count = 0
++        while qs.exists():
++            # TODO(dcramer): change this to delete by chunks of IDs and utilize
++            # bulk_delete_objects
++            self.stdout.write("Removing {model} chunk {count}\n".format(
++                model=model.__name__,
++                count=count,
++            ))
++            if self.concurrency > 1:
++                worker_pool = ThreadPool(workers=self.concurrency)
++                for obj in qs[:chunk_size].iterator():
++                    worker_pool.add(obj.id, delete_object, [obj])
++                    count += 1
++                worker_pool.join()
++                del worker_pool
++            else:
++                for obj in qs[:chunk_size].iterator():
++                    delete_object(obj)
++                    count += 1
++
+     def handle(self, **options):
+-        import logging
+-        from sentry.tasks.cleanup import cleanup, logger
+-
+-        if options['verbosity'] > 1:
+-            logger.setLevel(logging.DEBUG)
+-            logger.addHandler(logging.StreamHandler())
+-
+-        cleanup(
+-            days=options['days'],
+-            project=options['project'],
+-            concurrency=options['concurrency'],
+-        )
++        self.days = options['days']
++        self.concurrency = options['concurrency']
++        self.project = options['project']
++
++        self.stdout.write("Removing expired values for LostPasswordHash\n")
++        LostPasswordHash.objects.filter(
++            date_added__lte=timezone.now() - timedelta(hours=48)
++        ).delete()
++
++        if self.project:
++            self.stderr.write("Bulk NodeStore deletion not available for project selection\n")
++        else:
++            self.stdout.write("Removing old NodeStore values\n")
++            cutoff = timezone.now() - timedelta(days=self.days)
++            try:
++                nodestore.cleanup(cutoff)
++            except NotImplementedError:
++                self.stderr.write("NodeStore backend does not support cleanup operation\n")
++
++        for model, dtfield in self.BULK_DELETES:
++            self.stdout.write("Removing {model} for days={days} project={project}\n".format(
++                model=model.__name__,
++                days=self.days,
++                project=self.project or '*',
++            ))
++            self.bulk_delete(model, dtfield)
++
++        for model, dtfield in self.GENERIC_DELETES:
++            self.stdout.write("Removing {model} for days={days} project={project}\n".format(
++                model=model.__name__,
++                days=self.days,
++                project=self.project or '*',
++            ))
++            self.generic_delete(model, dtfield)
++
++        # EventMapping is fairly expensive and is special cased as it's likely you
++        # won't need a reference to an event for nearly as long
++        self.stdout.write("Removing expired values for EventMapping\n")
++        self.bulk_delete(EventMapping, 'date_added', days=min(self.days, 7))
+diff --git a/src/sentry/nodestore/django/backend.py b/src/sentry/nodestore/django/backend.py
+index bcb44ac2e9..d4f46c1263 100644
+--- a/src/sentry/nodestore/django/backend.py
++++ b/src/sentry/nodestore/django/backend.py
+@@ -44,6 +44,8 @@ class DjangoNodeStorage(NodeStorage):
+         )
+ 
+     def cleanup(self, cutoff_timestamp):
++        # TODO(dcramer): this should share the efficient bulk deletion
++        # mechanisms
+         query = """
+         DELETE FROM %s WHERE timestamp <= %%s
+         """ % (Node._meta.db_table,)
+diff --git a/src/sentry/tasks/cleanup.py b/src/sentry/tasks/cleanup.py
+deleted file mode 100644
+index dc72623425..0000000000
+--- a/src/sentry/tasks/cleanup.py
++++ /dev/null
+@@ -1,113 +0,0 @@
+-"""
+-sentry.tasks.cleanup
+-~~~~~~~~~~~~~~~~~~~~
+-
+-:copyright: (c) 2010-2014 by the Sentry Team, see AUTHORS for more details.
+-:license: BSD, see LICENSE for more details.
+-"""
+-from __future__ import absolute_import
+-
+-from celery.utils.log import get_task_logger
+-from nydus.utils import ThreadPool
+-
+-from sentry.tasks.base import instrumented_task
+-
+-logger = get_task_logger(__name__)
+-
+-
+-def delete_object(item):
+-    item.delete()
+-
+-
+-@instrumented_task(name='sentry.tasks.cleanup.cleanup', queue='cleanup')
+-def cleanup(days=30, project=None, chunk_size=1000, concurrency=1, **kwargs):
+-    """
+-    Deletes a portion of the trailing data in Sentry based on
+-    their creation dates. For example, if ``days`` is 30, this
+-    would attempt to clean up all data that's older than 30 days.
+-
+-    :param project: limit all deletion scopes to messages that are part
+-                    of the given project
+-    """
+-    import datetime
+-
+-    from django.utils import timezone
+-
+-    from sentry import app
+-    # TODO: TagKey and GroupTagKey need cleaned up
+-    from sentry.models import (
+-        Group, GroupRuleStatus, Event, EventMapping,
+-        GroupTagValue, TagValue, Alert,
+-        Activity, LostPasswordHash)
+-
+-    GENERIC_DELETES = (
+-        (GroupRuleStatus, 'date_added'),
+-        (GroupTagValue, 'last_seen'),
+-        (Event, 'datetime'),
+-        (Activity, 'datetime'),
+-        (TagValue, 'last_seen'),
+-        (Alert, 'datetime'),
+-        (EventMapping, 'date_added'),
+-        # Group should probably be last
+-        (Group, 'last_seen'),
+-    )
+-
+-    ts = timezone.now() - datetime.timedelta(days=days)
+-
+-    logger.info("Removing expired values for LostPasswordHash")
+-    LostPasswordHash.objects.filter(
+-        date_added__lte=timezone.now() - datetime.timedelta(hours=48)
+-    ).delete()
+-
+-    # TODO: we should move this into individual backends
+-    if not project:
+-        logger.info("Removing old Node values")
+-        try:
+-            app.nodestore.cleanup(ts)
+-        except NotImplementedError:
+-            logger.warning("Node backend does not support cleanup operation")
+-
+-    # Remove types which can easily be bound to project + date
+-    for model, date_col in GENERIC_DELETES:
+-        logger.info("Removing %s for days=%s project=%s", model.__name__, days, project or '*')
+-        qs = model.objects.filter(**{'%s__lte' % (date_col,): ts})
+-        if project:
+-            qs = qs.filter(project=project)
+-        # XXX: we step through because the deletion collector will pull all relations into memory
+-
+-        count = 0
+-        while qs.exists():
+-            # TODO(dcramer): change this to delete by chunks of IDs and utilize
+-            # bulk_delete_objects
+-            logger.info("Removing %s chunk %d", model.__name__, count)
+-            if concurrency > 1:
+-                worker_pool = ThreadPool(workers=concurrency)
+-                for obj in qs[:chunk_size].iterator():
+-                    worker_pool.add(obj.id, delete_object, [obj])
+-                    count += 1
+-                worker_pool.join()
+-                del worker_pool
+-            else:
+-                for obj in qs[:chunk_size].iterator():
+-                    delete_object(obj)
+-                    count += 1
+-
+-    # EventMapping is fairly expensive and is special cased as it's likely you
+-    # won't need a reference to an event for nearly as long
+-    if days > 7:
+-        logger.info("Removing expired values for EventMapping")
+-        qs = EventMapping.objects.filter(
+-            date_added__lte=timezone.now() - datetime.timedelta(days=7)
+-        )
+-        while qs.exists():
+-            if concurrency > 1:
+-                worker_pool = ThreadPool(workers=concurrency)
+-                for obj in qs[:chunk_size].iterator():
+-                    worker_pool.add(obj.id, delete_object, [obj])
+-                    count += 1
+-                worker_pool.join()
+-                del worker_pool
+-            else:
+-                for obj in qs[:chunk_size].iterator():
+-                    delete_object(obj)
+-                    count += 1
+diff --git a/tests/sentry/tasks/cleanup/__init__.py b/tests/sentry/management/__init__.py
+similarity index 100%
+rename from tests/sentry/tasks/cleanup/__init__.py
+rename to tests/sentry/management/__init__.py
+diff --git a/tests/sentry/management/commands/__init__.py b/tests/sentry/management/commands/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/tests/sentry/tasks/cleanup/tests.py b/tests/sentry/management/commands/test_cleanup.py
+similarity index 79%
+rename from tests/sentry/tasks/cleanup/tests.py
+rename to tests/sentry/management/commands/test_cleanup.py
+index e3c5740a0e..f7f9ee5ee7 100644
+--- a/tests/sentry/tasks/cleanup/tests.py
++++ b/tests/sentry/management/commands/test_cleanup.py
+@@ -2,8 +2,9 @@
+ 
+ from __future__ import absolute_import
+ 
++from django.core.management import call_command
++
+ from sentry.models import Event, Group, GroupTagValue, TagValue, TagKey
+-from sentry.tasks.cleanup import cleanup
+ from sentry.testutils import TestCase
+ 
+ ALL_MODELS = (Event, Group, GroupTagValue, TagValue, TagKey)
+@@ -13,7 +14,7 @@ class SentryCleanupTest(TestCase):
+     fixtures = ['tests/fixtures/cleanup.json']
+ 
+     def test_simple(self):
+-        cleanup(days=1)
++        call_command('cleanup', days=1)
+ 
+         for model in ALL_MODELS:
+             assert model.objects.count() == 0
+@@ -23,12 +24,12 @@ class SentryCleanupTest(TestCase):
+         for model in ALL_MODELS:
+             orig_counts[model] = model.objects.count()
+ 
+-        cleanup(days=1, project=2)
++        call_command('cleanup', days=1, project=2)
+ 
+         for model in ALL_MODELS:
+             assert model.objects.count() == orig_counts[model]
+ 
+-        cleanup(days=1, project=1)
++        call_command('cleanup', days=1, project=1)
+ 
+         for model in ALL_MODELS:
+             assert model.objects.count() == 0

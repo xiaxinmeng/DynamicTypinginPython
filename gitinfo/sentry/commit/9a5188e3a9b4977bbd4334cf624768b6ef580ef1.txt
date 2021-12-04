@@ -1,0 +1,165 @@
+commit 9a5188e3a9b4977bbd4334cf624768b6ef580ef1
+Author: Mark Story <mark@sentry.io>
+Date:   Fri Jun 5 14:38:47 2020 -0400
+
+    fix(discover) Fix negated issue conditions (#19175)
+    
+    The issue condition should support negation like other conditions. I've
+    changed the semantics a bit on how the issue filter works as it no
+    longer goes into the `group_ids` filter key, but from what I saw snuba
+    can still promote the new condition into a prewhere.
+    
+    We still need isNull to prevent the prewhere promotion which excludes
+    all the results we're interested in.
+    
+    Co-authored-by: evanh <evanh@users.noreply.github.com>
+
+diff --git a/src/sentry/api/event_search.py b/src/sentry/api/event_search.py
+index aa18d2dfcf..45582f6f95 100644
+--- a/src/sentry/api/event_search.py
++++ b/src/sentry/api/event_search.py
+@@ -760,6 +760,19 @@ def convert_search_filter_to_snuba_query(search_filter, key=None):
+                 )
+             )
+         return [name, search_filter.operator, internal_value]
++    elif name == "issue.id":
++        # Handle "has" queries
++        if search_filter.value.raw_value == "":
++            if search_filter.operator == "=":
++                # Use isNull to get events with no issue (transactions)
++                return [["isNull", [name]], search_filter.operator, 1]
++            else:
++                # Compare to 0 as group_id is not nullable on issues.
++                return [name, search_filter.operator, 0]
++
++        # Skip isNull check on group_id value as we want to
++        # allow snuba's prewhere optimizer to find this condition.
++        return [name, search_filter.operator, value]
+     else:
+         value = (
+             int(to_timestamp(value)) * 1000
+@@ -862,17 +875,21 @@ def get_filter(query=None, params=None):
+             elif name == ISSUE_ID_ALIAS and value != "":
+                 # A blank term value means that this is a has filter
+                 kwargs["group_ids"].extend(to_list(value))
+-            elif name == ISSUE_ALIAS and value != "":
+-                if params and "organization_id" in params:
++            elif name == ISSUE_ALIAS:
++                if value != "" and params and "organization_id" in params:
+                     try:
+                         group = Group.objects.by_qualified_short_id(
+                             params["organization_id"], value
+                         )
+-                        kwargs["group_ids"].extend(to_list(group.id))
+                     except Exception:
+                         raise InvalidSearchQuery(
+                             u"Invalid value '{}' for 'issue:' filter".format(value)
+                         )
++                    else:
++                        value = group.id
++                term = SearchFilter(SearchKey("issue.id"), term.operator, SearchValue(value))
++                converted_filter = convert_search_filter_to_snuba_query(term)
++                kwargs["conditions"].append(converted_filter)
+             elif name == USER_ALIAS:
+                 # If the key is user, do an OR across all the different possible user fields
+                 user_conditions = [
+diff --git a/tests/sentry/api/test_event_search.py b/tests/sentry/api/test_event_search.py
+index 0517505d38..58a8075c79 100644
+--- a/tests/sentry/api/test_event_search.py
++++ b/tests/sentry/api/test_event_search.py
+@@ -1146,7 +1146,7 @@ class GetSnubaQueryArgsTest(TestCase):
+     def test_has_issue_id(self):
+         has_issue_filter = get_filter("has:issue.id")
+         assert has_issue_filter.group_ids == []
+-        assert has_issue_filter.conditions == [[["isNull", ["issue.id"]], "!=", 1]]
++        assert has_issue_filter.conditions == [["issue.id", "!=", 0]]
+ 
+     def test_not_has_issue_id(self):
+         has_issue_filter = get_filter("!has:issue.id")
+@@ -1185,12 +1185,30 @@ class GetSnubaQueryArgsTest(TestCase):
+         assert _filter.filter_keys == {"group_id": [1]}
+         assert _filter.group_ids == [1]
+ 
+-    def test_issue_filter(self):
++    def test_issue_filter_invalid(self):
+         with pytest.raises(InvalidSearchQuery) as err:
+             get_filter("issue:1", {"organization_id": 1})
+         assert "Invalid value '" in six.text_type(err)
+         assert "' for 'issue:' filter" in six.text_type(err)
+ 
++    def test_issue_filter(self):
++        group = self.create_group(project=self.project)
++        _filter = get_filter(
++            "issue:{}".format(group.qualified_short_id), {"organization_id": self.organization.id}
++        )
++        assert _filter.conditions == [["issue.id", "=", group.id]]
++        assert _filter.filter_keys == {}
++        assert _filter.group_ids == []
++
++    def test_negated_issue_filter(self):
++        group = self.create_group(project=self.project)
++        _filter = get_filter(
++            "!issue:{}".format(group.qualified_short_id), {"organization_id": self.organization.id}
++        )
++        assert _filter.conditions == [["issue.id", "!=", group.id]]
++        assert _filter.filter_keys == {}
++        assert _filter.group_ids == []
++
+     def test_environment_param(self):
+         params = {"environment": ["", "prod"]}
+         _filter = get_filter("", params)
+diff --git a/tests/snuba/api/endpoints/test_organization_events_v2.py b/tests/snuba/api/endpoints/test_organization_events_v2.py
+index 110bd05198..9c86e30b06 100644
+--- a/tests/snuba/api/endpoints/test_organization_events_v2.py
++++ b/tests/snuba/api/endpoints/test_organization_events_v2.py
+@@ -1623,6 +1623,50 @@ class OrganizationEventsV2EndpointTest(APITestCase, SnubaTestCase):
+                 else:
+                     assert data[0].get("issue", None) is None
+ 
++    def test_issue_negation(self):
++        self.login_as(user=self.user)
++
++        project1 = self.create_project()
++        project2 = self.create_project()
++        event1 = self.store_event(
++            data={
++                "event_id": "a" * 32,
++                "transaction": "/example",
++                "message": "how to make fast",
++                "timestamp": self.two_min_ago,
++                "fingerprint": ["group_1"],
++            },
++            project_id=project1.id,
++        )
++        event2 = self.store_event(
++            data={
++                "event_id": "b" * 32,
++                "transaction": "/example",
++                "message": "go really fast plz",
++                "timestamp": self.two_min_ago,
++                "fingerprint": ["group_2"],
++            },
++            project_id=project2.id,
++        )
++
++        with self.feature(
++            {"organizations:discover-basic": True, "organizations:global-views": True}
++        ):
++            response = self.client.get(
++                self.url,
++                format="json",
++                data={
++                    "field": ["title", "issue.id"],
++                    "query": "!issue:{}".format(event1.group.qualified_short_id),
++                },
++            )
++
++            assert response.status_code == 200, response.content
++            data = response.data["data"]
++            assert len(data) == 1
++            assert data[0]["title"] == event2.title
++            assert data[0]["issue.id"] == event2.group_id
++
+     def test_search_for_nonexistent_issue(self):
+         self.login_as(user=self.user)
+ 

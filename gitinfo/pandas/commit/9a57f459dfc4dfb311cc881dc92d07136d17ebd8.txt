@@ -1,0 +1,348 @@
+commit 9a57f459dfc4dfb311cc881dc92d07136d17ebd8
+Author: alm <alonme@users.noreply.github.com>
+Date:   Wed Jun 3 00:04:13 2020 +0300
+
+    BUG/ENH: Fix apply to only call `func` once on the first column/row (#34183)
+
+diff --git a/doc/source/whatsnew/v1.1.0.rst b/doc/source/whatsnew/v1.1.0.rst
+index 6e8cbc34b..f3075901f 100644
+--- a/doc/source/whatsnew/v1.1.0.rst
++++ b/doc/source/whatsnew/v1.1.0.rst
+@@ -665,6 +665,45 @@ Using :meth:`DataFrame.groupby` with ``as_index=False`` and the function ``idxma
+ 
+    df.groupby("a", as_index=False).nunique()
+ 
++.. _whatsnew_110.api_breaking.apply_applymap_first_once:
++
++apply and applymap on ``DataFrame`` evaluates first row/column only once
++^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
++
++.. ipython:: python
++
++    df = pd.DataFrame({'a': [1, 2], 'b': [3, 6]})
++
++    def func(row):
++        print(row)
++        return row
++
++*Previous behavior*:
++
++.. code-block:: ipython
++
++    In [4]: df.apply(func, axis=1)
++    a    1
++    b    3
++    Name: 0, dtype: int64
++    a    1
++    b    3
++    Name: 0, dtype: int64
++    a    2
++    b    6
++    Name: 1, dtype: int64
++    Out[4]:
++       a  b
++    0  1  3
++    1  2  6
++
++*New behavior*:
++
++.. ipython:: python
++
++    df.apply(func, axis=1)
++
++
+ .. _whatsnew_110.deprecations:
+ 
+ Deprecations
+diff --git a/pandas/_libs/reduction.pyx b/pandas/_libs/reduction.pyx
+index 18422c2f8..99c6f8bde 100644
+--- a/pandas/_libs/reduction.pyx
++++ b/pandas/_libs/reduction.pyx
+@@ -107,6 +107,7 @@ cdef class Reducer:
+ 
+         result = np.empty(self.nresults, dtype='O')
+         it = <flatiter>PyArray_IterNew(result)
++        reduction_success = True
+ 
+         try:
+             for i in range(self.nresults):
+@@ -134,21 +135,35 @@ cdef class Reducer:
+                     res = self.f(chunk)
+ 
+                 # TODO: reason for not squeezing here?
+-                res = _extract_result(res, squeeze=False)
++                extracted_res = _extract_result(res, squeeze=False)
+                 if i == 0:
+                     # On the first pass, we check the output shape to see
+                     #  if this looks like a reduction.
+-                    _check_result_array(res, len(self.dummy))
+-
+-                PyArray_SETITEM(result, PyArray_ITER_DATA(it), res)
++                    #  If it does not, return the computed value to be used by the
++                    #  pure python implementation,
++                    #  so the function won't be called twice on the same object,
++                    #  and side effects would occur twice
++                    try:
++                        _check_result_array(extracted_res, len(self.dummy))
++                    except ValueError as err:
++                        if "Function does not reduce" not in str(err):
++                            # catch only the specific exception
++                            raise
++
++                        reduction_success = False
++                        PyArray_SETITEM(result, PyArray_ITER_DATA(it), copy(res))
++                        break
++
++                PyArray_SETITEM(result, PyArray_ITER_DATA(it), extracted_res)
+                 chunk.data = chunk.data + self.increment
+                 PyArray_ITER_NEXT(it)
++
+         finally:
+             # so we don't free the wrong memory
+             chunk.data = dummy_buf
+ 
+         result = maybe_convert_objects(result)
+-        return result
++        return result, reduction_success
+ 
+ 
+ cdef class _BaseGrouper:
+diff --git a/pandas/core/apply.py b/pandas/core/apply.py
+index a01343449..0a274d8be 100644
+--- a/pandas/core/apply.py
++++ b/pandas/core/apply.py
+@@ -220,14 +220,12 @@ class FrameApply(metaclass=abc.ABCMeta):
+ 
+     def apply_raw(self):
+         """ apply to the values as a numpy array """
+-        try:
+-            result = libreduction.compute_reduction(self.values, self.f, axis=self.axis)
+-        except ValueError as err:
+-            if "Function does not reduce" not in str(err):
+-                # catch only ValueError raised intentionally in libreduction
+-                raise
+-            # We expect np.apply_along_axis to give a two-dimensional result, or
+-            #  also raise.
++        result, reduction_success = libreduction.compute_reduction(
++            self.values, self.f, axis=self.axis
++        )
++
++        # We expect np.apply_along_axis to give a two-dimensional result, or raise.
++        if not reduction_success:
+             result = np.apply_along_axis(self.f, self.axis, self.values)
+ 
+         # TODO: mixed type case
+@@ -265,6 +263,9 @@ class FrameApply(metaclass=abc.ABCMeta):
+ 
+     def apply_standard(self):
+ 
++        # partial result that may be returned from reduction
++        partial_result = None
++
+         # try to reduce first (by default)
+         # this only matters if the reduction in values is of different dtype
+         # e.g. if we want to apply to a SparseFrame, then can't directly reduce
+@@ -292,13 +293,9 @@ class FrameApply(metaclass=abc.ABCMeta):
+             )
+ 
+             try:
+-                result = libreduction.compute_reduction(
++                result, reduction_success = libreduction.compute_reduction(
+                     values, self.f, axis=self.axis, dummy=dummy, labels=labels
+                 )
+-            except ValueError as err:
+-                if "Function does not reduce" not in str(err):
+-                    # catch only ValueError raised intentionally in libreduction
+-                    raise
+             except TypeError:
+                 # e.g. test_apply_ignore_failures we just ignore
+                 if not self.ignore_failures:
+@@ -307,29 +304,43 @@ class FrameApply(metaclass=abc.ABCMeta):
+                 # reached via numexpr; fall back to python implementation
+                 pass
+             else:
+-                return self.obj._constructor_sliced(result, index=labels)
++                if reduction_success:
++                    return self.obj._constructor_sliced(result, index=labels)
+ 
+-        # compute the result using the series generator
+-        results, res_index = self.apply_series_generator()
++                # no exceptions - however reduction was unsuccessful,
++                # use the computed function result for first element
++                partial_result = result[0]
++                if isinstance(partial_result, ABCSeries):
++                    partial_result = partial_result.infer_objects()
++
++        # compute the result using the series generator,
++        # use the result computed while trying to reduce if available.
++        results, res_index = self.apply_series_generator(partial_result)
+ 
+         # wrap results
+         return self.wrap_results(results, res_index)
+ 
+-    def apply_series_generator(self) -> Tuple[ResType, "Index"]:
++    def apply_series_generator(self, partial_result=None) -> Tuple[ResType, "Index"]:
+         series_gen = self.series_generator
+         res_index = self.result_index
+ 
+-        keys = []
+         results = {}
++
++        # If a partial result was already computed,
++        # use it instead of running on the first element again
++        series_gen_enumeration = enumerate(series_gen)
++        if partial_result is not None:
++            i, v = next(series_gen_enumeration)
++            results[i] = partial_result
++
+         if self.ignore_failures:
+             successes = []
+-            for i, v in enumerate(series_gen):
++            for i, v in series_gen_enumeration:
+                 try:
+                     results[i] = self.f(v)
+                 except Exception:
+                     pass
+                 else:
+-                    keys.append(v.name)
+                     successes.append(i)
+ 
+             # so will work with MultiIndex
+@@ -337,9 +348,9 @@ class FrameApply(metaclass=abc.ABCMeta):
+                 res_index = res_index.take(successes)
+ 
+         else:
+-            for i, v in enumerate(series_gen):
++            for i, v in series_gen_enumeration:
++
+                 results[i] = self.f(v)
+-                keys.append(v.name)
+ 
+         return results, res_index
+ 
+diff --git a/pandas/core/frame.py b/pandas/core/frame.py
+index dfc938918..013c7bb62 100644
+--- a/pandas/core/frame.py
++++ b/pandas/core/frame.py
+@@ -7526,14 +7526,6 @@ NaN 12.3   33.0
+         --------
+         DataFrame.apply : Apply a function along input axis of DataFrame.
+ 
+-        Notes
+-        -----
+-        In the current implementation applymap calls `func` twice on the
+-        first column/row to decide whether it can take a fast or slow
+-        code path. This can lead to unexpected behavior if `func` has
+-        side-effects, as they will take effect twice for the first
+-        column/row.
+-
+         Examples
+         --------
+         >>> df = pd.DataFrame([[1, 2.12], [3.356, 4.567]])
+diff --git a/pandas/tests/frame/test_apply.py b/pandas/tests/frame/test_apply.py
+index e32852325..d12699397 100644
+--- a/pandas/tests/frame/test_apply.py
++++ b/pandas/tests/frame/test_apply.py
+@@ -718,12 +718,73 @@ class TestDataFrameApply:
+ 
+     def test_apply_noreduction_tzaware_object(self):
+         # https://github.com/pandas-dev/pandas/issues/31505
+-        df = pd.DataFrame({"foo": [pd.Timestamp("2020", tz="UTC")]}, dtype="object")
++        df = pd.DataFrame(
++            {"foo": [pd.Timestamp("2020", tz="UTC")]}, dtype="datetime64[ns, UTC]"
++        )
+         result = df.apply(lambda x: x)
+         tm.assert_frame_equal(result, df)
+         result = df.apply(lambda x: x.copy())
+         tm.assert_frame_equal(result, df)
+ 
++    def test_apply_function_runs_once(self):
++        # https://github.com/pandas-dev/pandas/issues/30815
++
++        df = pd.DataFrame({"a": [1, 2, 3]})
++        names = []  # Save row names function is applied to
++
++        def reducing_function(row):
++            names.append(row.name)
++
++        def non_reducing_function(row):
++            names.append(row.name)
++            return row
++
++        for func in [reducing_function, non_reducing_function]:
++            del names[:]
++
++            df.apply(func, axis=1)
++            assert names == list(df.index)
++
++    @pytest.mark.xfail(
++        reason="The 'run once' enhancement for apply_raw not implemented yet."
++    )
++    def test_apply_raw_function_runs_once(self):
++        # https://github.com/pandas-dev/pandas/issues/34506
++
++        df = pd.DataFrame({"a": [1, 2, 3]})
++        values = []  # Save row values function is applied to
++
++        def reducing_function(row):
++            values.extend(row)
++
++        def non_reducing_function(row):
++            values.extend(row)
++            return row
++
++        for func in [reducing_function, non_reducing_function]:
++            del values[:]
++
++            df.apply(func, raw=True, axis=1)
++            assert values == list(df.a.to_list())
++
++    def test_applymap_function_runs_once(self):
++
++        df = pd.DataFrame({"a": [1, 2, 3]})
++        values = []  # Save values function is applied to
++
++        def reducing_function(val):
++            values.append(val)
++
++        def non_reducing_function(val):
++            values.append(val)
++            return val
++
++        for func in [reducing_function, non_reducing_function]:
++            del values[:]
++
++            df.applymap(func)
++            assert values == df.a.to_list()
++
+ 
+ class TestInferOutputShape:
+     # the user has supplied an opaque UDF where
+diff --git a/pandas/tests/groupby/test_bin_groupby.py b/pandas/tests/groupby/test_bin_groupby.py
+index e999b88fc..9df45f7a2 100644
+--- a/pandas/tests/groupby/test_bin_groupby.py
++++ b/pandas/tests/groupby/test_bin_groupby.py
+@@ -153,20 +153,20 @@ class TestReducer:
+             )
+ 
+         dummy = Series(0.0, index=np.arange(100))
+-        result = libreduction.compute_reduction(
++        result, _ = libreduction.compute_reduction(
+             arr, np.sum, dummy=dummy, labels=Index(np.arange(4))
+         )
+         expected = arr.sum(0)
+         tm.assert_almost_equal(result, expected)
+ 
+         dummy = Series(0.0, index=np.arange(4))
+-        result = libreduction.compute_reduction(
++        result, _ = libreduction.compute_reduction(
+             arr, np.sum, axis=1, dummy=dummy, labels=Index(np.arange(100))
+         )
+         expected = arr.sum(1)
+         tm.assert_almost_equal(result, expected)
+ 
+-        result = libreduction.compute_reduction(
++        result, _ = libreduction.compute_reduction(
+             arr, np.sum, axis=1, dummy=dummy, labels=Index(np.arange(100))
+         )
+         tm.assert_almost_equal(result, expected)

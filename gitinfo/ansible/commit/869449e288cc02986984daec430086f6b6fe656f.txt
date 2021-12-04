@@ -1,0 +1,961 @@
+commit 869449e288cc02986984daec430086f6b6fe656f
+Author: Matt Clay <matt@mystile.com>
+Date:   Wed Mar 15 12:17:42 2017 -0700
+
+    Add test verification to ansible-test. (#22636)
+    
+    * Add unified git diff parser.
+    * Add metadata and diff handling.
+    * Add test confidence/verification to bot output.
+
+diff --git a/test/runner/Makefile b/test/runner/Makefile
+new file mode 100644
+index 0000000000..cdb071ad69
+--- /dev/null
++++ b/test/runner/Makefile
+@@ -0,0 +1,12 @@
++.PHONY: all compile sanity units
++
++all: compile sanity units
++
++compile:
++	./ansible-test compile test/runner/ ${TEST_FLAGS}
++
++sanity:
++	./ansible-test sanity test/runner/ ${TEST_FLAGS}
++
++units:
++	PYTHONPATH=. pytest units ${TEST_FLAGS}
+diff --git a/test/runner/lib/changes.py b/test/runner/lib/changes.py
+index 8fc27f9666..2783e5516c 100644
+--- a/test/runner/lib/changes.py
++++ b/test/runner/lib/changes.py
+@@ -69,15 +69,18 @@ class ShippableChanges(object):
+ 
+         if self.is_pr:
+             self.paths = sorted(git.get_diff_names([self.branch]))
++            self.diff = git.get_diff([self.branch])
+         else:
+             merge_runs = self.get_merge_runs(self.project_id, self.branch)
+             last_successful_commit = self.get_last_successful_commit(git, merge_runs)
+ 
+             if last_successful_commit:
+                 self.paths = sorted(git.get_diff_names([last_successful_commit, self.commit]))
++                self.diff = git.get_diff([last_successful_commit, self.commit])
+             else:
+                 # tracked files (including unchanged)
+                 self.paths = sorted(git.get_file_names(['--cached']))
++                self.diff = None
+ 
+     def get_merge_runs(self, project_id, branch):
+         """
+@@ -161,6 +164,8 @@ class LocalChanges(object):
+         self.staged = sorted(git.get_diff_names(['--cached']))
+         # tracked changes (including deletions) which are not staged
+         self.unstaged = sorted(git.get_diff_names([]))
++        # diff of all tracked files from fork point to working copy
++        self.diff = git.get_diff([self.fork_point])
+ 
+     @staticmethod
+     def is_official_branch(name):
+diff --git a/test/runner/lib/delegation.py b/test/runner/lib/delegation.py
+index c6bb140028..1f0ddabafd 100644
+--- a/test/runner/lib/delegation.py
++++ b/test/runner/lib/delegation.py
+@@ -4,6 +4,7 @@ from __future__ import absolute_import, print_function
+ 
+ import os
+ import sys
++import tempfile
+ import time
+ 
+ import lib.pytar
+@@ -46,6 +47,27 @@ def delegate(args, exclude, require):
+     :type args: EnvironmentConfig
+     :type exclude: list[str]
+     :type require: list[str]
++    :rtype: bool
++    """
++    if isinstance(args, TestConfig):
++        with tempfile.NamedTemporaryFile(prefix='metadata-', suffix='.json', dir=os.getcwd()) as metadata_fd:
++            args.metadata_path = os.path.basename(metadata_fd.name)
++            args.metadata.to_file(args.metadata_path)
++
++            try:
++                return delegate_command(args, exclude, require)
++            finally:
++                args.metadata_path = None
++    else:
++        return delegate_command(args, exclude, require)
++
++
++def delegate_command(args, exclude, require):
++    """
++    :type args: EnvironmentConfig
++    :type exclude: list[str]
++    :type require: list[str]
++    :rtype: bool
+     """
+     if args.tox:
+         delegate_tox(args, exclude, require)
+@@ -396,6 +418,7 @@ def filter_options(args, argv, options, exclude, require):
+             '--ignore-unstaged': 0,
+             '--changed-from': 1,
+             '--changed-path': 1,
++            '--metadata': 1,
+         })
+     elif isinstance(args, SanityConfig):
+         options.update({
+@@ -427,3 +450,7 @@ def filter_options(args, argv, options, exclude, require):
+     for target in require:
+         yield '--require'
+         yield target
++
++    if args.metadata_path:
++        yield '--metadata'
++        yield args.metadata_path
+diff --git a/test/runner/lib/diff.py b/test/runner/lib/diff.py
+new file mode 100644
+index 0000000000..d5e929097b
+--- /dev/null
++++ b/test/runner/lib/diff.py
+@@ -0,0 +1,253 @@
++"""Diff parsing functions and classes."""
++from __future__ import absolute_import, print_function
++
++import re
++import textwrap
++import traceback
++
++from lib.util import (
++    ApplicationError,
++)
++
++
++def parse_diff(lines):
++    """
++    :type lines: list[str]
++    :rtype: list[FileDiff]
++    """
++    return DiffParser(lines).files
++
++
++class FileDiff(object):
++    """Parsed diff for a single file."""
++    def __init__(self, old_path, new_path):
++        """
++        :type old_path: str
++        :type new_path: str
++        """
++        self.old = DiffSide(old_path, new=False)
++        self.new = DiffSide(new_path, new=True)
++        self.headers = []  # list [str]
++        self.binary = False
++
++    def append_header(self, line):
++        """
++        :type line: str
++        """
++        self.headers.append(line)
++
++    @property
++    def is_complete(self):
++        """
++        :rtype: bool
++        """
++        return self.old.is_complete and self.new.is_complete
++
++
++class DiffSide(object):
++    """Parsed diff for a single 'side' of a single file."""
++    def __init__(self, path, new):
++        """
++        :type path: str
++        :type new: bool
++        """
++        self.path = path
++        self.new = new
++        self.prefix = '+' if self.new else '-'
++        self.eof_newline = True
++        self.exists = True
++
++        self.lines = []  # type: list [tuple[int, str]]
++        self.lines_and_context = []  # type: list [tuple[int, str]]
++        self.ranges = []  # type: list [tuple[int, int]]
++
++        self._next_line_number = 0
++        self._lines_remaining = 0
++        self._range_start = 0
++
++    def set_start(self, line_start, line_count):
++        """
++        :type line_start: int
++        :type line_count: int
++        """
++        self._next_line_number = line_start
++        self._lines_remaining = line_count
++        self._range_start = 0
++
++    def append(self, line):
++        """
++        :type line: str
++        """
++        if self._lines_remaining <= 0:
++            raise Exception('Diff range overflow.')
++
++        entry = self._next_line_number, line
++
++        if line.startswith(' '):
++            pass
++        elif line.startswith(self.prefix):
++            self.lines.append(entry)
++
++            if not self._range_start:
++                self._range_start = self._next_line_number
++        else:
++            raise Exception('Unexpected diff content prefix.')
++
++        self.lines_and_context.append(entry)
++
++        self._lines_remaining -= 1
++
++        if self._range_start:
++            if self.is_complete:
++                range_end = self._next_line_number
++            elif line.startswith(' '):
++                range_end = self._next_line_number - 1
++            else:
++                range_end = 0
++
++            if range_end:
++                self.ranges.append((self._range_start, range_end))
++                self._range_start = 0
++
++        self._next_line_number += 1
++
++    @property
++    def is_complete(self):
++        """
++        :rtype: bool
++        """
++        return self._lines_remaining == 0
++
++    def format_lines(self, context=True):
++        """
++        :type context: bool
++        :rtype: list[str]
++        """
++        if context:
++            lines = self.lines_and_context
++        else:
++            lines = self.lines
++
++        return ['%s:%4d %s' % (self.path, line[0], line[1]) for line in lines]
++
++
++class DiffParser(object):
++    """Parse diff lines."""
++    def __init__(self, lines):
++        """
++        :type lines: list[str]
++        """
++        self.lines = lines
++        self.files = []  # type: list [FileDiff]
++
++        self.action = self.process_start
++        self.line_number = 0
++        self.previous_line = None  # type: str
++        self.line = None  # type: str
++        self.file = None  # type: FileDiff
++
++        for self.line in self.lines:
++            self.line_number += 1
++
++            try:
++                self.action()
++            except Exception as ex:
++                message = textwrap.dedent('''
++                %s
++
++                     Line: %d
++                 Previous: %s
++                  Current: %s
++                %s
++                ''').strip() % (
++                    ex,
++                    self.line_number,
++                    self.previous_line or '',
++                    self.line or '',
++                    traceback.format_exc(),
++                )
++
++                raise ApplicationError(message.strip())
++
++            self.previous_line = self.line
++
++        self.complete_file()
++
++    def process_start(self):
++        """Process a diff start line."""
++        self.complete_file()
++
++        match = re.search(r'^diff --git a/(?P<old_path>.*) b/(?P<new_path>.*)$', self.line)
++
++        if not match:
++            raise Exception('Unexpected diff start line.')
++
++        self.file = FileDiff(match.group('old_path'), match.group('new_path'))
++        self.action = self.process_continue
++
++    def process_range(self):
++        """Process a diff range line."""
++        match = re.search(r'^@@ -((?P<old_start>[0-9]+),)?(?P<old_count>[0-9]+) \+((?P<new_start>[0-9]+),)?(?P<new_count>[0-9]+) @@', self.line)
++
++        if not match:
++            raise Exception('Unexpected diff range line.')
++
++        self.file.old.set_start(int(match.group('old_start') or 1), int(match.group('old_count')))
++        self.file.new.set_start(int(match.group('new_start') or 1), int(match.group('new_count')))
++        self.action = self.process_content
++
++    def process_continue(self):
++        """Process a diff start, range or header line."""
++        if self.line.startswith('diff '):
++            self.process_start()
++        elif self.line.startswith('@@ '):
++            self.process_range()
++        else:
++            self.process_header()
++
++    def process_header(self):
++        """Process a diff header line."""
++        if self.line.startswith('Binary files '):
++            self.file.binary = True
++        elif self.line == '--- /dev/null':
++            self.file.old.exists = False
++        elif self.line == '+++ /dev/null':
++            self.file.new.exists = False
++        else:
++            self.file.append_header(self.line)
++
++    def process_content(self):
++        """Process a diff content line."""
++        if self.line == r'\ No newline at end of file':
++            if self.previous_line.startswith(' '):
++                self.file.old.eof_newline = False
++                self.file.new.eof_newline = False
++            elif self.previous_line.startswith('-'):
++                self.file.old.eof_newline = False
++            elif self.previous_line.startswith('+'):
++                self.file.new.eof_newline = False
++            else:
++                raise Exception('Unexpected previous diff content line.')
++
++            return
++
++        if self.file.is_complete:
++            self.process_continue()
++            return
++
++        if self.line.startswith(' '):
++            self.file.old.append(self.line)
++            self.file.new.append(self.line)
++        elif self.line.startswith('-'):
++            self.file.old.append(self.line)
++        elif self.line.startswith('+'):
++            self.file.new.append(self.line)
++        else:
++            raise Exception('Unexpected diff content line.')
++
++    def complete_file(self):
++        """Complete processing of the current file, if any."""
++        if not self.file:
++            return
++
++        self.files.append(self.file)
+diff --git a/test/runner/lib/executor.py b/test/runner/lib/executor.py
+index 475a92666b..c70e0fd7aa 100644
+--- a/test/runner/lib/executor.py
++++ b/test/runner/lib/executor.py
+@@ -41,6 +41,7 @@ from lib.util import (
+     remove_tree,
+     make_dirs,
+     is_shippable,
++    is_binary_file,
+ )
+ 
+ from lib.test import (
+@@ -82,6 +83,10 @@ from lib.test import (
+     TestSkipped,
+ )
+ 
++from lib.metadata import (
++    Metadata,
++)
++
+ SUPPORTED_PYTHON_VERSIONS = (
+     '2.6',
+     '2.7',
+@@ -919,7 +924,7 @@ def detect_changes(args):
+ 
+ def detect_changes_shippable(args):
+     """Initialize change detection on Shippable.
+-    :type args: CommonConfig
++    :type args: TestConfig
+     :rtype: list[str]
+     """
+     git = Git(args)
+@@ -934,6 +939,9 @@ def detect_changes_shippable(args):
+ 
+     display.info('Processing %s for branch %s commit %s' % (job_type, result.branch, result.commit))
+ 
++    if not args.metadata.changes:
++        args.metadata.populate_changes(result.diff)
++
+     return result.paths
+ 
+ 
+@@ -977,6 +985,19 @@ def detect_changes_local(args):
+     if args.unstaged:
+         names |= set(result.unstaged)
+ 
++    if not args.metadata.changes:
++        args.metadata.populate_changes(result.diff)
++
++        for path in result.untracked:
++            if is_binary_file(path):
++                args.metadata.changes[path] = ((0, 0),)
++                continue
++
++            with open(path, 'r') as source_fd:
++                line_count = len(source_fd.read().splitlines())
++
++            args.metadata.changes[path] = ((1, line_count),)
++
+     return sorted(names)
+ 
+ 
+diff --git a/test/runner/lib/git.py b/test/runner/lib/git.py
+index 4161347646..07a4245958 100644
+--- a/test/runner/lib/git.py
++++ b/test/runner/lib/git.py
+@@ -18,6 +18,14 @@ class Git(object):
+         self.args = args
+         self.git = 'git'
+ 
++    def get_diff(self, args):
++        """
++        :type args: list[str]
++        :rtype: list[str]
++        """
++        cmd = ['diff'] + args
++        return self.run_git_split(cmd, '\n')
++
+     def get_diff_names(self, args):
+         """
+         :type args: list[str]
+diff --git a/test/runner/lib/metadata.py b/test/runner/lib/metadata.py
+new file mode 100644
+index 0000000000..64c6c8a4d3
+--- /dev/null
++++ b/test/runner/lib/metadata.py
+@@ -0,0 +1,82 @@
++"""Test metadata for passing data to delegated tests."""
++from __future__ import absolute_import, print_function
++
++import json
++
++from lib.util import (
++    display,
++)
++
++from lib.diff import (
++    parse_diff,
++    FileDiff,
++)
++
++
++class Metadata(object):
++    """Metadata object for passing data to delegated tests."""
++    def __init__(self):
++        """Initialize metadata."""
++        self.changes = {}  # type: dict [str, tuple[tuple[int, int]]
++
++    def populate_changes(self, diff):
++        """
++        :type diff: list[str] | None
++        """
++        patches = parse_diff(diff)
++        patches = sorted(patches, key=lambda k: k.new.path)  # type: list [FileDiff]
++
++        self.changes = dict((patch.new.path, tuple(patch.new.ranges)) for patch in patches)
++
++        renames = [patch.old.path for patch in patches if patch.old.path != patch.new.path and patch.old.exists and patch.new.exists]
++        deletes = [patch.old.path for patch in patches if not patch.new.exists]
++
++        # make sure old paths which were renamed or deleted are registered in changes
++        for path in renames + deletes:
++            if path in self.changes:
++                # old path was replaced with another file
++                continue
++
++            # failed tests involving deleted files should be using line 0 since there is no content remaining
++            self.changes[path] = ((0, 0),)
++
++    def to_dict(self):
++        """
++        :rtype: dict[str, any]
++        """
++        return dict(
++            changes=self.changes,
++        )
++
++    def to_file(self, path):
++        """
++        :type path: path
++        """
++        data = self.to_dict()
++
++        display.info('>>> Metadata: %s\n%s' % (path, data), verbosity=3)
++
++        with open(path, 'w') as data_fd:
++            json.dump(data, data_fd, sort_keys=True, indent=4)
++
++    @staticmethod
++    def from_file(path):
++        """
++        :type path: str
++        :rtype: Metadata
++        """
++        with open(path, 'r') as data_fd:
++            data = json.load(data_fd)
++
++        return Metadata.from_dict(data)
++
++    @staticmethod
++    def from_dict(data):
++        """
++        :type data: dict[str, any]
++        :rtype: Metadata
++        """
++        metadata = Metadata()
++        metadata.changes = data['changes']
++
++        return metadata
+diff --git a/test/runner/lib/sanity.py b/test/runner/lib/sanity.py
+index 618d0282ae..de1c597582 100644
+--- a/test/runner/lib/sanity.py
++++ b/test/runner/lib/sanity.py
+@@ -45,6 +45,7 @@ from lib.test import (
+     TestFailure,
+     TestSkipped,
+     TestMessage,
++    calculate_best_confidence,
+ )
+ 
+ COMMAND = 'sanity'
+@@ -364,6 +365,7 @@ def command_sanity_pep8(args, targets):
+                 path=PEP8_LEGACY_PATH,
+                 line=line,
+                 column=1,
++                confidence=calculate_best_confidence(((PEP8_LEGACY_PATH, line), (path, 0)), args.metadata) if args.metadata.changes else None,
+             ))
+ 
+         if path in used_paths and path not in failed_result_paths:
+@@ -374,6 +376,7 @@ def command_sanity_pep8(args, targets):
+                 path=PEP8_LEGACY_PATH,
+                 line=line,
+                 column=1,
++                confidence=calculate_best_confidence(((PEP8_LEGACY_PATH, line), (path, 0)), args.metadata) if args.metadata.changes else None,
+             ))
+ 
+     line = 0
+@@ -389,6 +392,7 @@ def command_sanity_pep8(args, targets):
+                 path=PEP8_SKIP_PATH,
+                 line=line,
+                 column=1,
++                confidence=calculate_best_confidence(((PEP8_SKIP_PATH, line), (path, 0)), args.metadata) if args.metadata.changes else None,
+             ))
+ 
+     for result in results:
+@@ -586,7 +590,7 @@ class SanityFailure(TestFailure):
+ 
+ class SanityMessage(TestMessage):
+     """Single sanity test message for one file."""
+-    def __init__(self, message, path, line=0, column=0, level='error', code=None):
++    def __init__(self, message, path, line=0, column=0, level='error', code=None, confidence=None):
+         """
+         :type message: str
+         :type path: str
+@@ -594,8 +598,9 @@ class SanityMessage(TestMessage):
+         :type column: int
+         :type level: str
+         :type code: str | None
++        :type confidence: int | None
+         """
+-        super(SanityMessage, self).__init__(message, path, line, column, level, code)
++        super(SanityMessage, self).__init__(message, path, line, column, level, code, confidence)
+ 
+ 
+ class SanityTargets(object):
+diff --git a/test/runner/lib/test.py b/test/runner/lib/test.py
+index e7edc6841d..f38d0f340e 100644
+--- a/test/runner/lib/test.py
++++ b/test/runner/lib/test.py
+@@ -10,6 +10,50 @@ from lib.util import (
+     EnvironmentConfig,
+ )
+ 
++from lib.metadata import (
++    Metadata,
++)
++
++
++def calculate_best_confidence(choices, metadata):
++    """
++    :type choices: tuple[tuple[str, int]]
++    :type metadata: Metadata
++    :rtype: int
++    """
++    best_confidence = 0
++
++    for path, line in choices:
++        confidence = calculate_confidence(path, line, metadata)
++        best_confidence = max(confidence, best_confidence)
++
++    return best_confidence
++
++
++def calculate_confidence(path, line, metadata):
++    """
++    :type path: str
++    :type line: int
++    :type metadata: Metadata
++    :rtype: int
++    """
++    ranges = metadata.changes.get(path)
++
++    # no changes were made to the file
++    if not ranges:
++        return 0
++
++    # changes were made to the same file and line
++    if any(r[0] <= line <= r[1] in r for r in ranges):
++        return 100
++
++    # changes were made to the same file and the line number is unknown
++    if line == 0:
++        return 75
++
++    # changes were made to the same file and the line number is different
++    return 50
++
+ 
+ class TestConfig(EnvironmentConfig):
+     """Configuration common to all test commands."""
+@@ -38,6 +82,9 @@ class TestConfig(EnvironmentConfig):
+         self.junit = args.junit if 'junit' in args else False  # type: bool
+         self.failure_ok = args.failure_ok if 'failure_ok' in args else False  # type: bool
+ 
++        self.metadata = Metadata.from_file(args.metadata) if args.metadata else Metadata()
++        self.metadata_path = None
++
+ 
+ class TestResult(object):
+     """Base class for test results."""
+@@ -201,9 +248,18 @@ class TestFailure(TestResult):
+         if messages:
+             messages = sorted(messages, key=lambda m: m.sort_key)
+ 
+-        self.messages = messages
++        self.messages = messages or []
+         self.summary = summary
+ 
++    def write(self, args):
++        """
++        :type args: TestConfig
++        """
++        if args.metadata.changes:
++            self.populate_confidence(args.metadata)
++
++        super(TestFailure, self).write(args)
++
+     def write_console(self):
+         """Write results to console."""
+         if self.summary:
+@@ -217,7 +273,7 @@ class TestFailure(TestResult):
+             display.error('Found %d %s issue(s)%s which need to be resolved:' % (len(self.messages), self.test or self.command, specifier))
+ 
+             for message in self.messages:
+-                display.error(message)
++                display.error(message.format(show_confidence=True))
+ 
+     def write_lint(self):
+         """Write lint results to stdout."""
+@@ -253,7 +309,13 @@ class TestFailure(TestResult):
+         message = self.format_title()
+         output = self.format_block()
+ 
++        if self.messages:
++            verified = all((m.confidence or 0) >= 50 for m in self.messages)
++        else:
++            verified = False
++
+         bot_data = dict(
++            verified=verified,
+             results=[
+                 dict(
+                     message=message,
+@@ -271,6 +333,14 @@ class TestFailure(TestResult):
+             json.dump(bot_data, bot_fd, indent=4, sort_keys=True)
+             bot_fd.write('\n')
+ 
++    def populate_confidence(self, metadata):
++        """
++        :type metadata: Metadata
++        """
++        for message in self.messages:
++            if message.confidence is None:
++                message.confidence = calculate_confidence(message.path, message.line, metadata)
++
+     def format_command(self):
+         """
+         :rtype: str
+@@ -319,7 +389,7 @@ class TestFailure(TestResult):
+ 
+ class TestMessage(object):
+     """Single test message for one file."""
+-    def __init__(self, message, path, line=0, column=0, level='error', code=None):
++    def __init__(self, message, path, line=0, column=0, level='error', code=None, confidence=None):
+         """
+         :type message: str
+         :type path: str
+@@ -327,6 +397,7 @@ class TestMessage(object):
+         :type column: int
+         :type level: str
+         :type code: str | None
++        :type confidence: int | None
+         """
+         self.path = path
+         self.line = line
+@@ -334,13 +405,24 @@ class TestMessage(object):
+         self.level = level
+         self.code = code
+         self.message = message
++        self.confidence = confidence
+ 
+     def __str__(self):
++        return self.format()
++
++    def format(self, show_confidence=False):
++        """
++        :type show_confidence: bool
++        :rtype: str
++        """
+         if self.code:
+             msg = '%s %s' % (self.code, self.message)
+         else:
+             msg = self.message
+ 
++        if show_confidence and self.confidence is not None:
++            msg += ' (%d%%)' % self.confidence
++
+         return '%s:%s:%s: %s' % (self.path, self.line, self.column, msg)
+ 
+     @property
+diff --git a/test/runner/lib/util.py b/test/runner/lib/util.py
+index 1b9084f657..46127c3420 100644
+--- a/test/runner/lib/util.py
++++ b/test/runner/lib/util.py
+@@ -165,10 +165,14 @@ def raw_command(cmd, capture=False, env=None, data=None, cwd=None, explain=False
+         raise
+ 
+     if communicate:
+-        stdout, stderr = process.communicate(data)
++        encoding = 'utf-8'
++        data_bytes = data.encode(encoding) if data else None
++        stdout_bytes, stderr_bytes = process.communicate(data_bytes)
++        stdout_text = stdout_bytes.decode(encoding) if stdout_bytes else u''
++        stderr_text = stderr_bytes.decode(encoding) if stderr_bytes else u''
+     else:
+         process.wait()
+-        stdout, stderr = None, None
++        stdout_text, stderr_text = None, None
+ 
+     status = process.returncode
+     runtime = time.time() - start
+@@ -176,9 +180,9 @@ def raw_command(cmd, capture=False, env=None, data=None, cwd=None, explain=False
+     display.info('Command exited with status %s after %s seconds.' % (status, runtime), verbosity=4)
+ 
+     if status == 0:
+-        return stdout, stderr
++        return stdout_text, stderr_text
+ 
+-    raise SubprocessError(cmd, status, stdout, stderr, runtime)
++    raise SubprocessError(cmd, status, stdout_text, stderr_text, runtime)
+ 
+ 
+ def common_environment():
+@@ -266,6 +270,15 @@ def make_dirs(path):
+             raise
+ 
+ 
++def is_binary_file(path):
++    """
++    :type path: str
++    :rtype: bool
++    """
++    with open(path, 'rb') as path_fd:
++        return b'\0' in path_fd.read(1024)
++
++
+ class Display(object):
+     """Manages color console output."""
+     clear = '\033[0m'
+diff --git a/test/runner/requirements/sanity.txt b/test/runner/requirements/sanity.txt
+index e1538122fc..728872577c 100644
+--- a/test/runner/requirements/sanity.txt
++++ b/test/runner/requirements/sanity.txt
+@@ -2,5 +2,6 @@ jinja2
+ mock
+ pep8
+ pylint
++pytest
+ voluptuous
+ yamllint
+diff --git a/test/runner/test.py b/test/runner/test.py
+index 494d210119..56fc4a7662 100755
+--- a/test/runner/test.py
++++ b/test/runner/test.py
+@@ -163,6 +163,9 @@ def parse_args():
+                       action='store_true',
+                       help='analyze code coverage when running tests')
+ 
++    test.add_argument('--metadata',
++                      help=argparse.SUPPRESS)
++
+     add_changes(test, argparse)
+     add_environments(test)
+ 
+diff --git a/test/runner/units/test_diff.py b/test/runner/units/test_diff.py
+new file mode 100644
+index 0000000000..22e28fb5a9
+--- /dev/null
++++ b/test/runner/units/test_diff.py
+@@ -0,0 +1,97 @@
++"""Tests for diff module."""
++import os
++import subprocess
++import pytest
++
++from lib.diff import (
++    parse_diff,
++    FileDiff,
++)
++
++
++def get_diff(base, head=None):
++    """Return a git diff between the base and head revision.
++    :type base: str
++    :type head: str | None
++    :rtype: list[str]
++    """
++    if not head or head == 'HEAD':
++        head = subprocess.check_output(['git', 'rev-parse', 'HEAD']).strip()
++
++    cache = '/tmp/git-diff-cache-%s-%s.log' % (base, head)
++
++    if os.path.exists(cache):
++        with open(cache, 'r') as cache_fd:
++            lines = cache_fd.read().splitlines()
++    else:
++        lines = subprocess.check_output(['git', 'diff', base, head]).splitlines()
++
++        with open(cache, 'w') as cache_fd:
++            cache_fd.write('\n'.join(lines))
++
++    assert lines
++
++    return lines
++
++
++def get_parsed_diff(base, head=None):
++    """Return a parsed git diff between the base and head revision.
++    :type base: str
++    :type head: str | None
++    :rtype: list[FileDiff]
++    """
++    lines = get_diff(base, head)
++    items = parse_diff(lines)
++
++    assert items
++
++    for item in items:
++        assert item.headers
++        assert item.is_complete
++
++        item.old.format_lines()
++        item.new.format_lines()
++
++        for line_range in item.old.ranges:
++            assert line_range[1] >= line_range[0] > 0
++
++        for line_range in item.new.ranges:
++            assert line_range[1] >= line_range[0] > 0
++
++    return items
++
++
++RANGES_TO_TEST = (
++    ('f31421576b00f0b167cdbe61217c31c21a41ac02', 'HEAD'),
++    ('b8125ac1a61f2c7d1de821c78c884560071895f1', '32146acf4e43e6f95f54d9179bf01f0df9814217')
++)
++
++
++@pytest.mark.parametrize("base, head", RANGES_TO_TEST)
++def test_parse_diff(base, head):
++    """Integration test to verify parsing of ansible/ansible history."""
++    get_parsed_diff(base, head)
++
++
++def test_parse_delete():
++    """Integration test to verify parsing of a deleted file."""
++    commit = 'ee17b914554861470b382e9e80a8e934063e0860'
++    items = get_parsed_diff(commit + '~', commit)
++    deletes = [item for item in items if not item.new.exists]
++
++    assert len(deletes) == 1
++    assert deletes[0].old.path == 'lib/ansible/plugins/connection/nspawn.py'
++    assert deletes[0].new.path == 'lib/ansible/plugins/connection/nspawn.py'
++
++
++def test_parse_rename():
++    """Integration test to verify parsing of renamed files."""
++    commit = '16a39639f568f4dd5cb233df2d0631bdab3a05e9'
++    items = get_parsed_diff(commit + '~', commit)
++    renames = [item for item in items if item.old.path != item.new.path and item.old.exists and item.new.exists]
++
++    assert len(renames) == 2
++    assert renames[0].old.path == 'test/integration/targets/eos_eapi/tests/cli/badtransport.yaml'
++    assert renames[0].new.path == 'test/integration/targets/eos_eapi/tests/cli/badtransport.1'
++    assert renames[1].old.path == 'test/integration/targets/eos_eapi/tests/cli/zzz_reset.yaml'
++    assert renames[1].new.path == 'test/integration/targets/eos_eapi/tests/cli/zzz_reset.1'
+diff --git a/test/utils/shippable/other.sh b/test/utils/shippable/other.sh
+index 841b9d159d..cfb8d1d7f9 100755
+--- a/test/utils/shippable/other.sh
++++ b/test/utils/shippable/other.sh
+@@ -17,10 +17,14 @@ ln -sf x86_64-linux-gnu-gcc-4.9 /usr/bin/x86_64-linux-gnu-gcc
+ 
+ retry.py pip install tox --disable-pip-version-check
+ 
++echo '{"verified": false, "results": []}' > test/results/bot/ansible-test-failure.json
++
+ ansible-test compile --failure-ok --color -v --junit --requirements
+ ansible-test sanity  --failure-ok --color -v --junit --tox --skip-test ansible-doc --python 2.7
+ ansible-test sanity  --failure-ok --color -v --junit --tox --test ansible-doc --coverage
+ 
++rm test/results/bot/ansible-test-failure.json
++
+ if find test/results/bot/ -mindepth 1 -name '.*' -prune -o -print -quit | grep -q .; then
+     echo "One or more of the above ansible-test commands recorded at least one test failure."
+     exit 1

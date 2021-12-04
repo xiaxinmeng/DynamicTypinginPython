@@ -1,0 +1,2539 @@
+commit 02d2b753db72ef925dac61b376565a92bcd44799
+Author: Peter Sprygada <privateip@users.noreply.github.com>
+Date:   Thu Feb 16 10:53:03 2017 -0500
+
+    refactors junos modules to support persistent socket connections (#21365)
+    
+    * updates junos_netconf module
+    * updates junos_command module
+    * updates junos_config module
+    * updates _junos_template module
+    * adds junos_rpc module
+    * adds junos_user module
+
+diff --git a/lib/ansible/module_utils/junos.py b/lib/ansible/module_utils/junos.py
+index 4423816bd3..092ced157b 100644
+--- a/lib/ansible/module_utils/junos.py
++++ b/lib/ansible/module_utils/junos.py
+@@ -1,5 +1,5 @@
+ #
+-# (c) 2015 Peter Sprygada, <psprygada@ansible.com>
++# (c) 2017 Red Hat, Inc.
+ #
+ # This file is part of Ansible
+ #
+@@ -16,314 +16,203 @@
+ # You should have received a copy of the GNU General Public License
+ # along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
+ #
+-import re
+-import shlex
+-
+-from distutils.version import LooseVersion
+-
+-from ansible.module_utils.pycompat24 import get_exception
+-from ansible.module_utils.network import register_transport, to_list
+-from ansible.module_utils.network import NetworkError
+-from ansible.module_utils.shell import CliBase
+-from ansible.module_utils.six import string_types
+-
+-try:
+-    from jnpr.junos import Device
+-    from jnpr.junos.utils.config import Config
+-    from jnpr.junos.version import VERSION
+-    from jnpr.junos.exception import RpcError, ConnectError, ConfigLoadError, CommitError
+-    from jnpr.junos.exception import LockError, UnlockError
+-    if LooseVersion(VERSION) < LooseVersion('1.2.2'):
+-        HAS_PYEZ = False
++from contextlib import contextmanager
++
++from ncclient.xml_ import new_ele, sub_ele, to_xml
++
++from ansible.module_utils.basic import env_fallback
++from ansible.module_utils.netconf import send_request
++from ansible.module_utils.netconf import discard_changes, validate
++from ansible.module_utils.network_common import to_list
++from ansible.module_utils.connection import exec_command
++
++ACTIONS = frozenset(['merge', 'override', 'replace', 'update', 'set'])
++JSON_ACTIONS = frozenset(['merge', 'override', 'update'])
++FORMATS = frozenset(['xml', 'text', 'json'])
++CONFIG_FORMATS = frozenset(['xml', 'text', 'json', 'set'])
++
++_DEVICE_CONFIGS = {}
++
++junos_argument_spec = {
++    'host': dict(),
++    'port': dict(type='int'),
++    'username': dict(fallback=(env_fallback, ['ANSIBLE_NET_USERNAME'])),
++    'password': dict(fallback=(env_fallback, ['ANSIBLE_NET_PASSWORD']), no_log=True),
++    'ssh_keyfile': dict(fallback=(env_fallback, ['ANSIBLE_NET_SSH_KEYFILE']), type='path'),
++    'timeout': dict(type='int', default=10),
++    'provider': dict(type='dict'),
++}
++
++def check_args(module, warnings):
++    provider = module.params['provider'] or {}
++    for key in junos_argument_spec:
++        if key in ('provider', 'transport') and module.params[key]:
++            warnings.append('argument %s has been deprecated and will be '
++                    'removed in a future version' % key)
++
++def validate_rollback_id(value):
++    try:
++        if not 0 <= int(value) <= 49:
++            raise ValueError
++    except ValueError:
++        module.fail_json(msg='rollback must be between 0 and 49')
++
++def load_configuration(module, candidate=None, action='merge', rollback=None, format='xml'):
++
++    if all((candidate is None, rollback is None)):
++        module.fail_json(msg='one of candidate or rollback must be specified')
++
++    elif all((candidate is not None, rollback is not None)):
++        module.fail_json(msg='candidate and rollback are mutually exclusive')
++
++    if format not in FORMATS:
++        module.fail_json(msg='invalid format specified')
++
++    if format == 'json' and action not in JSON_ACTIONS:
++        module.fail_json(msg='invalid action for format json')
++    elif format in ('text', 'xml') and action not in ACTIONS:
++        module.fail_json(msg='invalid action format %s' % format)
++    if action == 'set' and not format == 'text':
++        module.fail_json(msg='format must be text when action is set')
++
++    if rollback is not None:
++        validate_rollback_id(rollback)
++        xattrs = {'rollback': str(rollback)}
+     else:
+-        HAS_PYEZ = True
+-except ImportError:
+-    HAS_PYEZ = False
++        xattrs = {'action': action, 'format': format}
+ 
+-try:
+-    import jxmlease
+-    HAS_JXMLEASE = True
+-except ImportError:
+-    HAS_JXMLEASE = False
++    obj = new_ele('load-configuration', xattrs)
+ 
+-try:
+-    from lxml import etree
+-except ImportError:
+-    import xml.etree.ElementTree as etree
++    if candidate is not None:
++        lookup = {'xml': 'configuration', 'text': 'configuration-text',
++                  'set': 'configuration-set', 'json': 'configuration-json'}
+ 
+-
+-SUPPORTED_CONFIG_FORMATS = ['text', 'xml']
+-
+-
+-def xml_to_json(val):
+-    if isinstance(val, string_types):
+-        return jxmlease.parse(val)
+-    else:
+-        return jxmlease.parse_etree(val)
+-
+-
+-def xml_to_string(val):
+-    return etree.tostring(val)
+-
+-
+-class Netconf(object):
+-
+-    def __init__(self):
+-        if not HAS_PYEZ:
+-            raise NetworkError(
+-                msg='junos-eznc >= 1.2.2 is required but does not appear to be installed.  '
+-                'It can be installed using `pip install junos-eznc`'
+-            )
+-        if not HAS_JXMLEASE:
+-            raise NetworkError(
+-                msg='jxmlease is required but does not appear to be installed.  '
+-                'It can be installed using `pip install jxmlease`'
+-            )
+-        self.device = None
+-        self.config = None
+-        self._locked = False
+-        self._connected = False
+-        self.default_output = 'xml'
+-
+-    def raise_exc(self, msg):
+-        if self.device:
+-            if self._locked:
+-                self.config.unlock()
+-            self.disconnect()
+-        raise NetworkError(msg)
+-
+-    def connect(self, params, **kwargs):
+-        host = params['host']
+-
+-        kwargs = dict()
+-        kwargs['port'] = params.get('port') or 830
+-
+-        kwargs['user'] = params['username']
+-
+-        if params['password']:
+-            kwargs['passwd'] = params['password']
+-
+-        if params['ssh_keyfile']:
+-            kwargs['ssh_private_key_file'] = params['ssh_keyfile']
+-
+-        kwargs['gather_facts'] = False
+-
+-        try:
+-            self.device = Device(host, **kwargs)
+-            self.device.open()
+-            self.device.timeout = params['timeout']
+-        except ConnectError:
+-            exc = get_exception()
+-            self.raise_exc('unable to connect to %s: %s' % (host, str(exc)))
+-
+-        self.config = Config(self.device)
+-        self._connected = True
+-
+-    def disconnect(self):
+-        try:
+-            self.device.close()
+-        except AttributeError:
+-            pass
+-        self._connected = False
+-
+-    ### Command methods ###
+-
+-    def run_commands(self, commands):
+-        responses = list()
+-
+-        for cmd in commands:
+-            meth = getattr(self, cmd.args.get('command_type'))
+-            responses.append(meth(str(cmd), output=cmd.output))
+-
+-        for index, cmd in enumerate(commands):
+-            if cmd.output == 'xml':
+-                responses[index] = xml_to_json(responses[index])
+-            elif cmd.args.get('command_type') == 'rpc':
+-                responses[index] = str(responses[index].text).strip()
+-            elif 'RpcError' in responses[index]:
+-                raise NetworkError(responses[index])
+-
+-
+-        return responses
+-
+-    def cli(self, commands, output='xml'):
+-        '''Send commands to the device.'''
+-        try:
+-            return self.device.cli(commands, format=output, warning=False)
+-        except (ValueError, RpcError):
+-            exc = get_exception()
+-            self.raise_exc('Unable to get cli output: %s' % str(exc))
+-
+-    def rpc(self, command, output='xml'):
+-        name, kwargs = rpc_args(command)
+-        meth = getattr(self.device.rpc, name)
+-        reply = meth({'format': output}, **kwargs)
+-        return reply
+-
+-    ### Config methods ###
+-
+-    def get_config(self, config_format="text"):
+-        if config_format not in SUPPORTED_CONFIG_FORMATS:
+-            self.raise_exc(msg='invalid config format.  Valid options are '
+-                               '%s' % ', '.join(SUPPORTED_CONFIG_FORMATS))
+-
+-        ele = self.rpc('get_configuration', output=config_format)
+-
+-        if config_format == 'text':
+-            return unicode(ele.text).strip()
++        if action == 'set':
++            cfg = sub_ele(obj, 'configuration-set')
++            cfg.text = '\n'.join(candidate)
+         else:
+-            return ele
+-
+-    def load_config(self, config, commit=False, replace=False, confirm=None,
+-                    comment=None, config_format='text', overwrite=False, merge=False):
+-        if (overwrite or replace) and config_format == 'set':
+-            self.raise_exc('replace/overwrite cannot be True when config_format is `set`')
+-
+-        if replace:
+-            merge = False
+-
+-        self.lock_config()
+-
+-        try:
+-            candidate = '\n'.join(config)
+-            self.config.load(candidate, format=config_format, merge=merge,
+-                             overwrite=overwrite)
+-
+-        except ConfigLoadError:
+-            exc = get_exception()
+-            self.raise_exc('Unable to load config: %s' % str(exc))
+-
+-        diff = self.config.diff()
+-
+-        self.check_config()
+-
+-        if all((commit, diff)):
+-            self.commit_config(comment=comment, confirm=confirm)
+-
+-        self.unlock_config()
++            cfg = sub_ele(obj, lookup[format])
++            cfg.append(candidate)
++
++    return send_request(module, obj)
++
++def get_configuration(module, compare=False, format='xml', rollback='0'):
++    if format not in CONFIG_FORMATS:
++        module.fail_json(msg='invalid config format specified')
++    xattrs = {'format': format}
++    if compare:
++        validate_rollback_id(rollback)
++        xattrs['compare'] = 'rollback'
++        xattrs['rollback'] = str(rollback)
++    return send_request(module, new_ele('get-configuration', xattrs))
++
++def commit_configuration(module, confirm=False, check=False, comment=None, confirm_timeout=None):
++    obj = new_ele('commit-configuration')
++    if confirm:
++        sub_ele(obj, 'confirmed')
++    if check:
++        sub_ele(obj, 'check')
++    if comment:
++        children(obj, ('log', str(comment)))
++    if confirm_timeout:
++        children(obj, ('confirm-timeout', int(confirm_timeout)))
++    return send_request(module, obj)
++
++lock_configuration = lambda x: send_request(x, new_ele('lock-configuration'))
++unlock_configuration = lambda x: send_request(x, new_ele('unlock-configuration'))
++
++@contextmanager
++def locked_config(module):
++    try:
++        lock_configuration(module)
++        yield
++    finally:
++        unlock_configuration(module)
++
++def get_diff(module):
++    reply = get_configuration(module, compare=True, format='text')
++    output = reply.xpath('//configuration-output')
++    if output:
++        return output[0].text
++
++def load(module, candidate, action='merge', commit=False, format='xml'):
++    """Loads a configuration element into the target system
++    """
++    with locked_config(module):
++        resp = load_configuration(module, candidate, action=action, format=format)
++
++        validate(module)
++        diff = get_diff(module)
++
++        if diff:
++            diff = str(diff).strip()
++            if commit:
++                commit_configuration(module)
++            else:
++                discard_changes(module)
+ 
+         return diff
+ 
+-    def save_config(self):
+-        raise NotImplementedError
+ 
+-    ### end of Config ###
+ 
+-    def get_facts(self, refresh=True):
+-        if refresh:
+-            self.device.facts_refresh()
+-        return self.device.facts
++# START CLI FUNCTIONS
+ 
+-    def unlock_config(self):
+-        try:
+-            self.config.unlock()
+-            self._locked = False
+-        except UnlockError:
+-            exc = get_exception()
+-            raise NetworkError('unable to unlock config: %s' % str(exc))
++def get_config(module, flags=[]):
++    cmd = 'show configuration '
++    cmd += ' '.join(flags)
++    cmd = cmd.strip()
+ 
+-    def lock_config(self):
+-        try:
+-            self.config.lock()
+-            self._locked = True
+-        except LockError:
+-            exc = get_exception()
+-            raise NetworkError('unable to lock config: %s' % str(exc))
++    try:
++        return _DEVICE_CONFIGS[cmd]
++    except KeyError:
++        rc, out, err = exec_command(module, cmd)
++        if rc != 0:
++            module.fail_json(msg='unable to retrieve current config', stderr=err)
++        cfg = str(out).strip()
++        _DEVICE_CONFIGS[cmd] = cfg
++        return cfg
+ 
+-    def check_config(self):
+-        if not self.config.commit_check():
+-            self.raise_exc(msg='Commit check failed')
++def run_commands(module, commands, check_rc=True):
++    responses = list()
++    for cmd in to_list(commands):
++        cmd = module.jsonify(cmd)
++        rc, out, err = exec_command(module, cmd)
++        if check_rc and rc != 0:
++            module.fail_json(msg=err, rc=rc)
+ 
+-    def commit_config(self, comment=None, confirm=None):
+-        try:
+-            kwargs = dict(comment=comment)
+-            if confirm and confirm > 0:
+-                kwargs['confirm'] = confirm
+-            return self.config.commit(**kwargs)
+-        except CommitError:
+-            exc = get_exception()
+-            raise NetworkError('unable to commit config: %s' % str(exc))
+-
+-    def confirm_commit(self, checkonly=False):
+         try:
+-            resp = self.rpc('get_commit_information')
+-            needs_confirm = 'commit confirmed, rollback' in resp[0][4].text
+-            if checkonly:
+-                return needs_confirm
+-            return self.commit_config()
+-        except IndexError:
+-            # if there is no comment tag, the system is not in a commit
+-            # confirmed state so just return
+-            pass
+-
+-    def rollback_config(self, identifier, commit=True, comment=None):
+-
+-        self.lock_config()
+-
+-        try:
+-            self.config.rollback(identifier)
++            out = module.from_json(out)
+         except ValueError:
+-            exc = get_exception()
+-            self.raise_exc('Unable to rollback config: $s' % str(exc))
+-
+-        diff = self.config.diff()
+-        if commit:
+-            self.commit_config(comment=comment)
+-
+-        self.unlock_config()
+-        return diff
++            out = str(out).strip()
+ 
+-Netconf = register_transport('netconf')(Netconf)
++        responses.append(out)
++    return responses
+ 
++def load_config(module, config, commit=False, comment=None,
++        confirm=False, confirm_timeout=None):
+ 
+-class Cli(CliBase):
++    exec_command(module, 'configure')
+ 
+-    CLI_PROMPTS_RE = [
+-        re.compile(r"[\r\n]?[\w+\-\.:\/\[\]]+(?:\([^\)]+\)){,3}(?:>|#) ?$"),
+-        re.compile(r"\[\w+\@[\w\-\.]+(?: [^\]])\] ?[>#\$] ?$")
+-    ]
++    for item in to_list(config):
++        rc, out, err = exec_command(module, item)
++        if rc != 0:
++            module.fail_json(msg=str(err))
+ 
+-    CLI_ERRORS_RE = [
+-        re.compile(r"unkown command")
+-    ]
+-
+-    def connect(self, params, **kwargs):
+-        super(Cli, self).connect(params, **kwargs)
+-        if self.shell._matched_prompt.strip().endswith('%'):
+-            self.execute('cli')
+-        self.execute('set cli screen-length 0')
+-
+-    def configure(self, commands, comment=None):
+-        cmds = ['configure']
+-        cmds.extend(to_list(commands))
++    exec_command(module, 'top')
++    rc, diff, err = exec_command(module, 'show | compare')
+ 
++    if commit:
++        cmd = 'commit'
++        if commit:
++            cmd = 'commit confirmed'
++            if commit_timeout:
++                cmd +' %s' % confirm_timeout
+         if comment:
+-            cmds.append('commit and-quit comment "%s"' % comment)
+-        else:
+-            cmds.append('commit and-quit')
+-
+-        responses = self.execute(cmds)
+-        return responses[1:-1]
+-
+-Cli = register_transport('cli', default=True)(Cli)
+-
+-def split(value):
+-    lex = shlex.shlex(value)
+-    lex.quotes = '"'
+-    lex.whitespace_split = True
+-    lex.commenters = ''
+-    return list(lex)
+-
+-def rpc_args(args):
+-    kwargs = dict()
+-    args = split(args)
+-    name = args.pop(0)
+-    for arg in args:
+-        key, value = arg.split('=')
+-        if str(value).upper() in ['TRUE', 'FALSE']:
+-            kwargs[key] = bool(value)
+-        elif re.match(r'^[0-9]+$', value):
+-            kwargs[key] = int(value)
+-        else:
+-            kwargs[key] = str(value)
+-    return (name, kwargs)
++            cmd += ' comment "%s"' % comment
++        cmd += ' and-quit'
++        exec_command(module, cmd)
++    else:
++        for cmd in ['rollback 0', 'exit']:
++            exec_command(module, cmd)
++
++    return str(diff).strip()
+diff --git a/lib/ansible/modules/network/junos/_junos_template.py b/lib/ansible/modules/network/junos/_junos_template.py
+index 923ed915d7..04adae0c5d 100644
+--- a/lib/ansible/modules/network/junos/_junos_template.py
++++ b/lib/ansible/modules/network/junos/_junos_template.py
+@@ -127,22 +127,13 @@ def main():
+         transport=dict(default='netconf', choices=['netconf'])
+     )
+ 
+-    module = NetworkModule(argument_spec=argument_spec,
++    module = AnsibleModule(argument_spec=argument_spec,
+                            supports_check_mode=True)
+ 
+     comment = module.params['comment']
+     confirm = module.params['confirm']
+     commit = not module.check_mode
+-
+-    replace = False
+-    overwrite = False
+-
+     action = module.params['action']
+-    if action == 'overwrite':
+-        overwrite = True
+-    elif action == 'replace':
+-        replace = True
+-
+     src = module.params['src']
+     fmt = module.params['config_format']
+ 
+@@ -150,19 +141,16 @@ def main():
+         module.fail_json(msg="overwrite cannot be used when format is "
+             "set per junos-pyez documentation")
+ 
+-    results = dict(changed=False)
+-    results['_backup'] = unicode(module.config.get_config()).strip()
++    results = {'changed': False}
+ 
+-    try:
+-        diff = module.config.load_config(src, commit=commit, replace=replace,
+-                confirm=confirm, comment=comment, config_format=fmt)
++    if module.praams['backup']:
++        results['__backup__'] = unicode(get_configuration(module))
+ 
+-        if diff:
+-            results['changed'] = True
+-            results['diff'] = dict(prepared=diff)
+-    except NetworkError:
+-        exc = get_exception()
+-        module.fail_json(msg=str(exc), **exc.kwargs)
++    diff = load(module, src, **kwargs)
++    if diff:
++        results['changed'] = True
++        if module._diff:
++            results['diff'] = {'prepared': diff}
+ 
+     module.exit_json(**results)
+ 
+diff --git a/lib/ansible/modules/network/junos/junos_command.py b/lib/ansible/modules/network/junos/junos_command.py
+index ebe3dbbcb1..bc22fb8320 100644
+--- a/lib/ansible/modules/network/junos/junos_command.py
++++ b/lib/ansible/modules/network/junos/junos_command.py
+@@ -16,42 +16,32 @@
+ # along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
+ #
+ 
+-ANSIBLE_METADATA = {'status': ['preview'],
+-                    'supported_by': 'core',
+-                    'version': '1.0'}
++ANSIBLE_METADATA = {
++    'status': ['preview'],
++    'supported_by': 'core',
++    'version': '1.0'
++}
+ 
+ DOCUMENTATION = """
+ ---
+ module: junos_command
+ version_added: "2.1"
+ author: "Peter Sprygada (@privateip)"
+-short_description: Execute arbitrary commands on a remote device running Junos
++short_description: Run arbitrary commands on an Juniper junos device
+ description:
+-  - Network devices running the Junos operating system provide a command
+-    driven interface both over CLI and RPC.  This module provides an
+-    interface to execute commands using these functions and return the
+-    results to the Ansible playbook.  In addition, this
+-    module can specify a set of conditionals to be evaluated against the
+-    returned output, only returning control to the playbook once the
+-    entire set of conditionals has been met.
+-extends_documentation_fragment: junos
++  - Sends an arbitrary set of commands to an junos node and returns the results
++    read from the device.  This module includes an
++    argument that will cause the module to wait for a specific condition
++    before returning or timing out if the condition is not met.
+ options:
+   commands:
+     description:
+-      - The C(commands) to send to the remote device over the Netconf
+-        transport.  The resulting output from the command
++      - The commands to send to the remote junos device over the
++        configured provider.  The resulting output from the command
+         is returned.  If the I(wait_for) argument is provided, the
+         module is not returned until the condition is satisfied or
+         the number of I(retries) has been exceeded.
+-    required: false
+-    default: null
+-  rpcs:
+-    description:
+-      - The C(rpcs) argument accepts a list of RPCs to be executed
+-        over a netconf session and the results from the RPC execution
+-        is return to the playbook via the modules results dictionary.
+-    required: false
+-    default: null
++    required: true
+   wait_for:
+     description:
+       - Specifies what to evaluate from the output of the command
+@@ -77,9 +67,9 @@ options:
+     version_added: "2.2"
+   retries:
+     description:
+-      - Specifies the number of retries a command should by tried
++      - Specifies the number of retries a command should be tried
+         before it is considered failed.  The command is run on the
+-        target device every retry and evaluated against the I(waitfor)
++        target device every retry and evaluated against the I(wait_for)
+         conditionals.
+     required: false
+     default: 10
+@@ -91,214 +81,167 @@ options:
+         trying the command again.
+     required: false
+     default: 1
+-  format:
+-    description:
+-      - Configures the encoding scheme to use when serializing output
+-        from the device.  This handles how to properly understand the
+-        output and apply the conditionals path to the result set.
+-    required: false
+-    default: 'xml'
+-    choices: ['xml', 'text', 'json']
+-requirements:
+-  - junos-eznc
+-notes:
+-  - This module requires the netconf system service be enabled on
+-    the remote device being managed. 'json' format is supported
+-    for JUNON version >= 14.2
+ """
+ 
+ EXAMPLES = """
+ # Note: examples below use the following provider dict to handle
+ #       transport and authentication to the node.
+ ---
+-vars:
+-  netconf:
+-    host: "{{ inventory_hostname }}"
+-    username: ansible
+-    password: Ansible
++- name: run show version on remote devices
++  junos_command:
++    commands: show version
+ 
+----
+-- name: run a set of commands
++- name: run show version and check to see if output contains Juniper
+   junos_command:
+-    commands: ['show version', 'show ip route']
+-    provider: "{{ netconf }}"
++    commands: show version
++    wait_for: result[0] contains Juniper
+ 
+-- name: run a command with a conditional applied to the second command
++- name: run multiple commands on remote nodes
+   junos_command:
+     commands:
+       - show version
+-      - show interfaces fxp0
+-    waitfor:
+-      - "result[1].interface-information.physical-interface.name eq fxp0"
+-    provider: "{{ netconf }}"
++      - show interfaces
+ 
+-- name: collect interface information using rpc
++- name: run multiple commands and evaluate the output
+   junos_command:
+-    rpcs:
+-      - "get_interface_information interface=em0 media=True"
+-      - "get_interface_information interface=fxp0 media=True"
+-    provider: "{{ netconf }}"
++    commands:
++      - show version
++      - show interfaces
++    wait_for:
++      - result[0] contains Juniper
++      - result[1] contains Loopback0
++
++- name: run commands and specify the output format
++  junos_command:
++    commands:
++      - command: show version
++        output: json
+ """
+ 
+ RETURN = """
+-stdout:
+-  description: The output from the commands read from the device
+-  returned: always
+-  type: list
+-  sample: ['...', '...']
+-
+-stdout_lines:
+-  description: The output read from the device split into lines
+-  returned: always
+-  type: list
+-  sample: [['...', '...'], ['...', '...']]
+-
+-failed_conditionals:
++failed_conditions:
+   description: the conditionals that failed
+   returned: failed
+   type: list
+   sample: ['...', '...']
+ """
++import time
+ 
+-import ansible.module_utils.junos
+-from ansible.module_utils.basic import get_exception
+-from ansible.module_utils.network import NetworkModule, NetworkError
+-from ansible.module_utils.netcli import CommandRunner
+-from ansible.module_utils.netcli import AddCommandError, FailedConditionsError
+-from ansible.module_utils.netcli import FailedConditionalError, AddConditionError
+-from ansible.module_utils.junos import xml_to_json
++from functools import partial
++
++from ansible.module_utils.junos import run_commands
++from ansible.module_utils.junos import junos_argument_spec
++from ansible.module_utils.junos import check_args as junos_check_args
++from ansible.module_utils.basic import AnsibleModule
+ from ansible.module_utils.six import string_types
++from ansible.module_utils.netcli import Conditional
++from ansible.module_utils.network_common import ComplexList
+ 
+-VALID_KEYS = {
+-    'cli': frozenset(['command', 'output', 'prompt', 'response']),
+-    'rpc': frozenset(['command', 'output'])
+-}
++def check_args(module, warnings):
++    junos_check_args(module, warnings)
+ 
++    if module.params['rpcs']:
++        module.fail_json(msg='argument rpcs has been deprecated, please use '
++                             'junos_rpc instead')
+ 
+ def to_lines(stdout):
++    lines = list()
+     for item in stdout:
+         if isinstance(item, string_types):
+             item = str(item).split('\n')
+-        yield item
+-
+-def parse(module, command_type):
+-    if command_type == 'cli':
+-        items = module.params['commands']
+-    elif command_type == 'rpc':
+-        items = module.params['rpcs']
+-
+-    parsed = list()
+-    for item in (items or list()):
+-        if isinstance(item, string_types):
+-            item = dict(command=item, output=None)
+-        elif 'command' not in item:
+-            module.fail_json(msg='command keyword argument is required')
+-        elif item.get('output') not in [None, 'text', 'xml']:
+-            module.fail_json(msg='invalid output specified for command'
+-                                 'Supported values are `text` or `xml`')
+-        elif not set(item.keys()).issubset(VALID_KEYS[command_type]):
+-            module.fail_json(msg='unknown command keyword specified.  Valid '
+-                                 'values are %s' % ', '.join(VALID_KEYS[command_type]))
++        lines.append(item)
++    return lines
+ 
+-        if not item['output']:
+-            item['output'] = module.params['display']
++def parse_commands(module, warnings):
++    spec = dict(
++        command=dict(key=True),
++        output=dict(default=module.params['display'], choices=['text', 'json']),
++        prompt=dict(),
++        response=dict()
++    )
+ 
+-        item['command_type'] = command_type
++    transform = ComplexList(spec, module)
++    commands = transform(module.params['commands'])
+ 
+-        # show configuration [options] will return as text
+-        if item['command'].startswith('show configuration'):
+-            item['output'] = 'text'
++    for index, item in enumerate(commands):
++        if module.check_mode and not item['command'].startswith('show'):
++            warnings.append(
++                'Only show commands are supported when using check_mode, not '
++                'executing %s' % item['command']
++            )
+ 
+-        parsed.append(item)
++        if item['output'] == 'json' and 'display json' not in item['command']:
++            item['command'] += '| display json'
++        elif item['output'] == 'text' and 'display json' in item['command']:
++            item['command'] = item['command'].replace('| display json', '')
+ 
+-    return parsed
++        commands[index] = item
+ 
++    return commands
+ 
+ def main():
+-    """main entry point for Ansible module
++    """entry point for module execution
+     """
++    argument_spec = dict(
++        commands=dict(type='list', required=True),
++        display=dict(choices=['text', 'json'], default='text'),
+ 
+-    spec = dict(
+-        commands=dict(type='list'),
++        # deprecated (Ansible 2.3) - use junos_rpc
+         rpcs=dict(type='list'),
+ 
+-        display=dict(default='xml', choices=['text', 'xml', 'json'],
+-                     aliases=['format', 'output']),
+-
+         wait_for=dict(type='list', aliases=['waitfor']),
+         match=dict(default='all', choices=['all', 'any']),
+ 
+         retries=dict(default=10, type='int'),
+-        interval=dict(default=1, type='int'),
+-
+-        transport=dict(default='netconf', choices=['netconf'])
++        interval=dict(default=1, type='int')
+     )
+ 
+-    mutually_exclusive = [('commands', 'rpcs')]
++    argument_spec.update(junos_argument_spec)
+ 
+-    module = NetworkModule(argument_spec=spec,
+-                           mutually_exclusive=mutually_exclusive,
++    module = AnsibleModule(argument_spec=argument_spec,
+                            supports_check_mode=True)
+ 
+-    commands = list()
+-    for key in VALID_KEYS.keys():
+-        commands.extend(list(parse(module, key)))
+-
+-    conditionals = module.params['wait_for'] or list()
+ 
+     warnings = list()
++    check_args(module, warnings)
++
++    commands = parse_commands(module, warnings)
++
++    wait_for = module.params['wait_for'] or list()
++    conditionals = [Conditional(c) for c in wait_for]
++
++    retries = module.params['retries']
++    interval = module.params['interval']
++    match = module.params['match']
++
++    while retries > 0:
++        responses = run_commands(module, commands)
++
++        for item in list(conditionals):
++            if item(responses):
++                if match == 'any':
++                    conditionals = list()
++                    break
++                conditionals.remove(item)
++
++        if not conditionals:
++            break
++
++        time.sleep(interval)
++        retries -= 1
++
++    if conditionals:
++        failed_conditions = [item.raw for item in conditionals]
++        msg = 'One or more conditional statements have not be satisfied'
++        module.fail_json(msg=msg, failed_conditions=failed_conditions)
++
++    result = {
++        'changed': False,
++        'warnings': warnings,
++        'stdout': responses,
++        'stdout_lines': to_lines(responses)
++    }
+ 
+-    runner = CommandRunner(module)
+-
+-    for cmd in commands:
+-        if module.check_mode and not cmd['command'].startswith('show'):
+-            warnings.append('only show commands are supported when using '
+-                            'check mode, not executing `%s`' % cmd['command'])
+-        else:
+-            if cmd['command'].startswith('co'):
+-                module.fail_json(msg='junos_command does not support running '
+-                                     'config mode commands.  Please use '
+-                                     'junos_config instead')
+-            try:
+-                runner.add_command(**cmd)
+-            except AddCommandError:
+-                exc = get_exception()
+-                warnings.append('duplicate command detected: %s' % cmd)
+-
+-    try:
+-        for item in conditionals:
+-            runner.add_conditional(item)
+-    except (ValueError, AddConditionError):
+-        exc = get_exception()
+-        module.fail_json(msg=str(exc), condition=exc.condition)
+-
+-    runner.retries = module.params['retries']
+-    runner.interval = module.params['interval']
+-    runner.match = module.params['match']
+-
+-    try:
+-        runner.run()
+-    except FailedConditionsError:
+-        exc = get_exception()
+-        module.fail_json(msg=str(exc), failed_conditions=exc.failed_conditions)
+-    except FailedConditionalError:
+-        exc = get_exception()
+-        module.fail_json(msg=str(exc), failed_conditional=exc.failed_conditional)
+-    except NetworkError:
+-        exc = get_exception()
+-        module.fail_json(msg=str(exc))
+-
+-    result = dict(changed=False, stdout=list())
+-
+-    for cmd in commands:
+-        try:
+-            output = runner.get_command(cmd['command'], cmd.get('output'))
+-        except ValueError:
+-            output = 'command not executed due to check_mode, see warnings'
+-        result['stdout'].append(output)
+-
+-    result['warnings'] = warnings
+-    result['stdout_lines'] = list(to_lines(result['stdout']))
+ 
+     module.exit_json(**result)
+ 
+diff --git a/lib/ansible/modules/network/junos/junos_config.py b/lib/ansible/modules/network/junos/junos_config.py
+index e3a3175c3b..a7a7bd67b8 100644
+--- a/lib/ansible/modules/network/junos/junos_config.py
++++ b/lib/ansible/modules/network/junos/junos_config.py
+@@ -16,9 +16,11 @@
+ # along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
+ #
+ 
+-ANSIBLE_METADATA = {'status': ['preview'],
+-                    'supported_by': 'core',
+-                    'version': '1.0'}
++ANSIBLE_METADATA = {
++    'status': ['preview'],
++    'supported_by': 'core',
++    'version': '1.0'
++}
+ 
+ DOCUMENTATION = """
+ ---
+@@ -31,7 +33,6 @@ description:
+     configuration running on Juniper JUNOS devices.  It provides a set
+     of arguments for loading configuration, performing rollback operations
+     and zeroing the active configuration on the device.
+-extends_documentation_fragment: junos
+ options:
+   lines:
+     description:
+@@ -144,16 +145,6 @@ notes:
+ """
+ 
+ EXAMPLES = """
+-# Note: examples below use the following provider dict to handle
+-#       transport and authentication to the node.
+----
+-vars:
+-  netconf:
+-    host: "{{ inventory_hostname }}"
+-    username: ansible
+-    password: Ansible
+-
+----
+ - name: load configure file into device
+   junos_config:
+     src: srx.cfg
+@@ -182,19 +173,27 @@ backup_path:
+   type: path
+   sample: /playbooks/ansible/backup/config.2016-07-16@22:28:34
+ """
++import re
+ import json
+ 
+ from xml.etree import ElementTree
++from ncclient.xml_ import to_xml
+ 
+-import ansible.module_utils.junos
+-
+-from ansible.module_utils.basic import get_exception
+-from ansible.module_utils.network import NetworkModule, NetworkError
++from ansible.module_utils.junos import get_diff, load
++from ansible.module_utils.junos import locked_config, load_configuration
++from ansible.module_utils.junos import get_configuration
++from ansible.module_utils.basic import AnsibleModule
+ from ansible.module_utils.netcfg import NetworkConfig
+ 
+-
+ DEFAULT_COMMENT = 'configured by junos_config'
+ 
++def check_args(module, warnings):
++    if module.params['zeroize']:
++        module.fail_json(msg='argument zeroize is deprecated and no longer '
++                'supported, use junos_command instead')
++
++    if module.params['replace'] is not None:
++        module.fail_json(msg='argument replace is deprecated, use update')
+ 
+ def guess_format(config):
+     try:
+@@ -233,91 +232,63 @@ def config_to_commands(config):
+ 
+     return commands
+ 
+-def diff_commands(commands, config):
+-    config = [unicode(c).replace("'", '') for c in config]
+-
+-    updates = list()
+-    visited = set()
+-
+-    for index, item in enumerate(commands):
+-        if len(item) > 0:
+-            if not item.startswith('set') and not item.startswith('delete'):
+-                raise ValueError('line must start with either `set` or `delete`')
+-
+-            elif item.startswith('set') and item[4:] not in config:
+-                updates.append(item)
+-
+-            elif item.startswith('delete'):
+-                for entry in config + commands[0:index]:
+-                    if entry.startswith('set'):
+-                        entry = entry[4:]
+-                    if entry.startswith(item[7:]) and item not in visited:
+-                        updates.append(item)
+-                        visited.add(item)
+-
+-    return updates
+-
+-def load_config(module, result):
++def filter_delete_statements(module, candidate):
++    reply = get_configuration(module, format='set')
++    config = reply.xpath('//configuration-set')[0].text.strip()
++    for index, line in enumerate(candidate):
++        if line.startswith('delete'):
++            newline = re.sub('^delete', 'set', line)
++            if newline not in config:
++                del candidate[index]
++    return candidate
++
++def load_config(module):
+     candidate =  module.params['lines'] or module.params['src']
+     if isinstance(candidate, basestring):
+         candidate = candidate.split('\n')
+ 
+-    kwargs = dict()
+-    kwargs['comment'] = module.params['comment']
+-    kwargs['confirm'] = module.params['confirm']
+-    kwargs[module.params['update']] = True
+-    kwargs['commit'] = not module.check_mode
+-    kwargs['replace'] = module.params['replace']
++    confirm = module.params['confirm'] > 0
++    confirm_timeout = module.params['confirm']
++
++    kwargs = {
++        'confirm': module.params['confirm'] is not None,
++        'confirm_timeout': module.params['confirm_timeout'],
++        'comment': module.params['comment'],
++        'commit': not module.check_mode,
++    }
+ 
+     if module.params['src']:
+         config_format = module.params['src_format'] or guess_format(str(candidate))
+-    elif module.params['lines']:
+-        config_format = 'set'
+-    kwargs['config_format'] = config_format
++        kwargs.update({'format': config_format, 'action': module.params['update']})
+ 
+     # this is done to filter out `delete ...` statements which map to
+     # nothing in the config as that will cause an exception to be raised
+-    if config_format == 'set':
+-        config = module.config.get_config()
+-        config = config_to_commands(config)
+-        candidate = diff_commands(candidate, config)
+-
+-    diff = module.config.load_config(candidate, **kwargs)
++    if module.params['lines']:
++        candidate = filter_delete_statements(module, candidate)
++        kwargs.update({'action': 'set', 'format': 'text'})
+ 
+-    if diff:
+-        result['changed'] = True
+-        result['diff'] = dict(prepared=diff)
++    return load(module, candidate, **kwargs)
+ 
+ def rollback_config(module, result):
+     rollback = module.params['rollback']
++    diff = None
+ 
+-    kwargs = dict(comment=module.params['comment'],
+-                  commit=not module.check_mode)
+-
+-    diff = module.connection.rollback_config(rollback, **kwargs)
++    with locked_config:
++        load_configuration(module, rollback=rollback)
++        diff = get_diff(module)
+ 
+-    if diff:
+-        result['changed'] = True
+-        result['diff'] = dict(prepared=diff)
++    return diff
+ 
+-def zeroize_config(module, result):
+-    if not module.check_mode:
+-        module.connection.cli('request system zeroize')
+-    result['changed'] = True
++def confirm_config(module):
++    with locked_config:
++        commit_configuration(confirm=True)
+ 
+-def confirm_config(module, result):
+-    checkonly = module.check_mode
+-    result['changed'] = module.connection.confirm_commit(checkonly)
+-
+-def run(module, result):
+-    if module.params['rollback']:
+-        return rollback_config(module, result)
+-    elif module.params['zeroize']:
+-        return zeroize_config(module, result)
+-    elif not any((module.params['src'], module.params['lines'])):
+-        return confirm_config(module, result)
+-    else:
+-        return load_config(module, result)
++def update_result(module, result, diff=None):
++    if diff == '':
++        diff = None
++    result['changed'] = diff is not None
++    if module._diff:
++        result['diff'] =  {'prepared': diff}
+ 
+ 
+ def main():
+@@ -330,8 +301,10 @@ def main():
+         src_format=dict(choices=['xml', 'text', 'set', 'json']),
+ 
+         # update operations
+-        update=dict(default='merge', choices=['merge', 'overwrite', 'replace']),
+-        replace=dict(default=False, type='bool'),
++        update=dict(default='merge', choices=['merge', 'overwrite', 'replace', 'update']),
++
++        # deprecated replace in Ansible 2.3
++        replace=dict(type='bool'),
+ 
+         confirm=dict(default=0, type='int'),
+         comment=dict(default=DEFAULT_COMMENT),
+@@ -339,36 +312,35 @@ def main():
+         # config operations
+         backup=dict(type='bool', default=False),
+         rollback=dict(type='int'),
+-        zeroize=dict(default=False, type='bool'),
+ 
+-        transport=dict(default='netconf', choices=['netconf'])
++        # deprecated zeroize in Ansible 2.3
++        zeroize=dict(default=False, type='bool'),
+     )
+ 
+-    mutually_exclusive = [('lines', 'rollback'), ('lines', 'zeroize'),
+-                          ('rollback', 'zeroize'), ('lines', 'src'),
+-                          ('src', 'zeroize'), ('src', 'rollback'),
+-                          ('update', 'replace')]
+-
+-    required_if = [('replace', True, ['src']),
+-                   ('update', 'merge', ['src', 'lines'], True),
+-                   ('update', 'overwrite', ['src', 'lines'], True),
+-                   ('update', 'replace', ['src', 'lines'], True)]
++    mutually_exclusive = [('lines', 'src', 'rollback')]
+ 
+-    module = NetworkModule(argument_spec=argument_spec,
++    module = AnsibleModule(argument_spec=argument_spec,
+                            mutually_exclusive=mutually_exclusive,
+-                           required_if=required_if,
+                            supports_check_mode=True)
+ 
+-    result = dict(changed=False)
++    warnings = list()
++    check_args(module, warnings)
++
++    result = {'changed': False, 'warnings': warnings}
+ 
+     if module.params['backup']:
+-        result['__backup__'] = module.config.get_config()
++        result['__backup__'] = get_configuration()
+ 
+-    try:
+-        run(module, result)
+-    except NetworkError:
+-        exc = get_exception()
+-        module.fail_json(msg=str(exc), **exc.kwargs)
++    if module.params['rollback']:
++        diff = get_diff(module)
++        update_result(module, result, diff)
++
++    elif not any((module.params['src'], module.params['lines'])):
++        confirm_config(module)
++
++    else:
++        diff = load_config(module)
++        update_result(module, result, diff)
+ 
+     module.exit_json(**result)
+ 
+diff --git a/lib/ansible/modules/network/junos/junos_netconf.py b/lib/ansible/modules/network/junos/junos_netconf.py
+index f41cdccba0..7351037965 100644
+--- a/lib/ansible/modules/network/junos/junos_netconf.py
++++ b/lib/ansible/modules/network/junos/junos_netconf.py
+@@ -16,9 +16,11 @@
+ # along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
+ #
+ 
+-ANSIBLE_METADATA = {'status': ['preview'],
+-                    'supported_by': 'core',
+-                    'version': '1.0'}
++ANSIBLE_METADATA = {
++    'status': ['preview'],
++    'supported_by': 'core',
++    'version': '1.0'
++}
+ 
+ DOCUMENTATION = """
+ ---
+@@ -56,27 +58,14 @@ options:
+ """
+ 
+ EXAMPLES = """
+-# Note: examples below use the following provider dict to handle
+-#       transport and authentication to the node.
+----
+-vars:
+-  cli:
+-    host: "{{ inventory_hostname }}"
+-    username: ansible
+-    password: Ansible
+-    transport: cli
+-
+----
+ - name: enable netconf service on port 830
+   junos_netconf:
+     listens_on: 830
+     state: present
+-    provider: "{{ cli }}"
+ 
+ - name: disable netconf service
+   junos_netconf:
+     state: absent
+-    provider: "{{ cli }}"
+ """
+ 
+ RETURN = """
+@@ -88,64 +77,94 @@ commands:
+ """
+ import re
+ 
+-import ansible.module_utils.junos
++from ansible.module_utils.junos import load_config, get_config
++from ansible.module_utils.junos import junos_argument_spec, check_args
++from ansible.module_utils.basic import AnsibleModule
++from ansible.module_utils.six import iteritems
++
++
++def map_obj_to_commands(updates, module):
++    want, have = updates
++    commands = list()
++
++    if want['state'] == 'present' and have['state'] == 'absent':
++        commands.append(
++            'set system services netconf ssh port %s' % want['netconf_port']
++        )
++
++    elif want['state'] == 'absent' and have['state'] == 'present':
++        commands.append('delete system services netconf')
+ 
+-from ansible.module_utils.basic import get_exception
+-from ansible.module_utils.network import NetworkModule, NetworkError
++    elif want['netconf_port'] != have.get('netconf_port'):
++        commands.append(
++            'set system services netconf ssh port %s' % want['netconf_port']
++        )
++
++    return commands
+ 
+ def parse_port(config):
+     match = re.search(r'port (\d+)', config)
+     if match:
+         return int(match.group(1))
+ 
+-def get_instance(module):
+-    cmd = 'show configuration system services netconf'
+-    cfg = module.cli(cmd)[0]
+-    result = dict(state='absent')
+-    if cfg:
+-        result = dict(state='present')
+-        result['port'] = parse_port(cfg)
+-    return result
++def map_config_to_obj(module):
++    config = get_config(module, ['system services netconf'])
++    obj = {'state': 'absent'}
++    if config:
++        obj.update({
++            'state': 'present',
++            'netconf_port': parse_port(config)
++        })
++    return obj
++
++
++def validate_netconf_port(value, module):
++    if not 1 <= value <= 65535:
++        module.fail_json(msg='netconf_port must be between 1 and 65535')
++
++def map_params_to_obj(module):
++    obj = {
++        'netconf_port': module.params['netconf_port'],
++        'state': module.params['state']
++    }
++
++    for key, value in iteritems(obj):
++        # validate the param value (if validator func exists)
++        validator = globals().get('validate_%s' % key)
++        if all((value, validator)):
++            validator(value, module)
++
++    return obj
+ 
+ def main():
+     """main entry point for module execution
+     """
+-
+     argument_spec = dict(
+         netconf_port=dict(type='int', default=830, aliases=['listens_on']),
+         state=dict(default='present', choices=['present', 'absent']),
+-        transport=dict(default='cli', choices=['cli'])
+     )
+ 
+-    module = NetworkModule(argument_spec=argument_spec,
++    module = AnsibleModule(argument_spec=argument_spec,
+                            supports_check_mode=True)
+ 
+-    state = module.params['state']
+-    port = module.params['netconf_port']
++    warnings = list()
++    check_args(module, warnings)
+ 
+-    result = dict(changed=False)
++    result = {'changed': False, 'warnings': warnings}
+ 
+-    instance = get_instance(module)
++    want = map_params_to_obj(module)
++    have = map_config_to_obj(module)
+ 
+-    if state == 'present' and instance.get('state') == 'absent':
+-        commands = 'set system services netconf ssh port %s' % port
+-    elif state == 'present' and port != instance.get('port'):
+-        commands = 'set system services netconf ssh port %s' % port
+-    elif state == 'absent' and instance.get('state') == 'present':
+-        commands = 'delete system services netconf'
+-    else:
+-        commands = None
++    commands = map_obj_to_commands((want, have), module)
++    result['commands'] = commands
+ 
+     if commands:
+-        if not module.check_mode:
+-            try:
+-                comment = 'configuration updated by junos_netconf'
+-                module.config(commands, comment=comment)
+-            except NetworkError:
+-                exc = get_exception()
+-                module.fail_json(msg=str(exc), **exc.kwargs)
+-        result['changed'] = True
+-        result['commands'] = commands
++        commit = not module.check_mode
++        diff = load_config(module, commands, commit=commit)
++        if diff and module._diff:
++            if module._diff:
++                result['diff'] = {'prepared': diff}
++            result['changed'] = True
+ 
+     module.exit_json(**result)
+ 
+diff --git a/lib/ansible/modules/network/junos/junos_rpc.py b/lib/ansible/modules/network/junos/junos_rpc.py
+new file mode 100644
+index 0000000000..7ce754be0e
+--- /dev/null
++++ b/lib/ansible/modules/network/junos/junos_rpc.py
+@@ -0,0 +1,151 @@
++#!/usr/bin/python
++#
++# This file is part of Ansible
++#
++# Ansible is free software: you can redistribute it and/or modify
++# it under the terms of the GNU General Public License as published by
++# the Free Software Foundation, either version 3 of the License, or
++# (at your option) any later version.
++#
++# Ansible is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU General Public License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
++#
++
++ANSIBLE_METADATA = {
++    'status': ['preview'],
++    'supported_by': 'core',
++    'version': '1.0'
++}
++
++DOCUMENTATION = """
++---
++module: junos_rpc
++version_added: "2.3"
++author: "Peter Sprygada (@privateip)"
++short_description: Runs an arbitrary RPC on the remote device over NetConf
++description:
++  - Sends a request to the remote device running JUNOS to execute the
++    specified RPC using the NetConf transport.  The reply is then
++    returned to the playbook in the c(xml) key.  If an alternate output
++    format is requested, the reply is transformed to the requested output.
++options:
++  rpc:
++    description:
++      - The C(rpc) argument specifies the RPC call to send to the
++        remote devices to be executed.  The RPC Reply message is parsed
++        and the contents are returned to the playbook.
++    required: true
++  args:
++    description:
++      - The C(args) argument provides a set of arguments for the RPC
++        call and are encoded in the request message.  This argument
++        accepts a set of key=value arguments.
++    required: false
++    default: null
++  output:
++    description:
++      - The C(output) argument specifies the desired output of the
++        return data.  This argument accepts one of C(xml), C(text),
++        or C(json).  For C(json), the JUNOS device must be running a
++        version of software that supports native JSON output.
++    required: false
++    default: xml
++"""
++
++EXAMPLES = """
++- name: collect interface information using rpc
++  junos_rpc:
++    rpc: get-interface-information
++    args:
++      interface: em0
++      media: True
++
++- name: get system information
++  junos_rpc:
++    rpc: get-system-information
++"""
++
++RETURN = """
++xml:
++  description: The xml return string from the rpc request
++  returned: always
++output:
++  description: The rpc rely converted to the output format
++  returned: always
++output_lines:
++  description: The text output split into lines for readability
++  returned: always
++"""
++from ncclient.xml_ import new_ele, sub_ele, to_xml, to_ele
++
++from ansible.module_utils.basic import AnsibleModule
++from ansible.module_utils.netconf import send_request
++from ansible.module_utils.six import iteritems
++
++
++
++def main():
++    """main entry point for Ansible module
++    """
++    argument_spec = dict(
++        rpc=dict(required=True),
++        args=dict(type='dict'),
++        output=dict(default='xml', choices=['xml', 'json', 'text']),
++    )
++
++    module = AnsibleModule(argument_spec=argument_spec,
++                           supports_check_mode=False)
++
++    result = {'changed': False}
++
++    rpc = str(module.params['rpc']).replace('_', '-')
++
++    if all((module.check_mode, not rpc.startswith('get'))):
++        module.fail_json(msg='invalid rpc for running in check_mode')
++
++    args = module.params['args'] or {}
++
++    xattrs = {'format': module.params['output']}
++
++    element = new_ele(module.params['rpc'], xattrs)
++
++    for key, value in iteritems(args):
++        key = str(key).replace('_', '-')
++        if isinstance(value, list):
++            for item in value:
++                child = sub_ele(element, key)
++                if item is not True:
++                    child.text = item
++        else:
++            child = sub_ele(element, key)
++            if value is not True:
++                child.text = value
++
++    reply = send_request(module, element)
++
++    result['xml'] = str(to_xml(reply))
++
++    if module.params['output'] == 'text':
++        reply = to_ele(reply)
++        data = reply.xpath('//output')
++        result['output'] = data[0].text.strip()
++        result['output_lines'] = result['output'].split('\n')
++
++    elif module.params['output'] == 'json':
++        reply = to_ele(reply)
++        data = reply.xpath('//rpc-reply')
++        result['output'] = module.from_json(data[0].text.strip())
++
++    else:
++        result['output'] = str(to_xml(reply)).split('\n')
++
++    module.exit_json(**result)
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/lib/ansible/modules/network/junos/junos_user.py b/lib/ansible/modules/network/junos/junos_user.py
+new file mode 100644
+index 0000000000..032f261267
+--- /dev/null
++++ b/lib/ansible/modules/network/junos/junos_user.py
+@@ -0,0 +1,256 @@
++#!/usr/bin/python
++#
++# This file is part of Ansible
++#
++# Ansible is free software: you can redistribute it and/or modify
++# it under the terms of the GNU General Public License as published by
++# the Free Software Foundation, either version 3 of the License, or
++# (at your option) any later version.
++#
++# Ansible is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU General Public License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
++#
++
++ANSIBLE_METADATA = {
++    'status': ['preview'],
++    'supported_by': 'core',
++    'version': '1.0'
++}
++
++DOCUMENTATION = """
++---
++module: junos_user
++version_added: "2.3"
++author: "Peter Sprygada (@privateip)"
++short_description: Manage local user accounts on Juniper devices
++description:
++  - This module manages locally configured user accounts on remote
++    network devices running the JUNOS operating system.  It provides
++    a set of arguments for creating, removing and updating locally
++    defined accounts
++options:
++  users:
++    description:
++      - The C(users) argument defines a list of users to be configured
++        on the remote device.  The list of users will be compared against
++        the current users and only changes will be added or removed from
++        the device configuration.  This argument is mutually exclusive with
++        the name argument.
++    required: False
++    default: null
++  name:
++    description:
++      - The C(name) argument defines the username of the user to be created
++        on the system.  This argument must follow appropriate usernaming
++        conventions for the target device running JUNOS.  This argument is
++        mutually exclusive with the C(users) argument.
++    required: false
++    default: null
++  full_name:
++    description:
++      - The C(full_name) argument provides the full name of the user
++        account to be created on the remote device.  This argument accepts
++        any text string value.
++    required: false
++    default: null
++  role:
++    description:
++      - The C(role) argument defines the role of the user account on the
++        remote system.  User accounts can have more than one role
++        configured.
++    required: false
++    default: read-only
++    choices: ['operator', 'read-only', 'super-user', 'unauthorized']
++  sshkey:
++    description:
++      - The C(sshkey) argument defines the public SSH key to be configured
++        for the user account on the remote system.  This argument must
++        be a valid SSH key
++    required: false
++    default: null
++  purge:
++    description:
++      - The C(purge) argument instructs the module to consider the
++        users definition absolute.  It will remove any previously configured
++        users on the device with the exception of the current defined
++        set of users.
++    required: false
++    default: false
++  state:
++    description:
++      - The C(state) argument configures the state of the user definitions
++        as it relates to the device operational configuration.  When set
++        to I(present), the user should be configured in the device active
++        configuration and when set to I(absent) the user should not be
++        in the device active configuration
++    required: false
++    default: present
++    choices: ['present', 'absent']
++"""
++
++EXAMPLES = """
++- name: create new user account
++  junos_user:
++    name: ansible
++    role: super-user
++    sshkey: "{{ lookup('file', '~/.ssh/ansible.pub') }}"
++    state: present
++
++- name: remove a user account
++  junos_user:
++    name: ansible
++    state: absent
++
++- name: remove all user accounts except ansible
++  junos_user:
++    name: ansible
++    purge: yes
++"""
++
++RETURN = """
++"""
++from functools import partial
++
++from ncclient.xml_ import new_ele, sub_ele, to_xml
++
++from ansible.module_utils.basic import AnsibleModule
++from ansible.module_utils.junos import load
++from ansible.module_utils.six import iteritems
++
++ROLES = ['operator', 'read-only', 'super-user', 'unauthorized']
++
++def map_obj_to_ele(want):
++    element = new_ele('system')
++    login = sub_ele(element, 'login', {'replace': 'replace'})
++
++    for item in want:
++        if item['state'] != 'present':
++            operation = 'delete'
++        else:
++            operation = 'replace'
++
++        user = sub_ele(login, 'user', {'operation': operation})
++
++        sub_ele(user, 'name').text = item['name']
++
++        if operation == 'replace':
++            sub_ele(user, 'class').text = item['role']
++
++            if item.get('full_name'):
++                sub_ele(user, 'full-name').text = item['full_name']
++
++            if item.get('sshkey'):
++                auth = sub_ele(user, 'authentication')
++                ssh_rsa = sub_ele(auth, 'ssh-rsa')
++                key = sub_ele(ssh_rsa, 'name').text = item['sshkey']
++
++    return element
++
++def get_param_value(key, item, module):
++    # if key doesn't exist in the item, get it from module.params
++    if not item.get(key):
++        value = module.params[key]
++
++    # if key does exist, do a type check on it to validate it
++    else:
++        value_type = module.argument_spec[key].get('type', 'str')
++        type_checker = module._CHECK_ARGUMENT_TYPES_DISPATCHER[value_type]
++        type_checker(item[key])
++        value = item[key]
++
++    # validate the param value (if validator func exists)
++    validator = globals().get('validate_%s' % key)
++    if all((value, validator)):
++        validator(value, module)
++
++    return value
++
++def map_params_to_obj(module):
++    users = module.params['users']
++    if not users:
++        if not module.params['name'] and module.params['purge']:
++            return list()
++        elif not module.params['name']:
++            module.fail_json(msg='missing required argument: name')
++        else:
++            collection = [{'name': module.params['name']}]
++    else:
++        collection = list()
++        for item in users:
++            if not isinstance(item, dict):
++                collection.append({'username': item})
++            elif 'name' not in item:
++                module.fail_json(msg='missing required argument: name')
++            else:
++                collection.append(item)
++
++    objects = list()
++
++    for item in collection:
++        get_value = partial(get_param_value, item=item, module=module)
++        item.update({
++            'full_name': get_value('full_name'),
++            'role': get_value('role'),
++            'sshkey': get_value('sshkey'),
++            'state': get_value('state')
++        })
++
++        for key, value in iteritems(item):
++            # validate the param value (if validator func exists)
++            validator = globals().get('validate_%s' % key)
++            if all((value, validator)):
++                validator(value, module)
++
++        objects.append(item)
++
++    return objects
++
++
++def main():
++    """ main entry point for module execution
++    """
++    argument_spec = dict(
++        users=dict(type='list'),
++        name=dict(),
++
++        full_name=dict(),
++        role=dict(choices=ROLES, default='unauthorized'),
++        sshkey=dict(),
++
++        purge=dict(type='bool'),
++
++        state=dict(choices=['present', 'absent'], default='present')
++    )
++
++    mutually_exclusive = [('users', 'name')]
++
++    module = AnsibleModule(argument_spec=argument_spec,
++                           mutually_exclusive=mutually_exclusive,
++                           supports_check_mode=True)
++
++    result = {'changed': False}
++
++    want = map_params_to_obj(module)
++    ele = map_obj_to_ele(want)
++
++    kwargs = {'commit': not module.check_mode}
++    if module.params['purge']:
++        kwargs['action'] = 'replace'
++
++    diff = load(module, ele, **kwargs)
++
++    if diff:
++        result.update({
++            'changed': True,
++            'diff': {'prepared': diff}
++        })
++
++    module.exit_json(**result)
++
++if __name__ == "__main__":
++    main()
+diff --git a/lib/ansible/plugins/action/junos.py b/lib/ansible/plugins/action/junos.py
+new file mode 100644
+index 0000000000..be57467b0a
+--- /dev/null
++++ b/lib/ansible/plugins/action/junos.py
+@@ -0,0 +1,119 @@
++#
++# (c) 2016 Red Hat Inc.
++#
++# This file is part of Ansible
++#
++# Ansible is free software: you can redistribute it and/or modify
++# it under the terms of the GNU General Public License as published by
++# the Free Software Foundation, either version 3 of the License, or
++# (at your option) any later version.
++#
++# Ansible is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU General Public License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
++#
++from __future__ import (absolute_import, division, print_function)
++__metaclass__ = type
++
++import os
++import sys
++import copy
++
++from ansible.plugins.action.normal import ActionModule as _ActionModule
++from ansible.utils.path import unfrackpath
++from ansible.plugins import connection_loader
++from ansible.compat.six import iteritems
++from ansible.module_utils.junos import junos_argument_spec
++from ansible.module_utils.basic import AnsibleFallbackNotFound
++from ansible.module_utils._text import to_bytes
++
++from ncclient.xml_ import new_ele, sub_ele, to_xml
++
++try:
++    from __main__ import display
++except ImportError:
++    from ansible.utils.display import Display
++    display = Display()
++
++class ActionModule(_ActionModule):
++
++    def run(self, tmp=None, task_vars=None):
++
++        if self._play_context.connection != 'local':
++            return dict(
++                fail=True,
++                msg='invalid connection specified, expected connection=local, '
++                    'got %s' % self._play_context.connection
++            )
++
++        provider = self.load_provider()
++
++        pc = copy.deepcopy(self._play_context)
++        pc.network_os = 'junos'
++
++        if self._task.action in ('junos_command', 'junos_netconf', 'junos_config', '_junos_template'):
++            pc.connection = 'network_cli'
++            pc.port = provider['port'] or self._play_context.port or 22
++        else:
++            pc.connection = 'netconf'
++            pc.port = provider['port'] or self._play_context.port or 830
++
++        pc.remote_user = provider['username'] or self._play_context.connection_user
++        pc.password = provider['password'] or self._play_context.password
++        pc.private_key_file = provider['ssh_keyfile'] or self._play_context.private_key_file
++
++        socket_path = self._get_socket_path(pc)
++
++        if not os.path.exists(socket_path):
++            # start the connection if it isn't started
++            connection = self._shared_loader_obj.connection_loader.get('persistent', pc, sys.stdin)
++
++            if pc.connection == 'network_cli':
++                rc, out, err = connection.exec_command('show version')
++                display.vvv('%s %s %s' % (rc, out, err))
++
++            if pc.connection == 'netconf':
++                # <get-software-information />
++                req = new_ele('get-software-information')
++                connection.exec_command(to_xml(req))
++
++        task_vars['ansible_socket'] = socket_path
++
++        return super(ActionModule, self).run(tmp, task_vars)
++
++    def _get_socket_path(self, play_context):
++        ssh = connection_loader.get('ssh', class_only=True)
++        path = unfrackpath("$HOME/.ansible/pc")
++        cp = ssh._create_control_path(play_context.remote_addr, play_context.port, play_context.remote_user)
++        return cp % dict(directory=path)
++
++    def load_provider(self):
++        provider = self._task.args.get('provider', {})
++        for key, value in iteritems(junos_argument_spec):
++            if key != 'provider' and key not in provider:
++                if key in self._task.args:
++                    provider[key] = self._task.args[key]
++                elif 'fallback' in value:
++                    provider[key] = self._fallback(value['fallback'])
++                elif key not in provider:
++                    provider[key] = None
++        return provider
++
++    def _fallback(self, fallback):
++        strategy = fallback[0]
++        args = []
++        kwargs = {}
++
++        for item in fallback[1:]:
++            if isinstance(item, dict):
++                kwargs = item
++            else:
++                args = item
++        try:
++            return strategy(*args, **kwargs)
++        except AnsibleFallbackNotFound:
++            pass
+diff --git a/lib/ansible/plugins/action/junos_config.py b/lib/ansible/plugins/action/junos_config.py
+index ffcb0f057f..d7ac8a1949 100644
+--- a/lib/ansible/plugins/action/junos_config.py
++++ b/lib/ansible/plugins/action/junos_config.py
+@@ -1,5 +1,5 @@
+ #
+-# Copyright 2015 Peter Sprygada <psprygada@ansible.com>
++# (c) 2017, Red Hat, Inc.
+ #
+ # This file is part of Ansible
+ #
+@@ -19,10 +19,95 @@
+ from __future__ import (absolute_import, division, print_function)
+ __metaclass__ = type
+ 
+-from ansible.plugins.action import ActionBase
+-from ansible.plugins.action.net_config import ActionModule as NetActionModule
++import os
++import re
++import time
++import glob
+ 
+-class ActionModule(NetActionModule, ActionBase):
+-    pass
++from ansible.plugins.action.junos import ActionModule as _ActionModule
++from ansible.module_utils._text import to_text
++from ansible.module_utils.six.moves.urllib.parse import urlsplit
++from ansible.utils.vars import merge_hash
+ 
++PRIVATE_KEYS_RE = re.compile('__.+__')
++
++
++class ActionModule(_ActionModule):
++
++    def run(self, tmp=None, task_vars=None):
++
++        if self._task.args.get('src'):
++            try:
++                self._handle_template()
++            except ValueError as exc:
++                return dict(failed=True, msg=exc.message)
++
++        result = super(ActionModule, self).run(tmp, task_vars)
++
++        if self._task.args.get('backup') and result.get('__backup__'):
++            # User requested backup and no error occurred in module.
++            # NOTE: If there is a parameter error, _backup key may not be in results.
++            filepath = self._write_backup(task_vars['inventory_hostname'],
++                                          result['__backup__'])
++
++            result['backup_path'] = filepath
++
++        # strip out any keys that have two leading and two trailing
++        # underscore characters
++        for key in result.keys():
++            if PRIVATE_KEYS_RE.match(key):
++                del result[key]
++
++        return result
++
++    def _get_working_path(self):
++        cwd = self._loader.get_basedir()
++        if self._task._role is not None:
++            cwd = self._task._role._role_path
++        return cwd
++
++    def _write_backup(self, host, contents):
++        backup_path = self._get_working_path() + '/backup'
++        if not os.path.exists(backup_path):
++            os.mkdir(backup_path)
++        for fn in glob.glob('%s/%s*' % (backup_path, host)):
++            os.remove(fn)
++        tstamp = time.strftime("%Y-%m-%d@%H:%M:%S", time.localtime(time.time()))
++        filename = '%s/%s_config.%s' % (backup_path, host, tstamp)
++        open(filename, 'w').write(contents)
++        return filename
++
++    def _handle_template(self):
++        src = self._task.args.get('src')
++        working_path = self._get_working_path()
++
++        if os.path.isabs(src) or urlsplit('src').scheme:
++            source = src
++        else:
++            source = self._loader.path_dwim_relative(working_path, 'templates', src)
++            if not source:
++                source = self._loader.path_dwim_relative(working_path, src)
++
++        if not os.path.exists(source):
++            raise ValueError('path specified in src not found')
++
++        try:
++            with open(source, 'r') as f:
++                template_data = to_text(f.read())
++        except IOError:
++            return dict(failed=True, msg='unable to load src file')
++
++        # Create a template search path in the following order:
++        # [working_path, self_role_path, dependent_role_paths, dirname(source)]
++        searchpath = [working_path]
++        if self._task._role is not None:
++            searchpath.append(self._task._role._role_path)
++            if hasattr(self._task, "_block:"):
++                dep_chain = self._task._block.get_dep_chain()
++                if dep_chain is not None:
++                    for role in dep_chain:
++                        searchpath.append(role._role_path)
++        searchpath.append(os.path.dirname(source))
++        self._templar.environment.loader.searchpath = searchpath
++        self._task.args['src'] = self._templar.template(template_data)
+ 
+diff --git a/lib/ansible/plugins/action/junos_template.py b/lib/ansible/plugins/action/junos_template.py
+index eb5eb803dc..4524e0c8dd 100644
+--- a/lib/ansible/plugins/action/junos_template.py
++++ b/lib/ansible/plugins/action/junos_template.py
+@@ -1,5 +1,5 @@
+ #
+-# Copyright 2015 Peter Sprygada <psprygada@ansible.com>
++# (c) 2017 Red Hat, Inc.
+ #
+ # This file is part of Ansible
+ #
+@@ -19,12 +19,18 @@
+ from __future__ import (absolute_import, division, print_function)
+ __metaclass__ = type
+ 
+-from ansible.plugins.action import ActionBase
+-from ansible.plugins.action.net_template import ActionModule as NetActionModule
++import os
++import time
++import glob
++import urlparse
+ 
+-class ActionModule(NetActionModule, ActionBase):
++from ansible.module_utils._text import to_text
++from ansible.plugins.action.junos import ActionModule as _ActionModule
++
++class ActionModule(_ActionModule):
+ 
+     def run(self, tmp=None, task_vars=None):
++
+         src = self._task.args.get('src')
+ 
+         if self._task.args.get('config_format') is None:
+@@ -40,5 +46,72 @@ class ActionModule(NetActionModule, ActionBase):
+         if self._task.args.get('comment') is None:
+             self._task.args['comment'] = self._task.name
+ 
+-        return super(ActionModule, self).run(tmp, task_vars)
++        try:
++            self._handle_template()
++        except (ValueError, AttributeError) as exc:
++            return dict(failed=True, msg=exc.message)
++
++        result = super(ActionModule, self).run(tmp, task_vars)
++
++        if self._task.args.get('backup') and result.get('__backup__'):
++            # User requested backup and no error occurred in module.
++            # NOTE: If there is a parameter error, __backup__ key may not be in results.
++            self._write_backup(task_vars['inventory_hostname'], result['__backup__'])
++
++        if '__backup__' in result:
++            del result['__backup__']
++
++        return result
++
++    def _get_working_path(self):
++        cwd = self._loader.get_basedir()
++        if self._task._role is not None:
++            cwd = self._task._role._role_path
++        return cwd
++
++    def _write_backup(self, host, contents):
++        backup_path = self._get_working_path() + '/backup'
++        if not os.path.exists(backup_path):
++            os.mkdir(backup_path)
++        for fn in glob.glob('%s/%s*' % (backup_path, host)):
++            os.remove(fn)
++        tstamp = time.strftime("%Y-%m-%d@%H:%M:%S", time.localtime(time.time()))
++        filename = '%s/%s_config.%s' % (backup_path, host, tstamp)
++        open(filename, 'w').write(contents)
++
++    def _handle_template(self):
++        src = self._task.args.get('src')
++        if not src:
++            raise ValueError('missing required arguments: src')
++
++        working_path = self._get_working_path()
++
++        if os.path.isabs(src) or urlparse.urlsplit(src).scheme:
++            source = src
++        else:
++            source = self._loader.path_dwim_relative(working_path, 'templates', src)
++            if not source:
++                source = self._loader.path_dwim_relative(working_path, src)
++
++        if not os.path.exists(source):
++            return
++
++        try:
++            with open(source, 'r') as f:
++                template_data = to_text(f.read())
++        except IOError:
++            return dict(failed=True, msg='unable to load src file')
+ 
++        # Create a template search path in the following order:
++        # [working_path, self_role_path, dependent_role_paths, dirname(source)]
++        searchpath = [working_path]
++        if self._task._role is not None:
++            searchpath.append(self._task._role._role_path)
++            if hasattr(self._task, "_block:"):
++                dep_chain = self._task._block.get_dep_chain()
++                if dep_chain is not None:
++                    for role in dep_chain:
++                        searchpath.append(role._role_path)
++        searchpath.append(os.path.dirname(source))
++        self._templar.environment.loader.searchpath = searchpath
++        self._task.args['src'] = self._templar.template(template_data)
+diff --git a/lib/ansible/plugins/terminal/junos.py b/lib/ansible/plugins/terminal/junos.py
+index 620aaf66a5..451f251c44 100644
+--- a/lib/ansible/plugins/terminal/junos.py
++++ b/lib/ansible/plugins/terminal/junos.py
+@@ -54,10 +54,3 @@ class TerminalModule(TerminalBase):
+                 self._exec_cli_command(c)
+         except AnsibleConnectionFailure:
+             raise AnsibleConnectionFailure('unable to set terminal parameters')
+-
+-    @staticmethod
+-    def guess_network_os(conn):
+-        stdin, stdout, stderr = conn.exec_command('show version')
+-        if 'Junos' in stdout.read():
+-            return 'junos'
+-
+diff --git a/test/compile/python2.4-skip.txt b/test/compile/python2.4-skip.txt
+index 2b806b5d95..7910c72963 100644
+--- a/test/compile/python2.4-skip.txt
++++ b/test/compile/python2.4-skip.txt
+@@ -18,6 +18,7 @@
+ /lib/ansible/modules/remote_management/foreman/
+ /lib/ansible/modules/monitoring/zabbix.*.py
+ /lib/ansible/modules/network/avi/
++/lib/ansible/modules/network/junos/
+ /lib/ansible/modules/network/f5/
+ /lib/ansible/modules/network/nmcli.py
+ /lib/ansible/modules/notification/pushbullet.py
+diff --git a/test/units/modules/network/junos/fixtures/output/show_version.text b/test/units/modules/network/junos/fixtures/junos_command_show_version.txt
+similarity index 100%
+rename from test/units/modules/network/junos/fixtures/output/show_version.text
+rename to test/units/modules/network/junos/fixtures/junos_command_show_version.txt
+diff --git a/test/units/modules/network/junos/junos_module.py b/test/units/modules/network/junos/junos_module.py
+new file mode 100644
+index 0000000000..0edbff24d8
+--- /dev/null
++++ b/test/units/modules/network/junos/junos_module.py
+@@ -0,0 +1,122 @@
++# (c) 2016 Red Hat Inc.
++#
++# This file is part of Ansible
++#
++# Ansible is free software: you can redistribute it and/or modify
++# it under the terms of the GNU General Public License as published by
++# the Free Software Foundation, either version 3 of the License, or
++# (at your option) any later version.
++#
++# Ansible is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU General Public License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
++
++# Make coding more python3-ish
++from __future__ import (absolute_import, division, print_function)
++__metaclass__ = type
++
++import os
++import json
++import sys
++
++from ansible.compat.tests import unittest
++from ansible.compat.tests.mock import patch, Mock
++from ansible.module_utils import basic
++from ansible.module_utils._text import to_bytes
++
++
++def set_module_args(args):
++    args = json.dumps({'ANSIBLE_MODULE_ARGS': args})
++    basic._ANSIBLE_ARGS = to_bytes(args)
++
++fixture_path = os.path.join(os.path.dirname(__file__), 'fixtures')
++fixture_data = {}
++
++def load_fixture(name):
++    path = os.path.join(fixture_path, name)
++
++    if path in fixture_data:
++        return fixture_data[path]
++
++    with open(path) as f:
++        data = f.read()
++
++    try:
++        data = json.loads(data)
++    except:
++        pass
++
++    fixture_data[path] = data
++    return data
++
++class AnsibleExitJson(Exception):
++    pass
++
++class AnsibleFailJson(Exception):
++    pass
++
++
++mock_modules = {
++    'ncclient': Mock(),
++    'ncclient.xml_': Mock()
++}
++patch_import = patch.dict('sys.modules', mock_modules)
++patch_import.start()
++
++
++class TestJunosModule(unittest.TestCase):
++
++    def execute_module(self, failed=False, changed=False, commands=None,
++            sort=True, defaults=False):
++
++        self.load_fixtures(commands)
++
++        if failed:
++            result = self.failed()
++            self.assertTrue(result['failed'], result)
++        else:
++            result = self.changed(changed)
++            self.assertEqual(result['changed'], changed, result)
++
++        if commands:
++            if sort:
++                self.assertEqual(sorted(commands), sorted(result['commands']), result['commands'])
++            else:
++                self.assertEqual(commands, result['commands'], result['commands'])
++
++        return result
++
++    def failed(self):
++        def fail_json(*args, **kwargs):
++            kwargs['failed'] = True
++            raise AnsibleFailJson(kwargs)
++
++        with patch.object(basic.AnsibleModule, 'fail_json', fail_json):
++            with self.assertRaises(AnsibleFailJson) as exc:
++                self.module.main()
++
++        result = exc.exception.args[0]
++        self.assertTrue(result['failed'], result)
++        return result
++
++    def changed(self, changed=False):
++        def exit_json(*args, **kwargs):
++            if 'changed' not in kwargs:
++                kwargs['changed'] = False
++            raise AnsibleExitJson(kwargs)
++
++        with patch.object(basic.AnsibleModule, 'exit_json', exit_json):
++            with self.assertRaises(AnsibleExitJson) as exc:
++                self.module.main()
++
++        result = exc.exception.args[0]
++        self.assertEqual(result['changed'], changed, result)
++        return result
++
++    def load_fixtures(self, commands=None):
++        pass
++
+diff --git a/test/units/modules/network/junos/test_junos_command.py b/test/units/modules/network/junos/test_junos_command.py
+index 103fc9e103..5907371c44 100644
+--- a/test/units/modules/network/junos/test_junos_command.py
++++ b/test/units/modules/network/junos/test_junos_command.py
+@@ -19,175 +19,87 @@
+ from __future__ import (absolute_import, division, print_function)
+ __metaclass__ = type
+ 
+-import os
+-import sys
+ import json
+-try:
+-    from StringIO import StringIO
+-except ImportError:
+-    from io import StringIO
+-
+-from ansible.compat.tests import unittest
+-from ansible.compat.tests.mock import patch, MagicMock
+-from ansible.module_utils import basic
+-from ansible.module_utils._text import to_bytes
+-
+-jnpr_mock = MagicMock()
+-jxmlease_mock = MagicMock()
+-modules = {
+-    'jnpr': jnpr_mock,
+-    'jnpr.junos': jnpr_mock.junos,
+-    'jnpr.junos.utils': jnpr_mock.junos.utils,
+-    'jnpr.junos.utils.config': jnpr_mock.junos.utils.config,
+-    'jnpr.junos.version': jnpr_mock.junos.version,
+-    'jnpr.junos.exception': jnpr_mock.junos.execption,
+-    'jxmlease': jxmlease_mock
+-}
+-setattr(jnpr_mock.junos.version, 'VERSION', '2.0.0')
+-module_patcher = patch.dict('sys.modules', modules)
+-module_patcher.start()
+ 
+-from ansible.modules.network.junos import junos_command
+-
+-
+-def set_module_args(args):
+-    args = json.dumps({'ANSIBLE_MODULE_ARGS': args})
+-    basic._ANSIBLE_ARGS = to_bytes(args)
+-
+-fixture_path = os.path.join(os.path.dirname(__file__), 'fixtures')
+-fixture_data = {}
+-
+-
+-def load_fixture(name):
+-    path = os.path.join(fixture_path, name)
++from ansible.compat.tests.mock import patch
++from .junos_module import TestJunosModule, load_fixture, set_module_args
+ 
+-    if path in fixture_data:
+-        return fixture_data[path]
+-
+-    with open(path) as f:
+-        data = f.read()
+-
+-    try:
+-        data = json.loads(data)
+-    except:
+-        pass
+-
+-    fixture_data[path] = data
+-    return data
++from ansible.modules.network.junos import junos_command
+ 
+-rpc_command_map = {
+-    'get_software_information': 'show version'
+-}
+ 
++class TestJunosCommandModule(TestJunosModule):
+ 
+-class test_junosCommandModule(unittest.TestCase):
++    module = junos_command
+ 
+     def setUp(self):
+-        self.mock_run_commands = patch('ansible.module_utils.junos.Netconf.run_commands')
++        self.mock_run_commands = patch('ansible.modules.network.junos.junos_command.run_commands')
+         self.run_commands = self.mock_run_commands.start()
+ 
+-        self.mock_connect = patch('ansible.module_utils.junos.Netconf.connect')
+-        self.mock_connect.start()
+-
+-        self.saved_stdout = sys.stdout
+-
+     def tearDown(self):
+         self.mock_run_commands.stop()
+-        self.mock_connect.stop()
+-        sys.stdout = self.saved_stdout
+ 
+-    def execute_module(self, failed=False, changed=False, fmt='text', cmd_type='commands'):
++    def load_fixtures(self, commands=None):
+ 
+         def load_from_file(*args, **kwargs):
+-            commands = args[0]
++            module, commands = args
+             output = list()
+ 
+             for item in commands:
+                 try:
+-                    obj = json.loads(str(item))
++                    obj = json.loads(item['command'])
+                     command = obj['command']
+                 except ValueError:
+-                    command = item
+-                if cmd_type == 'rpcs':
+-                    command = rpc_command_map[str(command)]
+-                filename = os.path.join('output',
+-                                        str(command).replace(' ', '_') + '.{0}'.format(fmt))
++                    command = item['command']
++                filename = 'junos_command_%s.txt' % str(command).replace(' ', '_')
+                 output.append(load_fixture(filename))
+-
+             return output
+ 
+         self.run_commands.side_effect = load_from_file
+-        out = StringIO()
+-        sys.stdout = out
+-
+-        with self.assertRaises(SystemExit):
+-            junos_command.main()
+-
+-        result = json.loads(out.getvalue().strip())
+-        if failed:
+-            self.assertTrue(result.get('failed'))
+-        else:
+-            self.assertEqual(result.get('changed'), changed, result)
+-
+-        return result
+ 
+     def test_junos_command_format_text(self):
+-        set_module_args(dict(commands=['show version'], host='test', format='text'))
++        set_module_args(dict(commands=['show version'], display='text'))
+         result = self.execute_module()
+         self.assertEqual(len(result['stdout']), 1)
+         self.assertTrue(result['stdout'][0].startswith('Hostname'))
+ 
+     def test_junos_command_multiple(self):
+-        set_module_args(dict(commands=['show version', 'show version'], host='test', format='text'))
++        set_module_args(dict(commands=['show version', 'show version'], display='text'))
+         result = self.execute_module()
+         self.assertEqual(len(result['stdout']), 2)
+         self.assertTrue(result['stdout'][0].startswith('Hostname'))
+ 
+     def test_junos_command_wait_for(self):
+         wait_for = 'result[0] contains "Hostname"'
+-        set_module_args(dict(commands=['show version'], host='test', wait_for=wait_for, format='text'))
++        set_module_args(dict(commands=['show version'], wait_for=wait_for, display='text'))
+         self.execute_module()
+ 
+     def test_junos_command_wait_for_fails(self):
+         wait_for = 'result[0] contains "test string"'
+-        set_module_args(dict(commands=['show version'], host='test', wait_for=wait_for, format='text'))
++        set_module_args(dict(commands=['show version'], wait_for=wait_for, display='text'))
+         self.execute_module(failed=True)
+         self.assertEqual(self.run_commands.call_count, 10)
+ 
+     def test_junos_command_retries(self):
+         wait_for = 'result[0] contains "test string"'
+-        set_module_args(dict(commands=['show version'], host='test', wait_for=wait_for, retries=2, format='text'))
++        set_module_args(dict(commands=['show version'], wait_for=wait_for, retries=2, display='text'))
+         self.execute_module(failed=True)
+         self.assertEqual(self.run_commands.call_count, 2)
+ 
+     def test_junos_command_match_any(self):
+         wait_for = ['result[0] contains "Hostname"',
+                     'result[0] contains "test string"']
+-        set_module_args(dict(commands=['show version'], host='test', wait_for=wait_for, match='any', format='text'))
++        set_module_args(dict(commands=['show version'], wait_for=wait_for, match='any', display='text'))
+         self.execute_module()
+ 
+     def test_junos_command_match_all(self):
+         wait_for = ['result[0] contains "Hostname"',
+                     'result[0] contains "Model"']
+-        set_module_args(dict(commands=['show version'], host='test', wait_for=wait_for, match='all', format='text'))
++        set_module_args(dict(commands=['show version'], wait_for=wait_for, match='all', display='text'))
+         self.execute_module()
+ 
+     def test_junos_command_match_all_failure(self):
+         wait_for = ['result[0] contains "Hostname"',
+                     'result[0] contains "test string"']
+         commands = ['show version', 'show version']
+-        set_module_args(dict(commands=commands, host='test', wait_for=wait_for, match='all', format='text'))
++        set_module_args(dict(commands=commands, wait_for=wait_for, match='all', display='text'))
+         self.execute_module(failed=True)
+-
+-    def test_junos_command_rpc_format_text(self):
+-        set_module_args(dict(rpcs=['get_software_information'], host='test', format='text'))
+-        result = self.execute_module(fmt='text', cmd_type='rpcs')
+-        self.assertEqual(len(result['stdout']), 1)
+-        self.assertTrue(result['stdout'][0].startswith('Hostname'))
+-
+-    def test_junos_command_rpc_format_text_multiple(self):
+-        set_module_args(dict(commands=['get_software_information', 'get_software_information'], host='test',
+-                             format='text'))
+-        result = self.execute_module(cmd_type='rpcs')
+-        self.assertEqual(len(result['stdout']), 2)
+-        self.assertTrue(result['stdout'][0].startswith('Hostname'))

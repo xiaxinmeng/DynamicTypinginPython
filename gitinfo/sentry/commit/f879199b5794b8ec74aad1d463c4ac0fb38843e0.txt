@@ -1,0 +1,858 @@
+commit f879199b5794b8ec74aad1d463c4ac0fb38843e0
+Author: MeredithAnya <meredith.a.heller@gmail.com>
+Date:   Wed May 13 09:57:55 2020 -0700
+
+    feat(slack-migration): Slack reauthorization flow (#18740)
+    
+    * add steps to slack pipeline
+
+diff --git a/src/sentry/integrations/pipeline.py b/src/sentry/integrations/pipeline.py
+index 44172af3ae..7b29868915 100644
+--- a/src/sentry/integrations/pipeline.py
++++ b/src/sentry/integrations/pipeline.py
+@@ -51,6 +51,8 @@ class IntegrationPipeline(Pipeline):
+             return self.error(six.text_type(e))
+ 
+         response = self._finish_pipeline(data)
++        # TODO: pass in the post_install_data to be able to make the requests
++        # to Slack
+         self.provider.post_install(self.integration, self.organization)
+         self.clear_session()
+         return response
+@@ -62,7 +64,11 @@ class IntegrationPipeline(Pipeline):
+             )
+             self.integration.update(external_id=data["external_id"], status=ObjectStatus.VISIBLE)
+             self.integration.get_installation(self.organization.id).reinstall()
+-
++        if "integration_id" in data:
++            self.integration = Integration.objects.get(
++                provider=self.provider.integration_key, id=data["integration_id"]
++            )
++            self.integration.reauthorize(data)
+         elif "expect_exists" in data:
+             self.integration = Integration.objects.get(
+                 provider=self.provider.integration_key, external_id=data["external_id"]
+diff --git a/src/sentry/integrations/slack/integration.py b/src/sentry/integrations/slack/integration.py
+index 39699d8269..9f099711b3 100644
+--- a/src/sentry/integrations/slack/integration.py
++++ b/src/sentry/integrations/slack/integration.py
+@@ -2,6 +2,7 @@ from __future__ import absolute_import
+ 
+ import six
+ 
++from collections import namedtuple, defaultdict
+ from django.utils.translation import ugettext_lazy as _
+ 
+ from sentry.identity.pipeline import IdentityProviderPipeline
+@@ -12,13 +13,20 @@ from sentry.integrations import (
+     FeatureDescription,
+     IntegrationInstallation,
+ )
+-from sentry.pipeline import NestedPipelineView
++
++from sentry.models import Integration, Rule, RuleStatus
++from sentry.pipeline import NestedPipelineView, PipelineView
+ from sentry.utils.http import absolute_uri
+ from sentry.shared_integrations.exceptions import ApiError, IntegrationError
+ 
+ from .client import SlackClient
+ from .utils import logger
+ 
++from sentry.web.helpers import render_to_response
++
++
++Channel = namedtuple("Channel", ["name", "id"])
++
+ DESCRIPTION = """
+ Connect your Sentry organization to one or more Slack workspaces, and start
+ getting errors right in front of you where all the action happens in your
+@@ -110,7 +118,7 @@ class SlackIntegrationProvider(IntegrationProvider):
+             config=identity_pipeline_config,
+         )
+ 
+-        return [identity_pipeline_view]
++        return [SlackReAuthIntro(), SlackReAuthChannels(), identity_pipeline_view]
+ 
+     def get_team_info(self, access_token):
+         payload = {"token": access_token}
+@@ -146,7 +154,7 @@ class SlackIntegrationProvider(IntegrationProvider):
+             "installation_type": "born_as_bot",
+         }
+ 
+-        return {
++        integration = {
+             "name": team_name,
+             "external_id": team_id,
+             "metadata": metadata,
+@@ -157,3 +165,164 @@ class SlackIntegrationProvider(IntegrationProvider):
+                 "data": {},
+             },
+         }
++
++        # if we have the integration_id then we need to set the
++        # information for the migration, the user_id and channels
++        # are using in post_install to send messages to slack
++        if state.get("integration_id"):
++            metadata["installation_type"] = "migrated_to_bot"
++
++            post_install_data = {
++                "user_id": state["user_id"],
++                "channels": state["private_channels"],
++            }
++
++            integration["integration_id"] = state.get("integration_id")
++            integration["post_install_data"] = post_install_data
++
++        return integration
++
++
++class SlackReAuthIntro(PipelineView):
++    """
++        This pipeline step handles rendering the migration
++        intro with context about the migration.
++
++        If the `integration_id` is not present in the request
++        then we can fast forward through the pipeline to move
++        on to installing the integration as normal.
++
++    """
++
++    def dispatch(self, request, pipeline):
++        if "integration_id" in request.GET:
++            pipeline.bind_state("integration_id", request.GET["integration_id"])
++            pipeline.bind_state("user_id", request.user.id)
++
++            try:
++                all_channels = _get_channels_from_rules(pipeline)
++            except IntegrationError as error:
++                return pipeline.error(error)
++
++            pipeline.bind_state("all_channels", all_channels)
++
++            next_param = "?show_verification_results"
++
++            return render_to_response(
++                template="sentry/integrations/slack-reauth-introduction.html",
++                context={
++                    "next_url": "%s%s" % (absolute_uri("/extensions/slack/setup/"), next_param),
++                },
++                request=request,
++            )
++
++        if "show_verification_results" in request.GET:
++            return pipeline.next_step()
++
++        # if we dont have the integration_id we dont care about the
++        # migration path, skip straight to install
++        pipeline.state.step_index = 2
++        return pipeline.current_step()
++
++
++class SlackReAuthChannels(PipelineView):
++    """
++        This pipeline step handles making requests to Slack and
++        displaying the channels (if any) that are problematic:
++
++        1. private
++        2. removed
++        3. unauthorized
++
++        Any private channels in alert rules will also be binded
++        to the pipeline state to be used later.
++
++    """
++
++    def dispatch(self, request, pipeline):
++        if "start_migration" in request.GET:
++            return pipeline.next_step()
++
++        next_url_param = "?start_migration"
++
++        try:
++            channels = _request_channel_info(pipeline)
++        except IntegrationError as error:
++            return pipeline.error(error)
++
++        return render_to_response(
++            template="sentry/integrations/slack-reauth-details.html",
++            context={
++                "next_url": "%s%s" % (absolute_uri("/extensions/slack/setup/"), next_url_param),
++                "private": channels["private"],
++                "no_permission": channels["no_permission"],
++                "not_found": channels["channel_not_found"],
++            },
++            request=request,
++        )
++
++
++def _request_channel_info(pipeline):
++    channels = pipeline.fetch_state("all_channels")
++    integration_id = pipeline.fetch_state("integration_id")
++
++    try:
++        integration = Integration.objects.get(id=integration_id, provider="slack",)
++    except Integration.DoesNotExist:
++        raise IntegrationError("Could not find Slack integration.")
++
++    channel_responses = defaultdict(lambda: set())
++    for channel in channels:
++        payload = {
++            "token": integration.metadata["access_token"],
++            "channel": channel["id"],
++        }
++        client = SlackClient()
++        try:
++            resp = client.post("/conversations.info", data=payload)
++            # TODO(meredith): subclass the ApiError and make a SlackApiError so we can
++            # reraise the other errors
++        except ApiError as e:
++            # adds the channel to our dict grouped by the error message which could
++            # be any of the following found under the 'errors' section found in
++            # https://api.slack.com/methods/conversations.list
++            channel_responses[e].add(Channel(channel["name"], channel["id"]))
++            continue
++
++        if resp["channel"]["is_private"]:
++            channel_responses["private"].add(Channel(channel["name"], channel["id"]))
++
++    pipeline.bind_state("private_channels", channel_responses["private"])
++    return channel_responses
++
++
++def _get_channels_from_rules(pipeline):
++    organization = pipeline.organization
++    integration_id = pipeline.fetch_state("integration_id")
++
++    try:
++        integration = Integration.objects.get(id=integration_id, provider="slack",)
++    except Integration.DoesNotExist:
++        raise IntegrationError("Could not find Slack integration.")
++
++    rules = Rule.objects.filter(
++        project__in=organization.project_set.all(), status=RuleStatus.ACTIVE,
++    )
++
++    channels = set()
++    for rule in rules:
++        # try and see if its used for slack
++        for rule_action in rule.data["actions"]:
++            rule_integration_id = rule_action.get("workspace")
++            if rule_integration_id and rule_integration_id == six.text_type(integration.id):
++
++                channel_id = rule_action["channel_id"]
++                channel_name = rule_action["channel"]
++
++                # don't care if its a user
++                if channel_name[0] == "@":
++                    continue
++
++                channels.add(Channel(channel_name, channel_id))
++
++    return channels
+diff --git a/src/sentry/models/integration.py b/src/sentry/models/integration.py
+index 029fa5758a..5ae172228f 100644
+--- a/src/sentry/models/integration.py
++++ b/src/sentry/models/integration.py
+@@ -147,3 +147,16 @@ class Integration(DefaultFieldsModel):
+             )
+ 
+             return org_integration
++
++    def reauthorize(self, data):
++        """
++        The structure of `data` depends on the `build_integration`
++        method on the integration provider.
++
++        Each provider may have their own way of reauthorizing the
++        integration.
++        """
++        if self.provider == "slack":
++            metadata = data.get("metadata", {})
++            metadata["old_access_token"] = self.metadata["access_token"]
++            self.update(metadata=metadata)
+diff --git a/src/sentry/static/sentry/app/views/organizationIntegrations/addIntegration.tsx b/src/sentry/static/sentry/app/views/organizationIntegrations/addIntegration.tsx
+index f7f57d526c..74668a4674 100644
+--- a/src/sentry/static/sentry/app/views/organizationIntegrations/addIntegration.tsx
++++ b/src/sentry/static/sentry/app/views/organizationIntegrations/addIntegration.tsx
+@@ -14,7 +14,7 @@ type Props = {
+   ) => React.ReactNode;
+   provider: IntegrationProvider;
+   onInstall: (data: Integration) => void;
+-  reinstallId?: string;
++  integrationId?: string;
+   account?: string;
+   organization?: Organization; //for analytics
+   analyticsParams?: {
+@@ -28,7 +28,7 @@ export default class AddIntegration extends React.Component<Props> {
+     children: PropTypes.func.isRequired,
+     provider: PropTypes.object.isRequired,
+     onInstall: PropTypes.func.isRequired,
+-    reinstallId: PropTypes.string,
++    integrationId: PropTypes.string,
+     account: PropTypes.string,
+     organization: SentryTypes.Organization,
+   };
+@@ -86,8 +86,8 @@ export default class AddIntegration extends React.Component<Props> {
+ 
+     const query: {[key: string]: string} = {...urlParams};
+ 
+-    if (this.props.reinstallId) {
+-      query.reinstall_id = this.props.reinstallId;
++    if (this.props.integrationId) {
++      query.integration_id = this.props.integrationId;
+     }
+ 
+     if (this.props.account) {
+diff --git a/src/sentry/static/sentry/app/views/organizationIntegrations/addIntegrationButton.tsx b/src/sentry/static/sentry/app/views/organizationIntegrations/addIntegrationButton.tsx
+index d04f3002c1..8528b58a56 100644
+--- a/src/sentry/static/sentry/app/views/organizationIntegrations/addIntegrationButton.tsx
++++ b/src/sentry/static/sentry/app/views/organizationIntegrations/addIntegrationButton.tsx
+@@ -11,6 +11,7 @@ type Props = {
+   onAddIntegration: (data: Integration) => void;
+   buttonText?: string;
+   reinstall?: boolean;
++  integrationId?: string;
+   organization?: Organization; //for analytics
+   analyticsParams?: {
+     view: 'integrations_directory_integration_detail';
+@@ -26,6 +27,7 @@ export default class AddIntegrationButton extends React.Component<Props> {
+       onAddIntegration,
+       organization,
+       reinstall,
++      integrationId,
+       analyticsParams,
+       ...buttonProps
+     } = this.props;
+@@ -43,6 +45,7 @@ export default class AddIntegrationButton extends React.Component<Props> {
+           onInstall={onAddIntegration}
+           organization={organization}
+           analyticsParams={analyticsParams}
++          integrationId={integrationId}
+         >
+           {onClick => (
+             <Button
+diff --git a/src/sentry/static/sentry/app/views/organizationIntegrations/installedIntegration.tsx b/src/sentry/static/sentry/app/views/organizationIntegrations/installedIntegration.tsx
+index 91358e3eda..51e38bf6ec 100644
+--- a/src/sentry/static/sentry/app/views/organizationIntegrations/installedIntegration.tsx
++++ b/src/sentry/static/sentry/app/views/organizationIntegrations/installedIntegration.tsx
+@@ -14,6 +14,7 @@ import CircleIndicator from 'app/components/circleIndicator';
+ import theme from 'app/utils/theme';
+ import space from 'app/styles/space';
+ import {IconDelete, IconSettings, IconWarning} from 'app/icons';
++import AddIntegrationButton from 'app/views/organizationIntegrations/addIntegrationButton';
+ 
+ const CONFIGURABLE_FEATURES = ['commits', 'alert-rule'];
+ 
+@@ -153,14 +154,17 @@ export default class InstalledIntegration extends React.Component<Props> {
+                     'You must be an organization owner, manager or admin to re-authenticate'
+                   )}
+                 >
+-                  <Button
++                  <AddIntegrationButton
+                     disabled={!hasAccess}
++                    provider={provider}
++                    // TODO: actually pass in an onInstall function
++                    onAddIntegration={() => {}}
++                    integrationId={integration.id}
+                     priority="primary"
+                     size="small"
++                    buttonText={t('Re-authenticate Now')}
+                     icon={<IconWarning size="sm" />}
+-                  >
+-                    {t('Re-authenticate Now')}
+-                  </Button>
++                  />
+                 </Tooltip>
+               )}
+               <Tooltip
+diff --git a/src/sentry/templates/sentry/integrations/slack-reauth-details.html b/src/sentry/templates/sentry/integrations/slack-reauth-details.html
+new file mode 100644
+index 0000000000..11dd690d0d
+--- /dev/null
++++ b/src/sentry/templates/sentry/integrations/slack-reauth-details.html
+@@ -0,0 +1,95 @@
++{% extends "sentry/bases/modal.html" %}
++{% load crispy_forms_tags %}
++{% load sentry_assets %}
++{% load i18n %}
++
++{% block wrapperclass %}narrow auth{% endblock %}
++{% block modal_header_signout %}{% endblock %}
++
++
++{% block title %}{% trans "Slack Migration" %} | {{ block.super }}{% endblock %}
++
++{% block css %}
++  <style>
++    li {
++        list-style-type: none;
++        margin: 5px;
++    }
++    .channel-name {
++        margin-left: 10px;
++    }
++    div {
++        padding:10px 0px;
++    }
++    h6 {
++        margin: 0px 5px;
++    }
++    .section-info {
++        font-size: 90%;
++        margin-top: 5px;
++    }
++    .private :last-child {
++        margin-top: 20px;
++    }
++  </style>
++
++
++{% endblock %}
++
++
++{% block main %}
++    <h3>Authorize New Sentry Slack App</h3>
++    <div class="private">
++        {% if private %}
++            <strong>We've found some private channels being used in your alert rules:</strong>
++            <p class="section-info">
++                {% blocktrans %}
++                    What does this mean? Am I doomed? No, you're not doomed. All this means is that once you're done
++                    authorizing the new Slack app, you'll need to add the Sentry bot to each of these channels to
++                    ensure that the bot has access to alert you about your Sentry errors!
++                {% endblocktrans %}
++            </p>
++            {% for channel in private %}
++                <li class="channel-name">{{channel.name}} </li>
++            {% endfor %}
++            <p class="section-info">
++                {% blocktrans %}
++                    What if I forget what channels are used the moment I leave this screen? Don't worry, after the
++                    authentication step, we'll send your private channels one last message from the legacy app, reminding
++                    you to add the new Sentry bot.
++                {% endblocktrans %}
++            </p>
++        {% endif %}
++
++    </div>
++
++    <div>
++        {% if no_permission %}
++            <strong>Missing or Unauthorized Channels</strong>
++            <p class="section-info">
++                {% trans "These channels were found to be missing or unauthorized by the current Slack integration. If they are private channels, you'll have make sure to add the Sentry bot to the channels after migration. Otherwise you may want update your alert rules to use a different channel." %}
++            </p>
++        {% endif %}
++        {% for channel in no_permission %}
++            <li class="channel-name">{{channel.name}} </li>
++        {% endfor %}
++        {% for channel in not_found %}
++            <li class="channel-name">{{channel.name}} </li>
++        {% endfor %}
++    </div>
++
++    <div>
++        {% if not private and not no_permission and not not_found %}
++        <h6><strong>Next Steps</strong></h6>
++            <p class="section-info"> You are good to go! Click "Next" to start the re-authentication flow!</p>
++        {% endif %}
++
++
++    </div>
++
++    <div class="form-actions clearfix">
++        <div class="pull-right">
++            <a class="btn btn-primary" href="{{ next_url }}">{% trans "Start Authorization" %}</a>
++        </div>
++    </div>
++{% endblock %}
+diff --git a/src/sentry/templates/sentry/integrations/slack-reauth-introduction.html b/src/sentry/templates/sentry/integrations/slack-reauth-introduction.html
+new file mode 100644
+index 0000000000..e86a1c8039
+--- /dev/null
++++ b/src/sentry/templates/sentry/integrations/slack-reauth-introduction.html
+@@ -0,0 +1,120 @@
++{% extends "sentry/bases/modal.html" %}
++{% load crispy_forms_tags %}
++{% load sentry_assets %}
++{% load i18n %}
++
++{% block wrapperclass %}narrow auth{% endblock %}
++{% block modal_header_signout %}{% endblock %}
++
++{% block title %}{% trans "Slack Migration" %} | {{ block.super }}{% endblock %}
++
++{% block css %}
++  <style>
++    li {
++        list-style-type: none;
++    }
++    .channel-name {
++        margin-left: 20px;
++        font-size: 80%;
++    }
++    div {
++        padding:10px 0px;
++    }
++    h6 {
++        margin-bottom:3px;
++    }
++    .section-info {
++        font-size: 80%;
++    }
++    .loader, .loader:after {
++        border-radius: 50%;
++        width: 10em;
++        height: 10em;
++    }
++    .loader {
++        margin: 60px auto;
++        font-size: 10px;
++        position: relative;
++        text-indent: -9999em;
++        border-top: 1.1em solid rgba(70, 67, 67, 0.2);
++        border-right: 1.1em solid rgba(70, 67, 67, 0.2);
++        border-bottom: 1.1em solid rgba(70, 67, 67, 0.2);
++        border-left: 1.1em solid #494343;
++        -webkit-transform: translateZ(0);
++        -ms-transform: translateZ(0);
++        transform: translateZ(0);
++        -webkit-animation: load8 1.1s infinite linear;
++        animation: load8 1.1s infinite linear;
++    }
++    @-webkit-keyframes load8 {
++        0% {
++            -webkit-transform: rotate(0deg);
++            transform: rotate(0deg);
++        }
++        100% {
++            -webkit-transform: rotate(360deg);
++            transform: rotate(360deg);
++        }
++    }
++    @keyframes load8 {
++        0% {
++            -webkit-transform: rotate(0deg);
++            transform: rotate(0deg);
++        }
++        100% {
++            -webkit-transform: rotate(360deg);
++            transform: rotate(360deg);
++        }
++    }
++  </style>
++{% endblock %}
++
++{% block main %}
++<script>
++    function loading() {
++        document.getElementById("loader").setAttribute("class", "loader");
++    };
++</script>
++    <h3>Authorize New Sentry Slack App</h3>
++
++    <h5>Moving Off Slack's Legacy Workspace Apps</h5>
++    <strong>Was it worth it? When we work(space)d it.</strong>
++    <strong>We put our code down, flip it and reverse it.</strong>
++    <p>
++        {% blocktrans %}
++            Slack has deprecated their workspace apps which our integration
++            was previously built on. But not to worry, Sentry has built a new Slack app,
++            and a path for you to upgrade to this new app! In order to continue using
++            the Slack integration and your existing configuration, you will need to
++            authorize the new app in upcoming steps.
++        {% endblocktrans %}
++    </p>
++    <p>{% trans "If you want more details about the move, please visit our docs" %}</p>
++
++    <h5>Existing Alert Rule Configurations</h5>
++    <strong>We (may) interrupt your regularly scheduled programming...</strong>
++    <p>
++        {% blocktrans %}
++            If you aren't using any private channels in your alert rules, authorizing
++            the new Slack app will be all you need to do. However, if you <strong>do</strong>
++            have any private channels in your rule configurations, you'll have one extra
++            step after authorizing the new Slack app.
++        {% endblocktrans %}
++    </p>
++
++    <p>
++        {% blocktrans %}
++            But how do I know what channels are being used? Good question! This next step will
++            audit your alert rules to see if there are any private channels that require
++            attention after authenticating. Please note that if you have a high number
++            of slack channels in your alert rules this could take a hot minute...
++         {% endblocktrans %}
++     </p>
++
++    <div id="loader"></div>
++    <div class="form-actions clearfix">
++        <div class="pull-right">
++            <a class="btn btn-primary" onclick="loading()" href="{{ next_url }}">{% trans "Continue" %}</a>
++        </div>
++    </div>
++{% endblock %}
+diff --git a/src/sentry/testutils/factories.py b/src/sentry/testutils/factories.py
+index d24b65fe06..a623a42b40 100644
+--- a/src/sentry/testutils/factories.py
++++ b/src/sentry/testutils/factories.py
+@@ -69,6 +69,7 @@ from sentry.models import (
+     ExternalIssue,
+     GroupLink,
+     ReleaseFile,
++    Rule,
+ )
+ from sentry.models.integrationfeature import Feature, IntegrationFeature
+ from sentry.signals import project_created
+@@ -298,6 +299,47 @@ class Factories(object):
+     def create_project_bookmark(project, user):
+         return ProjectBookmark.objects.create(project_id=project.id, user=user)
+ 
++    @staticmethod
++    def create_project_rule(project, action_data=None, condition_data=None):
++        action_data = action_data or [
++            {
++                "id": "sentry.rules.actions.notify_event.NotifyEventAction",
++                "name": "Send a notification (for all legacy integrations)",
++            },
++            {
++                "id": "sentry.rules.actions.notify_event_service.NotifyEventServiceAction",
++                "service": "mail",
++                "name": "Send a notification via mail",
++            },
++        ]
++        condition_data = condition_data or [
++            {
++                "id": "sentry.rules.conditions.first_seen_event.FirstSeenEventCondition",
++                "name": "An issue is first seen",
++            },
++            {
++                "id": "sentry.rules.conditions.every_event.EveryEventCondition",
++                "name": "An event is seen",
++            },
++        ]
++        return Rule.objects.create(
++            project=project,
++            data={"conditions": condition_data, "actions": action_data, "action_match": "all"},
++        )
++
++    @staticmethod
++    def create_slack_project_rule(project, integration_id, channel_id=None, channel_name=None):
++        action_data = [
++            {
++                "id": "sentry.rules.actions.notify_event.SlackNotifyServiceAction",
++                "name": "Send a Slack notification",
++                "workspace": integration_id,
++                "channel_id": channel_id or "123453",
++                "channel": channel_name or "#general",
++            },
++        ]
++        return Factories.create_project_rule(project, action_data)
++
+     @staticmethod
+     def create_project_key(project):
+         return project.key_set.get_or_create()[0]
+diff --git a/src/sentry/testutils/fixtures.py b/src/sentry/testutils/fixtures.py
+index 5eba13670a..c18bb825c1 100644
+--- a/src/sentry/testutils/fixtures.py
++++ b/src/sentry/testutils/fixtures.py
+@@ -111,6 +111,33 @@ class Fixtures(object):
+             project = self.project
+         return Factories.create_project_key(project=project, *args, **kwargs)
+ 
++    def create_project_rule(
++        self, project=None, action_match=None, condition_match=None, *args, **kwargs
++    ):
++        if project is None:
++            project = self.project
++        return Factories.create_project_rule(
++            project=project,
++            action_match=action_match,
++            condition_match=condition_match,
++            *args,
++            **kwargs
++        )
++
++    def create_slack_project_rule(
++        self, project=None, integration_id=None, channel_id=None, channel_name=None, *args, **kwargs
++    ):
++        if project is None:
++            project = self.project
++        return Factories.create_slack_project_rule(
++            project,
++            integration_id=integration_id,
++            channel_id=channel_id,
++            channel_name=channel_name,
++            *args,
++            **kwargs
++        )
++
+     def create_release(self, project=None, user=None, *args, **kwargs):
+         if project is None:
+             project = self.project
+diff --git a/tests/sentry/integrations/slack/test_migration_flow.py b/tests/sentry/integrations/slack/test_migration_flow.py
+new file mode 100644
+index 0000000000..2bee8ac80b
+--- /dev/null
++++ b/tests/sentry/integrations/slack/test_migration_flow.py
+@@ -0,0 +1,160 @@
++from __future__ import absolute_import
++
++import responses
++import six
++
++from six.moves.urllib.parse import parse_qs, urlencode, urlparse
++
++from sentry.integrations.slack import SlackIntegrationProvider
++from sentry.models import (
++    Identity,
++    IdentityProvider,
++    IdentityStatus,
++    Integration,
++    OrganizationIntegration,
++)
++from sentry.testutils import IntegrationTestCase
++
++
++class SlackMigrationTest(IntegrationTestCase):
++    provider = SlackIntegrationProvider
++
++    def setUp(self):
++        super(SlackMigrationTest, self).setUp()
++        self.team = self.create_team(
++            organization=self.organization, name="Go Team", members=[self.user]
++        )
++        self.project = self.create_project(
++            organization=self.organization, teams=[self.team], name="Bengal"
++        )
++        self.integration = Integration.objects.create(
++            name="Example",
++            provider="slack",
++            external_id="TXXXXXXX1",
++            metadata={"access_token": "xoxa-xxxxxxxxx-xxxxxxxxxx-xxxxxxxxxxxx"},
++        )
++        OrganizationIntegration.objects.create(
++            organization=self.organization, integration=self.integration
++        )
++        self.rule = self.create_slack_project_rule(
++            project=self.project,
++            integration_id=six.text_type(self.integration.id),
++            channel_id="XXXXX",
++        )
++        self.init_path_verification_results = "%s%s" % (
++            self.setup_path,
++            "?show_verification_results",
++        )
++        self.init_path_channels = "%s%s" % (self.setup_path, "?start_migration")
++
++    def assert_setup_flow(
++        self,
++        team_id="TXXXXXXX1",
++        authorizing_user_id="UXXXXXXX1",
++        expected_client_id="slack-client-id",
++        expected_client_secret="slack-client-secret",
++    ):
++        responses.reset()
++
++        resp = self.client.get(
++            u"{}?{}".format(self.init_path, urlencode({"integration_id": self.integration.id}))
++        )
++        assert resp.status_code == 200
++
++        responses.add(
++            responses.POST,
++            "https://slack.com/api/conversations.info",
++            json={"ok": True, "channel": {"is_private": True}},
++        )
++        resp = self.client.get(self.init_path_verification_results)
++        assert resp.status_code == 200
++        resp = self.client.get(self.init_path_channels)
++        assert resp.status_code == 302
++
++        redirect = urlparse(resp["Location"])
++        assert redirect.scheme == "https"
++        assert redirect.netloc == "slack.com"
++        assert redirect.path == "/oauth/v2/authorize"
++        params = parse_qs(redirect.query)
++        scopes = self.provider.identity_oauth_scopes
++        assert params["scope"] == [" ".join(scopes)]
++        assert params["state"]
++        assert params["redirect_uri"] == ["http://testserver/extensions/slack/setup/"]
++        assert params["response_type"] == ["code"]
++        assert params["client_id"] == [expected_client_id]
++
++        assert params.get("user_scope") == ["links:read"]
++        # once we've asserted on it, switch to a singular values to make life
++        # easier
++        authorize_params = {k: v[0] for k, v in six.iteritems(params)}
++
++        access_json = {
++            "ok": True,
++            "access_token": "xoxb-xxxxxxxxx-xxxxxxxxxx-xxxxxxxxxxxx",
++            "team": {"id": team_id, "name": "Example"},
++            "authed_user": {"id": authorizing_user_id},
++        }
++        responses.add(responses.POST, "https://slack.com/api/oauth.v2.access", json=access_json)
++
++        responses.add(
++            responses.GET,
++            "https://slack.com/api/team.info",
++            json={
++                "ok": True,
++                "team": {
++                    "domain": "test-slack-workspace",
++                    "icon": {"image_132": "http://example.com/ws_icon.jpg"},
++                },
++            },
++        )
++
++        resp = self.client.get(
++            u"{}?{}".format(
++                self.setup_path,
++                urlencode({"code": "oauth-code", "state": authorize_params["state"]}),
++            )
++        )
++
++        mock_request = responses.calls[1].request
++        req_params = parse_qs(mock_request.body)
++        assert req_params["grant_type"] == ["authorization_code"]
++        assert req_params["code"] == ["oauth-code"]
++        assert req_params["redirect_uri"] == ["http://testserver/extensions/slack/setup/"]
++        assert req_params["client_id"] == [expected_client_id]
++        assert req_params["client_secret"] == [expected_client_secret]
++
++        assert resp.status_code == 200
++        self.assertDialogSuccess(resp)
++
++    @responses.activate
++    def test_migration_flow(self):
++        self.assert_setup_flow()
++
++        integration = Integration.objects.get(provider=self.provider.key)
++
++        assert integration.external_id == "TXXXXXXX1"
++        assert integration.name == "Example"
++        assert integration.metadata == {
++            "access_token": "xoxb-xxxxxxxxx-xxxxxxxxxx-xxxxxxxxxxxx",
++            "old_access_token": "xoxa-xxxxxxxxx-xxxxxxxxxx-xxxxxxxxxxxx",
++            "scopes": sorted(self.provider.identity_oauth_scopes),
++            "icon": "http://example.com/ws_icon.jpg",
++            "domain_name": "test-slack-workspace.slack.com",
++            "installation_type": "migrated_to_bot",
++        }
++
++        oi = OrganizationIntegration.objects.get(
++            integration=integration, organization=self.organization
++        )
++        assert oi.config == {}
++
++        idp = IdentityProvider.objects.get(type="slack", external_id="TXXXXXXX1")
++        identity = Identity.objects.get(idp=idp, user=self.user, external_id="UXXXXXXX1")
++        assert identity.status == IdentityStatus.VALID
++
++    def test_invalid_integration_id(self):
++        responses.reset()
++
++        resp = self.client.get(u"{}?{}".format(self.init_path, urlencode({"integration_id": -1})))
++        assert resp.status_code == 200
++        self.assertContains(resp, "Setup Error")

@@ -1,0 +1,354 @@
+commit 7a31fa2cabb0eec202f9a6c562cb711c1eef4333
+Author: Stephen Cefali <scefali@sentry.io>
+Date:   Fri Mar 27 12:36:59 2020 -0700
+
+    ref(ecosystem): reduce number of queries related to external issues (#17890)
+
+diff --git a/src/sentry/api/serializers/models/group.py b/src/sentry/api/serializers/models/group.py
+index 387c34789d..099cc47b68 100644
+--- a/src/sentry/api/serializers/models/group.py
++++ b/src/sentry/api/serializers/models/group.py
+@@ -5,6 +5,7 @@ from collections import defaultdict
+ from datetime import timedelta
+ 
+ import six
++import logging
+ 
+ from django.conf import settings
+ from django.db.models import Min, Q
+@@ -61,6 +62,14 @@ disabled = object()
+ snuba_tsdb = SnubaTSDB(**settings.SENTRY_TSDB_OPTIONS)
+ 
+ 
++logger = logging.getLogger(__name__)
++
++
++def merge_list_dictionaries(dict1, dict2):
++    for key, val in six.iteritems(dict2):
++        dict1.setdefault(key, []).extend(val)
++
++
+ class GroupSerializerBase(Serializer):
+     def _get_seen_stats(self, item_list, user):
+         """
+@@ -147,6 +156,8 @@ class GroupSerializerBase(Serializer):
+ 
+     def get_attrs(self, item_list, user):
+         from sentry.plugins.base import plugins
++        from sentry.integrations import IntegrationFeatures
++        from sentry.models import PlatformExternalIssue
+ 
+         GroupMeta.objects.populate_cache(item_list)
+ 
+@@ -226,10 +237,61 @@ class GroupSerializerBase(Serializer):
+ 
+         seen_stats = self._get_seen_stats(item_list, user)
+ 
++        annotations_by_group_id = defaultdict(list)
++
++        organization_id_list = list(set(item.project.organization_id for item in item_list))
++        # if no groups, then we can't proceed but this seems to be a valid use case
++        if not item_list:
++            return {}
++        if len(organization_id_list) > 1:
++            # this should never happen but if it does we should know about it
++            logger.warn(
++                u"Found multiple organizations for groups: %s, with orgs: %s"
++                % ([item.id for item in item_list], organization_id_list)
++            )
++
++        # should only have 1 org at this point
++        organization_id = organization_id_list[0]
++
++        # find all the integration installss that have issue tracking
++        for integration in Integration.objects.filter(organizations=organization_id):
++            if not (
++                integration.has_feature(IntegrationFeatures.ISSUE_BASIC)
++                or integration.has_feature(IntegrationFeatures.ISSUE_SYNC)
++            ):
++                continue
++
++            install = integration.get_installation(organization_id)
++            local_annotations_by_group_id = (
++                safe_execute(
++                    install.get_annotations_for_group_list,
++                    group_list=item_list,
++                    _with_transaction=False,
++                )
++                or {}
++            )
++            merge_list_dictionaries(annotations_by_group_id, local_annotations_by_group_id)
++
++        # find the external issues for sentry apps and add them in
++        local_annotations_by_group_id = (
++            safe_execute(
++                PlatformExternalIssue.get_annotations_for_group_list,
++                group_list=item_list,
++                _with_transaction=False,
++            )
++            or {}
++        )
++        merge_list_dictionaries(annotations_by_group_id, local_annotations_by_group_id)
++
+         for item in item_list:
+             active_date = item.active_at or item.first_seen
+ 
+             annotations = []
++            annotations.extend(annotations_by_group_id[item.id])
++
++            # add the annotations for plugins
++            # note that the model GroupMeta where all the information is stored is already cached at the top of this function
++            # so these for loops doesn't make a bunch of queries
+             for plugin in plugins.for_project(project=item.project, version=1):
+                 safe_execute(plugin.tags, None, item, annotations, _with_transaction=False)
+             for plugin in plugins.for_project(project=item.project, version=2):
+@@ -237,31 +299,6 @@ class GroupSerializerBase(Serializer):
+                     safe_execute(plugin.get_annotations, group=item, _with_transaction=False) or ()
+                 )
+ 
+-            from sentry.integrations import IntegrationFeatures
+-
+-            for integration in Integration.objects.filter(
+-                organizations=item.project.organization_id
+-            ):
+-                if not (
+-                    integration.has_feature(IntegrationFeatures.ISSUE_BASIC)
+-                    or integration.has_feature(IntegrationFeatures.ISSUE_SYNC)
+-                ):
+-                    continue
+-
+-                install = integration.get_installation(item.project.organization_id)
+-                annotations.extend(
+-                    safe_execute(install.get_annotations, group=item, _with_transaction=False) or ()
+-                )
+-
+-            from sentry.models import PlatformExternalIssue
+-
+-            annotations.extend(
+-                safe_execute(
+-                    PlatformExternalIssue.get_annotations, group=item, _with_transaction=False
+-                )
+-                or ()
+-            )
+-
+             resolution_actor = None
+             resolution_type = None
+             resolution = release_resolutions.get(item.id)
+diff --git a/src/sentry/integrations/issues.py b/src/sentry/integrations/issues.py
+index 52eb79abc0..73f64c8375 100644
+--- a/src/sentry/integrations/issues.py
++++ b/src/sentry/integrations/issues.py
+@@ -2,12 +2,14 @@ from __future__ import absolute_import
+ 
+ import logging
+ import six
++from collections import defaultdict
+ 
+ from sentry import features
+ from sentry.shared_integrations.exceptions import ApiError, IntegrationError
+ from sentry.models import Activity, ExternalIssue, Group, GroupLink, GroupStatus, Organization
+ from sentry.utils.http import absolute_uri
+ from sentry.utils.safe import safe_execute
++from sentry.utils.compat import filter
+ 
+ logger = logging.getLogger("sentry.integrations.issues")
+ 
+@@ -220,17 +222,29 @@ class IssueBasicMixin(object):
+         """
+         return (default_repo, default_repo)
+ 
+-    def get_annotations(self, group):
+-        external_issue_ids = GroupLink.objects.filter(
+-            group_id=group.id,
+-            project_id=group.project_id,
++    def get_annotations_for_group_list(self, group_list):
++        group_links = GroupLink.objects.filter(
++            group_id__in=[group.id for group in group_list],
++            project_id__in=list(set(group.project.id for group in group_list)),
+             linked_type=GroupLink.LinkedType.issue,
+             relationship=GroupLink.Relationship.references,
+-        ).values_list("linked_id", flat=True)
++        )
+ 
+         external_issues = ExternalIssue.objects.filter(
+-            id__in=external_issue_ids, integration_id=self.model.id
++            id__in=[group_link.linked_id for group_link in group_links],
++            integration_id=self.model.id,
+         )
++
++        # group annotations by group id
++        annotations_by_group_id = defaultdict(list)
++        for group_link in group_links:
++            issues_for_group = filter(lambda x: x.id == group_link.linked_id, external_issues)
++            annotations = self.map_external_issues_to_annotations(issues_for_group)
++            annotations_by_group_id[group_link.group_id].extend(annotations)
++
++        return annotations_by_group_id
++
++    def map_external_issues_to_annotations(self, external_issues):
+         annotations = []
+         for ei in external_issues:
+             link = self.get_issue_url(ei.key)
+diff --git a/src/sentry/models/platformexternalissue.py b/src/sentry/models/platformexternalissue.py
+index 577a5b9694..e735461f1a 100644
+--- a/src/sentry/models/platformexternalissue.py
++++ b/src/sentry/models/platformexternalissue.py
+@@ -2,6 +2,7 @@ from __future__ import absolute_import, print_function
+ 
+ from django.db import models
+ from django.utils import timezone
++from collections import defaultdict
+ 
+ from sentry.db.models import BoundedBigIntegerField, Model, sane_repr
+ 
+@@ -24,10 +25,13 @@ class PlatformExternalIssue(Model):
+     __repr__ = sane_repr("group_id", "service_type", "display_name", "web_url")
+ 
+     @classmethod
+-    def get_annotations(cls, group):
+-        external_issues = cls.objects.filter(group_id=group.id)
+-        annotations = []
++    def get_annotations_for_group_list(cls, group_list):
++        external_issues = cls.objects.filter(group_id__in=[group.id for group in group_list])
++
++        # group annotations by group id
++        annotations_by_group_id = defaultdict(list)
+         for ei in external_issues:
+-            annotations.append('<a href="%s">%s</a>' % (ei.web_url, ei.display_name))
++            annotation = '<a href="%s">%s</a>' % (ei.web_url, ei.display_name)
++            annotations_by_group_id[ei.group_id].append(annotation)
+ 
+-        return annotations
++        return annotations_by_group_id
+diff --git a/src/sentry/testutils/factories.py b/src/sentry/testutils/factories.py
+index 85f621376c..26375bca78 100644
+--- a/src/sentry/testutils/factories.py
++++ b/src/sentry/testutils/factories.py
+@@ -66,6 +66,8 @@ from sentry.models import (
+     EventAttachment,
+     UserReport,
+     PlatformExternalIssue,
++    ExternalIssue,
++    GroupLink,
+     ReleaseFile,
+ )
+ from sentry.models.integrationfeature import Feature, IntegrationFeature
+@@ -737,6 +739,22 @@ class Factories(object):
+             group_id=group.id, service_type=service_type, display_name=display_name, web_url=web_url
+         )
+ 
++    @staticmethod
++    def create_integration_external_issue(group=None, integration=None, key=None):
++        external_issue = ExternalIssue.objects.create(
++            organization_id=group.organization.id, integration_id=integration.id, key=key
++        )
++
++        GroupLink.objects.create(
++            group_id=group.id,
++            project_id=group.project_id,
++            linked_type=GroupLink.LinkedType.issue,
++            linked_id=external_issue.id,
++            relationship=GroupLink.Relationship.references,
++        )
++
++        return external_issue
++
+     @staticmethod
+     def create_incident(
+         organization,
+diff --git a/src/sentry/testutils/fixtures.py b/src/sentry/testutils/fixtures.py
+index 6570e509b6..5eba13670a 100644
+--- a/src/sentry/testutils/fixtures.py
++++ b/src/sentry/testutils/fixtures.py
+@@ -210,6 +210,9 @@ class Fixtures(object):
+     def create_platform_external_issue(self, *args, **kwargs):
+         return Factories.create_platform_external_issue(*args, **kwargs)
+ 
++    def create_integration_external_issue(self, *args, **kwargs):
++        return Factories.create_integration_external_issue(*args, **kwargs)
++
+     def create_incident(self, organization=None, projects=None, *args, **kwargs):
+         if not organization:
+             organization = self.organization
+diff --git a/tests/sentry/api/endpoints/test_group_details.py b/tests/sentry/api/endpoints/test_group_details.py
+index 83c6e3187b..eed30e2a3f 100644
+--- a/tests/sentry/api/endpoints/test_group_details.py
++++ b/tests/sentry/api/endpoints/test_group_details.py
+@@ -21,9 +21,12 @@ from sentry.models import (
+     GroupSubscription,
+     GroupStatus,
+     GroupTombstone,
++    GroupMeta,
+     Release,
++    Integration,
+ )
+ from sentry.testutils import APITestCase
++from sentry.plugins.base import plugins
+ 
+ 
+ class GroupDetailsTest(APITestCase):
+@@ -138,6 +141,43 @@ class GroupDetailsTest(APITestCase):
+             u'<a href="https://example.com/issues/2">Issue#2</a>'
+         ]
+ 
++    def test_plugin_external_issue_annotation(self):
++        group = self.create_group()
++        GroupMeta.objects.create(group=group, key="trello:tid", value="134")
++
++        plugins.get("trello").enable(group.project)
++        plugins.get("trello").set_option("key", "some_value", group.project)
++        plugins.get("trello").set_option("token", "another_value", group.project)
++
++        self.login_as(user=self.user)
++
++        url = u"/api/0/issues/{}/".format(group.id)
++        response = self.client.get(url, format="json")
++
++        assert response.data["annotations"] == [
++            u'<a href="https://trello.com/c/134">Trello-134</a>'
++        ]
++
++    def test_integration_external_issue_annotation(self):
++        group = self.create_group()
++        integration = Integration.objects.create(
++            provider="jira",
++            external_id="some_id",
++            name="Hello world",
++            metadata={"base_url": "https://example.com"},
++        )
++        integration.add_organization(group.organization, self.user)
++        self.create_integration_external_issue(group=group, integration=integration, key="api-123")
++
++        self.login_as(user=self.user)
++
++        url = u"/api/0/issues/{}/".format(group.id)
++        response = self.client.get(url, format="json")
++
++        assert response.data["annotations"] == [
++            u'<a href="https://example.com/browse/api-123">api-123</a>'
++        ]
++
+     def test_permalink_superuser(self):
+         superuser = self.create_user(is_superuser=True)
+         self.login_as(user=superuser, superuser=True)
+diff --git a/tests/sentry/integrations/test_issues.py b/tests/sentry/integrations/test_issues.py
+index 6312d3f3b0..c62ffe10b3 100644
+--- a/tests/sentry/integrations/test_issues.py
++++ b/tests/sentry/integrations/test_issues.py
+@@ -149,12 +149,12 @@ class IssueDefaultTest(TestCase):
+         label = self.installation.get_issue_display_name(self.external_issue)
+         link = self.installation.get_issue_url(self.external_issue.key)
+ 
+-        assert self.installation.get_annotations(self.group) == [
+-            '<a href="%s">%s</a>' % (link, label)
+-        ]
++        assert self.installation.get_annotations_for_group_list([self.group]) == {
++            self.group.id: ['<a href="%s">%s</a>' % (link, label)]
++        }
+ 
+         integration = Integration.objects.create(provider="example", external_id="4444")
+         integration.add_organization(self.group.organization, self.user)
+         installation = integration.get_installation(self.group.organization.id)
+ 
+-        assert installation.get_annotations(self.group) == []
++        assert installation.get_annotations_for_group_list([self.group]) == {self.group.id: []}

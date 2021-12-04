@@ -1,0 +1,284 @@
+commit 183a36b0240f0738a8a78ea38c480835274c2038
+Author: Markus Unterwaditzer <markus@unterwaditzer.net>
+Date:   Tue May 12 14:11:38 2020 +0200
+
+    fix: Use Redis instead of memcached for consistency (#18724)
+    
+    
+    
+    We used memcached instead of Redis in projectconfig debouncing which led to deletes not being visible to some other machines. While fixing this bug I investigated where I got that code from, and added comments to that code, shy of just deleting it.
+
+diff --git a/src/sentry/conf/server.py b/src/sentry/conf/server.py
+index 366c91af68..63ea30ff86 100644
+--- a/src/sentry/conf/server.py
++++ b/src/sentry/conf/server.py
+@@ -1069,6 +1069,12 @@ SENTRY_QUOTA_OPTIONS = {}
+ SENTRY_RELAY_PROJECTCONFIG_CACHE = "sentry.relay.projectconfig_cache.base.ProjectConfigCache"
+ SENTRY_RELAY_PROJECTCONFIG_CACHE_OPTIONS = {}
+ 
++# Which cache to use for debouncing cache updates to the projectconfig cache
++SENTRY_RELAY_PROJECTCONFIG_DEBOUNCE_CACHE = (
++    "sentry.relay.projectconfig_debounce_cache.base.ProjectConfigDebounceCache"
++)
++SENTRY_RELAY_PROJECTCONFIG_DEBOUNCE_CACHE_OPTIONS = {}
++
+ # Rate limiting backend
+ SENTRY_RATELIMITER = "sentry.ratelimits.base.RateLimiter"
+ SENTRY_RATELIMITER_OPTIONS = {}
+diff --git a/src/sentry/ingest/ingest_consumer.py b/src/sentry/ingest/ingest_consumer.py
+index 2560f8be60..2b58ec9067 100644
+--- a/src/sentry/ingest/ingest_consumer.py
++++ b/src/sentry/ingest/ingest_consumer.py
+@@ -129,6 +129,18 @@ def process_event(message, projects):
+ 
+     # check that we haven't already processed this event (a previous instance of the forwarder
+     # died before it could commit the event queue offset)
++    #
++    # XXX(markus): I believe this code is extremely broken:
++    #
++    # * it practically uses memcached in prod which has no consistency
++    #   guarantees (no idea how we don't run into issues there)
++    #
++    # * a TTL of 1h basically doesn't guarantee any deduplication at all. It
++    #   just guarantees a good error message... for one hour.
++    #
++    # This code has been ripped from the old python store endpoint. We're
++    # keeping it around because it does provide some protection against
++    # reprocessing good events if a single consumer is in a restart loop.
+     deduplication_key = "ev:{}:{}".format(project_id, event_id)
+     if cache.get(deduplication_key) is not None:
+         logger.warning(
+diff --git a/src/sentry/relay/projectconfig_debounce_cache/__init__.py b/src/sentry/relay/projectconfig_debounce_cache/__init__.py
+new file mode 100644
+index 0000000000..686492f9f5
+--- /dev/null
++++ b/src/sentry/relay/projectconfig_debounce_cache/__init__.py
+@@ -0,0 +1,15 @@
++from __future__ import absolute_import
++
++from django.conf import settings
++
++from sentry.utils.services import LazyServiceWrapper
++
++from .base import ProjectConfigDebounceCache
++
++backend = LazyServiceWrapper(
++    ProjectConfigDebounceCache,
++    settings.SENTRY_RELAY_PROJECTCONFIG_DEBOUNCE_CACHE,
++    settings.SENTRY_RELAY_PROJECTCONFIG_DEBOUNCE_CACHE_OPTIONS,
++)
++
++backend.expose(locals())
+diff --git a/src/sentry/relay/projectconfig_debounce_cache/base.py b/src/sentry/relay/projectconfig_debounce_cache/base.py
+new file mode 100644
+index 0000000000..142d378a9b
+--- /dev/null
++++ b/src/sentry/relay/projectconfig_debounce_cache/base.py
+@@ -0,0 +1,40 @@
++from __future__ import absolute_import
++
++from sentry.utils.services import Service
++
++
++class ProjectConfigDebounceCache(Service):
++    """
++    A cache for debouncing updates for the relay projectconfig cache.
++
++    Whenever a project or organization option changes, we schedule a celery
++    task that updates the relay configuration in the projectconfig cache.
++    However, at the same time we want to debounce this task in case multiple
++    option updates have been scheduled at the same time.
++
++    This cache is allowed to randomly lose data but `mark_task_done` should be
++    visible immediately, everywhere, consistently. Memcached is probably not
++    going to cut it.
++    """
++
++    __all__ = ("check_is_debounced", "mark_task_done")
++
++    def __init__(self, **options):
++        pass
++
++    def check_is_debounced(self, project_id, organization_id):
++        """
++        Check if the given project/organization should be debounced.
++
++        It's fine to erroneously return false, it's not fine to erroneously
++        return true.
++        """
++
++        return False
++
++    def mark_task_done(self, project_id, organization_id):
++        """
++        Mark a task done such that `check_is_debounced` starts emitting False
++        for the given parameters.
++        """
++        pass
+diff --git a/src/sentry/relay/projectconfig_debounce_cache/redis.py b/src/sentry/relay/projectconfig_debounce_cache/redis.py
+new file mode 100644
+index 0000000000..ff4cc43320
+--- /dev/null
++++ b/src/sentry/relay/projectconfig_debounce_cache/redis.py
+@@ -0,0 +1,47 @@
++from __future__ import absolute_import
++
++from sentry.relay.projectconfig_debounce_cache.base import ProjectConfigDebounceCache
++from sentry.utils.redis import get_dynamic_cluster_from_options, validate_dynamic_cluster
++
++
++REDIS_CACHE_TIMEOUT = 3600  # 1 hr
++
++
++def _get_redis_key(project_id, organization_id):
++    if organization_id:
++        return "relayconfig-debounce:o:%s" % (organization_id,)
++    elif project_id:
++        return "relayconfig-debounce:p:%s" % (project_id,)
++    else:
++        raise ValueError()
++
++
++class RedisProjectConfigDebounceCache(ProjectConfigDebounceCache):
++    def __init__(self, **options):
++        self.is_redis_cluster, self.cluster, options = get_dynamic_cluster_from_options(
++            "SENTRY_RELAY_PROJECTCONFIG_DEBOUNCE_CACHE_OPTIONS", options
++        )
++        super(RedisProjectConfigDebounceCache, self).__init__(**options)
++
++    def validate(self):
++        validate_dynamic_cluster(self.is_redis_cluster, self.cluster)
++
++    def __get_redis_client(self, routing_key):
++        if self.is_redis_cluster:
++            return self.cluster
++        else:
++            return self.cluster.get_local_client_for_key(routing_key)
++
++    def check_is_debounced(self, project_id, organization_id):
++        key = _get_redis_key(project_id, organization_id)
++        client = self.__get_redis_client(key)
++        if client.get(key):
++            return True
++
++        client.setex(key, REDIS_CACHE_TIMEOUT, 1)
++        return False
++
++    def mark_task_done(self, project_id, organization_id):
++        key = _get_redis_key(project_id, organization_id)
++        client = self.__get_redis_client(key)
++        client.delete(key)
+diff --git a/src/sentry/tasks/relay.py b/src/sentry/tasks/relay.py
+index 5597066864..e3d6506a99 100644
+--- a/src/sentry/tasks/relay.py
++++ b/src/sentry/tasks/relay.py
+@@ -3,11 +3,12 @@ from __future__ import absolute_import
+ import logging
+ 
+ from django.conf import settings
+-from django.core.cache import cache
+ 
+ from sentry.models.projectkey import ProjectKey
+ from sentry.tasks.base import instrumented_task
+ from sentry.utils import metrics
++from sentry.relay import projectconfig_debounce_cache
++
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -37,8 +38,7 @@ def update_config_cache(generate, organization_id=None, project_id=None, update_
+     # If this was running at the end of the task, it would be more effective
+     # against bursts of updates, but introduces a different race where an
+     # outdated cache may be used.
+-    debounce_key = _get_schedule_debounce_key(project_id, organization_id)
+-    cache.delete(debounce_key)
++    projectconfig_debounce_cache.mark_task_done(project_id, organization_id)
+ 
+     if project_id:
+         projects = [Project.objects.get_from_cache(id=project_id)]
+@@ -69,15 +69,6 @@ def update_config_cache(generate, organization_id=None, project_id=None, update_
+     )
+ 
+ 
+-def _get_schedule_debounce_key(project_id, organization_id):
+-    if organization_id:
+-        return "relayconfig-debounce:o:%s" % (organization_id,)
+-    elif project_id:
+-        return "relayconfig-debounce:p:%s" % (project_id,)
+-    else:
+-        raise ValueError()
+-
+-
+ def schedule_update_config_cache(
+     generate, project_id=None, organization_id=None, update_reason=None
+ ):
+@@ -102,8 +93,7 @@ def schedule_update_config_cache(
+     if bool(organization_id) == bool(project_id):
+         raise TypeError("One of organization_id and project_id has to be provided, not both.")
+ 
+-    debounce_key = _get_schedule_debounce_key(project_id, organization_id)
+-    if cache.get(debounce_key, None):
++    if projectconfig_debounce_cache.check_is_debounced(project_id, organization_id):
+         metrics.incr(
+             "relay.projectconfig_cache.skipped",
+             tags={"reason": "debounce", "update_reason": update_reason},
+@@ -111,8 +101,6 @@ def schedule_update_config_cache(
+         # If this task is already in the queue, do not schedule another task.
+         return
+ 
+-    cache.set(debounce_key, True, 3600)
+-
+     # XXX(markus): We could schedule this task a couple seconds into the
+     # future, this would make debouncing more effective. If we want to do this
+     # we might want to use the sleep queue.
+diff --git a/src/sentry/web/api.py b/src/sentry/web/api.py
+index bfb394672f..d9b5610e78 100644
+--- a/src/sentry/web/api.py
++++ b/src/sentry/web/api.py
+@@ -253,6 +253,13 @@ def process_event(event_manager, project, key, remote_addr, helper, attachments,
+     # supplied by the user
+     cache_key = "ev:%s:%s" % (project_config.project_id, event_id)
+ 
++    # XXX(markus): I believe this code is extremely broken:
++    #
++    # * it practically uses memcached in prod which has no consistency
++    #   guarantees (no idea how we don't run into issues there)
++    #
++    # * a TTL of 1h basically doesn't guarantee any deduplication at all. It
++    #   just guarantees a good error message... for one hour.
+     if cache.get(cache_key) is not None:
+         track_outcome(
+             project_config.organization_id,
+diff --git a/tests/sentry/tasks/test_relay.py b/tests/sentry/tasks/test_relay.py
+index bb8b2ef595..7457fb3098 100644
+--- a/tests/sentry/tasks/test_relay.py
++++ b/tests/sentry/tasks/test_relay.py
+@@ -6,6 +6,7 @@ from sentry.utils.compat.mock import patch
+ 
+ from sentry.tasks.relay import schedule_update_config_cache
+ from sentry.relay.projectconfig_cache.redis import RedisProjectConfigCache
++from sentry.relay.projectconfig_debounce_cache.redis import RedisProjectConfigDebounceCache
+ 
+ 
+ @pytest.fixture
+@@ -20,6 +21,20 @@ def redis_cache(monkeypatch):
+     monkeypatch.setattr("sentry.relay.projectconfig_cache.delete_many", cache.delete_many)
+     monkeypatch.setattr("sentry.relay.projectconfig_cache.get", cache.get)
+ 
++    monkeypatch.setattr(
++        "django.conf.settings.SENTRY_RELAY_PROJECTCONFIG_DEBOUNCE_CACHE",
++        "sentry.relay.projectconfig_debounce_cache.redis.RedisProjectConfigDebounceCache",
++    )
++
++    debounce_cache = RedisProjectConfigDebounceCache()
++    monkeypatch.setattr(
++        "sentry.relay.projectconfig_debounce_cache.mark_task_done", debounce_cache.mark_task_done
++    )
++    monkeypatch.setattr(
++        "sentry.relay.projectconfig_debounce_cache.check_is_debounced",
++        debounce_cache.check_is_debounced,
++    )
++
+     return cache
+ 
+ 

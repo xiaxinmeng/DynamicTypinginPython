@@ -1,0 +1,334 @@
+commit 6a34a0529b3419375bb0edc374613fa7018ed864
+Author: Armin Ronacher <armin.ronacher@active-4.com>
+Date:   Wed Dec 7 09:50:29 2016 +0100
+
+    Restructured dsym processing to support better error reporting
+
+diff --git a/src/sentry/lang/native/plugin.py b/src/sentry/lang/native/plugin.py
+index 59e574e2d6..bcedd2fc4b 100644
+--- a/src/sentry/lang/native/plugin.py
++++ b/src/sentry/lang/native/plugin.py
+@@ -8,9 +8,10 @@ import logging
+ import posixpath
+ 
+ from symsynd.demangle import demangle_symbol
++
+ from sentry.models import Project, EventError
+ from sentry.plugins import Plugin2
+-from sentry.lang.native.symbolizer import Symbolizer
++from sentry.lang.native.symbolizer import Symbolizer, SymbolicationFailed
+ from sentry.lang.native.utils import find_all_stacktraces, \
+     find_apple_crash_report_referenced_images, get_sdk_from_event, \
+     find_stacktrace_referenced_images, get_sdk_from_apple_system_info, \
+@@ -363,11 +364,7 @@ def resolve_frame_symbols(data):
+         errors.append({
+             'type': EventError.NATIVE_INTERNAL_FAILURE,
+             'frame': frame,
+-            'error': 'frame #%d: %s: %s' % (
+-                idx,
+-                e.__class__.__name__,
+-                six.text_type(e),
+-            )
++            'error': u'frame #%d: %s' % (idx, e)
+         })
+ 
+     with sym:
+@@ -381,13 +378,15 @@ def resolve_frame_symbols(data):
+                    'symbol_addr' not in frame:
+                     continue
+                 try:
+-                    sfrm = sym.symbolize_frame({
+-                        'object_name': frame.get('package'),
+-                        'object_addr': frame['image_addr'],
+-                        'instruction_addr': frame['instruction_addr'],
+-                        'symbol_addr': frame['symbol_addr'],
+-                    }, sdk_info, report_error=report_error)
+-                    if not sfrm:
++                    try:
++                        sfrm = sym.symbolize_frame({
++                            'object_name': frame.get('package'),
++                            'object_addr': frame['image_addr'],
++                            'instruction_addr': frame['instruction_addr'],
++                            'symbol_addr': frame['symbol_addr'],
++                        }, sdk_info)
++                    except SymbolicationFailed as e:
++                        report_error(e)
+                         continue
+                     new_frame = dict(frame)
+                     # XXX: log here if symbol could not be found?
+@@ -417,7 +416,7 @@ def resolve_frame_symbols(data):
+                     new_frame['symbol_addr'] = '0x%x' % parse_addr(sfrm['symbol_addr'])
+                     new_frame['instruction_addr'] = '0x%x' % parse_addr(
+                         sfrm['instruction_addr'])
+-                    new_frame['in_app'] = is_in_app(new_frame)
++                    new_frame['in_app'] = sym.is_app_frame(sfrm)
+ 
+                     if new_frame != frame:
+                         new_frames[idx] = new_frame
+diff --git a/src/sentry/lang/native/symbolizer.py b/src/sentry/lang/native/symbolizer.py
+index 6f423bb8ad..f87e423396 100644
+--- a/src/sentry/lang/native/symbolizer.py
++++ b/src/sentry/lang/native/symbolizer.py
+@@ -1,5 +1,6 @@
+ from __future__ import absolute_import
+ 
++import re
+ import six
+ 
+ from symsynd.driver import Driver, SymbolicationError
+@@ -8,10 +9,48 @@ from symsynd.macho.arch import get_cpu_name
+ 
+ from sentry.lang.native.dsymcache import dsymcache
+ from sentry.utils.safe import trim
++from sentry.utils.compat import implements_to_string
+ from sentry.models import DSymSymbol, EventError
+ from sentry.constants import MAX_SYM
+ 
+ 
++APP_BUNDLE_PATHS = (
++    '/var/containers/Bundle/Application/',
++    '/private/var/containers/Bundle/Application/',
++)
++_swift_framework_re = re.compile(r'/Frameworks/libswift([a-zA-Z0-9]+)\.dylib$')
++SIM_PATH = '/Developer/CoreSimulator/Devices/'
++SIM_APP_PATH = '/Containers/Bundle/Application/'
++
++
++@implements_to_string
++class SymbolicationFailed(Exception):
++    message = None
++
++    def __init__(self, message=None, type=None, image_uuid=None,
++                 image_path=None, is_fixable=False):
++        Exception.__init__(self)
++        self.message = six.text_type(message)
++        self.type = type
++        if is_fixable and image_uuid is not None:
++            raise RuntimeError('Fixable symbolication failures require '
++                               'an image UUID')
++        self.image_uuid = image_uuid
++        self.image_path = image_path
++        self.is_fixable = is_fixable
++
++    def __str__(self):
++        rv = []
++        if self.type is not None:
++            rv.append(u'%s: ' % self.type)
++        rv.append(self.message or 'no information available')
++        if self.image_uuid is not None:
++            rv.append(' image-uuid=%s' % self.image_uuid)
++        if self.image_path is not None:
++            rv.append(' image-path=%s' % self.image_path)
++        return u''.join(rv)
++
++
+ def trim_frame(frame):
+     # This matches what's in stacktrace.py
+     frame['symbol_name'] = trim(frame.get('symbol_name'), MAX_SYM)
+@@ -81,42 +120,107 @@ class Symbolizer(object):
+             rv['uuid'] = img['uuid']
+         return rv
+ 
+-    def symbolize_app_frame(self, frame):
+-        img = self.images.get(frame['object_addr'])
+-        new_frame = self.symsynd_symbolizer.symbolize_frame(
+-            frame, silent=False, demangle=False)
+-        if new_frame is not None:
+-            return self._process_frame(new_frame, img)
+-
+-    def symbolize_system_frame(self, frame, sdk_info):
++    def _get_real_package(self, frame):
++        fn = frame.get('object_name')
++        if fn and '/' in fn:
++            return fn
+         img = self.images.get(frame['object_addr'])
+-        if img is None:
+-            return
++        if img is not None:
++            return img['name']
++
++    def is_app_bundled_frame(self, frame):
++        fn = self._get_real_package(frame)
++        if fn is None:
++            return False
++        if not (fn.startswith(APP_BUNDLE_PATHS) or
++                (SIM_PATH in fn and SIM_APP_PATH in fn)):
++            return False
++        return True
++
++    def is_app_frame(self, frame):
++        if not self.is_app_bundled_frame(frame):
++            return False
++        fn = self._get_real_package(frame)
++        # Swift packages do not belong to the app
++        match = _swift_framework_re.match(fn)
++        if match is not None:
++            return False
++        return True
++
++    def symbolize_app_frame(self, frame, img):
++        if frame['object_addr'] not in self.symsynd_symbolizer.images:
++            raise SymbolicationFailed(
++                type='missing-dsym',
++                message=(
++                    'Frame references a missing dSYM file'
++                ),
++                image_uuid=img['uuid'],
++                image_path=self._get_real_package(frame),
++                is_fixable=True
++            )
+ 
+-        symbol = find_system_symbol(img, frame['instruction_addr'],
+-                                    sdk_info)
++        try:
++            new_frame = self.symsynd_symbolizer.symbolize_frame(
++                frame, silent=False, demangle=False)
++        except SymbolicationError as e:
++            raise SymbolicationFailed(
++                type='bad-dsym',
++                message='Symbolication failed due to bad dsym: %s' % e,
++                image_uuid=img['uuid'],
++                image_path=self._get_real_package(frame),
++                is_fixable=True
++            )
++
++        if new_frame is None:
++            raise SymbolicationFailed(
++                type='missing-symbol',
++                message=(
++                    'Upon symbolication a frame could not be resolved.'
++                ),
++                image_uuid=img['uuid'],
++                image_path=self._get_real_package(frame)
++            )
++
++        return self._process_frame(new_frame, img)
++
++    def symbolize_system_frame(self, frame, img, sdk_info):
++        """Symbolizes a frame with system symbols only."""
++        symbol = find_system_symbol(img, frame['instruction_addr'], sdk_info)
+         if symbol is None:
+-            return
++            raise SymbolicationFailed(
++                type='missing-system-dsym',
++                message=(
++                    'Attempted to look up system in the system symbols but '
++                    'no symbol could be found.  This might happen with beta '
++                    'releases of SDKs'
++                ),
++                image_uuid=img['uuid'],
++                image_path=self._get_real_package(frame)
++            )
+ 
+         rv = dict(frame, symbol_name=symbol, filename=None,
+                   line=0, column=0, uuid=img['uuid'],
+                   object_name=img['name'])
+         return self._process_frame(rv, img)
+ 
+-    def symbolize_frame(self, frame, sdk_info=None, report_error=None):
+-        # Step one: try to symbolize with cached dsym files.
+-        try:
+-            rv = self.symbolize_app_frame(frame)
+-            if rv is not None:
+-                return rv
+-        except SymbolicationError as e:
+-            if report_error is not None:
+-                report_error(e)
++    def symbolize_frame(self, frame, sdk_info=None):
++        img = self.images.get(frame['object_addr'])
++        if img is None:
++            raise SymbolicationFailed(
++                type='unknown-image',
++                message=(
++                    'The stacktrace referred to an object at an address '
++                    'that was not registered in the debug meta information.'
++                )
++            )
++
++        # If we are dealing with a frame that is not bundled with the app
++        # we look at system symbols.  If that fails, we go to looking for
++        # app symbols explicitly.
++        if not self.is_app_bundled_frame(frame):
++            return self.symbolize_system_frame(frame, img, sdk_info)
+ 
+-        # If that does not work, look up system symbols.
+-        rv = self.symbolize_system_frame(frame, sdk_info)
+-        if rv is not None:
+-            return rv
++        return self.symbolize_app_frame(frame, img)
+ 
+     def symbolize_backtrace(self, backtrace, sdk_info=None):
+         rv = []
+@@ -127,14 +231,12 @@ class Symbolizer(object):
+             errors.append({
+                 'type': EventError.NATIVE_INTERNAL_FAILURE,
+                 'frame': frm,
+-                'error': 'frame #%d: %s: %s' % (
+-                    idx,
+-                    e.__class__.__name__,
+-                    six.text_type(e),
+-                )
++                'error': u'frame #%d: %s' % (idx, e),
+             })
+ 
+         for idx, frm in enumerate(backtrace):
+-            rv.append(self.symbolize_frame(
+-                frm, sdk_info, report_error=report_error) or frm)
++            try:
++                rv.append(self.symbolize_frame(frm, sdk_info) or frm)
++            except SymbolicationFailed as e:
++                report_error(e)
+         return rv, errors
+diff --git a/tests/sentry/lang/native/test_plugin.py b/tests/sentry/lang/native/test_plugin.py
+index 4ba2bc4623..b9d7dc8e97 100644
+--- a/tests/sentry/lang/native/test_plugin.py
++++ b/tests/sentry/lang/native/test_plugin.py
+@@ -233,7 +233,7 @@ class BasicResolvingIntegrationTest(TestCase):
+ 
+         assert len(event.interfaces['threads'].values) == 1
+ 
+-    def sym_app_frame(self, frame):
++    def sym_app_frame(self, frame, img):
+         object_name = (
+             "/var/containers/Bundle/Application/"
+             "B33C37A8-F933-4B6B-9FFA-152282BFDF13/"
+diff --git a/tests/sentry/lang/native/test_processor.py b/tests/sentry/lang/native/test_processor.py
+index 5a12ba026e..7d4b17a50f 100644
+--- a/tests/sentry/lang/native/test_processor.py
++++ b/tests/sentry/lang/native/test_processor.py
+@@ -20,7 +20,7 @@ SDK_INFO = {
+ }
+ 
+ 
+-def patched_symbolize_app_frame(self, frame):
++def patched_symbolize_app_frame(self, frame, img):
+     if frame['instruction_addr'] == 4295123760:
+         return {
+             'filename': 'Foo.swift',
+@@ -33,7 +33,7 @@ def patched_symbolize_app_frame(self, frame):
+         }
+ 
+ 
+-def patched_symbolize_system_frame(self, frame, sdk_info):
++def patched_symbolize_system_frame(self, frame, img, sdk_info):
+     assert sdk_info == SDK_INFO
+     if frame['instruction_addr'] == 4295123360:
+         return {
+@@ -69,6 +69,17 @@ class BasicResolvingFileTest(TestCase):
+                         "cpu_type": 16777228,
+                         "image_size": 32768,
+                         "name": OBJECT_NAME,
++                    },
++                    {
++                        "type": "apple",
++                        "cpu_subtype": 0,
++                        "cpu_type": 16777228,
++                        "uuid": "B78CB4FB-3A90-4039-9EFD-C58932803AE5",
++                        "image_vmaddr": 0,
++                        "image_addr": 4295092368,
++                        "cpu_type": 16777228,
++                        "image_size": 32768,
++                        'name': '/usr/lib/whatever.dylib',
+                     }
+                 ],
+                 "sdk_info": SDK_INFO,

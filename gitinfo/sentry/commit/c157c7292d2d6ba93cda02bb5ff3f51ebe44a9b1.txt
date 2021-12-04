@@ -1,0 +1,144 @@
+commit c157c7292d2d6ba93cda02bb5ff3f51ebe44a9b1
+Author: Matt Robenolt <matt@ydekproductions.com>
+Date:   Tue Apr 18 17:14:28 2017 -0700
+
+    buffer: improve throughput of process_pending by pushing batches into queue
+    
+    Right now, the bottleneck is simply fanning out a write to RabbitMQ for
+    every single increment. Batching these together into larger chunks
+    should make this much faster by limiting the amount of back and forth
+    AMQP by an order of magnitude
+
+diff --git a/src/sentry/buffer/redis.py b/src/sentry/buffer/redis.py
+index 9041402014..a29b989c72 100644
+--- a/src/sentry/buffer/redis.py
++++ b/src/sentry/buffer/redis.py
+@@ -24,9 +24,37 @@ from sentry.utils.imports import import_string
+ from sentry.utils.redis import get_cluster_from_options
+ 
+ 
++class RingBuffer(object):
++    def __init__(self, size):
++        assert size > 0
++        self.buffer = [None] * size
++        self.size = size
++        self.pointer = 0
++
++    def full(self):
++        return self.pointer == self.size
++
++    def empty(self):
++        return self.pointer == 0
++
++    def append(self, item):
++        assert not self.full()
++        self.buffer[self.pointer] = item
++        self.pointer += 1
++
++    def clear(self):
++        self.pointer = 0
++
++    def flush(self):
++        rv = self.buffer[:self.pointer]
++        self.clear()
++        return rv
++
++
+ class RedisBuffer(Buffer):
+     key_expire = 60 * 60  # 1 hour
+     pending_key = 'b:p'
++    incr_batch_size = 10
+ 
+     def __init__(self, **options):
+         self.cluster, options = get_cluster_from_options('SENTRY_BUFFER_OPTIONS', options)
+@@ -94,6 +122,8 @@ class RedisBuffer(Buffer):
+         if not client.set(lock_key, '1', nx=True, ex=60):
+             return
+ 
++        pending_ring_buffer = RingBuffer(self.incr_batch_size)
++
+         try:
+             keycount = 0
+             with self.cluster.all() as conn:
+@@ -105,15 +135,34 @@ class RedisBuffer(Buffer):
+                         continue
+                     keycount += len(keys)
+                     for key in keys:
+-                        process_incr.apply_async(kwargs={
+-                            'key': key,
+-                        })
++                        pending_ring_buffer.append(key)
++                        if pending_ring_buffer.full():
++                            process_incr.apply_async(kwargs={
++                                'batch_keys': pending_ring_buffer.flush(),
++                            })
+                     conn.target([host_id]).zrem(self.pending_key, *keys)
++
++            # queue up remainder of pending keys
++            if not pending_ring_buffer.empty():
++                process_incr.apply_async(kwargs={
++                    'batch_keys': pending_ring_buffer.flush(),
++                })
++
+             metrics.timing('buffer.pending-size', keycount)
+         finally:
+             client.delete(lock_key)
+ 
+-    def process(self, key):
++    def process(self, key=None, batch_keys=None):
++        assert not (key is None and batch_keys is None)
++        assert not (key is not None and batch_keys is not None)
++
++        if key is not None:
++            batch_keys = [key]
++
++        for key in batch_keys:
++            self._process_single_incr(key)
++
++    def _process_single_incr(self, key):
+         client = self.cluster.get_routing_client()
+         lock_key = self._make_lock_key(key)
+         # prevent a stampede due to the way we use celery etas + duplicate
+diff --git a/tests/sentry/buffer/redis/tests.py b/tests/sentry/buffer/redis/tests.py
+index 46f47f55a6..44b1f98f2d 100644
+--- a/tests/sentry/buffer/redis/tests.py
++++ b/tests/sentry/buffer/redis/tests.py
+@@ -21,14 +21,35 @@ class RedisBufferTest(TestCase):
+ 
+     @mock.patch('sentry.buffer.redis.RedisBuffer._make_key', mock.Mock(return_value='foo'))
+     @mock.patch('sentry.buffer.redis.process_incr')
+-    def test_process_pending(self, process_incr):
++    def test_process_pending_one_batch(self, process_incr):
++        self.buf.incr_batch_size = 5
+         with self.buf.cluster.map() as client:
+             client.zadd('b:p', 1, 'foo')
+             client.zadd('b:p', 2, 'bar')
+         self.buf.process_pending()
++        assert len(process_incr.apply_async.mock_calls) == 1
++        process_incr.apply_async.assert_any_call(kwargs={
++            'batch_keys': ['foo', 'bar'],
++        })
++        client = self.buf.cluster.get_routing_client()
++        assert client.zrange('b:p', 0, -1) == []
++
++    @mock.patch('sentry.buffer.redis.RedisBuffer._make_key', mock.Mock(return_value='foo'))
++    @mock.patch('sentry.buffer.redis.process_incr')
++    def test_process_pending_multiple_batches(self, process_incr):
++        self.buf.incr_batch_size = 2
++        with self.buf.cluster.map() as client:
++            client.zadd('b:p', 1, 'foo')
++            client.zadd('b:p', 2, 'bar')
++            client.zadd('b:p', 3, 'baz')
++        self.buf.process_pending()
+         assert len(process_incr.apply_async.mock_calls) == 2
+-        process_incr.apply_async.assert_any_call(kwargs={'key': 'foo'})
+-        process_incr.apply_async.assert_any_call(kwargs={'key': 'bar'})
++        process_incr.apply_async.assert_any_call(kwargs={
++            'batch_keys': ['foo', 'bar'],
++        })
++        process_incr.apply_async.assert_any_call(kwargs={
++            'batch_keys': ['baz'],
++        })
+         client = self.buf.cluster.get_routing_client()
+         assert client.zrange('b:p', 0, -1) == []
+ 

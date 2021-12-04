@@ -1,0 +1,159 @@
+commit e9fa79390a76193609e814345231991ab49f03b9
+Author: Dan Fuller <dfuller@sentry.io>
+Date:   Mon Feb 24 17:07:37 2020 -0800
+
+    feat(subscriptions): Delete subscriptions from snuba if they don't exist in sentry
+    
+    If we receive an update from a subscription that doesn't have a `QuerySubscription` in sentry then
+    delete it from snuba. This should help correct situations where we have subscriptions that are no
+    longer valid from taking up resources.
+
+diff --git a/src/sentry/snuba/query_subscription_consumer.py b/src/sentry/snuba/query_subscription_consumer.py
+index 2178aa013a..b43fbfec42 100644
+--- a/src/sentry/snuba/query_subscription_consumer.py
++++ b/src/sentry/snuba/query_subscription_consumer.py
+@@ -11,7 +11,8 @@ from dateutil.parser import parse as parse_date
+ from django.conf import settings
+ 
+ from sentry.snuba.json_schemas import SUBSCRIPTION_PAYLOAD_VERSIONS, SUBSCRIPTION_WRAPPER_SCHEMA
+-from sentry.snuba.models import QuerySubscription
++from sentry.snuba.models import QueryDatasets, QuerySubscription
++from sentry.snuba.subscriptions import _delete_from_snuba
+ from sentry.utils import metrics
+ 
+ logger = logging.getLogger(__name__)
+@@ -45,6 +46,8 @@ class QuerySubscriptionConsumer(object):
+     These values are passed along to a callback associated with the subscription.
+     """
+ 
++    topic_to_dataset = {settings.KAFKA_SNUBA_QUERY_SUBSCRIPTIONS: QueryDatasets.EVENTS}
++
+     def __init__(
+         self, group_id, topic=None, commit_batch_size=100, initial_offset_reset="earliest"
+     ):
+@@ -166,6 +169,13 @@ class QuerySubscriptionConsumer(object):
+                         "value": message.value(),
+                     },
+                 )
++                try:
++                    _delete_from_snuba(
++                        self.topic_to_dataset[message.topic()], contents["subscription_id"]
++                    )
++                except Exception:
++                    logger.exception("Failed to delete unused subscription from snuba.")
++
+                 return
+ 
+             if subscription.type not in subscriber_registry:
+diff --git a/src/sentry/snuba/subscriptions.py b/src/sentry/snuba/subscriptions.py
+index ec232fac9a..5327659674 100644
+--- a/src/sentry/snuba/subscriptions.py
++++ b/src/sentry/snuba/subscriptions.py
+@@ -1,6 +1,7 @@
+ from __future__ import absolute_import
+ 
+ import json
++import logging
+ 
+ from django.db import transaction
+ 
+@@ -13,6 +14,7 @@ query_aggregation_to_snuba = {
+     QueryAggregations.TOTAL: ("count()", "", "count"),
+     QueryAggregations.UNIQUE_USERS: ("uniq", "tags[sentry:user]", "unique_users"),
+ }
++logger = logging.getLogger(__name__)
+ 
+ 
+ def bulk_create_snuba_subscriptions(
+@@ -145,10 +147,11 @@ def update_snuba_subscription(
+     # TODO: Move this call to snuba into a task. This lets us successfully update a
+     # subscription in postgres and rollback as needed without having to create/delete
+     # from snuba
+-    _delete_from_snuba(subscription)
++    dataset = QueryDatasets(subscription.dataset)
++    _delete_from_snuba(dataset, subscription.subscription_id)
+     subscription_id = _create_in_snuba(
+         subscription.project,
+-        QueryDatasets(subscription.dataset),
++        dataset,
+         query,
+         aggregation,
+         time_window,
+@@ -187,7 +190,7 @@ def delete_snuba_subscription(subscription):
+         # TODO: Move this call to snuba into a task. This lets us successfully delete a
+         # subscription in postgres and rollback as needed without having to create/delete
+         # from snuba
+-        _delete_from_snuba(subscription)
++        _delete_from_snuba(QueryDatasets(subscription.dataset), subscription.subscription_id)
+ 
+ 
+ def _create_in_snuba(
+@@ -220,11 +223,9 @@ def _create_in_snuba(
+     return json.loads(response.data)["subscription_id"]
+ 
+ 
+-def _delete_from_snuba(subscription):
++def _delete_from_snuba(dataset, subscription_id):
+     response = _snuba_pool.urlopen(
+-        "DELETE",
+-        "/%s/subscriptions/%s" % (subscription.dataset, subscription.subscription_id),
+-        retries=False,
++        "DELETE", "/%s/subscriptions/%s" % (dataset.value, subscription_id)
+     )
+     if response.status != 202:
+         raise SnubaError("HTTP %s response from Snuba!" % response.status)
+diff --git a/tests/sentry/snuba/test_query_subscription_consumer.py b/tests/sentry/snuba/test_query_subscription_consumer.py
+index aa5becab25..2bb2774671 100644
+--- a/tests/sentry/snuba/test_query_subscription_consumer.py
++++ b/tests/sentry/snuba/test_query_subscription_consumer.py
+@@ -4,13 +4,15 @@ import json
+ import unittest
+ from copy import deepcopy
+ 
++import mock
+ import six
+ import pytz
+ from dateutil.parser import parse as parse_date
++from django.conf import settings
+ from exam import fixture, patcher
+ 
+ from sentry.utils.compat.mock import Mock
+-from sentry.snuba.models import QuerySubscription
++from sentry.snuba.models import QueryDatasets, QuerySubscription
+ from sentry.snuba.query_subscription_consumer import (
+     InvalidMessageError,
+     InvalidSchemaError,
+@@ -38,9 +40,11 @@ class BaseQuerySubscriptionTest(object):
+             "timestamp": "2020-01-01T01:23:45.1234",
+         }
+ 
+-    def build_mock_message(self, data):
++    def build_mock_message(self, data, topic=None):
+         message = Mock()
+         message.value.return_value = json.dumps(data)
++        if topic:
++            message.topic.return_value = topic
+         return message
+ 
+ 
+@@ -48,7 +52,19 @@ class HandleMessageTest(BaseQuerySubscriptionTest, TestCase):
+     metrics = patcher("sentry.snuba.query_subscription_consumer.metrics")
+ 
+     def test_no_subscription(self):
+-        self.consumer.handle_message(self.build_mock_message(self.valid_wrapper))
++        with mock.patch("sentry.snuba.subscriptions._snuba_pool") as pool:
++            pool.urlopen.return_value.status = 202
++            self.consumer.handle_message(
++                self.build_mock_message(
++                    self.valid_wrapper, topic=settings.KAFKA_SNUBA_QUERY_SUBSCRIPTIONS
++                )
++            )
++            pool.urlopen.assert_called_once_with(
++                "DELETE",
++                "/{}/subscriptions/{}".format(
++                    QueryDatasets.EVENTS.value, self.valid_payload["subscription_id"]
++                ),
++            )
+         self.metrics.incr.assert_called_once_with(
+             "snuba_query_subscriber.subscription_doesnt_exist"
+         )

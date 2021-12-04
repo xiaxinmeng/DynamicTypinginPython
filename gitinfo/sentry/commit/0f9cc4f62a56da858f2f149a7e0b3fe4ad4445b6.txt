@@ -1,0 +1,350 @@
+commit 0f9cc4f62a56da858f2f149a7e0b3fe4ad4445b6
+Author: Dan Fuller <dfuller@sentry.io>
+Date:   Thu Jun 13 13:54:47 2019 -0700
+
+    feat(api): Add analytics tracking for incidents (SEN-567)
+    
+    This adds tracking to:
+    Incident creation
+    Incident status changes
+    Incident comments
+    
+    Also adds `referrer=incident_activity_email` to the incident link in activity emails for
+    clicktracking purposes.
+
+diff --git a/src/sentry/incidents/__init__.py b/src/sentry/incidents/__init__.py
+index c3961685ab..9418ba1d64 100644
+--- a/src/sentry/incidents/__init__.py
++++ b/src/sentry/incidents/__init__.py
+@@ -1 +1,2 @@
+ from __future__ import absolute_import
++from . import events  # NOQA
+diff --git a/src/sentry/incidents/events.py b/src/sentry/incidents/events.py
+new file mode 100644
+index 0000000000..2196dfaea7
+--- /dev/null
++++ b/src/sentry/incidents/events.py
+@@ -0,0 +1,36 @@
++from __future__ import absolute_import
++
++from sentry import analytics
++
++
++class BaseIncidentEvent(analytics.Event):
++    attributes = (
++        analytics.Attribute('incident_id'),
++        analytics.Attribute('organization_id'),
++        analytics.Attribute('incident_type'),
++    )
++
++
++class IncidentCreatedEvent(BaseIncidentEvent):
++    type = 'incident.created'
++
++
++class IncidentStatusUpdatedEvent(BaseIncidentEvent):
++    type = 'incident.status_change'
++    attributes = BaseIncidentEvent.attributes + (
++        analytics.Attribute('prev_status'),
++        analytics.Attribute('status'),
++    )
++
++
++class IncidentCommentCreatedEvent(BaseIncidentEvent):
++    type = 'incident.comment'
++    attributes = BaseIncidentEvent.attributes + (
++        analytics.Attribute('user_id', required=False),
++        analytics.Attribute('activity_id', required=False),
++    )
++
++
++analytics.register(IncidentCreatedEvent)
++analytics.register(IncidentStatusUpdatedEvent)
++analytics.register(IncidentCommentCreatedEvent)
+diff --git a/src/sentry/incidents/logic.py b/src/sentry/incidents/logic.py
+index 8e483d8e17..bf6380438a 100644
+--- a/src/sentry/incidents/logic.py
++++ b/src/sentry/incidents/logic.py
+@@ -6,11 +6,8 @@ import six
+ from django.db import transaction
+ from django.utils import timezone
+ 
++from sentry import analytics
+ from sentry.api.event_search import get_snuba_query_args
+-from sentry.models import (
+-    Commit,
+-    Release,
+-)
+ from sentry.incidents.models import (
+     Incident,
+     IncidentActivity,
+@@ -24,6 +21,10 @@ from sentry.incidents.models import (
+     TimeSeriesSnapshot,
+ )
+ from sentry.incidents.tasks import send_subscriber_notifications
++from sentry.models import (
++    Commit,
++    Release,
++)
+ from sentry.utils.committers import get_event_file_committers
+ from sentry.utils.snuba import (
+     raw_query,
+@@ -90,6 +91,13 @@ def create_incident(
+             event_stats_snapshot=event_stats_snapshot,
+             user=user,
+         )
++        analytics.record(
++            'incident.created',
++            incident_id=incident.id,
++            organization_id=incident.organization_id,
++            incident_type=type.value,
++        )
++
+     return incident
+ 
+ 
+@@ -114,6 +122,8 @@ def update_incident_status(incident, status, user=None, comment=None):
+         if user:
+             subscribe_to_incident(incident, user)
+ 
++        prev_status = incident.status
++
+         kwargs = {
+             'status': status.value,
+         }
+@@ -128,6 +138,14 @@ def update_incident_status(incident, status, user=None, comment=None):
+             # TODO: Delete snapshot? Not sure if needed
+ 
+         incident.update(**kwargs)
++        analytics.record(
++            'incident.status_change',
++            incident_id=incident.id,
++            organization_id=incident.organization_id,
++            incident_type=incident.type,
++            prev_status=prev_status,
++            status=incident.status,
++        )
+         return incident
+ 
+ 
+@@ -193,6 +211,16 @@ def create_incident_activity(
+         kwargs={'activity_id': activity.id},
+         countdown=10,
+     )
++    if activity_type == IncidentActivityType.COMMENT:
++        analytics.record(
++            'incident.comment',
++            incident_id=incident.id,
++            organization_id=incident.organization_id,
++            incident_type=incident.type,
++            user_id=user.id if user else None,
++            activity_id=activity.id,
++        )
++
+     return activity
+ 
+ 
+diff --git a/src/sentry/incidents/tasks.py b/src/sentry/incidents/tasks.py
+index d3f92b8d20..a99ab55450 100644
+--- a/src/sentry/incidents/tasks.py
++++ b/src/sentry/incidents/tasks.py
+@@ -1,6 +1,7 @@
+ from __future__ import absolute_import
+ 
+ from django.core.urlresolvers import reverse
++from six.moves.urllib.parse import urlencode
+ 
+ from sentry.auth.access import from_user
+ from sentry.incidents.models import (
+@@ -86,7 +87,7 @@ def build_activity_context(activity, user):
+                 'organization_slug': incident.organization.slug,
+                 'incident_id': incident.identifier,
+             },
+-        )),
++        )) + '?' + urlencode({'referrer': 'incident_activity_email'}),
+         'comment': activity.comment,
+         'unsubscribe_link': generate_signed_link(
+             user,
+diff --git a/tests/sentry/incidents/test_logic.py b/tests/sentry/incidents/test_logic.py
+index 0ee365c979..721984967f 100644
+--- a/tests/sentry/incidents/test_logic.py
++++ b/tests/sentry/incidents/test_logic.py
+@@ -10,6 +10,11 @@ import six
+ from django.utils import timezone
+ from django.utils.functional import cached_property
+ 
++from sentry.incidents.events import (
++    IncidentCommentCreatedEvent,
++    IncidentCreatedEvent,
++    IncidentStatusUpdatedEvent,
++)
+ from sentry.incidents.logic import (
+     create_event_stat_snapshot,
+     create_incident,
+@@ -41,6 +46,8 @@ from sentry.testutils import (
+ 
+ 
+ class CreateIncidentTest(TestCase):
++    record_event = patcher('sentry.analytics.base.Analytics.record_event')
++
+     def test_simple(self):
+         incident_type = IncidentType.CREATED
+         title = 'hello'
+@@ -48,6 +55,7 @@ class CreateIncidentTest(TestCase):
+         date_started = timezone.now()
+         other_project = self.create_project()
+         other_group = self.create_group(project=other_project)
++        self.record_event.reset_mock()
+         incident = create_incident(
+             self.organization,
+             type=incident_type,
+@@ -76,10 +84,20 @@ class CreateIncidentTest(TestCase):
+             type=IncidentActivityType.CREATED.value,
+             event_stats_snapshot__isnull=False,
+         ).count() == 1
++        assert len(self.record_event.call_args_list) == 1
++        event = self.record_event.call_args[0][0]
++        assert isinstance(event, IncidentCreatedEvent)
++        assert event.data == {
++            'organization_id': six.text_type(self.organization.id),
++            'incident_id': six.text_type(incident.id),
++            'incident_type': six.text_type(IncidentType.CREATED.value),
++        }
+ 
+ 
+ @freeze_time()
+ class UpdateIncidentStatus(TestCase):
++    record_event = patcher('sentry.analytics.base.Analytics.record_event')
++
+     def get_most_recent_incident_activity(self, incident):
+         return IncidentActivity.objects.filter(incident=incident).order_by('-id')[:1].get()
+ 
+@@ -97,6 +115,7 @@ class UpdateIncidentStatus(TestCase):
+         comment=None,
+     ):
+         prev_status = incident.status
++        self.record_event.reset_mock()
+         update_incident_status(incident, status, user=user, comment=comment)
+         incident = Incident.objects.get(id=incident.id)
+         assert incident.status == status.value
+@@ -111,6 +130,17 @@ class UpdateIncidentStatus(TestCase):
+         assert activity.comment == comment
+         assert activity.event_stats_snapshot is None
+ 
++        assert len(self.record_event.call_args_list) == 1
++        event = self.record_event.call_args[0][0]
++        assert isinstance(event, IncidentStatusUpdatedEvent)
++        assert event.data == {
++            'organization_id': six.text_type(self.organization.id),
++            'incident_id': six.text_type(incident.id),
++            'incident_type': six.text_type(incident.type),
++            'prev_status': six.text_type(prev_status),
++            'status': six.text_type(incident.status),
++        }
++
+     def test_closed(self):
+         incident = self.create_incident()
+         self.run_test(incident, IncidentStatus.CLOSED, timezone.now())
+@@ -254,6 +284,7 @@ class CreateEventStatTest(TestCase, BaseIncidentsTest):
+ @freeze_time()
+ class CreateIncidentActivityTest(TestCase, BaseIncidentsTest):
+     send_subscriber_notifications = patcher('sentry.incidents.logic.send_subscriber_notifications')
++    record_event = patcher('sentry.analytics.base.Analytics.record_event')
+ 
+     def assert_notifications_sent(self, activity):
+         self.send_subscriber_notifications.apply_async.assert_called_once_with(
+@@ -263,6 +294,7 @@ class CreateIncidentActivityTest(TestCase, BaseIncidentsTest):
+ 
+     def test_no_snapshot(self):
+         incident = self.create_incident()
++        self.record_event.reset_mock()
+         activity = create_incident_activity(
+             incident,
+             IncidentActivityType.STATUS_CHANGE,
+@@ -276,6 +308,7 @@ class CreateIncidentActivityTest(TestCase, BaseIncidentsTest):
+         assert activity.value == six.text_type(IncidentStatus.CLOSED.value)
+         assert activity.previous_value == six.text_type(IncidentStatus.OPEN.value)
+         self.assert_notifications_sent(activity)
++        assert not self.record_event.called
+ 
+     def test_snapshot(self):
+         self.create_event(self.now - timedelta(minutes=2))
+@@ -295,6 +328,7 @@ class CreateIncidentActivityTest(TestCase, BaseIncidentsTest):
+             projects=[self.project]
+         )
+         event_stats_snapshot = create_initial_event_stats_snapshot(incident)
++        self.record_event.reset_mock()
+         activity = create_incident_activity(
+             incident,
+             IncidentActivityType.CREATED,
+@@ -307,6 +341,7 @@ class CreateIncidentActivityTest(TestCase, BaseIncidentsTest):
+ 
+         assert event_stats_snapshot == activity.event_stats_snapshot
+         self.assert_notifications_sent(activity)
++        assert not self.record_event.called
+ 
+     def test_comment(self):
+         incident = self.create_incident()
+@@ -319,6 +354,7 @@ class CreateIncidentActivityTest(TestCase, BaseIncidentsTest):
+             before=False,
+             after=True,
+         ):
++            self.record_event.reset_mock()
+             activity = create_incident_activity(
+                 incident,
+                 IncidentActivityType.COMMENT,
+@@ -332,6 +368,16 @@ class CreateIncidentActivityTest(TestCase, BaseIncidentsTest):
+         assert activity.value is None
+         assert activity.previous_value is None
+         self.assert_notifications_sent(activity)
++        assert len(self.record_event.call_args_list) == 1
++        event = self.record_event.call_args[0][0]
++        assert isinstance(event, IncidentCommentCreatedEvent)
++        assert event.data == {
++            'organization_id': six.text_type(self.organization.id),
++            'incident_id': six.text_type(incident.id),
++            'incident_type': six.text_type(incident.type),
++            'user_id': six.text_type(self.user.id),
++            'activity_id': six.text_type(activity.id),
++        }
+ 
+     def test_mentioned_user_ids(self):
+         incident = self.create_incident()
+@@ -345,6 +391,7 @@ class CreateIncidentActivityTest(TestCase, BaseIncidentsTest):
+             before=False,
+             after=True,
+         ):
++            self.record_event.reset_mock()
+             activity = create_incident_activity(
+                 incident,
+                 IncidentActivityType.COMMENT,
+@@ -359,6 +406,16 @@ class CreateIncidentActivityTest(TestCase, BaseIncidentsTest):
+         assert activity.value is None
+         assert activity.previous_value is None
+         self.assert_notifications_sent(activity)
++        assert len(self.record_event.call_args_list) == 1
++        event = self.record_event.call_args[0][0]
++        assert isinstance(event, IncidentCommentCreatedEvent)
++        assert event.data == {
++            'organization_id': six.text_type(self.organization.id),
++            'incident_id': six.text_type(incident.id),
++            'incident_type': six.text_type(incident.type),
++            'user_id': six.text_type(self.user.id),
++            'activity_id': six.text_type(activity.id),
++        }
+ 
+ 
+ @freeze_time()
+diff --git a/tests/sentry/incidents/test_tasks.py b/tests/sentry/incidents/test_tasks.py
+index 5561c7b355..b7c5d24fb1 100644
+--- a/tests/sentry/incidents/test_tasks.py
++++ b/tests/sentry/incidents/test_tasks.py
+@@ -113,7 +113,7 @@ class TestBuildActivityContext(BaseIncidentActivityTest, TestCase):
+                 'organization_slug': incident.organization.slug,
+                 'incident_id': incident.identifier,
+             },
+-        ))
++        )) + '?referrer=incident_activity_email'
+         assert context['comment'] == expected_comment
+         assert context['unsubscribe_link'] == generate_signed_link(
+             expected_recipient,

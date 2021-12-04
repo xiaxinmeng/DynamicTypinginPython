@@ -1,0 +1,479 @@
+commit 8fef91acd6ca45576f723e2ce102dc059fbf0d69
+Author: Ted Kaemming <ted@kaemming.com>
+Date:   Mon Oct 26 16:31:55 2015 -0700
+
+    Update digest scheduling algorithm.
+    
+    - Adds the "immediate scheduling" concept.
+    - Removes backoff strategies -- these are incompatible with new
+      approach, and are simpler to model using options now.
+
+diff --git a/src/sentry/digests/backends/base.py b/src/sentry/digests/backends/base.py
+index c57d5605f2..eb14ec1255 100644
+--- a/src/sentry/digests/backends/base.py
++++ b/src/sentry/digests/backends/base.py
+@@ -12,18 +12,6 @@ def load(options):
+     return import_string(options['path'])(**options.get('options', {}))
+ 
+ 
+-DEFAULT_BACKOFF = {
+-    'path': 'sentry.digests.backoff.IntervalBackoffStrategy',
+-    'options': {
+-        'default': 60 * 15,
+-        'intervals': {
+-            0: 30,
+-            1: 60 * 5,
+-        },
+-    },
+-}
+-
+-
+ DEFAULT_CODEC = {
+     'path': 'sentry.digests.codecs.CompressedPickleCodec',
+ }
+@@ -51,15 +39,14 @@ class Backend(object):
+     deleted (although deletion may be preempted by a new record being added to
+     the timeline, requiring it to be transitioned to "waiting" instead.)
+     """
++    interval = 60  # TODO: make option
++    maximum_delay = interval * 5
++
+     def __init__(self, **options):
+         # The ``codec`` option provides the strategy for encoding and decoding
+         # records in the timeline.
+         self.codec = load(options.pop('codec', DEFAULT_CODEC))
+ 
+-        # The ``backoff`` option provides the strategy for calculating
+-        # scheduling intervals.
+-        self.backoff = load(options.pop('backoff', DEFAULT_BACKOFF))
+-
+         # The ``capacity`` option defines the maximum number of items that
+         # should be contained within a timeline. (Whether this is a hard or
+         # soft limit is backend dependent -- see the ``trim_chance`` option.)
+@@ -96,6 +83,9 @@ class Backend(object):
+ 
+         If another record exists in the timeline with the same record key, it
+         will be overwritten.
++
++        The return value this function indicates whether or not the timeline is
++        ready for immediate digestion.
+         """
+         raise NotImplementedError
+ 
+diff --git a/src/sentry/digests/backends/redis.py b/src/sentry/digests/backends/redis.py
+index 7952633244..f5b0ff04fe 100644
+--- a/src/sentry/digests/backends/redis.py
++++ b/src/sentry/digests/backends/redis.py
+@@ -37,6 +37,7 @@ TIMELINE_PATH_COMPONENT = 't'
+ TIMELINE_ITERATION_PATH_COMPONENT = 'i'
+ TIMELINE_DIGEST_PATH_COMPONENT = 'd'
+ TIMELINE_RECORD_PATH_COMPONENT = 'r'
++TIMELINE_LAST_PROCESSED_TIMESTAMP_PATH_COMPONENT = 'l'
+ 
+ 
+ def make_rb_cluster(hosts, **kwargs):
+@@ -60,8 +61,8 @@ def make_timeline_key(namespace, key):
+     return '{0}:{1}:{2}'.format(namespace, TIMELINE_PATH_COMPONENT, key)
+ 
+ 
+-def make_iteration_key(timeline_key):
+-    return '{0}:{1}'.format(timeline_key, TIMELINE_ITERATION_PATH_COMPONENT)
++def make_last_processed_timestamp_key(timeline_key):
++    return '{0}:{1}'.format(timeline_key, TIMELINE_LAST_PROCESSED_TIMESTAMP_PATH_COMPONENT)
+ 
+ 
+ def make_digest_key(timeline_key):
+@@ -72,30 +73,57 @@ def make_record_key(timeline_key, record):
+     return '{0}:{1}:{2}'.format(timeline_key, TIMELINE_RECORD_PATH_COMPONENT, record)
+ 
+ 
+-# Ensures an timeline is scheduled to be digested.
+-# KEYS: {WATING, READY}
+-# ARGV: {TIMELINE, TIMESTAMP}
++# Ensures an timeline is scheduled to be digested, adjusting the schedule time
++# if necessary.
++# KEYS: {WAITING, READY}
++# ARGV: {
++#   TIMELINE,   -- timeline key
++#   TIMESTAMP,  --
++#   INCREMENT,  -- amount of time (in seconds) that an event addition delays scheduling
++#   MAXIMUM     -- maximum amount of time (in seconds) between a timeline being
++#               -- digested, and the same timeline being scheduled for the next
++#               -- digestion
++# }
+ ENSURE_TIMELINE_SCHEDULED_SCRIPT = """\
+--- Check to see if the timeline exists in the "waiting" set (heuristics tell us
+--- that this should be more likely than it's presence in the "ready" set.)
+-local waiting = redis.call('ZSCORE', KEYS[1], ARGV[1])
+-
+-if waiting ~= false then
+-    -- If the item already exists, update the score if the provided timestamp
+-    -- is less than the current score.
+-    if tonumber(waiting) > tonumber(ARGV[2]) then
+-        redis.call('ZADD', KEYS[1], ARGV[2], ARGV[1])
+-    end
+-    return
++-- If the timeline is already in the "ready" set, this is a noop.
++if tonumber(redis.call('ZSCORE', KEYS[2], ARGV[1])) ~= nil then
++    return false
+ end
+ 
+--- Otherwise, check to see if the timeline already exists in the "ready" set.
+--- If it doesn't, it needs to be added to the "waiting" set to be scheduled.
+-if redis.call('ZSCORE', KEYS[2], ARGV[1]) == false then
+-    redis.call('ZADD', KEYS[1], ARGV[2], ARGV[1])
+-    return
++-- Otherwise, check to see if the timeline is in the "waiting" set.
++local score = tonumber(redis.call('ZSCORE', KEYS[1], ARGV[1]))
++if score ~= nil then
++    -- If the timeline is already in the "waiting" set, increase the delay by
++    -- min(current schedule + increment value, maximum delay after last processing time).
++    local last = tonumber(redis.call('GET', ARGV[1] .. ':{TIMELINE_LAST_PROCESSED_TIMESTAMP_PATH_COMPONENT}'))
++    local update = nil;
++    if last == nil then
++        -- If the last processed timestamp is missing for some reason (possibly
++        -- evicted), be conservative and allow the timeline to be scheduled
++        -- with either the current schedule time or provided timestamp,
++        -- whichever is smaller.
++        update = math.min(last, ARGV[2])
++    else
++        update = math.min(
++            score + tonumber(ARGV[3]),
++            last + tonumber(ARGV[4])
++        )
++    end
++
++    if update ~= score then
++        redis.call('ZADD', KEYS[1], update, ARGV[1])
++    end
++    return false
+ end
+-"""
++
++-- If the timeline isn't already in either set, add it to the "ready" set with
++-- the provided timestamp. This allows for immediate scheduling, bypassing the
++-- imposed delay of the "waiting" state.
++redis.call('ZADD', KEYS[2], ARGV[2], ARGV[1])
++return true
++""".format(
++    TIMELINE_LAST_PROCESSED_TIMESTAMP_PATH_COMPONENT=TIMELINE_LAST_PROCESSED_TIMESTAMP_PATH_COMPONENT,
++)
+ 
+ 
+ # Trims a timeline to a maximum number of records.
+@@ -123,14 +151,10 @@ class RedisBackend(Backend):
+     Implements the digest backend API, backed by Redis.
+ 
+     Each timeline is modeled as a sorted set, and also maintains a separate key
+-    that contains the iteration counter for implementing backoff strategies
+-    that require this value as an argument, such as exponential backoff.
++    that contains the last time the digest was processed (used for scheduling.)
+ 
+     .. code::
+ 
+-        redis:6379> GET "d:t:mail:p:1:i"
+-        "1"
+-
+         redis:6379> ZREVRANGEBYSCORE "d:t:mail:p:1" inf -inf WITHSCORES
+         1) "433be20b807c4cd49a132de69c0f6c55"
+         2) "1444847625"
+@@ -138,10 +162,8 @@ class RedisBackend(Backend):
+         4) "1444847625"
+         ...
+ 
+-    In the example above, the timeline ``mail:p:1`` has already been digested
+-    once, as evidenced by the iteration counter (the key that ends with
+-    ``:i``.) The timeline also contains references to several records, which
+-    are stored separately, encoded using the codec provided to the backend:
++    The timeline contains references to several records, which are stored
++    separately, encoded using the codec provided to the backend:
+ 
+     .. code::
+ 
+@@ -189,7 +211,7 @@ class RedisBackend(Backend):
+         # timelines, digests, and records should all be deleted after they have
+         # been processed -- this is mainly to ensure stale data doesn't hang
+         # around too long in the case of a configuration error. This should be
+-        # larger than the maximum backoff value to ensure data is not evicted
++        # larger than the maximum scheduling delay to ensure data is not evicted
+         # too early.
+         self.ttl = options.pop('ttl', 60 * 60)
+ 
+@@ -218,9 +240,6 @@ class RedisBackend(Backend):
+                 ex=self.ttl,
+             )
+ 
+-            pipeline.set(make_iteration_key(timeline_key), 0, nx=True)
+-            pipeline.expire(make_iteration_key(timeline_key), self.ttl)
+-
+             # In the future, it might make sense to prefix the entry with the
+             # timestamp (lexicographically sortable) to ensure that we can
+             # maintain the correct sort order with abitrary precision:
+@@ -233,7 +252,12 @@ class RedisBackend(Backend):
+                     functools.partial(make_schedule_key, self.namespace),
+                     (SCHEDULE_STATE_WAITING, SCHEDULE_STATE_READY,),
+                 ),
+-                (key, record.timestamp + self.backoff(0)),
++                (
++                    key,
++                    record.timestamp,
++                    5,
++                    self.maximum_delay,
++                ),
+                 pipeline,
+             )
+ 
+@@ -245,6 +269,8 @@ class RedisBackend(Backend):
+             if should_truncate:
+                 logger.info('Removed %s extra records from %s.', results[-1], key)
+ 
++            return results[-2 if should_truncate else -1]
++
+     def schedule(self, deadline, chunk=1000):
+         # TODO: This doesn't lead to a fair balancing of workers, ideally each
+         # scheduling task would be executed by a different process for each
+@@ -463,15 +489,6 @@ class RedisBackend(Backend):
+             if not records:
+                 logger.info('Retrieved timeline containing no records.')
+ 
+-            def get_iteration_count(default=0):
+-                value = connection.get(make_iteration_key(timeline_key))
+-                if not value:
+-                    logger.warning('Could not retrieve iteration counter for %s, defaulting to %s.', key, default)
+-                    return default
+-                return int(value)
+-
+-            iteration = get_iteration_count()
+-
+             def get_records_for_digest():
+                 with connection.pipeline(transaction=False) as pipeline:
+                     for record_key, timestamp in records:
+@@ -500,8 +517,8 @@ class RedisBackend(Backend):
+ 
+                     cleanup_records(pipeline)
+                     pipeline.zrem(make_schedule_key(self.namespace, SCHEDULE_STATE_READY), key)
+-                    pipeline.zadd(make_schedule_key(self.namespace, SCHEDULE_STATE_WAITING), time.time() + self.backoff(iteration + 1), key)
+-                    pipeline.set(make_iteration_key(timeline_key), iteration + 1)
++                    pipeline.zadd(make_schedule_key(self.namespace, SCHEDULE_STATE_WAITING), time.time() + self.interval, key)
++                    pipeline.setex(make_last_processed_timestamp_key(timeline_key), self.ttl, int(time.time()))
+                     pipeline.execute()
+ 
+             def unschedule():
+@@ -512,15 +529,15 @@ class RedisBackend(Backend):
+                     pipeline.multi()
+                     if connection.zcard(timeline_key) is 0:
+                         cleanup_records(pipeline)
+-                        pipeline.delete(make_iteration_key(timeline_key))
++                        pipeline.delete(make_last_processed_timestamp_key(timeline_key))
+                         pipeline.zrem(make_schedule_key(self.namespace, SCHEDULE_STATE_READY), key)
+                         pipeline.zrem(make_schedule_key(self.namespace, SCHEDULE_STATE_WAITING), key)
+                         pipeline.execute()
+ 
+-            # If there were records in the digest, we need to schedule it so that
+-            # we schedule any records that were added during digestion with the
+-            # appropriate backoff. If there were no items, we can try to remove the
+-            # timeline from the digestion schedule.
++            # If there were records in the digest, we need to schedule it so
++            # that we schedule any records that were added during digestion. If
++            # there were no items, we can try to remove the timeline from the
++            # digestion schedule.
+             if records:
+                 reschedule()
+             else:
+diff --git a/src/sentry/digests/backoff.py b/src/sentry/digests/backoff.py
+deleted file mode 100644
+index 1cfbb7c0aa..0000000000
+--- a/src/sentry/digests/backoff.py
++++ /dev/null
+@@ -1,15 +0,0 @@
+-from __future__ import absolute_import
+-
+-
+-class BackoffStrategy(object):
+-    def __call__(self, iteration):
+-        raise NotImplementedError
+-
+-
+-class IntervalBackoffStrategy(BackoffStrategy):
+-    def __init__(self, default=60, intervals=None):
+-        self.default = default
+-        self.intervals = intervals if intervals is not None else {}
+-
+-    def __call__(self, iteration):
+-        return self.intervals.get(iteration, self.default)
+diff --git a/src/sentry/plugins/bases/notify.py b/src/sentry/plugins/bases/notify.py
+index da07d60585..7c05dbfda0 100644
+--- a/src/sentry/plugins/bases/notify.py
++++ b/src/sentry/plugins/bases/notify.py
+@@ -22,6 +22,7 @@ from sentry.digests.notifications import (
+ )
+ from sentry.plugins import Notification, Plugin
+ from sentry.models import UserOption
++from sentry.tasks.digests import deliver_digest
+ 
+ 
+ class NotificationConfigurationForm(forms.Form):
+@@ -67,10 +68,9 @@ class NotificationPlugin(Plugin):
+             raise NotImplementedError('The default behavior for notification de-duplication does not support args')
+ 
+         if self.__can_be_digested(event):
+-            digests.add(
+-                unsplit_key(self, event.group.project),  # TODO: Improve this abstraction.
+-                event_to_record(event, rules),
+-            )
++            key = unsplit_key(self, event.group.project)
++            if digests.add(key, event_to_record(event, rules)):
++                deliver_digest.delay(key)
+         else:
+             notification = Notification(event=event, rules=rules)
+             self.notify(notification)
+diff --git a/src/sentry/tasks/digests.py b/src/sentry/tasks/digests.py
+index 5e20d9052a..23825f22d2 100644
+--- a/src/sentry/tasks/digests.py
++++ b/src/sentry/tasks/digests.py
+@@ -35,7 +35,7 @@ def schedule_digests():
+ @instrumented_task(
+     name='sentry.tasks.digests.deliver_digest',
+     queue='digests.delivery')
+-def deliver_digest(key, schedule_timestamp):
++def deliver_digest(key, schedule_timestamp=None):
+     from sentry.app import digests
+ 
+     plugin, project = split_key(key)
+diff --git a/tests/sentry/digests/backends/test_redis.py b/tests/sentry/digests/backends/test_redis.py
+index 7219a7f9d8..723ee42731 100644
+--- a/tests/sentry/digests/backends/test_redis.py
++++ b/tests/sentry/digests/backends/test_redis.py
+@@ -17,7 +17,7 @@ from sentry.digests.backends.redis import (
+     RedisBackend,
+     ensure_timeline_scheduled,
+     make_digest_key,
+-    make_iteration_key,
++    make_last_processed_timestamp_key,
+     make_record_key,
+     make_schedule_key,
+     make_timeline_key,
+@@ -63,31 +63,31 @@ class RedisScriptTestCase(BaseRedisBackendTestCase):
+         timeline_score_in_waiting_set = functools.partial(client.zscore, 'waiting', timeline)
+         timeline_score_in_ready_set = functools.partial(client.zscore, 'ready', timeline)
+ 
+-        # The first addition should cause the timeline to be added to the waiting set.
+-        with self.assertChanges(waiting_set_size, before=0, after=1), \
+-                self.assertChanges(timeline_score_in_waiting_set, before=None, after=timestamp):
+-            ensure_timeline_scheduled(('waiting', 'ready'), (timeline, timestamp), client)
++        # The first addition should cause the timeline to be added to the ready set.
++        with self.assertChanges(ready_set_size, before=0, after=1), \
++                self.assertChanges(timeline_score_in_ready_set, before=None, after=timestamp):
++            assert ensure_timeline_scheduled(('waiting', 'ready'), (timeline, timestamp, 1, 10), client) == 1
+ 
+         # Adding it again with a timestamp in the future should not change the schedule time.
+         with self.assertDoesNotChange(waiting_set_size), \
+-                self.assertDoesNotChange(timeline_score_in_waiting_set):
+-            ensure_timeline_scheduled(('waiting', 'ready'), (timeline, timestamp + 50), client)
++                self.assertDoesNotChange(ready_set_size), \
++                self.assertDoesNotChange(timeline_score_in_ready_set):
++            assert ensure_timeline_scheduled(('waiting', 'ready'), (timeline, timestamp + 50, 1, 10), client) is None
+ 
+-        # If we see a record with a timestamp earlier than the schedule time,
+-        # we should change the schedule.
+-        with self.assertDoesNotChange(waiting_set_size), \
+-                self.assertChanges(timeline_score_in_waiting_set, before=timestamp, after=timestamp - 50):
+-            ensure_timeline_scheduled(('waiting', 'ready'), (timeline, timestamp - 50), client)
++        # Move the timeline from the ready set to the waiting set.
++        client.zrem('ready', timeline)
++        client.zadd('waiting', timestamp, timeline)
++        client.set(make_last_processed_timestamp_key(timeline), timestamp)
+ 
+-        # Move the timeline from the waiting set to the ready set.
+-        client.zrem('waiting', timeline)
+-        client.zadd('ready', timestamp, timeline)
++        increment = 1
++        with self.assertDoesNotChange(waiting_set_size), \
++                self.assertChanges(timeline_score_in_waiting_set, before=timestamp, after=timestamp + increment):
++            assert ensure_timeline_scheduled(('waiting', 'ready'), (timeline, timestamp, increment, 10), client) is None
+ 
+-        # Nothing should change.
++        # Make sure the schedule respects the maximum value.
+         with self.assertDoesNotChange(waiting_set_size), \
+-                self.assertDoesNotChange(ready_set_size), \
+-                self.assertDoesNotChange(timeline_score_in_ready_set):
+-            ensure_timeline_scheduled(('waiting', 'ready'), (timeline, timestamp - 50), client)
++                self.assertChanges(timeline_score_in_waiting_set, before=timestamp + 1, after=timestamp):
++            assert ensure_timeline_scheduled(('waiting', 'ready'), (timeline, timestamp, increment, 0), client) is None
+ 
+     def test_truncate_timeline_script(self):
+         client = StrictRedis(db=9)
+@@ -123,19 +123,17 @@ class RedisBackendTestCase(BaseRedisBackendTestCase):
+         connection = backend.cluster.get_local_client_for_key(timeline_key)
+ 
+         record = next(self.records)
+-        waiting_set_key = make_schedule_key(backend.namespace, SCHEDULE_STATE_WAITING)
++        ready_set_key = make_schedule_key(backend.namespace, SCHEDULE_STATE_READY)
+         record_key = make_record_key(timeline_key, record.key)
+ 
+-        get_timeline_score_in_waiting_set = functools.partial(connection.zscore, waiting_set_key, timeline)
+-        get_timeline_iteration_counter = functools.partial(connection.get, make_iteration_key(timeline_key))
++        get_timeline_score_in_ready_set = functools.partial(connection.zscore, ready_set_key, timeline)
+         get_record_score_in_timeline_set = functools.partial(connection.zscore, timeline_key, record.key)
+ 
+         def get_record_value():
+             value = connection.get(record_key)
+             return backend.codec.decode(value) if value is not None else None
+ 
+-        with self.assertChanges(get_timeline_score_in_waiting_set, before=None, after=record.timestamp + backend.backoff(0)), \
+-                self.assertChanges(get_timeline_iteration_counter, before=None, after='0'), \
++        with self.assertChanges(get_timeline_score_in_ready_set, before=None, after=record.timestamp), \
+                 self.assertChanges(get_record_score_in_timeline_set, before=None, after=record.timestamp), \
+                 self.assertChanges(get_record_value, before=None, after=record.value):
+             backend.add(timeline, record)
+@@ -234,8 +232,9 @@ class DigestTestCase(BaseRedisBackendTestCase):
+                 entries = list(entries)
+                 assert entries == records[::-1]
+ 
+-            next_scheduled_delivery = timestamp + backend.backoff(1)
++            next_scheduled_delivery = timestamp + backend.interval
+             assert client.zscore(waiting_set_key, timeline) == next_scheduled_delivery
++            assert int(client.get(make_last_processed_timestamp_key(timeline_key))) == int(timestamp)
+ 
+         # Move the timeline back to the ready set.
+         for entry in backend.schedule(next_scheduled_delivery):
+@@ -247,6 +246,8 @@ class DigestTestCase(BaseRedisBackendTestCase):
+             with backend.digest(timeline) as entries:
+                 assert list(entries) == []
+ 
++        assert client.get(make_last_processed_timestamp_key(timeline_key)) is None
++
+     def test_digesting_failure_recovery(self):
+         backend = self.get_backend()
+ 
+@@ -272,13 +273,11 @@ class DigestTestCase(BaseRedisBackendTestCase):
+         get_ready_set_size = functools.partial(get_set_size, backend.cluster, ready_set_key)
+         get_timeline_size = functools.partial(client.zcard, timeline_key)
+         get_digest_size = functools.partial(client.zcard, make_digest_key(timeline_key))
+-        get_iteration_counter = functools.partial(client.get, make_iteration_key(timeline_key))
+ 
+         with self.assertChanges(get_timeline_size, before=n, after=0), \
+                 self.assertChanges(get_digest_size, before=0, after=n), \
+                 self.assertDoesNotChange(get_waiting_set_size), \
+-                self.assertDoesNotChange(get_ready_set_size), \
+-                self.assertDoesNotChange(get_iteration_counter):
++                self.assertDoesNotChange(get_ready_set_size):
+             try:
+                 with backend.digest(timeline) as entries:
+                     raise ExpectedError
+@@ -293,13 +292,11 @@ class DigestTestCase(BaseRedisBackendTestCase):
+         with self.assertChanges(get_timeline_size, before=len(extra), after=0), \
+                 self.assertChanges(get_digest_size, before=len(records), after=0), \
+                 self.assertChanges(get_waiting_set_size, before=0, after=1), \
+-                self.assertChanges(get_ready_set_size, before=1, after=0), \
+-                self.assertChanges(get_iteration_counter, before='0', after='1'):
+-
++                self.assertChanges(get_ready_set_size, before=1, after=0):
+             timestamp = time.time()
+             with mock.patch('time.time', return_value=timestamp), \
+                     backend.digest(timeline) as entries:
+                 entries = list(entries)
+                 assert entries == (records + extra)[::-1]
+ 
+-            assert client.zscore(waiting_set_key, timeline) == timestamp + backend.backoff(1)
++            assert client.zscore(waiting_set_key, timeline) == timestamp + backend.interval

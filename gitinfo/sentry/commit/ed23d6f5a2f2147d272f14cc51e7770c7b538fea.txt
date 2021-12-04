@@ -1,0 +1,236 @@
+commit ed23d6f5a2f2147d272f14cc51e7770c7b538fea
+Author: Brett Hoerner <brett@bretthoerner.com>
+Date:   Fri Jul 20 15:14:08 2018 -0500
+
+    feat(snuba): Respect Organization retention in queries (#9123)
+    
+    * feat(snuba): Respect Organization retention in queries
+    
+    Fixes SNS-125
+
+diff --git a/src/sentry/utils/snuba.py b/src/sentry/utils/snuba.py
+index 883aff1fee..cc5e4fd4bb 100644
+--- a/src/sentry/utils/snuba.py
++++ b/src/sentry/utils/snuba.py
+@@ -2,6 +2,7 @@ from __future__ import absolute_import
+ 
+ from collections import OrderedDict
+ from contextlib import contextmanager
++from datetime import datetime, timedelta
+ from dateutil.parser import parse as parse_datetime
+ from itertools import chain
+ from operator import or_
+@@ -12,8 +13,12 @@ import urllib3
+ from django.conf import settings
+ from django.db.models import Q
+ 
++from sentry import quotas
+ from sentry.event_manager import HASH_RE
+-from sentry.models import Environment, Group, GroupHash, GroupHashTombstone, GroupRelease, Release, ReleaseProject
++from sentry.models import (
++    Environment, Group, GroupHash, GroupHashTombstone, GroupRelease,
++    Organization, Project, Release, ReleaseProject
++)
+ from sentry.utils import metrics, json
+ from sentry.utils.dates import to_timestamp
+ from functools import reduce
+@@ -27,6 +32,10 @@ class SnubaError(Exception):
+     pass
+ 
+ 
++class EntireQueryOutsideRetentionError(Exception):
++    pass
++
++
+ @contextmanager
+ def timer(name, prefix='snuba.client'):
+     t = time.time()
+@@ -96,6 +105,16 @@ def raw_query(start, end, groupby=None, conditions=None, filter_keys=None,
+     if not project_ids:
+         raise SnubaError("No project_id filter, or none could be inferred from other filters.")
+ 
++    # any project will do, as they should all be from the same organization
++    project = Project.objects.get(pk=project_ids[0])
++    retention = quotas.get_event_retention(
++        organization=Organization(project.organization_id)
++    )
++    if retention:
++        start = max(start, datetime.utcnow() - timedelta(days=retention))
++        if start > end:
++            raise EntireQueryOutsideRetentionError
++
+     # If the grouping, aggregation, or any of the conditions reference `issue`
+     # we need to fetch the issue definitions (issue -> fingerprint hashes)
+     aggregate_cols = [a[1] for a in aggregations]
+@@ -157,9 +176,16 @@ def query(start, end, groupby, conditions=None, filter_keys=None,
+     filter_keys = filter_keys or {}
+     selected_columns = selected_columns or []
+ 
+-    body = raw_query(start, end, groupby=groupby, conditions=conditions, filter_keys=filter_keys,
+-                     selected_columns=selected_columns, aggregations=aggregations, rollup=rollup, arrayjoin=arrayjoin,
+-                     limit=limit, orderby=orderby, having=having, referrer=referrer, is_grouprelease=is_grouprelease)
++    try:
++        body = raw_query(
++            start, end, groupby=groupby, conditions=conditions, filter_keys=filter_keys,
++            selected_columns=selected_columns, aggregations=aggregations, rollup=rollup,
++            arrayjoin=arrayjoin, limit=limit, orderby=orderby, having=having,
++            referrer=referrer, is_grouprelease=is_grouprelease
++        )
++    except EntireQueryOutsideRetentionError:
++        # this exception could also bubble up to the caller instead
++        return OrderedDict()
+ 
+     # Validate and scrub response, and translate snuba keys back to IDs
+     aggregate_cols = [a[2] for a in aggregations]
+diff --git a/tests/snuba/test_snuba.py b/tests/snuba/test_snuba.py
+index 81651294a6..fad00a8c6c 100644
+--- a/tests/snuba/test_snuba.py
++++ b/tests/snuba/test_snuba.py
+@@ -19,7 +19,7 @@ class SnubaTest(SnubaTestCase):
+         events = [{
+             'event_id': 'x' * 32,
+             'primary_hash': '1' * 32,
+-            'project_id': 100,
++            'project_id': self.project.id,
+             'message': 'message',
+             'platform': 'python',
+             'datetime': now.strftime('%Y-%m-%dT%H:%M:%S.%fZ'),
+@@ -34,8 +34,8 @@ class SnubaTest(SnubaTestCase):
+             start=now - timedelta(days=1),
+             end=now + timedelta(days=1),
+             groupby=['project_id'],
+-            filter_keys={'project_id': [100]},
+-        ) == {100: 1}
++            filter_keys={'project_id': [self.project.id]},
++        ) == {self.project.id: 1}
+ 
+     def test_fail(self):
+         now = datetime.now()
+@@ -43,7 +43,7 @@ class SnubaTest(SnubaTestCase):
+             snuba.query(
+                 start=now - timedelta(days=1),
+                 end=now + timedelta(days=1),
+-                filter_keys={'project_id': [100]},
++                filter_keys={'project_id': [self.project.id]},
+                 groupby=[")("],
+             )
+ 
+@@ -70,22 +70,22 @@ class SnubaTest(SnubaTestCase):
+         assert self.group.id in group_ids
+         assert None not in group_ids
+ 
++    def _insert_event_for_time(self, ts, hash='a' * 32):
++        self.snuba_insert({
++            'event_id': uuid.uuid4().hex,
++            'primary_hash': hash,
++            'project_id': self.project.id,
++            'message': 'message',
++            'platform': 'python',
++            'datetime': ts.strftime('%Y-%m-%dT%H:%M:%S.%fZ'),
++            'data': {
++                'received': time.mktime(ts.timetuple()),
++            }
++        })
++
+     def test_project_issues_with_tombstones(self):
+         base_time = datetime.utcnow()
+-        a_hash = 'a' * 32
+-
+-        def _insert_event_for_time(ts):
+-            self.snuba_insert({
+-                'event_id': uuid.uuid4().hex,
+-                'primary_hash': a_hash,
+-                'project_id': 100,
+-                'message': 'message',
+-                'platform': 'python',
+-                'datetime': ts.strftime('%Y-%m-%dT%H:%M:%S.%fZ'),
+-                'data': {
+-                    'received': time.mktime(ts.timetuple()),
+-                }
+-            })
++        hash = 'a' * 32
+ 
+         def _query_for_issue(group_id):
+             return snuba.query(
+@@ -93,7 +93,7 @@ class SnubaTest(SnubaTestCase):
+                 end=base_time + timedelta(days=1),
+                 groupby=['issue'],
+                 filter_keys={
+-                    'project_id': [100],
++                    'project_id': [self.project.id],
+                     'issue': [group_id]
+                 },
+             )
+@@ -104,13 +104,13 @@ class SnubaTest(SnubaTestCase):
+         GroupHash.objects.create(
+             project=self.project,
+             group=group1,
+-            hash=a_hash
++            hash=hash
+         )
+         assert snuba.get_project_issues([self.project], [group1.id]) == \
+             [(group1.id, group1.project_id, [('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', None)])]
+ 
+         # 1 event in the groups, no deletes have happened
+-        _insert_event_for_time(base_time)
++        self._insert_event_for_time(base_time, hash)
+         assert _query_for_issue(group1.id) == {group1.id: 1}
+ 
+         # group is deleted and then returns (as a new group with the same hash)
+@@ -122,18 +122,52 @@ class SnubaTest(SnubaTestCase):
+         GroupHash.objects.create(
+             project=self.project,
+             group=group2,
+-            hash=a_hash,
++            hash=hash,
+         )
+ 
+         # tombstone time is returned as expected
+         assert snuba.get_project_issues([self.project], [group2.id]) == \
+             [(group2.id, group2.project_id, [('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+-                           ght.deleted_at.strftime("%Y-%m-%d %H:%M:%S"))])]
++                                              ght.deleted_at.strftime("%Y-%m-%d %H:%M:%S"))])]
+ 
+         # events <= to the tombstone date aren't returned
+-        _insert_event_for_time(ght.deleted_at)
++        self._insert_event_for_time(ght.deleted_at, hash)
+         assert _query_for_issue(group2.id) == {}
+ 
+         # only the event > than the tombstone date is returned
+-        _insert_event_for_time(ght.deleted_at + timedelta(seconds=1))
++        self._insert_event_for_time(ght.deleted_at + timedelta(seconds=1), hash)
+         assert _query_for_issue(group2.id) == {group2.id: 1}
++
++    def test_organization_retention_respected(self):
++        base_time = datetime.utcnow()
++
++        self._insert_event_for_time(base_time - timedelta(minutes=1))
++        self._insert_event_for_time(base_time - timedelta(days=2))
++
++        def _get_event_count():
++            # attempt to query back 90 days
++            return snuba.query(
++                start=base_time - timedelta(days=90),
++                end=base_time + timedelta(days=1),
++                groupby=['project_id'],
++                filter_keys={
++                    'project_id': [self.project.id],
++                },
++            )
++
++        assert _get_event_count() == {self.project.id: 2}
++        with self.options({'system.event-retention-days': 1}):
++            assert _get_event_count() == {self.project.id: 1}
++
++    def test_organization_retention_larger_than_end_date(self):
++        base_time = datetime.utcnow()
++
++        with self.options({'system.event-retention-days': 1}):
++            assert snuba.query(
++                start=base_time - timedelta(days=90),
++                end=base_time - timedelta(days=60),
++                groupby=['project_id'],
++                filter_keys={
++                    'project_id': [self.project.id],
++                },
++            ) == {}

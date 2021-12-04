@@ -1,0 +1,246 @@
+commit 84b559536b6e8b006bdc7a787d1fb3765975df08
+Author: Markus Unterwaditzer <markus@unterwaditzer.net>
+Date:   Wed Oct 16 11:34:59 2019 +0200
+
+    ref: Prepare for diffing rust datascrubbers (#15097)
+
+diff --git a/src/sentry/coreapi.py b/src/sentry/coreapi.py
+index c8e455db3b..f9741135ec 100644
+--- a/src/sentry/coreapi.py
++++ b/src/sentry/coreapi.py
+@@ -24,7 +24,6 @@ from sentry.utils import json
+ from sentry.utils.auth import parse_auth_header
+ from sentry.utils.http import origin_from_request
+ from sentry.utils.strings import decompress
+-from sentry.utils.safe import get_path
+ from sentry.utils.sdk import configure_scope
+ from sentry.utils.canonical import CANONICAL_TYPES
+ 
+@@ -139,19 +138,6 @@ class ClientApiHelper(object):
+     def project_id_from_auth(self, auth):
+         return self.project_key_from_auth(auth).project_id
+ 
+-    def ensure_does_not_have_ip(self, data):
+-        env = get_path(data, "request", "env")
+-        if env:
+-            env.pop("REMOTE_ADDR", None)
+-
+-        user = get_path(data, "user")
+-        if user:
+-            user.pop("ip_address", None)
+-
+-        sdk = get_path(data, "sdk")
+-        if sdk:
+-            sdk.pop("client_ip", None)
+-
+     def insert_data_to_database(
+         self, data, start_time=None, from_reprocessing=False, attachments=None
+     ):
+diff --git a/src/sentry/management/commands/serve_normalize.py b/src/sentry/management/commands/serve_normalize.py
+index 20a28de5c7..f0f1954c47 100644
+--- a/src/sentry/management/commands/serve_normalize.py
++++ b/src/sentry/management/commands/serve_normalize.py
+@@ -15,7 +15,6 @@ import time
+ import traceback
+ import json
+ import resource
+-import multiprocessing
+ from optparse import make_option
+ 
+ from django.core.management.base import BaseCommand, CommandError
+@@ -54,9 +53,13 @@ def catch_errors(f):
+ 
+ 
+ # Here's where the normalization itself happens
+-def process_event(data, meta):
++def process_event(data, meta, project_config):
+     from sentry.event_manager import EventManager
+     from sentry.tasks.store import should_process
++    from sentry.web.api import _scrub_event_data
++    from sentry.relay.config import ProjectConfig
++
++    project_config = ProjectConfig(None, **project_config)
+ 
+     event_manager = EventManager(
+         data,
+@@ -71,15 +74,18 @@ def process_event(data, meta):
+     event = event_manager.get_data()
+     group_hash = None
+ 
++    datascrubbing_settings = project_config.config.get("datascrubbingSettings") or {}
++    event = _scrub_event_data(event, datascrubbing_settings)
++
+     if not should_process(event):
+         group_hash = event_manager._get_event_instance(project_id=1).get_hashes()
+     return {"event": dict(event), "group_hash": group_hash}
+ 
+ 
+ def decode(message):
+-    meta, data_encoded = json.loads(message)
++    meta, data_encoded, project_config = json.loads(message)
+     data = base64.b64decode(data_encoded)
+-    return data, meta
++    return data, meta, project_config
+ 
+ 
+ def encode(data):
+@@ -92,8 +98,8 @@ def handle_data(data):
+     mc = MetricCollector()
+ 
+     metrics_before = mc.collect_metrics()
+-    data, meta = decode(data)
+-    rv = process_event(data, meta)
++    data, meta, project_config = decode(data)
++    rv = process_event(data, meta, project_config)
+     metrics_after = mc.collect_metrics()
+ 
+     return encode(
+@@ -101,10 +107,6 @@ def handle_data(data):
+     )
+ 
+ 
+-def handle_data_piped(pipe, data):
+-    pipe.send(handle_data(data))
+-
+-
+ class MetricCollector(object):
+     def __init__(self):
+         self.is_linux = sys.platform.startswith("linux")
+@@ -157,17 +159,7 @@ class EventNormalizeHandler(SocketServer.BaseRequestHandler):
+         self.request.close()
+ 
+     def handle_data(self):
+-        @catch_errors
+-        def inner():
+-            # TODO: Remove this contraption once we no longer get segfaults
+-            parent_conn, child_conn = multiprocessing.Pipe()
+-            p = multiprocessing.Process(target=handle_data_piped, args=(child_conn, self.data))
+-            p.start()
+-            p.join(1)
+-            assert parent_conn.poll(), "Process crashed"
+-            return parent_conn.recv()
+-
+-        return inner()
++        return handle_data(self.data)
+ 
+ 
+ class Command(BaseCommand):
+diff --git a/src/sentry/utils/data_scrubber.py b/src/sentry/utils/data_scrubber.py
+index e4acb8e9d9..8bdbd343e9 100644
+--- a/src/sentry/utils/data_scrubber.py
++++ b/src/sentry/utils/data_scrubber.py
+@@ -195,3 +195,17 @@ class SensitiveDataFilter(object):
+                     querybits.append(chunk)
+             query = "&".join("=".join(k) for k in querybits)
+             data[key] = urlunsplit((scheme, netloc, path, query, fragment))
++
++
++def ensure_does_not_have_ip(data):
++    env = get_path(data, "request", "env")
++    if env:
++        env.pop("REMOTE_ADDR", None)
++
++    user = get_path(data, "user")
++    if user:
++        user.pop("ip_address", None)
++
++    sdk = get_path(data, "sdk")
++    if sdk:
++        sdk.pop("client_ip", None)
+diff --git a/src/sentry/web/api.py b/src/sentry/web/api.py
+index 82cb62673a..7f133fb415 100644
+--- a/src/sentry/web/api.py
++++ b/src/sentry/web/api.py
+@@ -3,6 +3,7 @@ from __future__ import absolute_import, print_function
+ import base64
+ import math
+ 
++import os
+ import io
+ import jsonschema
+ import logging
+@@ -67,7 +68,7 @@ from sentry.signals import event_accepted, event_dropped, event_filtered, event_
+ from sentry.quotas.base import RateLimit
+ from sentry.utils import json, metrics
+ from sentry.utils.data_filters import FilterStatKeys
+-from sentry.utils.data_scrubber import SensitiveDataFilter
++from sentry.utils.data_scrubber import SensitiveDataFilter, ensure_does_not_have_ip
+ from sentry.utils.http import is_valid_origin, get_origins, is_same_domain, origin_from_request
+ from sentry.utils.outcomes import Outcome, track_outcome, decide_signals_in_consumer
+ from sentry.utils.pubsub import QueuedPublisherService, KafkaPublisher
+@@ -288,18 +289,42 @@ def process_event(event_manager, project, key, remote_addr, helper, attachments,
+     config = project_config.config
+     datascrubbing_settings = config.get("datascrubbingSettings") or {}
+ 
+-    scrub_ip_address = datascrubbing_settings.get("scrubIpAddresses")
++    data = _scrub_event_data(data, datascrubbing_settings)
++
++    # mutates data (strips a lot of context if not queued)
++    helper.insert_data_to_database(data, start_time=start_time, attachments=attachments)
++
++    cache.set(cache_key, "", 60 * 60)  # Cache for 1 hour
++
++    api_logger.debug("New event received (%s)", event_id)
++
++    event_accepted.send_robust(ip=remote_addr, data=data, project=project, sender=process_event)
++
++    return event_id
++
+ 
++def _scrub_event_data(data, datascrubbing_settings):
++    scrub_ip_address = datascrubbing_settings.get("scrubIpAddresses")
+     scrub_data = datascrubbing_settings.get("scrubData")
+ 
+-    if random.random() < options.get("store.sample-rust-data-scrubber", 0.0):
++    if os.environ.get("SENTRY_USE_RUST_DATASCRUBBER") == "true":
++        sample_rust_scrubber = True
++        use_rust_scrubber = True
++    elif os.environ.get("SENTRY_USE_RUST_DATASCRUBBER") == "false":
++        sample_rust_scrubber = False
++        use_rust_scrubber = False
++    else:
++        sample_rust_scrubber = random.random() < options.get("store.sample-rust-data-scrubber", 0.0)
++        use_rust_scrubber = options.get("store.use-rust-data-scrubber", False)
++
++    if sample_rust_scrubber:
+         rust_scrubbed_data = safe_execute(
+             semaphore.scrub_event, datascrubbing_settings, dict(data), _with_transaction=False
+         )
+     else:
+         rust_scrubbed_data = None
+ 
+-    if rust_scrubbed_data and options.get("store.use-rust-data-scrubber", False):
++    if rust_scrubbed_data and use_rust_scrubber:
+         data = rust_scrubbed_data
+         data["_rust_data_scrubbed"] = True  # TODO: Remove after sampling
+     else:
+@@ -317,18 +342,9 @@ def process_event(event_manager, project, key, remote_addr, helper, attachments,
+ 
+         if scrub_ip_address:
+             # We filter data immediately before it ever gets into the queue
+-            helper.ensure_does_not_have_ip(data)
++            ensure_does_not_have_ip(data)
+ 
+-    # mutates data (strips a lot of context if not queued)
+-    helper.insert_data_to_database(data, start_time=start_time, attachments=attachments)
+-
+-    cache.set(cache_key, "", 60 * 60)  # Cache for 1 hour
+-
+-    api_logger.debug("New event received (%s)", event_id)
+-
+-    event_accepted.send_robust(ip=remote_addr, data=data, project=project, sender=process_event)
+-
+-    return event_id
++    return data
+ 
+ 
+ class APIView(BaseView):
+@@ -413,7 +429,7 @@ class APIView(BaseView):
+ 
+             kafka_publisher.publish(
+                 channel=getattr(settings, "KAFKA_RAW_EVENTS_PUBLISHER_TOPIC", "raw-store-events"),
+-                value=json.dumps([meta, base64.b64encode(data)]),
++                value=json.dumps([meta, base64.b64encode(data), project_config.to_dict()]),
+             )
+         except Exception as e:
+             logger.debug("Cannot publish event to Kafka: {}".format(e.message))

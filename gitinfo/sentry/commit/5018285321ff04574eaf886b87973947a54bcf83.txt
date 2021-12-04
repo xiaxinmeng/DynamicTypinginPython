@@ -1,0 +1,499 @@
+commit 5018285321ff04574eaf886b87973947a54bcf83
+Author: David Cramer <dcramer@gmail.com>
+Date:   Wed Mar 21 20:06:32 2012 -0700
+
+    Initial implementation of caching
+
+diff --git a/sentry/conf/defaults.py b/sentry/conf/defaults.py
+index b88eabf4c9..3661112a60 100644
+--- a/sentry/conf/defaults.py
++++ b/sentry/conf/defaults.py
+@@ -149,3 +149,6 @@ ALLOW_ORIGIN = None
+ 
+ # Enable capturing of JavaScript errors (Sentry internal errors)
+ USE_JS_CLIENT = False
++
++# The alias for the cache backend (MUST be a compatible backend string for < 1.3)
++CACHE_BACKEND = 'dummy://'
+diff --git a/sentry/conf/server.py b/sentry/conf/server.py
+index e70b77b41b..8f383c5e0b 100644
+--- a/sentry/conf/server.py
++++ b/sentry/conf/server.py
+@@ -131,6 +131,7 @@ CELERY_TASK_RESULT_EXPIRES = 1
+ 
+ SENTRY_PUBLIC = False
+ SENTRY_PROJECT = 1
++SENTRY_CACHE_BACKEND = 'default'
+ 
+ EMAIL_SUBJECT_PREFIX = '[Sentry] '
+ 
+diff --git a/sentry/coreapi.py b/sentry/coreapi.py
+index 3bde58f9fa..2b122740c7 100644
+--- a/sentry/coreapi.py
++++ b/sentry/coreapi.py
+@@ -75,7 +75,7 @@ def project_from_auth_vars(auth_vars, data):
+ 
+     if api_key:
+         try:
+-            pm = ProjectMember.objects.get(public_key=api_key)
++            pm = ProjectMember.objects.get_from_cache(public_key=api_key)
+         except ProjectMember.DoesNotExist:
+             raise APIForbidden('Invalid signature')
+         project = pm.project
+@@ -109,10 +109,13 @@ def project_from_api_key_and_id(api_key, project_id):
+     a project instance or throws APIUnauthorized.
+     """
+     try:
+-        pm = ProjectMember.objects.get(public_key=api_key, project=project_id)
++        pm = ProjectMember.objects.get_from_cache(public_key=api_key)
+     except ProjectMember.DoesNotExist:
+         raise APIUnauthorized()
+ 
++    if str(pm.project_id) != str(project_id):
++        raise APIUnauthorized()
++
+     return pm.project
+ 
+ 
+diff --git a/sentry/manager.py b/sentry/manager.py
+index ae63c6496c..50d5eeac8d 100644
+--- a/sentry/manager.py
++++ b/sentry/manager.py
+@@ -14,10 +14,12 @@ import logging
+ import re
+ import warnings
+ 
++from django.core.cache import cache
+ from django.core.signals import request_finished
+ from django.db import models, transaction, IntegrityError
+ from django.db.models import Sum, F
+-from django.utils.encoding import force_unicode
++from django.db.models.signals import post_save, post_delete, post_init, class_prepared
++from django.utils.encoding import force_unicode, smart_str
+ 
+ from raven.utils.encoding import to_string
+ from sentry.conf import settings
+@@ -32,6 +34,8 @@ from sentry.utils.queue import maybe_delay
+ 
+ logger = logging.getLogger('sentry.errors')
+ 
++UNSAVED = dict()
++
+ 
+ def get_checksum_from_event(event):
+     for interface in event.interfaces.itervalues():
+@@ -44,6 +48,152 @@ def get_checksum_from_event(event):
+     return hashlib.md5(to_string(event.message)).hexdigest()
+ 
+ 
++class BaseManager(models.Manager):
++    lookup_handlers = {
++        'iexact': lambda x: x.upper(),
++    }
++
++    def __init__(self, *args, **kwargs):
++        self.cache_fields = kwargs.pop('cache_fields', [])
++        self.cache_ttl = kwargs.pop('cache_ttl', 60 * 5)
++        super(BaseManager, self).__init__(*args, **kwargs)
++
++    def contribute_to_class(self, model, name):
++        super(BaseManager, self).contribute_to_class(model, name)
++        class_prepared.connect(self._class_prepared, sender=model)
++
++    def _prep_value(self, key, value):
++        if isinstance(value, models.Model):
++            value = value.pk
++        else:
++            value = unicode(value)
++        parts = key.split('__')
++        if len(key) > 1 and parts[-1] in self.lookup_handlers:
++            value = self.lookup_handlers[parts[-1]](value)
++        return value
++
++    def _prep_key(self, key):
++        if key == 'pk':
++            return self.model._meta.pk.name
++        return key
++
++    def _make_key(self, prefix, kwargs):
++        kwargs_bits = []
++        for k, v in sorted(kwargs.iteritems()):
++            k = self._prep_key(k)
++            v = smart_str(self._prep_value(k, v))
++            kwargs_bits.append('%s=%s' % (k, v))
++        kwargs_bits = ':'.join(kwargs_bits)
++
++        return '%s:%s:%s' % (prefix, self.model.__name__, hashlib.md5(kwargs_bits).hexdigest())
++
++    def _class_prepared(self, sender, **kwargs):
++        """
++        Given the cache is configured, connects the required signals for invalidation.
++        """
++        if not self.cache_fields:
++            return
++        sender.__cache_data = {}
++        post_init.connect(self._post_init, sender=sender, weak=False)
++        post_save.connect(self._post_save, sender=sender, weak=False)
++        post_delete.connect(self._post_delete, sender=sender, weak=False)
++
++    def _cache_state(self, instance):
++        """
++        Updates the tracked state of an instance.
++        """
++        if instance.pk:
++            instance.__cache_data = dict((f, getattr(instance, f)) for f in self.cache_fields)
++        else:
++            instance.__cache_data = UNSAVED
++
++    def _post_init(self, instance, **kwargs):
++        """
++        Stores the initial state of an instance.
++        """
++        self._cache_state(instance)
++
++    def _post_save(self, instance, **kwargs):
++        """
++        Pushes changes to an instance into the cache, and removes invalid (changed)
++        lookup values.
++        """
++        pk_name = instance._meta.pk.name
++        pk_names = ('pk', pk_name)
++        pk_val = instance.pk
++        for key in self.cache_fields:
++            if key in pk_names:
++                continue
++            # store pointers
++            cache.set(self._get_from_cache_key(**{key: getattr(instance, key)}), pk_val, self.cache_ttl)  # 1 hour
++
++        # Ensure we dont serialize the database into the cache
++        db = instance._state.db
++        instance._state.db = None
++        # store actual object
++        cache.set(self._get_from_cache_key(**{pk_name: pk_val}), instance, self.cache_ttl)
++        instance._state.db = db
++
++        # Kill off any keys which are no longer valid
++        for key in self.cache_fields:
++            if key not in instance.__cache_data:
++                continue
++            value = instance.__cache_data[key]
++            if value != getattr(instance, key):
++                cache.delete(self._get_from_cache_key(**{key: value}))
++
++        self._cache_state(instance)
++
++    def _post_delete(self, instance, **kwargs):
++        """
++        Drops instance from all cache storages.
++        """
++        pk_name = instance._meta.pk.name
++        for key in self.cache_fields:
++            if key in ('pk', pk_name):
++                continue
++            # remove pointers
++            cache.delete(self._get_from_cache_key(**{key: getattr(instance, key)}))
++        # remove actual object
++        cache.delete(self._get_from_cache_key(**{pk_name: instance.pk}))
++
++    def _get_from_cache_key(self, **kwargs):
++        return self._make_key('modelcache', kwargs)
++
++    def get_from_cache(self, **kwargs):
++        """
++        Wrapper around QuerySet.get which supports caching of the
++        intermediate value.  Callee is responsible for making sure
++        the cache key is cleared on save.
++        """
++        if not self.cache_fields or len(kwargs) > 1:
++            return self.get(**kwargs)
++
++        pk_name = self.model._meta.pk.name
++        key, value = kwargs.items()[0]
++
++        # Kill __exact since it's the default behavior
++        if key.endswith('__exact'):
++            key = key.split('__exact', 1)[0]
++
++        if key in self.cache_fields or key in ('pk', pk_name):
++            cache_key = self._get_from_cache_key(**{key: value})
++
++            retval = cache.get(cache_key)
++            if retval is None:
++                result = self.get(**kwargs)
++                # Ensure we're pushing it into the cache
++                self._post_save(instance=result)
++                return result
++
++            # If we didn't look up by pk we need to hit the reffed
++            # key
++            if key not in (pk_name, 'pk'):
++                return self.get(pk=retval)
++
++            return retval
++
++
+ class ScoreClause(object):
+     def __init__(self, group):
+         self.group = group
+@@ -129,7 +279,7 @@ class ChartMixin(object):
+         return [rows.get(today - datetime.timedelta(hours=d), 0) for d in xrange(first_seen, -1, -1)]
+ 
+ 
+-class GroupManager(models.Manager, ChartMixin):
++class GroupManager(BaseManager, ChartMixin):
+     use_for_related_fields = True
+ 
+     def __init__(self, *args, **kwargs):
+@@ -215,7 +365,7 @@ class GroupManager(models.Manager, ChartMixin):
+         from sentry.models import Event, Project, View
+         from sentry.views import View as ViewHandler
+ 
+-        project = Project.objects.get(pk=project)
++        project = Project.objects.get_from_cache(pk=project)
+ 
+         if any(k in kwargs for k in ('view', 'message_id')):
+             # we must be passing legacy data, let's convert it
+@@ -539,11 +689,11 @@ class RawQuerySet(object):
+         return self.queryset.raw(query, self.params)
+ 
+ 
+-class ProjectManager(models.Manager, ChartMixin):
++class ProjectManager(BaseManager, ChartMixin):
+     pass
+ 
+ 
+-class MetaManager(models.Manager):
++class MetaManager(BaseManager):
+     NOTSET = object()
+ 
+     def __init__(self, *args, **kwargs):
+@@ -585,7 +735,7 @@ class MetaManager(models.Manager):
+         self._metadata = {}
+ 
+ 
+-class InstanceMetaManager(models.Manager):
++class InstanceMetaManager(BaseManager):
+     NOTSET = object()
+ 
+     def __init__(self, field_name, *args, **kwargs):
+@@ -646,7 +796,7 @@ class InstanceMetaManager(models.Manager):
+         self._metadata = {}
+ 
+ 
+-class SearchDocumentManager(models.Manager):
++class SearchDocumentManager(BaseManager):
+     # Words which should not be indexed
+     STOP_WORDS = set(['the', 'of', 'to', 'and', 'a', 'in', 'is', 'it', 'you', 'that'])
+ 
+diff --git a/sentry/models.py b/sentry/models.py
+index e909bce51e..e15641a136 100644
+--- a/sentry/models.py
++++ b/sentry/models.py
+@@ -28,7 +28,7 @@ from django.utils.translation import ugettext_lazy as _
+ 
+ from sentry.conf import settings
+ from sentry.manager import GroupManager, ProjectManager, \
+-  MetaManager, InstanceMetaManager, SearchDocumentManager
++  MetaManager, InstanceMetaManager, SearchDocumentManager, BaseManager
+ from sentry.utils import cached_property, \
+   MockDjangoRequest
+ from sentry.utils.models import Model, GzippedDictField
+@@ -71,7 +71,9 @@ class Option(Model):
+     key = models.CharField(max_length=64, unique=True)
+     value = PickledObjectField()
+ 
+-    objects = MetaManager()
++    objects = MetaManager(cache_fields=[
++        'key',
++    ])
+ 
+ 
+ class Project(Model):
+@@ -88,7 +90,9 @@ class Project(Model):
+         (1, 'Hidden'),
+     ), db_index=True)
+ 
+-    objects = ProjectManager()
++    objects = ProjectManager(cache_fields=[
++        'pk',
++    ])
+ 
+     def __unicode__(self):
+         return u'#%s %r' % (self.pk, self.name)
+@@ -102,7 +106,7 @@ class Project(Model):
+ 
+     def merge_to(self, project):
+         if not isinstance(project, Project):
+-            project = Project.objects.get(pk=project)
++            project = Project.objects.get_from_cache(pk=project)
+ 
+         for group in Group.objects.filter(project=self):
+             try:
+@@ -187,6 +191,11 @@ class ProjectMember(Model):
+     type = models.IntegerField(choices=MEMBER_TYPES, default=globals().get(settings.DEFAULT_PROJECT_ACCESS))
+     date_added = models.DateTimeField(default=datetime.now)
+ 
++    objects = BaseManager(cache_fields=[
++        'public_key',
++        'secret_key',
++    ])
++
+     class Meta:
+         unique_together = (('project', 'user'),)
+ 
+@@ -222,6 +231,8 @@ class ProjectDomain(Model):
+     project = models.ForeignKey(Project, related_name="domain_set")
+     domain = models.CharField(max_length=128)
+ 
++    objects = BaseManager()
++
+     class Meta:
+         unique_together = (('project', 'domain'),)
+ 
+@@ -261,6 +272,10 @@ class View(Model):
+     verbose_name = models.CharField(max_length=200, null=True)
+     verbose_name_plural = models.CharField(max_length=200, null=True)
+ 
++    objects = BaseManager(cache_fields=[
++        'path',
++    ])
++
+     def __unicode__(self):
+         return self.path
+ 
+@@ -394,6 +409,9 @@ class Event(MessageBase):
+     server_name = models.CharField(max_length=128, db_index=True, null=True)
+     site = models.CharField(max_length=128, db_index=True, null=True)
+ 
++    objects = BaseManager()
++
++
+     class Meta:
+         verbose_name = _('message')
+         verbose_name_plural = _('messages')
+@@ -469,6 +487,8 @@ class GroupBookmark(Model):
+     # namespace related_name on User since we dont own the model
+     user = models.ForeignKey(User, related_name="sentry_bookmark_set")
+ 
++    objects = BaseManager()
++
+     class Meta:
+         # composite index includes project for efficient queries
+         unique_together = (('project', 'user', 'group'),)
+@@ -482,6 +502,8 @@ class FilterValue(Model):
+     key = models.CharField(choices=FILTER_KEYS, max_length=32)
+     value = models.CharField(max_length=200)
+ 
++    objects = BaseManager()
++
+     class Meta:
+         unique_together = (('project', 'key', 'value'),)
+ 
+@@ -502,6 +524,8 @@ class MessageFilterValue(Model):
+     last_seen = models.DateTimeField(default=datetime.now, db_index=True, null=True)
+     first_seen = models.DateTimeField(default=datetime.now, db_index=True, null=True)
+ 
++    objects = BaseManager()
++
+     class Meta:
+         unique_together = (('project', 'key', 'value', 'group'),)
+ 
+@@ -524,6 +548,8 @@ class MessageCountByMinute(Model):
+     time_spent_total = models.FloatField(default=0)
+     time_spent_count = models.IntegerField(default=0)
+ 
++    objects = BaseManager()
++
+     class Meta:
+         unique_together = (('project', 'group', 'date'),)
+ 
+@@ -544,6 +570,8 @@ class ProjectCountByMinute(Model):
+     time_spent_total = models.FloatField(default=0)
+     time_spent_count = models.IntegerField(default=0)
+ 
++    objects = BaseManager()
++
+     class Meta:
+         unique_together = (('project', 'date'),)
+ 
+@@ -568,6 +596,8 @@ class SearchToken(Model):
+     token = models.CharField(max_length=128)
+     times_seen = models.PositiveIntegerField(default=1)
+ 
++    objects = BaseManager()
++
+     class Meta:
+         unique_together = (('document', 'field', 'token'),)
+ 
+diff --git a/sentry/utils/cache.py b/sentry/utils/cache.py
+new file mode 100644
+index 0000000000..94ce044464
+--- /dev/null
++++ b/sentry/utils/cache.py
+@@ -0,0 +1,5 @@
++from django.core.cache import get_cache
++
++from sentry.conf import settings
++
++cache = get_cache(settings.CACHE_BACKEND)
+diff --git a/sentry/web/api.py b/sentry/web/api.py
+index 6460ba8282..28bad889b4 100644
+--- a/sentry/web/api.py
++++ b/sentry/web/api.py
+@@ -137,7 +137,7 @@ def poll(request, project):
+     view_id = request.GET.get('view_id')
+     if view_id:
+         try:
+-            view = View.objects.get(pk=view_id)
++            view = View.objects.get_from_cache(pk=view_id)
+         except View.DoesNotExist:
+             return HttpResponseBadRequest()
+     else:
+@@ -235,7 +235,7 @@ def clear(request, project):
+     view_id = request.GET.get('view_id')
+     if view_id:
+         try:
+-            view = View.objects.get(pk=view_id)
++            view = View.objects.get_from_cache(pk=view_id)
+         except View.DoesNotExist:
+             return HttpResponseBadRequest()
+     else:
+diff --git a/sentry/web/forms.py b/sentry/web/forms.py
+index 4d4463c398..12dcbf0234 100644
+--- a/sentry/web/forms.py
++++ b/sentry/web/forms.py
+@@ -74,7 +74,7 @@ class RemoveProjectForm(forms.Form):
+ 
+     def clean_project(self):
+         project_id = self.cleaned_data['project']
+-        return Project.objects.get(id=project_id)
++        return Project.objects.get_from_cache(id=project_id)
+ 
+ 
+ class NewProjectForm(forms.ModelForm):
+diff --git a/sentry/web/frontend/groups.py b/sentry/web/frontend/groups.py
+index c47f42a778..a001368923 100644
+--- a/sentry/web/frontend/groups.py
++++ b/sentry/web/frontend/groups.py
+@@ -185,7 +185,7 @@ def group_list(request, project, view_id=None):
+ 
+     if view_id:
+         try:
+-            view = View.objects.get(pk=view_id)
++            view = View.objects.get_from_cache(pk=view_id)
+         except View.DoesNotExist:
+             return HttpResponseRedirect(reverse('sentry', args=[project.pk]))
+     else:
+diff --git a/tests/sentry/api/tests.py b/tests/sentry/api/tests.py
+index b4ff323182..da82b33cb1 100644
+--- a/tests/sentry/api/tests.py
++++ b/tests/sentry/api/tests.py
+@@ -46,7 +46,7 @@ class APITest(TestCase):
+ 
+     def test_valid_project_from_api_key_and_id(self):
+         api_key = self.pm.public_key
+-        project = project_from_api_key_and_id(api_key, self.project)
++        project = project_from_api_key_and_id(api_key, self.project.id)
+         self.assertEquals(project, self.project)
+ 
+     def test_invalid_project_from_api_key_and_id(self):

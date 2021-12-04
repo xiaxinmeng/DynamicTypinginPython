@@ -1,0 +1,1735 @@
+commit ae9340bef2c7dae6c0af5c848e2178ece84beba7
+Author: Markus Unterwaditzer <markus@unterwaditzer.net>
+Date:   Tue Apr 2 12:07:52 2019 +0200
+
+    feat(native): Use Symbolicator for native processing (#12517)
+    
+    Symbolicator is a new external service responsible for processing native stacktraces. It replaces the symbolic python library for processing native event stack traces. This PR only covers frame symbolication and does not touch minidumps yet.
+
+diff --git a/requirements-test.txt b/requirements-test.txt
+index a11304b5aa..2f012bfc80 100644
+--- a/requirements-test.txt
++++ b/requirements-test.txt
+@@ -1,3 +1,4 @@
++betamax>=0.8.1,<0.9.0
+ # cassandra
+ blist
+ # TODO(dcramer): figure out why Travis needs this
+diff --git a/src/sentry/lang/native/plugin.py b/src/sentry/lang/native/plugin.py
+index 53f8d80a78..c69bc0e02a 100644
+--- a/src/sentry/lang/native/plugin.py
++++ b/src/sentry/lang/native/plugin.py
+@@ -12,9 +12,11 @@ from sentry.plugins import Plugin2
+ from sentry.lang.native.cfi import reprocess_minidump_with_cfi
+ from sentry.lang.native.minidump import is_minidump_event
+ from sentry.lang.native.symbolizer import Symbolizer, SymbolicationFailed
++from sentry.lang.native.symbolicator import run_symbolicator
+ from sentry.lang.native.utils import get_sdk_from_event, cpu_name_from_data, \
+-    rebase_addr
++    rebase_addr, signal_from_data, image_name
+ from sentry.lang.native.systemsymbols import lookup_system_symbols
++from sentry.models.eventerror import EventError
+ from sentry.utils import metrics
+ from sentry.utils.safe import get_path
+ from sentry.stacktraces import StacktraceProcessor
+@@ -24,6 +26,19 @@ logger = logging.getLogger(__name__)
+ 
+ FRAME_CACHE_VERSION = 6
+ 
++SYMBOLICATOR_FRAME_ATTRS = ("instruction_addr", "package", "lang", "symbol",
++                            "function", "symbol_addr", "filename", "lineno",
++                            "line_addr")
++
++
++def _is_symbolicator_enabled(project):
++    return options.get('symbolicator.enabled') and \
++        project.get_option('sentry:symbolicator-enabled')
++
++
++def request_id_cache_key_for_event(data):
++    return u'symbolicator:{1}:{0}'.format(data['project'], data['event_id'])
++
+ 
+ class NativeStacktraceProcessor(StacktraceProcessor):
+     supported_platforms = ('cocoa', 'native')
+@@ -33,7 +48,15 @@ class NativeStacktraceProcessor(StacktraceProcessor):
+     def __init__(self, *args, **kwargs):
+         StacktraceProcessor.__init__(self, *args, **kwargs)
+ 
++        # If true, the project has been opted into using the symbolicator
++        # service for native symbolication, which also means symbolic is not
++        # used at all anymore.
++        # The (iOS) symbolserver is still used regardless of this value.
++        self.use_symbolicator = _is_symbolicator_enabled(self.project)
++
+         self.arch = cpu_name_from_data(self.data)
++        self.signal = signal_from_data(self.data)
++
+         self.sym = None
+         self.difs_referenced = set()
+ 
+@@ -44,6 +67,7 @@ class NativeStacktraceProcessor(StacktraceProcessor):
+             self.available = True
+             self.sdk_info = get_sdk_from_event(self.data)
+             self.object_lookup = ObjectLookup(images)
++            self.images = images
+         else:
+             self.available = False
+ 
+@@ -84,10 +108,7 @@ class NativeStacktraceProcessor(StacktraceProcessor):
+             # The signal is useful information for symbolic in some situations
+             # to disambiugate the first frame.  If we can get this information
+             # from the mechanism we want to pass it onwards.
+-            exceptions = get_path(self.data, 'exception', 'values', filter=True)
+-            signal = get_path(exceptions, 0, 'mechanism', 'meta', 'signal', 'number')
+-            if signal is not None:
+-                signal = int(signal)
++            signal = self.signal
+ 
+             registers = processable_frame.stacktrace_info.stacktrace.get('registers')
+             if registers:
+@@ -118,6 +139,14 @@ class NativeStacktraceProcessor(StacktraceProcessor):
+             'obj': obj,
+             'debug_id': obj.debug_id if obj is not None else None,
+             'symbolserver_match': None,
++
++            # `[]` is used to indicate to the symbolizer that the symbolicator
++            # deliberately discarded this frame, while `None` means the
++            # symbolicator didn't run (because `self.use_symbolicator` is
++            # false).
++            # If the symbolicator did run and was not able to symbolize the
++            # frame, this value will be a list with the raw frame as only item.
++            'symbolicator_match': [] if self.use_symbolicator else None,
+         }
+ 
+         if obj is not None:
+@@ -152,6 +181,113 @@ class NativeStacktraceProcessor(StacktraceProcessor):
+         if options.get('symbolserver.enabled'):
+             self.fetch_system_symbols(processing_task)
+ 
++        if self.use_symbolicator:
++            self.run_symbolicator(processing_task)
++
++    def run_symbolicator(self, processing_task):
++        # TODO(markus): Make this work with minidumps. An unprocessed minidump
++        # event will not contain unsymbolicated frames, because the minidump
++        # upload already happened in store.
++        # It will also presumably not contain images, so `self.available` will
++        # already be `False`.
++
++        if not self.available:
++            return
++
++        request_id_cache_key = request_id_cache_key_for_event(self.data)
++
++        stacktraces = []
++        processable_stacktraces = []
++        for stacktrace_info, pf_list in processing_task.iter_processable_stacktraces():
++            registers = stacktrace_info.stacktrace.get('registers') or {}
++
++            # The filtering condition of this list comprehension is copied
++            # from `iter_processable_frames`.
++            #
++            # We cannot reuse `iter_processable_frames` because the
++            # symbolicator currently expects a list of stacktraces, not
++            # flat frames.
++            #
++            # Right now we can't even filter out frames (e.g. using a frame
++            # cache locally). The stacktraces have to be as complete as
++            # possible because the symbolicator assumes the first frame of
++            # a stacktrace to be the crashing frame. This assumption is
++            # already violated because the SDK might chop off frames though
++            # (which is less likely to be the case though).
++            pf_list = [
++                pf for pf in reversed(pf_list)
++                if pf.processor == self
++            ]
++
++            frames = []
++
++            for pf in pf_list:
++                frame = {'instruction_addr': pf['instruction_addr']}
++                if pf.get('trust') is not None:
++                    frame['trust'] = pf['trust']
++                frames.append(frame)
++
++            stacktraces.append({
++                'registers': registers,
++                'frames': frames
++            })
++
++            processable_stacktraces.append(pf_list)
++
++        rv = run_symbolicator(stacktraces=stacktraces, modules=self.images,
++                              project=self.project, arch=self.arch,
++                              signal=self.signal,
++                              request_id_cache_key=request_id_cache_key)
++        if not rv:
++            self.data \
++                .setdefault('errors', []) \
++                .extend(self._handle_symbolication_failed(
++                    SymbolicationFailed(type=EventError.NATIVE_SYMBOLICATOR_FAILED)
++                ))
++            return
++
++        # TODO(markus): Set signal and os context from symbolicator response,
++        # for minidumps
++
++        assert len(self.images) == len(rv['modules']), (self.images, rv)
++
++        for image, fetched_debug_file in zip(self.images, rv['modules']):
++            status = fetched_debug_file.pop('status')
++            # Set image data from symbolicator as symbolicator might know more
++            # than the SDK, especially for minidumps
++            image.update(fetched_debug_file)
++
++            if status in ('found', 'unused'):
++                continue
++            elif status == 'missing_debug_file':
++                error = SymbolicationFailed(type=EventError.NATIVE_MISSING_DSYM)
++            elif status == 'malformed_debug_file':
++                error = SymbolicationFailed(type=EventError.NATIVE_BAD_DSYM)
++            elif status == 'too_large':
++                error = SymbolicationFailed(type=EventError.FETCH_TOO_LARGE)
++            elif status == 'other':
++                error = SymbolicationFailed(type=EventError.UNKNOWN_ERROR)
++            else:
++                logger.error("Unknown status: %s", status)
++                continue
++
++            error.image_arch = image['arch']
++            error.image_path = image['code_file']
++            error.image_name = image_name(image['code_file'])
++            error.image_uuid = image['debug_id']
++            self.data.setdefault('errors', []) \
++                .extend(self._handle_symbolication_failed(error))
++
++        assert len(stacktraces) == len(rv['stacktraces'])
++
++        for pf_list, symbolicated_stacktrace in zip(
++            processable_stacktraces,
++            rv['stacktraces']
++        ):
++            for symbolicated_frame in symbolicated_stacktrace.get('frames') or ():
++                pf = pf_list[symbolicated_frame['original_index']]
++                pf.data['symbolicator_match'].append(symbolicated_frame)
++
+     def fetch_system_symbols(self, processing_task):
+         to_lookup = []
+         pf_list = []
+@@ -188,6 +324,35 @@ class NativeStacktraceProcessor(StacktraceProcessor):
+                     continue
+                 pf.data['symbolserver_match'] = symrv
+ 
++    def _handle_symbolication_failed(self, e):
++        # User fixable but fatal errors are reported as processing
++        # issues
++        if e.is_user_fixable and e.is_fatal:
++            report_processing_issue(
++                self.data,
++                scope='native',
++                object='dsym:%s' % e.image_uuid,
++                type=e.type,
++                data=e.get_data()
++            )
++
++        # This in many ways currently does not really do anything.
++        # The reason is that once a processing issue is reported
++        # the event will only be stored as a raw event and no
++        # group will be generated.  As a result it also means that
++        # we will not have any user facing event or error showing
++        # up at all.  We want to keep this here though in case we
++        # do not want to report some processing issues (eg:
++        # optional difs)
++        errors = []
++        if e.is_user_fixable or e.is_sdk_failure:
++            errors.append(e.get_data())
++        else:
++            logger.debug('Failed to symbolicate with native backend',
++                         exc_info=True)
++
++        return errors
++
+     def process_frame(self, processable_frame, processing_task):
+         frame = processable_frame.frame
+         raw_frame = dict(frame)
+@@ -218,6 +383,7 @@ class NativeStacktraceProcessor(StacktraceProcessor):
+                     instruction_addr,
+                     self.sdk_info,
+                     symbolserver_match=processable_frame.data['symbolserver_match'],
++                    symbolicator_match=processable_frame.data.get('symbolicator_match'),
+                     trust=raw_frame.get('trust'),
+                 )
+                 if not symbolicated_frames:
+@@ -226,32 +392,7 @@ class NativeStacktraceProcessor(StacktraceProcessor):
+                     else:
+                         return None, [raw_frame], []
+             except SymbolicationFailed as e:
+-                # User fixable but fatal errors are reported as processing
+-                # issues
+-                if e.is_user_fixable and e.is_fatal:
+-                    report_processing_issue(
+-                        self.data,
+-                        scope='native',
+-                        object='dsym:%s' % e.image_uuid,
+-                        type=e.type,
+-                        data=e.get_data()
+-                    )
+-
+-                # This in many ways currently does not really do anything.
+-                # The reason is that once a processing issue is reported
+-                # the event will only be stored as a raw event and no
+-                # group will be generated.  As a result it also means that
+-                # we will not have any user facing event or error showing
+-                # up at all.  We want to keep this here though in case we
+-                # do not want to report some processing issues (eg:
+-                # optional difs)
+-                errors = []
+-                if e.is_user_fixable or e.is_sdk_failure:
+-                    errors.append(e.get_data())
+-                else:
+-                    logger.debug('Failed to symbolicate with native backend',
+-                                 exc_info=True)
+-
++                errors = self._handle_symbolication_failed(e)
+                 return [raw_frame], [raw_frame], errors
+ 
+             processable_frame.set_cache_value([in_app, symbolicated_frames])
+diff --git a/src/sentry/lang/native/symbolicator.py b/src/sentry/lang/native/symbolicator.py
+new file mode 100644
+index 0000000000..cd6391364a
+--- /dev/null
++++ b/src/sentry/lang/native/symbolicator.py
+@@ -0,0 +1,144 @@
++from __future__ import absolute_import
++
++import six
++
++import time
++import logging
++
++from django.core.urlresolvers import reverse
++
++from requests.exceptions import RequestException
++
++from sentry import options
++from sentry.cache import default_cache
++from sentry.utils import metrics
++from sentry.net.http import Session
++from sentry.tasks.store import RetrySymbolication
++
++MAX_ATTEMPTS = 3
++REQUEST_CACHE_TIMEOUT = 3600
++SYMBOLICATOR_TIMEOUT = 5
++
++logger = logging.getLogger(__name__)
++
++
++def run_symbolicator(stacktraces, modules, project, arch, signal, request_id_cache_key):
++    self_url_prefix = options.get('system.internal-url-prefix') \
++        or options.get('system.url-prefix')
++
++    assert self_url_prefix
++    self_bucket_url = '%s%s' % (
++        self_url_prefix.rstrip('/'),
++        reverse('sentry-api-0-dsym-files', kwargs={
++            'organization_slug': project.organization.slug,
++            'project_slug': project.slug
++        })
++    )
++
++    symbolicator_options = options.get('symbolicator.options')
++    base_url = symbolicator_options['url'].rstrip('/')
++    assert base_url
++
++    project_id = six.text_type(project.id)
++    request_id = default_cache.get(request_id_cache_key)
++    sess = Session()
++
++    attempts = 0
++    wait = 0.5
++
++    with sess:
++        while 1:
++            try:
++
++                if request_id:
++                    rv = _poll_symbolication_task(
++                        sess=sess, base_url=base_url,
++                        request_id=request_id
++                    )
++                else:
++                    rv = _create_symbolication_task(
++                        sess=sess, base_url=base_url,
++                        project_id=project_id, self_bucket_url=self_bucket_url,
++                        signal=signal, stacktraces=stacktraces, modules=modules
++                    )
++
++                metrics.incr('events.symbolicator.status.%s' % rv.status_code, tags={
++                    'project_id': project_id
++                })
++
++                if rv.status_code == 404 and request_id:
++                    default_cache.delete(request_id_cache_key)
++                    request_id = None
++                    continue
++                elif rv.status_code == 503:
++                    raise RetrySymbolication(retry_after=10)
++
++                rv.raise_for_status()
++                json = rv.json()
++                metrics.incr(
++                    'events.symbolicator.response.%s' % json['status'],
++                    tags={'project_id': project_id}
++                )
++
++                if json['status'] == 'pending':
++                    default_cache.set(
++                        request_id_cache_key,
++                        json['request_id'],
++                        REQUEST_CACHE_TIMEOUT)
++                    raise RetrySymbolication(retry_after=json['retry_after'])
++                elif json['status'] == 'completed':
++                    default_cache.delete(request_id_cache_key)
++                    return rv.json()
++                else:
++                    logger.error("Unexpected status: %s", json['status'])
++                    default_cache.delete(request_id_cache_key)
++                    return
++
++            except (IOError, RequestException):
++                attempts += 1
++                if attempts > MAX_ATTEMPTS:
++                    logger.error('Failed to contact symbolicator', exc_info=True)
++                    default_cache.delete(request_id_cache_key)
++                    return
++
++                time.sleep(wait)
++                wait *= 2.0
++
++
++def _poll_symbolication_task(sess, base_url, request_id):
++    url = '{base_url}/requests/{request_id}?timeout={timeout}'.format(
++        base_url=base_url,
++        request_id=request_id,
++        timeout=SYMBOLICATOR_TIMEOUT,
++    )
++    return sess.get(url)
++
++
++def _create_symbolication_task(sess, base_url, project_id,
++                               self_bucket_url, signal, stacktraces, modules):
++    request = {
++        'signal': signal,
++        'sources': [
++            # TODO(markus): Support for internal bucket here once we
++            # figured auth out
++            {
++                "type": "http",
++                "id": "microsoft",
++                "layout": "symstore",
++                "filetypes": ["pdb", "pe"],
++                "url": "https://msdl.microsoft.com/download/symbols/",
++                "is_public": True,
++            }
++        ],
++        'request': {
++            'timeout': SYMBOLICATOR_TIMEOUT,
++        },
++        'threads': stacktraces,
++        'modules': modules,
++    }
++    url = '{base_url}/symbolicate?timeout={timeout}&scope={scope}'.format(
++        base_url=base_url,
++        timeout=SYMBOLICATOR_TIMEOUT,
++        scope=project_id,
++    )
++    return sess.post(url, json=request)
+diff --git a/src/sentry/lang/native/symbolizer.py b/src/sentry/lang/native/symbolizer.py
+index 8a6a883f0a..e32937f488 100644
+--- a/src/sentry/lang/native/symbolizer.py
++++ b/src/sentry/lang/native/symbolizer.py
+@@ -11,10 +11,15 @@ from sentry.models import EventError, ProjectDebugFile
+ from sentry.lang.native.utils import image_name, rebase_addr
+ from sentry.constants import MAX_SYM, NATIVE_UNKNOWN_STRING
+ 
+-FATAL_ERRORS = (EventError.NATIVE_MISSING_DSYM, EventError.NATIVE_BAD_DSYM, )
++FATAL_ERRORS = (EventError.NATIVE_MISSING_DSYM, EventError.NATIVE_BAD_DSYM,
++                EventError.NATIVE_SYMBOLICATOR_FAILED)
+ USER_FIXABLE_ERRORS = (
+     EventError.NATIVE_MISSING_DSYM, EventError.NATIVE_MISSING_OPTIONALLY_BUNDLED_DSYM,
+     EventError.NATIVE_BAD_DSYM, EventError.NATIVE_MISSING_SYMBOL,
++
++    # XXX: user can't fix this, but they should see it regardless to see it's
++    # not their fault. Also better than silently creating an unsymbolicated event
++    EventError.NATIVE_SYMBOLICATOR_FAILED
+ )
+ APP_BUNDLE_PATHS = (
+     '/var/containers/Bundle/Application/', '/private/var/containers/Bundle/Application/',
+@@ -127,7 +132,7 @@ class Symbolizer(object):
+                 on_dif_referenced=on_dif_referenced,
+                 with_conversion_errors=True)
+ 
+-    def _process_frame(self, sym, obj, package=None, addr_off=0):
++    def _process_frame(self, sym, package=None, addr_off=0):
+         frame = {
+             'sym_addr': sym.sym_addr + addr_off,
+             'instruction_addr': sym.instr_addr + addr_off,
+@@ -253,9 +258,9 @@ class Symbolizer(object):
+                 return []
+             raise SymbolicationFailed(
+                 type=EventError.NATIVE_MISSING_SYMBOL, obj=obj)
+-        return [self._process_frame(s, obj, addr_off=obj.addr) for s in reversed(rv)]
++        return [self._process_frame(s, addr_off=obj.addr) for s in reversed(rv)]
+ 
+-    def _convert_symbolserver_match(self, instruction_addr, symbolserver_match, obj):
++    def _convert_symbolserver_match(self, instruction_addr, symbolserver_match):
+         """Symbolizes a frame with system symbols only."""
+         if symbolserver_match is None:
+             return []
+@@ -271,36 +276,66 @@ class Symbolizer(object):
+                 line=None,
+                 lang=None,
+                 symbol=symbol,
+-            ), obj, package=symbolserver_match['object_name'])
++            ), package=symbolserver_match['object_name'])
+         ]
+ 
+-    def symbolize_frame(self, instruction_addr, sdk_info=None, symbolserver_match=None, trust=None):
+-        obj = self.object_lookup.find_object(instruction_addr)
+-        if obj is None:
+-            if trust == 'scan':
+-                return []
+-            raise SymbolicationFailed(type=EventError.NATIVE_UNKNOWN_IMAGE)
+-
+-        # Try to always prefer the images from the application storage.
+-        # If the symbolication fails we keep the error for later
++    def symbolize_frame(self, instruction_addr, sdk_info=None,
++                        symbolserver_match=None, symbolicator_match=None,
++                        trust=None):
+         app_err = None
+-        try:
+-            match = self._symbolize_app_frame(instruction_addr, obj, sdk_info=sdk_info, trust=trust)
+-            if match:
+-                return match
+-        except SymbolicationFailed as err:
+-            app_err = err
++
++        # A missing symbolicator match indicates that the symbolicator was not
++        # active for this event. Symbolize the app frame directly using
++        # symbolic.
++        # TODO: Remove this after fully switching to symbolicator
++        if symbolicator_match is None:
++            obj = self.object_lookup.find_object(instruction_addr)
++            if obj is None:
++                if trust == 'scan':
++                    return []
++                raise SymbolicationFailed(type=EventError.NATIVE_UNKNOWN_IMAGE)
++
++            # Try to always prefer the images from the application storage.
++            # If the symbolication fails we keep the error for later
++            try:
++                match = self._symbolize_app_frame(
++                    instruction_addr, obj, sdk_info=sdk_info, trust=trust)
++                if match:
++                    return match
++            except SymbolicationFailed as err:
++                app_err = err
++
++        # If the symbolicator was used, trust its result. Errors that were
++        # generated during symbolication are merged into the event's error
++        # array separately and do not need to be handled here. The match
++        # returned can either be:
++        #  - empty: Symbolicator has explicitly discarded this
++        #    frame as a false positive. This happens especially when
++        #    stackwalking without CFI.
++        #  - all unsymbolicated frames:
++        #    Symbolicator was unable to resolve symbols for this frame, so we
++        #    fall back to (iOS) symbolserver (see below).
++        #  - some unsymbolicated frames:
++        #    Symbolicator was able to resolve e.g.
++        #    an inline frame but then failed to symbolicate. This is not really
++        #    that useful either.
++        #
++        # TODO: Remove this fallback once symbolicator supports iOS system
++        # symbols and fully trust the symbolicator response.
++        elif all(x["status"] == "symbolicated" for x in symbolicator_match) or symbolicator_match == []:
++            return symbolicator_match
+ 
+         # Then we check the symbolserver for a match.
+-        match = self._convert_symbolserver_match(instruction_addr, symbolserver_match, obj)
++        match = self._convert_symbolserver_match(instruction_addr, symbolserver_match)
+ 
+         # If we do not get a match and the image was from an app bundle
+         # and we got an error first, we now fail with the original error
+         # as we did indeed encounter a symbolication error.  If however
+         # the match was empty we just accept it as a valid symbolication
+         # that just did not return any results but without error.
+-        if not match and self.is_image_from_app_bundle(obj, sdk_info=sdk_info) \
+-           and app_err is not None:
++        if app_err is not None \
++                and not match \
++                and self.is_image_from_app_bundle(obj, sdk_info=sdk_info):
+             raise app_err
+ 
+         return match
+diff --git a/src/sentry/lang/native/utils.py b/src/sentry/lang/native/utils.py
+index 5c0471ceaf..b780843510 100644
+--- a/src/sentry/lang/native/utils.py
++++ b/src/sentry/lang/native/utils.py
+@@ -79,3 +79,12 @@ def sdk_info_to_sdk_id(sdk_info):
+     if build is not None:
+         rv = '%s_%s' % (rv, build)
+     return rv
++
++
++def signal_from_data(data):
++    exceptions = get_path(data, 'exception', 'values', filter=True)
++    signal = get_path(exceptions, 0, 'mechanism', 'meta', 'signal', 'number')
++    if signal is not None:
++        return int(signal)
++
++    return None
+diff --git a/src/sentry/models/eventerror.py b/src/sentry/models/eventerror.py
+index de900fd809..42f5bdaf9c 100644
+--- a/src/sentry/models/eventerror.py
++++ b/src/sentry/models/eventerror.py
+@@ -48,6 +48,7 @@ class EventError(object):
+     NATIVE_MISSING_SYMBOL = 'native_missing_symbol'
+     NATIVE_SIMULATOR_FRAME = 'native_simulator_frame'
+     NATIVE_UNKNOWN_IMAGE = 'native_unknown_image'
++    NATIVE_SYMBOLICATOR_FAILED = 'native_symbolicator_failed'
+ 
+     # Processing: Proguard
+     PROGUARD_MISSING_MAPPING = 'proguard_missing_mapping'
+@@ -93,6 +94,7 @@ class EventError(object):
+         NATIVE_MISSING_SYMBOL: u'Could not resolve one or more frames in debug information file.',
+         NATIVE_SIMULATOR_FRAME: u'Encountered an unprocessable simulator frame.',
+         NATIVE_UNKNOWN_IMAGE: u'A binary image is referenced that is unknown.',
++        NATIVE_SYMBOLICATOR_FAILED: u'Failed to call Sentry-internal service.',
+ 
+         PROGUARD_MISSING_MAPPING: u'A proguard mapping file was missing.',
+         PROGUARD_MISSING_LINENO: u'A proguard mapping file does not contain line info.',
+diff --git a/src/sentry/tasks/store.py b/src/sentry/tasks/store.py
+index d1992a7223..0bb8dd4189 100644
+--- a/src/sentry/tasks/store.py
++++ b/src/sentry/tasks/store.py
+@@ -43,6 +43,11 @@ class RetryProcessing(Exception):
+     pass
+ 
+ 
++class RetrySymbolication(Exception):
++    def __init__(self, retry_after=None):
++        self.retry_after = retry_after
++
++
+ def should_process(data):
+     """Quick check if processing is needed at all."""
+     from sentry.plugins import plugins
+@@ -146,7 +151,32 @@ def preprocess_event_from_reprocessing(
+     )
+ 
+ 
+-def _do_process_event(cache_key, start_time, event_id, process_task, data=None):
++@instrumented_task(
++    name='sentry.tasks.store.retry_process_event',
++    queue='events.process_event',  # XXX(markus): Change to new queue
++    time_limit=(60 * 5) + 5,
++    soft_time_limit=60 * 5,
++)
++def retry_process_event(process_task_name, task_kwargs, **kwargs):
++    """
++    The only purpose of this task is be enqueued with some ETA set. This is
++    essentially an implementation of ETAs on top of Celery's existing ETAs, but
++    with the intent of having separate workers wait for those ETAs.
++    """
++    tasks = {
++        "process_event": process_event,
++        "process_event_from_reprocessing": process_event_from_reprocessing,
++    }
++
++    process_task = tasks.get(process_task_name)
++    if not process_task:
++        raise ValueError("Invalid argument for process_task_name: %s" % (process_task_name,))
++
++    process_task.delay(**task_kwargs)
++
++
++def _do_process_event(cache_key, start_time, event_id, process_task,
++                      data=None):
+     from sentry.plugins import plugins
+ 
+     if data is None:
+@@ -182,11 +212,29 @@ def _do_process_event(cache_key, start_time, event_id, process_task, data=None):
+                 data = enhanced
+                 has_changed = True
+ 
+-    # Stacktrace based event processors.
+-    new_data = process_stacktraces(data)
+-    if new_data is not None:
+-        has_changed = True
+-        data = new_data
++    try:
++        # Stacktrace based event processors.
++        new_data = process_stacktraces(data)
++        if new_data is not None:
++            has_changed = True
++            data = new_data
++    except RetrySymbolication as e:
++        if start_time and (time() - start_time) > 3600:
++            raise RuntimeError('Event spent one hour in processing')
++
++        retry_process_event.apply_async(
++            args=(),
++            kwargs={
++                'process_task_name': process_task.__name__,
++                'task_kwargs': {
++                    'cache_key': cache_key,
++                    'event_id': event_id,
++                    'start_time': start_time,
++                }
++            },
++            countdown=e.retry_after
++        )
++        return
+ 
+     # TODO(dcramer): ideally we would know if data changed by default
+     # Default event processors.
+@@ -239,7 +287,8 @@ def _do_process_event(cache_key, start_time, event_id, process_task, data=None):
+     soft_time_limit=60,
+ )
+ def process_event(cache_key, start_time=None, event_id=None, **kwargs):
+-    return _do_process_event(cache_key, start_time, event_id, process_event)
++    return _do_process_event(cache_key=cache_key, start_time=start_time,
++                             event_id=event_id, process_task=process_event)
+ 
+ 
+ @instrumented_task(
+@@ -249,8 +298,9 @@ def process_event(cache_key, start_time=None, event_id=None, **kwargs):
+     soft_time_limit=60,
+ )
+ def process_event_from_reprocessing(cache_key, start_time=None, event_id=None, **kwargs):
+-    return _do_process_event(cache_key, start_time, event_id,
+-                             process_event_from_reprocessing)
++    return _do_process_event(cache_key=cache_key, start_time=start_time,
++                             event_id=event_id,
++                             process_task=process_event_from_reprocessing)
+ 
+ 
+ def delete_raw_event(project_id, event_id, allow_hint_clear=False):
+diff --git a/src/sentry/utils/pytest/sentry.py b/src/sentry/utils/pytest/sentry.py
+index c147aefe15..bdc9f888ac 100644
+--- a/src/sentry/utils/pytest/sentry.py
++++ b/src/sentry/utils/pytest/sentry.py
+@@ -3,6 +3,7 @@ from __future__ import absolute_import
+ import pytest
+ import mock
+ import os
++import betamax
+ 
+ from django.conf import settings
+ from sentry_sdk import Hub
+@@ -198,6 +199,10 @@ def pytest_configure(config):
+     from sentry import http
+     http.DISALLOWED_IPS = set()
+ 
++    with betamax.Betamax.configure() as config:
++        config.cassette_library_dir = 'tests/betamax/'
++        config.default_cassette_options['match_requests_on'] = ['method', 'path']
++
+ 
+ def register_extensions():
+     from sentry.plugins import plugins
+diff --git a/tests/betamax/tests.sentry.lang.native.test_plugin.SymbolicatorResolvingIntegrationTest.test_debug_id_resolving.json b/tests/betamax/tests.sentry.lang.native.test_plugin.SymbolicatorResolvingIntegrationTest.test_debug_id_resolving.json
+new file mode 100644
+index 0000000000..08d4927b6f
+--- /dev/null
++++ b/tests/betamax/tests.sentry.lang.native.test_plugin.SymbolicatorResolvingIntegrationTest.test_debug_id_resolving.json
+@@ -0,0 +1 @@
++{"http_interactions": [{"request": {"body": {"string": "{\"sources\": [{\"url\": \"http://localhost:8081/api/0/projects/baz/bar/files/dsyms/\", \"token\": \"1046795e1f8f4e23a819b0afd5d1edce\", \"type\": \"sentry\", \"id\": \"sentry-project-difs\"}, {\"layout\": \"symstore\", \"url\": \"https://msdl.microsoft.com/download/symbols/\", \"filetypes\": [\"pdb\", \"pe\"], \"is_public\": true, \"type\": \"http\", \"id\": \"microsoft\"}], \"signal\": null, \"request\": {\"timeout\": 5}, \"modules\": [{\"code_file\": \"C:\\\\projects\\\\breakpad-tools\\\\windows\\\\Release\\\\crash.exe\", \"debug_id\": \"3249d99d-0c40-4931-8610-f4e4fb0b6936-1\", \"type\": \"symbolic\", \"image_addr\": \"0x2a0000\", \"image_size\": 36864}], \"threads\": [{\"frames\": [{\"trust\": null, \"instruction_addr\": \"0x2a2a3d\"}], \"registers\": {}}]}", "encoding": "utf-8"}, "headers": {"Content-Length": ["682"], "Accept-Encoding": ["gzip, deflate"], "Accept": ["*/*"], "User-Agent": ["python-requests/2.20.1"], "Connection": ["keep-alive"], "Content-Type": ["application/json"]}, "method": "POST", "uri": "http://127.0.0.1:3021/symbolicate?timeout=5&scope=12"}, "response": {"body": {"base64_string": "H4sIAAAAAAAE/6WRwW6DMAyG3yXnUdHCUOG6N9h1VMgkhmYEByVBbVfx7jMUqu02aZySH/v3l9934QOE0YtCSNsPBgMq8SK8bgmMKGg0hm8BZBccSOS6j7toHPTrUZMPbpRBW6pAKcc+8fUAB0hmmwFkBy2y+FaU5eDsJ8rgy7J2CN0AKgrWGr5fNCl74cM7GgSPZSkd+PMOr8gwBqh9otz62jKY6EET/2tGWobziE3RBon5VmUnh4HroPbVAOHMqvwbykJQlrPr6mE0IVlRJK8cya3/9d58H/MU63SrCUylSeFVFDEXbvH6hVxLmBOeTtPpRfRWjWYN8rmGxo6k2CvcBmTarY0VcHLmH6kjeyEWFNZjW2nFZckhzVWeqyiWaRylebKPjtk+jpoU06aO6yxPsmjPPdIqXFpoWe3DouHMtoTlXPAQxH+2pnve/M+MYv4Y4KF7/YWcZHbM0uk0fQPIYjMjhgIAAA==", "encoding": null}, "headers": {"date": ["Mon, 01 Apr 2019 09:52:40 GMT"], "content-length": ["361"], "content-type": ["application/json"], "content-encoding": ["gzip"]}, "status": {"message": "OK", "code": 200}, "url": "http://127.0.0.1:3021/symbolicate?timeout=5&scope=12"}, "recorded_at": "2019-04-01T09:52:40"}], "recorded_with": "betamax/0.8.1"}
+diff --git a/tests/betamax/tests.sentry.lang.native.test_plugin.SymbolicatorResolvingIntegrationTest.test_missing_dsym.json b/tests/betamax/tests.sentry.lang.native.test_plugin.SymbolicatorResolvingIntegrationTest.test_missing_dsym.json
+new file mode 100644
+index 0000000000..ef0350ba37
+--- /dev/null
++++ b/tests/betamax/tests.sentry.lang.native.test_plugin.SymbolicatorResolvingIntegrationTest.test_missing_dsym.json
+@@ -0,0 +1 @@
++{"http_interactions": [{"request": {"body": {"string": "{\"sources\": [{\"url\": \"http://localhost:8081/api/0/projects/baz/bar/files/dsyms/\", \"token\": \"f19caa13ba80489fbf3685e421b71d56\", \"type\": \"sentry\", \"id\": \"sentry-project-difs\"}, {\"layout\": \"symstore\", \"url\": \"https://msdl.microsoft.com/download/symbols/\", \"filetypes\": [\"pdb\", \"pe\"], \"is_public\": true, \"type\": \"http\", \"id\": \"microsoft\"}], \"signal\": null, \"request\": {\"timeout\": 5}, \"modules\": [{\"code_file\": \"Foo.app/Contents/Foo\", \"arch\": \"x86_64\", \"image_vmaddr\": \"0x100000000\", \"image_addr\": \"0x100000000\", \"image_size\": 4096, \"type\": \"macho\", \"debug_id\": \"502fc0a5-1ec1-3e47-9998-684fa139dca7\"}], \"threads\": [{\"frames\": [{\"trust\": null, \"instruction_addr\": \"0x100000fa0\"}], \"registers\": {}}]}", "encoding": "utf-8"}, "headers": {"Content-Length": ["694"], "Accept-Encoding": ["gzip, deflate"], "Accept": ["*/*"], "User-Agent": ["python-requests/2.20.1"], "Connection": ["keep-alive"], "Content-Type": ["application/json"]}, "method": "POST", "uri": "http://127.0.0.1:3021/symbolicate?timeout=5&scope=13"}, "response": {"body": {"base64_string": "H4sIAAAAAAAE/21Ry27CMBD8lz2TkpQQCNdK/YkKWYsfwcJeR7EjQVH+vUsSc6pPnn3M7sw+ISZMY4QTyOB7p5NWsIFoO0IHJxqdY5RQ3tKAUnPdzxPMgH79WoppGGWygQQqNTBPea/K1zNYMlOP8oadzlQOqcv/+PCX8B5iRpppctZYp4nnZIyXKHpM14ydJU0hI+Za5y8rh8F2ltAJS0rf4VTOKhah3sZoqRNKX8ZOGJ4D03k6b8AHNbpV2NuWf6o3kB49SwKP8hpYJA6S94L7sRFNzVjNzFaxG/vy08gS90WlZVXsdH0o2rY9Fs2xNljtWiXxwB0yKC1eDTQ7vhDMq603kK+CJQDfIXxg32+/AiVNKW45wBzWs9GrC5CvwJd4p6L95a3rsm2m8/QHhiAHbPoBAAA=", "encoding": null}, "headers": {"date": ["Mon, 01 Apr 2019 09:52:43 GMT"], "content-length": ["311"], "content-type": ["application/json"], "content-encoding": ["gzip"]}, "status": {"message": "OK", "code": 200}, "url": "http://127.0.0.1:3021/symbolicate?timeout=5&scope=13"}, "recorded_at": "2019-04-01T09:52:43"}], "recorded_with": "betamax/0.8.1"}
+diff --git a/tests/betamax/tests.sentry.lang.native.test_plugin.SymbolicatorResolvingIntegrationTest.test_real_resolving.json b/tests/betamax/tests.sentry.lang.native.test_plugin.SymbolicatorResolvingIntegrationTest.test_real_resolving.json
+new file mode 100644
+index 0000000000..66a7fe2308
+--- /dev/null
++++ b/tests/betamax/tests.sentry.lang.native.test_plugin.SymbolicatorResolvingIntegrationTest.test_real_resolving.json
+@@ -0,0 +1 @@
++{"http_interactions": [{"request": {"body": {"string": "{\"sources\": [{\"url\": \"http://localhost:8081/api/0/projects/baz/bar/files/dsyms/\", \"token\": \"ebf401209574487ea7fb5f051739ca9d\", \"type\": \"sentry\", \"id\": \"sentry-project-difs\"}, {\"layout\": \"symstore\", \"url\": \"https://msdl.microsoft.com/download/symbols/\", \"filetypes\": [\"pdb\", \"pe\"], \"is_public\": true, \"type\": \"http\", \"id\": \"microsoft\"}], \"signal\": null, \"request\": {\"timeout\": 5}, \"modules\": [{\"code_file\": \"Foo.app/Contents/Foo\", \"arch\": \"x86_64\", \"image_vmaddr\": \"0x100000000\", \"image_addr\": \"0x100000000\", \"image_size\": 4096, \"type\": \"macho\", \"debug_id\": \"502fc0a5-1ec1-3e47-9998-684fa139dca7\"}], \"threads\": [{\"frames\": [{\"trust\": null, \"instruction_addr\": \"0x100000fa0\"}], \"registers\": {}}]}", "encoding": "utf-8"}, "headers": {"Content-Length": ["694"], "Accept-Encoding": ["gzip, deflate"], "Accept": ["*/*"], "User-Agent": ["python-requests/2.20.1"], "Connection": ["keep-alive"], "Content-Type": ["application/json"]}, "method": "POST", "uri": "http://127.0.0.1:3021/symbolicate?timeout=5&scope=14"}, "response": {"body": {"base64_string": "H4sIAAAAAAAE/21R0W7CMAz8lzxT2o5SaF8n7ScmVBknLRGJEzWJBEP997kUNgmRp/hsn8/nmwgRYgqiFeisNyoqKVYi6IHAiJaSMRxFwHMcARXXfd9EP4J9fDWFOCaM2lEHUo7MU1zKYn49FMzkAc8wKMa/nFuD9/mno6gohpwBLjBAA2eRv+Fqj46nCguaOO4T4czM6SeijSIezshJGePWcxscQ+chnhjMo/X5f8ZoUuREW/IOV/teoBv1oAlMp0mqi2gLrn1asgjSCLMr02E6rIR1MpnH8n/W9S6RZMHx6hWrsIAnxyGMOIu67OuurjiW6piGTksu2RYfPRawzUqFZbZR1S5rmmaf1fuqh3LTSIQdd6CT6t5A90MsBL02PGVBcC5YAMF+vjNYW/b/dXc+ENMvqaB/mK8qmno6TL8VmA1fEQIAAA==", "encoding": null}, "headers": {"date": ["Mon, 01 Apr 2019 09:52:45 GMT"], "content-length": ["328"], "content-type": ["application/json"], "content-encoding": ["gzip"]}, "status": {"message": "OK", "code": 200}, "url": "http://127.0.0.1:3021/symbolicate?timeout=5&scope=14"}, "recorded_at": "2019-04-01T09:52:45"}], "recorded_with": "betamax/0.8.1"}
+diff --git a/tests/betamax/tests.sentry.lang.native.test_plugin.SymbolicatorResolvingIntegrationTest.test_real_resolving_with_multiple_requests.json b/tests/betamax/tests.sentry.lang.native.test_plugin.SymbolicatorResolvingIntegrationTest.test_real_resolving_with_multiple_requests.json
+new file mode 100644
+index 0000000000..7467b699d4
+--- /dev/null
++++ b/tests/betamax/tests.sentry.lang.native.test_plugin.SymbolicatorResolvingIntegrationTest.test_real_resolving_with_multiple_requests.json
+@@ -0,0 +1 @@
++{"http_interactions": [{"request": {"body": {"string": "{\"sources\": [{\"url\": \"http://localhost:8081/api/0/projects/baz/bar/files/dsyms/\", \"token\": \"64df1a49430f46d985cae3980ba129ef\", \"type\": \"sentry\", \"id\": \"sentry-project-difs\"}, {\"layout\": \"symstore\", \"url\": \"https://msdl.microsoft.com/download/symbols/\", \"filetypes\": [\"pdb\", \"pe\"], \"is_public\": true, \"type\": \"http\", \"id\": \"microsoft\"}], \"signal\": null, \"request\": {\"timeout\": 0}, \"modules\": [{\"code_file\": \"Foo.app/Contents/Foo\", \"arch\": \"x86_64\", \"image_vmaddr\": \"0x100000000\", \"image_addr\": \"0x100000000\", \"image_size\": 4096, \"type\": \"macho\", \"debug_id\": \"502fc0a5-1ec1-3e47-9998-684fa139dca7\"}], \"threads\": [{\"frames\": [{\"trust\": null, \"instruction_addr\": \"0x100000fa0\"}], \"registers\": {}}]}", "encoding": "utf-8"}, "headers": {"Content-Length": ["694"], "Accept-Encoding": ["gzip, deflate"], "Accept": ["*/*"], "User-Agent": ["python-requests/2.20.1"], "Connection": ["keep-alive"], "Content-Type": ["application/json"]}, "method": "POST", "uri": "http://127.0.0.1:3021/symbolicate?timeout=0&scope=15"}, "response": {"body": {"string": "{\"status\":\"pending\",\"request_id\":\"b907f7ab-d8c3-4169-9b08-453591101f2c\",\"retry_after\":30}", "encoding": null}, "headers": {"date": ["Mon, 01 Apr 2019 09:52:47 GMT"], "content-length": ["89"], "content-type": ["application/json"]}, "status": {"message": "OK", "code": 200}, "url": "http://127.0.0.1:3021/symbolicate?timeout=0&scope=15"}, "recorded_at": "2019-04-01T09:52:47"}, {"request": {"body": {"string": "", "encoding": "utf-8"}, "headers": {"Connection": ["keep-alive"], "Accept-Encoding": ["gzip, deflate"], "Accept": ["*/*"], "User-Agent": ["python-requests/2.20.1"]}, "method": "GET", "uri": "http://127.0.0.1:3021/requests/b907f7ab-d8c3-4169-9b08-453591101f2c?timeout=0"}, "response": {"body": {"string": "{\"status\":\"pending\",\"request_id\":\"b907f7ab-d8c3-4169-9b08-453591101f2c\",\"retry_after\":30}", "encoding": null}, "headers": {"date": ["Mon, 01 Apr 2019 09:52:47 GMT"], "content-length": ["89"], "content-type": ["application/json"]}, "status": {"message": "OK", "code": 200}, "url": "http://127.0.0.1:3021/requests/b907f7ab-d8c3-4169-9b08-453591101f2c?timeout=0"}, "recorded_at": "2019-04-01T09:52:47"}, {"request": {"body": {"string": "", "encoding": "utf-8"}, "headers": {"Connection": ["keep-alive"], "Accept-Encoding": ["gzip, deflate"], "Accept": ["*/*"], "User-Agent": ["python-requests/2.20.1"]}, "method": "GET", "uri": "http://127.0.0.1:3021/requests/b907f7ab-d8c3-4169-9b08-453591101f2c?timeout=0"}, "response": {"body": {"base64_string": "H4sIAAAAAAAE/21R0W7CMAz8lzxT2o5SaF8n7ScmVBknLRGJEzWJBEP997kUNgmRp/hsn8/nmwgRYgqiFeisNyoqKVYi6IHAiJaSMRxFwHMcARXXfd9EP4J9fDWFOCaM2lEHUo7MU1zKYn49FMzkAc8wKMa/nFuD9/mno6gohpwBLjBAA2eRv+Fqj46nCguaOO4T4czM6SeijSIezshJGePWcxscQ+chnhjMo/X5f8ZoUuREW/IOV/teoBv1oAlMp0mqi2gLrn1asgjSCLMr02E6rIR1MpnH8n/W9S6RZMHx6hWrsIAnxyGMOIu67OuurjiW6piGTksu2RYfPRawzUqFZbZR1S5rmmaf1fuqh3LTSIQdd6CT6t5A90MsBL02PGVBcC5YAMF+vjNYW/b/dXc+ENMvqaB/mK8qmno6TL8VmA1fEQIAAA==", "encoding": null}, "headers": {"date": ["Mon, 01 Apr 2019 09:52:47 GMT"], "content-length": ["328"], "content-type": ["application/json"], "content-encoding": ["gzip"]}, "status": {"message": "OK", "code": 200}, "url": "http://127.0.0.1:3021/requests/b907f7ab-d8c3-4169-9b08-453591101f2c?timeout=0"}, "recorded_at": "2019-04-01T09:52:47"}], "recorded_with": "betamax/0.8.1"}
+diff --git a/tests/sentry/lang/native/snapshots/SymbolicResolvingIntegrationTest/test_debug_id_resolving.pysnap b/tests/sentry/lang/native/snapshots/SymbolicResolvingIntegrationTest/test_debug_id_resolving.pysnap
+new file mode 100644
+index 0000000000..8fd0ceec85
+--- /dev/null
++++ b/tests/sentry/lang/native/snapshots/SymbolicResolvingIntegrationTest/test_debug_id_resolving.pysnap
+@@ -0,0 +1,75 @@
++---
++created: '2019-04-01T13:57:47.289476Z'
++creator: sentry
++source: tests/sentry/lang/native/test_plugin.py
++---
++contexts:
++  device:
++    arch: x86
++    type: device
++  os:
++    build: ''
++    name: Windows
++    type: os
++    version: 10.0.14393
++culprit: main
++debug_meta:
++  images:
++  - code_file: C:\projects\breakpad-tools\windows\Release\crash.exe
++    debug_id: 3249d99d-0c40-4931-8610-f4e4fb0b6936-1
++    image_addr: '0x2a0000'
++    image_size: 36864
++    type: symbolic
++exception:
++  values:
++  - raw_stacktrace:
++      frames:
++      - function: <unknown>
++        in_app: false
++        instruction_addr: '0x2a2a3d'
++        package: C:\projects\breakpad-tools\windows\Release\crash.exe
++    stacktrace:
++      frames:
++      - abs_path: c:\projects\breakpad-tools\windows\crash\main.cpp
++        filename: main.cpp
++        function: main
++        in_app: false
++        instruction_addr: '0x2a2a3d'
++        lineno: 35
++        package: C:\projects\breakpad-tools\windows\Release\crash.exe
++    thread_id: 1636
++    type: EXCEPTION_ACCESS_VIOLATION_WRITE
++    value: 'Fatal Error: EXCEPTION_ACCESS_VIOLATION_WRITE'
++fingerprint:
++- '{{ default }}'
++grouping_config:
++  id: legacy:2019-03-12
++hashes:
++- ffe48bfc93b1bf86ffb750d5d2bdc51a
++level: error
++location: main.cpp
++logger: ''
++metadata:
++  filename: main.cpp
++  function: main
++  type: EXCEPTION_ACCESS_VIOLATION_WRITE
++  value: 'Fatal Error: EXCEPTION_ACCESS_VIOLATION_WRITE'
++platform: native
++sdk:
++  name: _postWithHeader
++  version: 0.0.0
++tags:
++- - level
++  - error
++- - sentry:user
++  - ip:127.0.0.1
++- - os
++  - Windows 10.0.14393
++- - os.name
++  - Windows
++title: 'EXCEPTION_ACCESS_VIOLATION_WRITE: Fatal Error: EXCEPTION_ACCESS_VIOLATION_WRITE'
++type: error
++use_rust_normalize: true
++user:
++  ip_address: 127.0.0.1
++version: '6'
+diff --git a/tests/sentry/lang/native/snapshots/SymbolicResolvingIntegrationTest/test_missing_dsym.pysnap b/tests/sentry/lang/native/snapshots/SymbolicResolvingIntegrationTest/test_missing_dsym.pysnap
+new file mode 100644
+index 0000000000..7e38dcc265
+--- /dev/null
++++ b/tests/sentry/lang/native/snapshots/SymbolicResolvingIntegrationTest/test_missing_dsym.pysnap
+@@ -0,0 +1,77 @@
++---
++created: '2019-04-01T13:57:48.442366Z'
++creator: sentry
++source: tests/sentry/lang/native/test_plugin.py
++---
++culprit: unknown
++debug_meta:
++  images:
++  - arch: x86_64
++    code_file: Foo.app/Contents/Foo
++    debug_id: 502fc0a5-1ec1-3e47-9998-684fa139dca7
++    image_addr: '0x100000000'
++    image_size: 4096
++    image_vmaddr: '0x100000000'
++    type: macho
++  sdk_info:
++    sdk_name: macOS
++    version_major: 10
++    version_minor: 12
++    version_patchlevel: 4
++errors:
++- image_arch: x86_64
++  image_path: Foo.app/Contents/Foo
++  image_uuid: 502fc0a5-1ec1-3e47-9998-684fa139dca7
++  message: None
++  type: native_missing_dsym
++exception:
++  values:
++  - raw_stacktrace:
++      frames:
++      - &id001
++        function: unknown
++        in_app: false
++        instruction_addr: '0x100000fa0'
++    stacktrace:
++      frames:
++      - *id001
++    type: Fail
++    value: fail
++fingerprint:
++- '{{ default }}'
++grouping_config:
++  id: legacy:2019-03-12
++hashes:
++- efca000ff6704f25e5434e9ed7eff02f
++level: error
++location: null
++logger: ''
++metadata:
++  type: Fail
++  value: fail
++platform: cocoa
++processing_issues:
++  native:dsym:502fc0a5-1ec1-3e47-9998-684fa139dca7:
++    data:
++      image_arch: x86_64
++      image_path: Foo.app/Contents/Foo
++      image_uuid: 502fc0a5-1ec1-3e47-9998-684fa139dca7
++      message: None
++      type: native_missing_dsym
++    object: dsym:502fc0a5-1ec1-3e47-9998-684fa139dca7
++    scope: native
++    type: native_missing_dsym
++sdk:
++  name: _postWithHeader
++  version: 0.0.0
++tags:
++- - level
++  - error
++- - sentry:user
++  - ip:127.0.0.1
++title: 'Fail: fail'
++type: error
++use_rust_normalize: true
++user:
++  ip_address: 127.0.0.1
++version: '6'
+diff --git a/tests/sentry/lang/native/snapshots/SymbolicResolvingIntegrationTest/test_real_resolving.pysnap b/tests/sentry/lang/native/snapshots/SymbolicResolvingIntegrationTest/test_real_resolving.pysnap
+new file mode 100644
+index 0000000000..e626c36399
+--- /dev/null
++++ b/tests/sentry/lang/native/snapshots/SymbolicResolvingIntegrationTest/test_real_resolving.pysnap
+@@ -0,0 +1,67 @@
++---
++created: '2019-04-01T13:57:49.268992Z'
++creator: sentry
++source: tests/sentry/lang/native/test_plugin.py
++---
++culprit: main
++debug_meta:
++  images:
++  - arch: x86_64
++    code_file: Foo.app/Contents/Foo
++    debug_id: 502fc0a5-1ec1-3e47-9998-684fa139dca7
++    image_addr: '0x100000000'
++    image_size: 4096
++    image_vmaddr: '0x100000000'
++    type: macho
++  sdk_info:
++    sdk_name: macOS
++    version_major: 10
++    version_minor: 12
++    version_patchlevel: 4
++exception:
++  values:
++  - raw_stacktrace:
++      frames:
++      - function: unknown
++        in_app: false
++        instruction_addr: '0x100000fa0'
++    stacktrace:
++      frames:
++      - abs_path: /tmp/hello.c
++        filename: hello.c
++        function: main
++        in_app: false
++        instruction_addr: '0x100000fa0'
++        lineno: 1
++        package: Foo.app/Contents/Foo
++    type: Fail
++    value: fail
++fingerprint:
++- '{{ default }}'
++grouping_config:
++  id: legacy:2019-03-12
++hashes:
++- 6e2889ec15f82569f56fdba9ffc9b90b
++level: error
++location: hello.c
++logger: ''
++metadata:
++  filename: hello.c
++  function: main
++  type: Fail
++  value: fail
++platform: cocoa
++sdk:
++  name: _postWithHeader
++  version: 0.0.0
++tags:
++- - level
++  - error
++- - sentry:user
++  - ip:127.0.0.1
++title: 'Fail: fail'
++type: error
++use_rust_normalize: true
++user:
++  ip_address: 127.0.0.1
++version: '6'
+diff --git a/tests/sentry/lang/native/snapshots/SymbolicatorResolvingIntegrationTest/test_debug_id_resolving.pysnap b/tests/sentry/lang/native/snapshots/SymbolicatorResolvingIntegrationTest/test_debug_id_resolving.pysnap
+new file mode 100644
+index 0000000000..7bbe2f7aab
+--- /dev/null
++++ b/tests/sentry/lang/native/snapshots/SymbolicatorResolvingIntegrationTest/test_debug_id_resolving.pysnap
+@@ -0,0 +1,79 @@
++---
++created: '2019-04-01T16:17:33.768481Z'
++creator: sentry
++source: tests/sentry/lang/native/test_plugin.py
++---
++contexts:
++  device:
++    arch: x86
++    type: device
++  os:
++    build: ''
++    name: Windows
++    type: os
++    version: 10.0.14393
++culprit: main
++debug_meta:
++  images:
++  - arch: unknown
++    code_file: C:\projects\breakpad-tools\windows\Release\crash.exe
++    code_id: null
++    debug_file: null
++    debug_id: 3249d99d-0c40-4931-8610-f4e4fb0b6936-1
++    image_addr: '0x2a0000'
++    image_size: 36864
++    type: symbolic
++exception:
++  values:
++  - raw_stacktrace:
++      frames:
++      - function: <unknown>
++        in_app: false
++        instruction_addr: '0x2a2a3d'
++        package: C:\projects\breakpad-tools\windows\Release\crash.exe
++    stacktrace:
++      frames:
++      - abs_path: c:\projects\breakpad-tools\windows\crash\main.cpp
++        filename: main.cpp
++        function: main
++        in_app: false
++        instruction_addr: '0x2a2a3d'
++        lineno: 35
++        package: C:\projects\breakpad-tools\windows\Release\crash.exe
++        symbol: main
++    thread_id: 1636
++    type: EXCEPTION_ACCESS_VIOLATION_WRITE
++    value: 'Fatal Error: EXCEPTION_ACCESS_VIOLATION_WRITE'
++fingerprint:
++- '{{ default }}'
++grouping_config:
++  id: legacy:2019-03-12
++hashes:
++- ffe48bfc93b1bf86ffb750d5d2bdc51a
++level: error
++location: main.cpp
++logger: ''
++metadata:
++  filename: main.cpp
++  function: main
++  type: EXCEPTION_ACCESS_VIOLATION_WRITE
++  value: 'Fatal Error: EXCEPTION_ACCESS_VIOLATION_WRITE'
++platform: native
++sdk:
++  name: _postWithHeader
++  version: 0.0.0
++tags:
++- - level
++  - error
++- - sentry:user
++  - ip:127.0.0.1
++- - os
++  - Windows 10.0.14393
++- - os.name
++  - Windows
++title: 'EXCEPTION_ACCESS_VIOLATION_WRITE: Fatal Error: EXCEPTION_ACCESS_VIOLATION_WRITE'
++type: error
++use_rust_normalize: true
++user:
++  ip_address: 127.0.0.1
++version: '6'
+diff --git a/tests/sentry/lang/native/snapshots/SymbolicatorResolvingIntegrationTest/test_missing_dsym.pysnap b/tests/sentry/lang/native/snapshots/SymbolicatorResolvingIntegrationTest/test_missing_dsym.pysnap
+new file mode 100644
+index 0000000000..0f0428c498
+--- /dev/null
++++ b/tests/sentry/lang/native/snapshots/SymbolicatorResolvingIntegrationTest/test_missing_dsym.pysnap
+@@ -0,0 +1,80 @@
++---
++created: '2019-04-01T16:44:06.691058Z'
++creator: sentry
++source: tests/sentry/lang/native/test_plugin.py
++---
++culprit: unknown
++debug_meta:
++  images:
++  - arch: x86_64
++    code_file: Foo.app/Contents/Foo
++    code_id: null
++    debug_file: null
++    debug_id: 502fc0a5-1ec1-3e47-9998-684fa139dca7
++    image_addr: '0x100000000'
++    image_size: 4096
++    image_vmaddr: '0x100000000'
++    type: macho
++  sdk_info:
++    sdk_name: macOS
++    version_major: 10
++    version_minor: 12
++    version_patchlevel: 4
++errors:
++- image_arch: x86_64
++  image_path: Foo.app/Contents/Foo
++  image_uuid: 502fc0a5-1ec1-3e47-9998-684fa139dca7
++  message: None
++  type: native_missing_dsym
++exception:
++  values:
++  - raw_stacktrace:
++      frames:
++      - function: unknown
++        in_app: false
++        instruction_addr: '0x100000fa0'
++    stacktrace:
++      frames:
++      - function: unknown
++        in_app: false
++        instruction_addr: '0x100000fa0'
++    type: Fail
++    value: fail
++fingerprint:
++- '{{ default }}'
++grouping_config:
++  id: legacy:2019-03-12
++hashes:
++- efca000ff6704f25e5434e9ed7eff02f
++level: error
++location: null
++logger: ''
++metadata:
++  type: Fail
++  value: fail
++platform: cocoa
++processing_issues:
++  native:dsym:502fc0a5-1ec1-3e47-9998-684fa139dca7:
++    data:
++      image_arch: x86_64
++      image_path: Foo.app/Contents/Foo
++      image_uuid: 502fc0a5-1ec1-3e47-9998-684fa139dca7
++      message: None
++      type: native_missing_dsym
++    object: dsym:502fc0a5-1ec1-3e47-9998-684fa139dca7
++    scope: native
++    type: native_missing_dsym
++sdk:
++  name: _postWithHeader
++  version: 0.0.0
++tags:
++- - level
++  - error
++- - sentry:user
++  - ip:127.0.0.1
++title: 'Fail: fail'
++type: error
++use_rust_normalize: true
++user:
++  ip_address: 127.0.0.1
++version: '6'
+diff --git a/tests/sentry/lang/native/snapshots/SymbolicatorResolvingIntegrationTest/test_real_resolving.pysnap b/tests/sentry/lang/native/snapshots/SymbolicatorResolvingIntegrationTest/test_real_resolving.pysnap
+new file mode 100644
+index 0000000000..192aeb9acd
+--- /dev/null
++++ b/tests/sentry/lang/native/snapshots/SymbolicatorResolvingIntegrationTest/test_real_resolving.pysnap
+@@ -0,0 +1,70 @@
++---
++created: '2019-04-01T16:17:40.223840Z'
++creator: sentry
++source: tests/sentry/lang/native/test_plugin.py
++---
++culprit: main
++debug_meta:
++  images:
++  - arch: x86_64
++    code_file: Foo.app/Contents/Foo
++    code_id: null
++    debug_file: null
++    debug_id: 502fc0a5-1ec1-3e47-9998-684fa139dca7
++    image_addr: '0x100000000'
++    image_size: 4096
++    image_vmaddr: '0x100000000'
++    type: macho
++  sdk_info:
++    sdk_name: macOS
++    version_major: 10
++    version_minor: 12
++    version_patchlevel: 4
++exception:
++  values:
++  - raw_stacktrace:
++      frames:
++      - function: unknown
++        in_app: false
++        instruction_addr: '0x100000fa0'
++    stacktrace:
++      frames:
++      - abs_path: /tmp/hello.c
++        filename: hello.c
++        function: main
++        in_app: false
++        instruction_addr: '0x100000fa0'
++        lineno: 1
++        package: Foo.app/Contents/Foo
++        symbol: main
++    type: Fail
++    value: fail
++fingerprint:
++- '{{ default }}'
++grouping_config:
++  id: legacy:2019-03-12
++hashes:
++- 6e2889ec15f82569f56fdba9ffc9b90b
++level: error
++location: hello.c
++logger: ''
++metadata:
++  filename: hello.c
++  function: main
++  type: Fail
++  value: fail
++platform: cocoa
++sdk:
++  name: _postWithHeader
++  version: 0.0.0
++tags:
++- - level
++  - error
++- - sentry:user
++  - ip:127.0.0.1
++title: 'Fail: fail'
++type: error
++use_rust_normalize: true
++user:
++  ip_address: 127.0.0.1
++version: '6'
+diff --git a/tests/sentry/lang/native/snapshots/SymbolicatorResolvingIntegrationTest/test_real_resolving_with_multiple_requests.pysnap b/tests/sentry/lang/native/snapshots/SymbolicatorResolvingIntegrationTest/test_real_resolving_with_multiple_requests.pysnap
+new file mode 100644
+index 0000000000..e9d0e0db57
+--- /dev/null
++++ b/tests/sentry/lang/native/snapshots/SymbolicatorResolvingIntegrationTest/test_real_resolving_with_multiple_requests.pysnap
+@@ -0,0 +1,70 @@
++---
++created: '2019-04-01T16:17:43.289893Z'
++creator: sentry
++source: tests/sentry/lang/native/test_plugin.py
++---
++culprit: main
++debug_meta:
++  images:
++  - arch: x86_64
++    code_file: Foo.app/Contents/Foo
++    code_id: null
++    debug_file: null
++    debug_id: 502fc0a5-1ec1-3e47-9998-684fa139dca7
++    image_addr: '0x100000000'
++    image_size: 4096
++    image_vmaddr: '0x100000000'
++    type: macho
++  sdk_info:
++    sdk_name: macOS
++    version_major: 10
++    version_minor: 12
++    version_patchlevel: 4
++exception:
++  values:
++  - raw_stacktrace:
++      frames:
++      - function: unknown
++        in_app: false
++        instruction_addr: '0x100000fa0'
++    stacktrace:
++      frames:
++      - abs_path: /tmp/hello.c
++        filename: hello.c
++        function: main
++        in_app: false
++        instruction_addr: '0x100000fa0'
++        lineno: 1
++        package: Foo.app/Contents/Foo
++        symbol: main
++    type: Fail
++    value: fail
++fingerprint:
++- '{{ default }}'
++grouping_config:
++  id: legacy:2019-03-12
++hashes:
++- 6e2889ec15f82569f56fdba9ffc9b90b
++level: error
++location: hello.c
++logger: ''
++metadata:
++  filename: hello.c
++  function: main
++  type: Fail
++  value: fail
++platform: cocoa
++sdk:
++  name: _postWithHeader
++  version: 0.0.0
++tags:
++- - level
++  - error
++- - sentry:user
++  - ip:127.0.0.1
++title: 'Fail: fail'
++type: error
++use_rust_normalize: true
++user:
++  ip_address: 127.0.0.1
++version: '6'
+diff --git a/tests/sentry/lang/native/test_plugin.py b/tests/sentry/lang/native/test_plugin.py
+index 240ac4402c..41cedb0851 100644
+--- a/tests/sentry/lang/native/test_plugin.py
++++ b/tests/sentry/lang/native/test_plugin.py
+@@ -3,6 +3,7 @@ from __future__ import absolute_import
+ import os
+ import pytest
+ import zipfile
++
+ from mock import patch
+ from six import BytesIO
+ 
+@@ -10,12 +11,50 @@ from django.conf import settings
+ from django.core.urlresolvers import reverse
+ from django.core.files.uploadedfile import SimpleUploadedFile
+ 
+-from sentry.testutils import TestCase
++from sentry.testutils import TestCase, TransactionTestCase
+ from sentry.lang.native.symbolizer import Symbolizer
+ from sentry.models import Event, EventAttachment, File, ProjectDebugFile
+ 
+ from symbolic import parse_addr, SymbolicError, SymCache
+ 
++REAL_RESOLVING_EVENT_DATA = {
++    "platform": "cocoa",
++    "debug_meta": {
++        "images": [{
++            "type": "apple",
++            "arch": "x86_64",
++            "uuid": "502fc0a5-1ec1-3e47-9998-684fa139dca7",
++            "image_vmaddr": "0x0000000100000000",
++            "image_size": 4096,
++            "image_addr": "0x0000000100000000",
++            "name": "Foo.app/Contents/Foo"
++        }],
++        "sdk_info": {
++            "dsym_type": "macho",
++            "sdk_name": "macOS",
++            "version_major": 10,
++            "version_minor": 12,
++            "version_patchlevel": 4,
++        }
++    },
++    "exception": {
++        "values": [
++            {
++                'stacktrace': {
++                    "frames": [
++                        {
++                            "function": "unknown",
++                            "instruction_addr": "0x0000000100000fa0"
++                        },
++                    ]
++                },
++                "type": "Fail",
++                "value": "fail"
++            }
++        ]
++    },
++}
++
+ 
+ class BasicResolvingIntegrationTest(TestCase):
+ 
+@@ -1050,7 +1089,7 @@ class InAppHonoringResolvingIntegrationTest(TestCase):
+         assert frames[0].in_app
+ 
+ 
+-class RealResolvingIntegrationTest(TestCase):
++class ResolvingIntegrationTestBase(object):
+     def test_real_resolving(self):
+         url = reverse(
+             'sentry-api-0-dsym-files',
+@@ -1078,151 +1117,17 @@ class RealResolvingIntegrationTest(TestCase):
+         assert response.status_code == 201, response.content
+         assert len(response.data) == 1
+ 
+-        event_data = {
+-            "project": self.project.id,
+-            "platform": "cocoa",
+-            "debug_meta": {
+-                "images": [{
+-                    "type": "apple",
+-                    "arch": "x86_64",
+-                    "uuid": "502fc0a5-1ec1-3e47-9998-684fa139dca7",
+-                    "image_vmaddr": "0x0000000100000000",
+-                    "image_size": 4096,
+-                    "image_addr": "0x0000000100000000",
+-                    "name": "Foo.app/Contents/Foo"
+-                }],
+-                "sdk_info": {
+-                    "dsym_type": "macho",
+-                    "sdk_name": "macOS",
+-                    "version_major": 10,
+-                    "version_minor": 12,
+-                    "version_patchlevel": 4,
+-                }
+-            },
+-            "exception": {
+-                "values": [
+-                    {
+-                        'stacktrace': {
+-                            "frames": [
+-                                {
+-                                    "function": "unknown",
+-                                    "instruction_addr": "0x0000000100000fa0"
+-                                },
+-                            ]
+-                        },
+-                        "type": "Fail",
+-                        "value": "fail"
+-                    }
+-                ]
+-            },
+-        }
+-
+-        resp = self._postWithHeader(event_data)
++        resp = self._postWithHeader(dict(project=self.project.id, **REAL_RESOLVING_EVENT_DATA))
+         assert resp.status_code == 200
+ 
+         event = Event.objects.get()
+-
+-        bt = event.interfaces['exception'].values[0].stacktrace
+-        frames = bt.frames
+-
+-        assert frames[0].function == 'main'
+-        assert frames[0].filename == 'hello.c'
+-        assert frames[0].abs_path == '/tmp/hello.c'
+-        assert frames[0].lineno == 1
+-
+-    def test_broken_conversion(self):
+-        url = reverse(
+-            'sentry-api-0-dsym-files',
+-            kwargs={
+-                'organization_slug': self.project.organization.slug,
+-                'project_slug': self.project.slug,
+-            }
+-        )
+-
+-        self.login_as(user=self.user)
+-
+-        out = BytesIO()
+-        f = zipfile.ZipFile(out, 'w')
+-        f.write(os.path.join(os.path.dirname(__file__), 'fixtures', 'hello.dsym'),
+-                'dSYM/hello')
+-        f.close()
+-
+-        original_make_symcache = SymCache.from_object
+-
+-        @classmethod
+-        def broken_make_symcache(cls, obj):
+-            raise SymbolicError('shit on fire')
+-        SymCache.from_object = broken_make_symcache
+-
+-        try:
+-            response = self.client.post(
+-                url, {
+-                    'file':
+-                    SimpleUploadedFile(
+-                        'symbols.zip',
+-                        out.getvalue(),
+-                        content_type='application/zip'),
+-                },
+-                format='multipart'
+-            )
+-            assert response.status_code == 201, response.content
+-            assert len(response.data) == 1
+-
+-            event_data = {
+-                "project": self.project.id,
+-                "platform": "cocoa",
+-                "debug_meta": {
+-                    "images": [{
+-                        "type": "apple",
+-                        "arch": "x86_64",
+-                        "uuid": "502fc0a5-1ec1-3e47-9998-684fa139dca7",
+-                        "image_vmaddr": "0x0000000100000000",
+-                        "image_size": 4096,
+-                        "image_addr": "0x0000000100000000",
+-                        "name": "Foo.app/Contents/Foo"
+-                    }],
+-                    "sdk_info": {
+-                        "dsym_type": "macho",
+-                        "sdk_name": "macOS",
+-                        "version_major": 10,
+-                        "version_minor": 12,
+-                        "version_patchlevel": 4,
+-                    }
+-                },
+-                "exception": {
+-                    "values": [
+-                        {
+-                            'stacktrace': {
+-                                "frames": [
+-                                    {
+-                                        "function": "unknown",
+-                                        "instruction_addr": "0x0000000100000fa0"
+-                                    },
+-                                ]
+-                            },
+-                            "type": "Fail",
+-                            "value": "fail"
+-                        }
+-                    ]
+-                },
+-            }
+-
+-            for _ in range(3):
+-                resp = self._postWithHeader(event_data)
+-                assert resp.status_code == 200
+-                event = Event.objects.get(project_id=self.project.id)
+-                errors = event.data['errors']
+-                assert len(errors) == 1
+-                assert errors[0] == {
+-                    'image_arch': u'x86_64',
+-                    'image_path': u'Foo.app/Contents/Foo',
+-                    'image_uuid': u'502fc0a5-1ec1-3e47-9998-684fa139dca7',
+-                    'message': u'shit on fire',
+-                    'type': 'native_bad_dsym'
+-                }
+-                event.delete()
+-        finally:
+-            SymCache.from_object = original_make_symcache
++        snapshot_data = dict(event.data)
++        del snapshot_data['event_id']
++        del snapshot_data['timestamp']
++        del snapshot_data['received']
++        del snapshot_data['key_id']
++        del snapshot_data['project']
++        self.insta_snapshot(snapshot_data)
+ 
+     def test_debug_id_resolving(self):
+         file = File.objects.create(
+@@ -1290,14 +1195,152 @@ class RealResolvingIntegrationTest(TestCase):
+         assert resp.status_code == 200
+ 
+         event = Event.objects.get()
++        snapshot_data = dict(event.data)
++        del snapshot_data['event_id']
++        del snapshot_data['timestamp']
++        del snapshot_data['received']
++        del snapshot_data['key_id']
++        del snapshot_data['project']
++        self.insta_snapshot(snapshot_data)
++
++    def test_missing_dsym(self):
++        self.login_as(user=self.user)
+ 
+-        bt = event.interfaces['exception'].values[0].stacktrace
+-        frames = bt.frames
++        resp = self._postWithHeader(dict(project=self.project.id, **REAL_RESOLVING_EVENT_DATA))
++        assert resp.status_code == 200
++
++        event = Event.objects.get()
++        snapshot_data = dict(event.data)
++        del snapshot_data['event_id']
++        del snapshot_data['timestamp']
++        del snapshot_data['received']
++        del snapshot_data['key_id']
++        del snapshot_data['project']
++        self.insta_snapshot(snapshot_data)
++
++
++class SymbolicResolvingIntegrationTest(ResolvingIntegrationTestBase, TestCase):
++    @pytest.fixture(autouse=True)
++    def inject_pytest_monkeypatch(self, monkeypatch):
++        self.pytest_monkeypatch = monkeypatch
++
++    def test_broken_conversion(self):
++        url = reverse(
++            'sentry-api-0-dsym-files',
++            kwargs={
++                'organization_slug': self.project.organization.slug,
++                'project_slug': self.project.slug,
++            }
++        )
++
++        self.login_as(user=self.user)
++
++        out = BytesIO()
++        f = zipfile.ZipFile(out, 'w')
++        f.write(os.path.join(os.path.dirname(__file__), 'fixtures', 'hello.dsym'),
++                'dSYM/hello')
++        f.close()
++
++        @classmethod
++        def broken_make_symcache(cls, obj):
++            raise SymbolicError('shit on fire')
++
++        self.pytest_monkeypatch.setattr(SymCache, 'from_object', broken_make_symcache)
++
++        response = self.client.post(
++            url, {
++                'file':
++                SimpleUploadedFile(
++                    'symbols.zip',
++                    out.getvalue(),
++                    content_type='application/zip'),
++            },
++            format='multipart'
++        )
++        assert response.status_code == 201, response.content
++        assert len(response.data) == 1
++
++        event_data = {
++            "project": self.project.id,
++            "platform": "cocoa",
++            "debug_meta": {
++                "images": [{
++                    "type": "apple",
++                    "arch": "x86_64",
++                    "uuid": "502fc0a5-1ec1-3e47-9998-684fa139dca7",
++                    "image_vmaddr": "0x0000000100000000",
++                    "image_size": 4096,
++                    "image_addr": "0x0000000100000000",
++                    "name": "Foo.app/Contents/Foo"
++                }],
++                "sdk_info": {
++                    "dsym_type": "macho",
++                    "sdk_name": "macOS",
++                    "version_major": 10,
++                    "version_minor": 12,
++                    "version_patchlevel": 4,
++                }
++            },
++            "exception": {
++                "values": [
++                    {
++                        'stacktrace': {
++                            "frames": [
++                                {
++                                    "function": "unknown",
++                                    "instruction_addr": "0x0000000100000fa0"
++                                },
++                            ]
++                        },
++                        "type": "Fail",
++                        "value": "fail"
++                    }
++                ]
++            },
++        }
++
++        for _ in range(3):
++            resp = self._postWithHeader(event_data)
++            assert resp.status_code == 200
++            event = Event.objects.get(project_id=self.project.id)
++            errors = event.data['errors']
++            assert len(errors) == 1
++            assert errors[0] == {
++                'image_arch': u'x86_64',
++                'image_path': u'Foo.app/Contents/Foo',
++                'image_uuid': u'502fc0a5-1ec1-3e47-9998-684fa139dca7',
++                'message': u'shit on fire',
++                'type': 'native_bad_dsym'
++            }
++            event.delete()
++
++
++class SymbolicatorResolvingIntegrationTest(ResolvingIntegrationTestBase, TransactionTestCase):
++    @pytest.fixture(autouse=True)
++    def initialize(self, live_server, monkeypatch, betamax_recorder):
++        self.live_server = live_server
++        self.monkeypatch = monkeypatch
++        self.betamax_recorder = betamax_recorder
++
++        monkeypatch.setattr('sentry.lang.native.symbolicator.Session',
++                            lambda: betamax_recorder.session)
++        monkeypatch.setattr('sentry.lang.native.plugin._is_symbolicator_enabled',
++                            lambda _: True)
++
++        with patch('sentry.lang.native.symbolizer.Symbolizer._symbolize_app_frame') \
++                as symbolize_app_frame, \
++                self.options({"system.url-prefix": live_server.url}):
++
++            # Run test case:
++            yield
++
++            # Teardown:
++            assert not symbolize_app_frame.called
+ 
+-        assert frames[0].function == 'main'
+-        assert frames[0].filename == 'main.cpp'
+-        assert frames[0].abs_path == 'c:\\projects\\breakpad-tools\\windows\\crash\\main.cpp'
+-        assert frames[0].lineno == 35
++    def test_real_resolving_with_multiple_requests(self):
++        self.monkeypatch.setattr('sentry.lang.native.symbolicator.SYMBOLICATOR_TIMEOUT', 0)
++        self.test_real_resolving()
++        assert len(self.betamax_recorder.current_cassette.interactions) > 2
+ 
+ 
+ class ExceptionMechanismIntegrationTest(TestCase):
+diff --git a/tests/sentry/lang/native/test_processor.py b/tests/sentry/lang/native/test_processor.py
+index d5117c902e..48cd8943d9 100644
+--- a/tests/sentry/lang/native/test_processor.py
++++ b/tests/sentry/lang/native/test_processor.py
+@@ -41,7 +41,7 @@ def patched_symbolize_app_frame(self, instruction_addr, img, sdk_info=None, trus
+     ]
+ 
+ 
+-def patched_convert_symbolserver_match(self, instruction_addr, symbolserver_match, img):
++def patched_convert_symbolserver_match(self, instruction_addr, symbolserver_match):
+     if 6016 <= instruction_addr < 6020:
+         return [
+             {

@@ -1,0 +1,216 @@
+commit 837a75053441044341617472b9bce2e2a2bf3789
+Author: Markus Unterwaditzer <markus@unterwaditzer.net>
+Date:   Mon Oct 14 17:02:15 2019 +0200
+
+    feat(outcomes-consumer): Multithreading (#15068)
+    
+    * feat(outcomes-consumer): Multithreading
+    
+    * feat: Add concurrency option
+    
+    * fix: Actually use concurrency setting
+
+diff --git a/src/sentry/ingest/outcomes_consumer.py b/src/sentry/ingest/outcomes_consumer.py
+index 6855467a27..a7677fd5bc 100644
+--- a/src/sentry/ingest/outcomes_consumer.py
++++ b/src/sentry/ingest/outcomes_consumer.py
+@@ -17,7 +17,10 @@ signals to getSentry for these outcomes.
+ """
+ from __future__ import absolute_import
+ 
++import atexit
+ import logging
++import multiprocessing.dummy
++import multiprocessing as _multiprocessing
+ 
+ from sentry.utils.batching_kafka_consumer import AbstractBatchWorker
+ 
+@@ -59,56 +62,68 @@ def is_signal_sent(project_id, event_id):
+     return cache.get(key, None) is not None
+ 
+ 
+-class OutcomesConsumerWorker(AbstractBatchWorker):
+-    def process_message(self, message):
+-        msg = json.loads(message.value())
++def _process_message(message):
++    msg = json.loads(message)
++
++    project_id = int(msg.get("project_id", 0))
++    if project_id == 0:
++        return  # no project. this is valid, so ignore silently.
++
++    outcome = int(msg.get("outcome", -1))
++    if outcome not in (Outcome.FILTERED, Outcome.RATE_LIMITED):
++        return  # nothing to do here
+ 
+-        project_id = int(msg.get("project_id", 0))
+-        if project_id == 0:
+-            return True  # no project. this is valid, so ignore silently.
++    event_id = msg.get("event_id")
++    if is_signal_sent(project_id=project_id, event_id=event_id):
++        return  # message already processed nothing left to do
+ 
+-        outcome = int(msg.get("outcome", -1))
+-        if outcome not in (Outcome.FILTERED, Outcome.RATE_LIMITED):
+-            return True  # nothing to do here
++    try:
++        project = Project.objects.get_from_cache(id=project_id)
++    except Project.DoesNotExist:
++        logger.error("OutcomesConsumer could not find project with id: %s", project_id)
++        return
+ 
+-        event_id = msg.get("event_id")
+-        if is_signal_sent(project_id=project_id, event_id=event_id):
+-            return True  # message already processed nothing left to do
++    reason = msg.get("reason")
++    remote_addr = msg.get("remote_addr")
+ 
+-        try:
+-            project = Project.objects.get_from_cache(id=project_id)
+-        except Project.DoesNotExist:
+-            logger.error("OutcomesConsumer could not find project with id: %s", project_id)
+-            return True
++    if outcome == Outcome.FILTERED:
++        event_filtered.send_robust(ip=remote_addr, project=project, sender=OutcomesConsumerWorker)
++    elif outcome == Outcome.RATE_LIMITED:
++        event_dropped.send_robust(
++            ip=remote_addr, project=project, reason_code=reason, sender=OutcomesConsumerWorker
++        )
+ 
+-        reason = msg.get("reason")
+-        remote_addr = msg.get("remote_addr")
++    # remember that we sent the signal just in case the processor dies before
++    mark_signal_sent(project_id=project_id, event_id=event_id)
+ 
+-        if outcome == Outcome.FILTERED:
+-            event_filtered.send_robust(ip=remote_addr, project=project, sender=self.process_message)
+-        elif outcome == Outcome.RATE_LIMITED:
+-            event_dropped.send_robust(
+-                ip=remote_addr, project=project, reason_code=reason, sender=self.process_message
+-            )
+ 
+-        # remember that we sent the signal just in case the processor dies before
+-        mark_signal_sent(project_id=project_id, event_id=event_id)
++class OutcomesConsumerWorker(AbstractBatchWorker):
++    def __init__(self, multiprocessing, concurrency):
++        if multiprocessing:
++            self.pool = _multiprocessing.Pool(concurrency)
++        else:
++            self.pool = _multiprocessing.dummy.Pool(concurrency)
++
++        atexit.register(self.pool.close)
+ 
+-        # Return *something* so that it counts against batch size
+-        return True
++    def process_message(self, message):
++        return message.value()
+ 
+     def flush_batch(self, batch):
+-        pass
++        for _ in self.pool.imap_unordered(_process_message, batch, chunksize=100):
++            pass
+ 
+     def shutdown(self):
+         pass
+ 
+ 
+-def get_outcomes_consumer(**options):
++def get_outcomes_consumer(multiprocessing=False, concurrency=None, **options):
+     """
+     Handles outcome requests coming via a kafka queue from Relay.
+     """
+ 
+     return create_batching_kafka_consumer(
+-        topic_name=settings.KAFKA_OUTCOMES, worker=OutcomesConsumerWorker(), **options
++        topic_name=settings.KAFKA_OUTCOMES,
++        worker=OutcomesConsumerWorker(multiprocessing=multiprocessing, concurrency=concurrency),
++        **options
+     )
+diff --git a/src/sentry/runner/commands/run.py b/src/sentry/runner/commands/run.py
+index 12536a8a7a..342bf51dc0 100644
+--- a/src/sentry/runner/commands/run.py
++++ b/src/sentry/runner/commands/run.py
+@@ -434,6 +434,17 @@ def ingest_consumer(consumer_type, **options):
+ @run.command("outcomes-consumer")
+ @log_options()
+ @batching_kafka_options("outcomes-consumer")
++@click.option(
++    "--multiprocessing/--multithreading",
++    default=False,
++    help="Use threads vs processes for concurrency. Per default it's threads.",
++)
++@click.option(
++    "--concurrency",
++    type=int,
++    default=None,
++    help="Spawn this many threads/processes to process outcomes. Defaults to number of CPUs.",
++)
+ @configuration
+ def outcome_consumer(**options):
+     """
+diff --git a/tests/sentry/ingest/test_outcome_consumer.py b/tests/sentry/ingest/test_outcome_consumer.py
+index 90747fdeed..cbbbef9d1c 100644
+--- a/tests/sentry/ingest/test_outcome_consumer.py
++++ b/tests/sentry/ingest/test_outcome_consumer.py
+@@ -109,7 +109,7 @@ def test_outcome_consumer_ignores_outcomes_already_handled(
+     event_dropped.connect(event_dropped_receiver)
+ 
+     consumer = get_outcomes_consumer(
+-        max_batch_size=2, max_batch_time=100, group_id=group_id, auto_offset_reset="earliest"
++        max_batch_size=1, max_batch_time=100, group_id=group_id, auto_offset_reset="earliest"
+     )
+ 
+     # run the outcome consumer
+@@ -164,7 +164,7 @@ def test_outcome_consumer_ignores_invalid_outcomes(
+     event_dropped.connect(event_dropped_receiver)
+ 
+     consumer = get_outcomes_consumer(
+-        max_batch_size=4, max_batch_time=100, group_id=group_id, auto_offset_reset="earliest"
++        max_batch_size=1, max_batch_time=100, group_id=group_id, auto_offset_reset="earliest"
+     )
+ 
+     # run the outcome consumer
+@@ -215,7 +215,7 @@ def test_outcome_consumer_remembers_handled_outcomes(
+     event_dropped.connect(event_dropped_receiver)
+ 
+     consumer = get_outcomes_consumer(
+-        max_batch_size=2, max_batch_time=100, group_id=group_id, auto_offset_reset="earliest"
++        max_batch_size=1, max_batch_time=100, group_id=group_id, auto_offset_reset="earliest"
+     )
+ 
+     # run the outcome consumer
+@@ -265,7 +265,7 @@ def test_outcome_consumer_handles_filtered_outcomes(
+     event_dropped.connect(event_dropped_receiver)
+ 
+     consumer = get_outcomes_consumer(
+-        max_batch_size=2, max_batch_time=100, group_id=group_id, auto_offset_reset="earliest"
++        max_batch_size=1, max_batch_time=100, group_id=group_id, auto_offset_reset="earliest"
+     )
+ 
+     # run the outcome consumer
+@@ -277,7 +277,7 @@ def test_outcome_consumer_handles_filtered_outcomes(
+ 
+     # verify that the appropriate filters were called
+     assert len(event_filtered_sink) == 2
+-    assert event_filtered_sink == ["127.33.44.1", "127.33.44.2"]
++    assert set(event_filtered_sink) == set(["127.33.44.1", "127.33.44.2"])
+     assert len(event_dropped_sink) == 0
+ 
+ 
+@@ -315,7 +315,7 @@ def test_outcome_consumer_handles_rate_limited_outcomes(
+     event_dropped.connect(event_dropped_receiver)
+ 
+     consumer = get_outcomes_consumer(
+-        max_batch_size=2, max_batch_time=100, group_id=group_id, auto_offset_reset="earliest"
++        max_batch_size=1, max_batch_time=100, group_id=group_id, auto_offset_reset="earliest"
+     )
+ 
+     # run the outcome consumer
+@@ -328,4 +328,6 @@ def test_outcome_consumer_handles_rate_limited_outcomes(
+     # verify that the appropriate filters were called
+     assert len(event_filtered_sink) == 0
+     assert len(event_dropped_sink) == 2
+-    assert event_dropped_sink == [("127.33.44.1", "reason_1"), ("127.33.44.2", "reason_2")]
++    assert set(event_dropped_sink) == set(
++        [("127.33.44.1", "reason_1"), ("127.33.44.2", "reason_2")]
++    )

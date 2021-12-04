@@ -1,0 +1,1442 @@
+commit 30cca53e740786112c7f2022e0f03200c313c15f
+Author: ted kaemming <ted@kaemming.com>
+Date:   Wed May 17 15:41:56 2017 -0700
+
+    Implement `GroupHash` unmerging. (#5357)
+    
+    This allows disassociating a `GroupHash` record from a group. This causes a new group to be created, and denormalized statistics (time series and tag data, among others) are backfilled for both the source and destination groups.
+    
+    This implementation does have a few caveats:
+    
+    - if sampling is enabled, statistics will be incorrect (by a factor of the sampling ratio, so assuming a uniform distribution, the proportions of the statistics should still be representative of the inputs),
+    - this cannot handle checksums provided as part of the data payload, since they are deleted from the payload on ingest,
+    - this assumes no modifications to the fingerprinting algorithm, since calculated fingerprint values are never associated with the event when using default fingerprints.
+
+diff --git a/src/sentry/api/endpoints/organization_activity.py b/src/sentry/api/endpoints/organization_activity.py
+index a4ba2ce82b..e5cfe5c0b5 100644
+--- a/src/sentry/api/endpoints/organization_activity.py
++++ b/src/sentry/api/endpoints/organization_activity.py
+@@ -15,6 +15,11 @@ class OrganizationActivityEndpoint(OrganizationMemberEndpoint):
+                     organizationmember=member,
+                 ).values('team')
+             )
++        ).exclude(
++            # There is an activity record created for both sides of the unmerge
++            # operation, so we only need to include one of them here to avoid
++            # showing the same entry twice.
++            type=Activity.UNMERGE_SOURCE,
+         ).select_related('project', 'group', 'user')
+ 
+         return self.paginate(
+diff --git a/src/sentry/api/serializers/models/activity.py b/src/sentry/api/serializers/models/activity.py
+index 2f01db7a0a..1ce01cd9a2 100644
+--- a/src/sentry/api/serializers/models/activity.py
++++ b/src/sentry/api/serializers/models/activity.py
+@@ -1,9 +1,11 @@
+ from __future__ import absolute_import
+ 
++import functools
+ import six
+ 
+ from sentry.api.serializers import Serializer, register, serialize
+-from sentry.models import Activity, Commit
++from sentry.models import Activity, Commit, Group
++from sentry.utils.functional import apply_values
+ 
+ 
+ @register(Activity)
+@@ -34,9 +36,19 @@ class ActivitySerializer(Serializer):
+         else:
+             commits = {}
+ 
++        groups = apply_values(
++            functools.partial(serialize, user=user),
++            Group.objects.in_bulk(
++                set(i.data['source_id'] for i in item_list if i.type == Activity.UNMERGE_DESTINATION) |
++                set(i.data['destination_id'] for i in item_list if i.type == Activity.UNMERGE_SOURCE)
++            )
++        )
++
+         return {
+             item: {
+                 'user': users[six.text_type(item.user_id)] if item.user_id else None,
++                'source': groups.get(item.data['source_id']) if item.type == Activity.UNMERGE_DESTINATION else None,
++                'destination': groups.get(item.data['destination_id']) if item.type == Activity.UNMERGE_SOURCE else None,
+                 'commit': commits.get(item),
+             } for item in item_list
+         }
+@@ -46,6 +58,16 @@ class ActivitySerializer(Serializer):
+             data = {
+                 'commit': attrs['commit'],
+             }
++        elif obj.type == Activity.UNMERGE_DESTINATION:
++            data = {
++                'fingerprints': obj.data['fingerprints'],
++                'source': attrs['source'],
++            }
++        elif obj.type == Activity.UNMERGE_SOURCE:
++            data = {
++                'fingerprints': obj.data['fingerprints'],
++                'destination': attrs['destination'],
++            }
+         else:
+             data = obj.data
+ 
+diff --git a/src/sentry/conf/server.py b/src/sentry/conf/server.py
+index 5bf45b07d8..48ed6805dd 100644
+--- a/src/sentry/conf/server.py
++++ b/src/sentry/conf/server.py
+@@ -447,14 +447,13 @@ CELERY_IMPORTS = (
+     'sentry.tasks.auth',
+     'sentry.tasks.auto_resolve_issues',
+     'sentry.tasks.beacon',
+-    'sentry.tasks.commits',
+     'sentry.tasks.check_auth',
+     'sentry.tasks.clear_expired_snoozes',
+     'sentry.tasks.collect_project_platforms',
++    'sentry.tasks.commits',
+     'sentry.tasks.deletion',
+     'sentry.tasks.digests',
+     'sentry.tasks.dsymcache',
+-    'sentry.tasks.reprocessing',
+     'sentry.tasks.email',
+     'sentry.tasks.merge',
+     'sentry.tasks.options',
+@@ -462,7 +461,9 @@ CELERY_IMPORTS = (
+     'sentry.tasks.post_process',
+     'sentry.tasks.process_buffer',
+     'sentry.tasks.reports',
++    'sentry.tasks.reprocessing',
+     'sentry.tasks.store',
++    'sentry.tasks.unmerge',
+ )
+ CELERY_QUEUES = [
+     Queue('alerts', routing_key='alerts'),
+@@ -487,6 +488,7 @@ CELERY_QUEUES = [
+     Queue('reports.prepare', routing_key='reports.prepare'),
+     Queue('search', routing_key='search'),
+     Queue('stats', routing_key='stats'),
++    Queue('unmerge', routing_key='unmerge'),
+     Queue('update', routing_key='update'),
+ ]
+ 
+diff --git a/src/sentry/models/activity.py b/src/sentry/models/activity.py
+index 8476ea3f2e..2c725e9ce4 100644
+--- a/src/sentry/models/activity.py
++++ b/src/sentry/models/activity.py
+@@ -8,14 +8,13 @@ sentry.models.activity
+ from __future__ import absolute_import
+ 
+ import six
+-
+ from django.conf import settings
+ from django.db import models
+ from django.db.models import F
+ from django.utils import timezone
+ 
+ from sentry.db.models import (
+-    Model, BoundedPositiveIntegerField, FlexibleForeignKey, GzippedDictField,
++    BoundedPositiveIntegerField, FlexibleForeignKey, GzippedDictField, Model,
+     sane_repr
+ )
+ from sentry.tasks import activity
+@@ -42,6 +41,8 @@ class Activity(Model):
+     SET_RESOLVED_IN_COMMIT = 16
+     DEPLOY = 17
+     NEW_PROCESSING_ISSUES = 18
++    UNMERGE_SOURCE = 19
++    UNMERGE_DESTINATION = 20
+ 
+     TYPE = (
+         # (TYPE, verb-slug)
+@@ -63,6 +64,8 @@ class Activity(Model):
+         (MERGE, 'merge'),
+         (DEPLOY, 'deploy'),
+         (NEW_PROCESSING_ISSUES, 'new_processing_issues'),
++        (UNMERGE_SOURCE, 'unmerge_source'),
++        (UNMERGE_DESTINATION, 'unmerge_destination'),
+     )
+ 
+     project = FlexibleForeignKey('sentry.Project')
+diff --git a/src/sentry/static/sentry/app/components/activity/item.jsx b/src/sentry/static/sentry/app/components/activity/item.jsx
+index 364507c11f..6cf5088432 100644
+--- a/src/sentry/static/sentry/app/components/activity/item.jsx
++++ b/src/sentry/static/sentry/app/components/activity/item.jsx
+@@ -9,7 +9,7 @@ import MemberListStore from '../../stores/memberListStore';
+ import TimeSince from '../../components/timeSince';
+ import Version from '../../components/version';
+ 
+-import {tct} from '../../locale';
++import {t, tn, tct} from '../../locale';
+ 
+ const ActivityItem = React.createClass({
+   propTypes: {
+@@ -150,6 +150,19 @@ const ActivityItem = React.createClass({
+           provider: data.provider,
+           issue: issueLink
+         });
++      case 'unmerge_destination':
++        return tn(
++          '%2$s migrated %1$d fingerprint from %3$s to %4$s',
++          '%2$s migrated %1$d fingerprints from %3$s to %4$s',
++          data.fingerprints.length,
++          author,
++          data.source
++            ? <a href={`/${orgId}/${project.slug}/issues/${data.source.id}`}>
++                {data.source.shortId}
++              </a>
++            : t('a group'),
++          issueLink
++        );
+       case 'first_seen':
+         return tct('[author] saw [link:issue]', {
+           author: author,
+diff --git a/src/sentry/static/sentry/app/views/groupActivity/index.jsx b/src/sentry/static/sentry/app/views/groupActivity/index.jsx
+index c76fa12aad..4c2327ce04 100644
+--- a/src/sentry/static/sentry/app/views/groupActivity/index.jsx
++++ b/src/sentry/static/sentry/app/views/groupActivity/index.jsx
+@@ -88,6 +88,30 @@ const GroupActivity = React.createClass({
+           provider: data.provider,
+           title: <a href={data.location}>{data.title}</a>
+         });
++      case 'unmerge_source':
++        return tn(
++          '%2$s migrated %1$d fingerprint to %3$s',
++          '%2$s migrated %1$d fingerprints to %3$s',
++          data.fingerprints.length,
++          author,
++          data.destination
++            ? <a href={`/${orgId}/${projectId}/issues/${data.destination.id}`}>
++                {data.destination.shortId}
++              </a>
++            : t('a group')
++        );
++      case 'unmerge_destination':
++        return tn(
++          '%2$s migrated %1$d fingerprint from %3$s',
++          '%2$s migrated %1$d fingerprints from %3$s',
++          data.fingerprints.length,
++          author,
++          data.source
++            ? <a href={`/${orgId}/${projectId}/issues/${data.source.id}`}>
++                {data.source.shortId}
++              </a>
++            : t('a group')
++        );
+       case 'first_seen':
+         return t('%s first saw this issue', author);
+       case 'assigned':
+diff --git a/src/sentry/tasks/unmerge.py b/src/sentry/tasks/unmerge.py
+new file mode 100644
+index 0000000000..85bed8ee67
+--- /dev/null
++++ b/src/sentry/tasks/unmerge.py
+@@ -0,0 +1,545 @@
++from __future__ import absolute_import
++
++import logging
++from collections import defaultdict
++
++from django.db.models import F
++
++from sentry.app import tsdb
++from sentry.constants import DEFAULT_LOGGER_NAME, LOG_LEVELS_MAP
++from sentry.event_manager import (
++    ScoreClause, generate_culprit, get_hashes_for_event, md5_from_hash
++)
++from sentry.models import (
++    Activity, Environment, Event, EventMapping, EventTag, EventUser, Group,
++    GroupHash, GroupRelease, GroupTagKey, GroupTagValue, Project, Release,
++    UserReport
++)
++from sentry.tasks.base import instrumented_task
++
++
++def cache(function):
++    results = {}
++
++    def fetch(*key):
++        value = results.get(key)
++        if value is None:
++            try:
++                value = results[key] = (True, function(*key))
++            except Exception as error:
++                value = results[key] = (False, error)
++
++        ok, result = value
++        if ok:
++            return result
++        else:
++            raise result
++
++    return fetch
++
++
++def get_caches():
++    return {
++        Environment: cache(
++            lambda organization_id, name: Environment.objects.get(
++                organization_id=organization_id,
++                name=name,
++            ),
++        ),
++        GroupRelease: cache(
++            lambda group_id, environment, release_id: GroupRelease.objects.get(
++                group_id=group_id,
++                environment=environment,
++                release_id=release_id,
++            ),
++        ),
++        Project: cache(
++            lambda id: Project.objects.get(id=id),
++        ),
++        Release: cache(
++            lambda organization_id, version: Release.objects.get(
++                organization_id=organization_id,
++                version=version,
++            ),
++        ),
++    }
++
++
++def merge_mappings(values):
++    result = {}
++    for value in values:
++        result.update(value)
++    return result
++
++
++initial_fields = {
++    'culprit': lambda event: generate_culprit(
++        event.data,
++        event.platform,
++    ),
++    'data': lambda event: {
++        'last_received': event.data.get('received') or float(event.datetime.strftime('%s')),
++        'type': event.data['type'],
++        'metadata': event.data['metadata'],
++    },
++    'last_seen': lambda event: event.datetime,
++    'level': lambda event: LOG_LEVELS_MAP.get(
++        event.get_tag('level'),
++        logging.ERROR,
++    ),
++    'message': lambda event: event.message,
++    'times_seen': lambda event: 0,
++}
++
++
++backfill_fields = {
++    'platform': lambda caches, data, event: event.platform,
++    'logger': lambda caches, data, event: event.get_tag('logger') or DEFAULT_LOGGER_NAME,
++    'first_seen': lambda caches, data, event: event.datetime,
++    'active_at': lambda caches, data, event: event.datetime,
++    'first_release': lambda caches, data, event: caches[Release](
++        caches[Project](event.project_id).organization_id,
++        event.get_tag('sentry:release'),
++    ) if event.get_tag('sentry:release') else data.get('first_release', None),
++    'times_seen': lambda caches, data, event: data['times_seen'] + 1,
++    'score': lambda caches, data, event: ScoreClause.calculate(
++        data['times_seen'] + 1,
++        data['last_seen'],
++    ),
++}
++
++
++def get_group_creation_attributes(caches, events):
++    latest_event = events[0]
++    return reduce(
++        lambda data, event: merge_mappings([
++            data,
++            {name: f(caches, data, event) for name, f in backfill_fields.items()},
++        ]),
++        events,
++        {name: f(latest_event) for name, f in initial_fields.items()},
++    )
++
++
++def get_group_backfill_attributes(caches, group, events):
++    return {
++        k: v for k, v in
++        reduce(
++            lambda data, event: merge_mappings([
++                data,
++                {name: f(caches, data, event) for name, f in backfill_fields.items()},
++            ]),
++            events,
++            {name: getattr(group, name) for name in set(initial_fields.keys()) | set(backfill_fields.keys())},
++        ).items()
++        if k in backfill_fields
++    }
++
++
++def get_fingerprint(event):
++    # TODO: This *might* need to be protected from an IndexError?
++    primary_hash = get_hashes_for_event(event)[0]
++    return md5_from_hash(primary_hash)
++
++
++def migrate_events(caches, project, source_id, destination_id, fingerprints, events, actor_id):
++    # XXX: This is only actually able to create a destination group and migrate
++    # the group hashes if there are events that can be migrated. How do we
++    # handle this if there aren't any events? We can't create a group (there
++    # isn't any data to derive the aggregates from), so we'd have to mark the
++    # hash as in limbo somehow...?)
++    if not events:
++        return destination_id
++
++    if destination_id is None:
++        # XXX: There is a race condition here between the (wall clock) time
++        # that the migration is started by the user and when we actually
++        # get to this block where the new destination is created and we've
++        # moved the ``GroupHash`` so that events start being associated
++        # with it. During this gap, there could have been additional events
++        # ingested, and if we want to handle this, we'd need to record the
++        # highest event ID we've seen at the beginning of the migration,
++        # then scan all events greater than that ID and migrate the ones
++        # where necessary. (This still isn't even guaranteed to catch all
++        # of the events due to processing latency, but it's a better shot.)
++        # Create a new destination group.
++        destination = Group.objects.create(
++            project_id=project.id,
++            short_id=project.next_short_id(),
++            **get_group_creation_attributes(caches, events)
++        )
++
++        destination_id = destination.id
++
++        # Move the group hashes to the destination.
++        # TODO: What happens if this ``GroupHash`` has already been
++        # migrated somewhere else? Right now, this just assumes we have
++        # exclusive access to it (which is not a safe assumption.)
++        GroupHash.objects.filter(
++            project_id=project.id,
++            hash__in=fingerprints,
++        ).update(group=destination_id)
++
++        # Create activity records for the source and destination group.
++        Activity.objects.create(
++            project_id=project.id,
++            group_id=destination_id,
++            type=Activity.UNMERGE_DESTINATION,
++            user_id=actor_id,
++            data={
++                'fingerprints': fingerprints,
++                'source_id': source_id,
++            },
++        )
++
++        Activity.objects.create(
++            project_id=project.id,
++            group_id=source_id,
++            type=Activity.UNMERGE_SOURCE,
++            user_id=actor_id,
++            data={
++                'fingerprints': fingerprints,
++                'destination_id': destination_id,
++            },
++        )
++    else:
++        # Update the existing destination group.
++        destination = Group.objects.get(id=destination_id)
++        destination.update(**get_group_backfill_attributes(caches, destination, events))
++
++    event_id_set = set(event.id for event in events)
++
++    Event.objects.filter(
++        project_id=project.id,
++        id__in=event_id_set,
++    ).update(group_id=destination_id)
++
++    for event in events:
++        event.group = destination
++
++    EventTag.objects.filter(
++        project_id=project.id,
++        event_id__in=event_id_set,
++    ).update(group_id=destination_id)
++
++    event_event_id_set = set(event.event_id for event in events)
++
++    EventMapping.objects.filter(
++        project_id=project.id,
++        event_id__in=event_event_id_set,
++    ).update(group_id=destination_id)
++
++    UserReport.objects.filter(
++        project_id=project.id,
++        event_id__in=event_event_id_set,
++    ).update(group=destination_id)
++
++    return destination.id
++
++
++def truncate_denormalizations(group_id):
++    GroupTagKey.objects.filter(
++        group_id=group_id,
++    ).delete()
++
++    GroupTagValue.objects.filter(
++        group_id=group_id,
++    ).delete()
++
++    GroupRelease.objects.filter(
++        group_id=group_id,
++    ).delete()
++
++    tsdb.delete([
++        tsdb.models.group,
++    ], [group_id])
++
++    tsdb.delete_distinct_counts([
++        tsdb.models.users_affected_by_group,
++    ], [group_id])
++
++    tsdb.delete_frequencies([
++        tsdb.models.frequent_releases_by_group,
++        tsdb.models.frequent_environments_by_group,
++    ], [group_id])
++
++
++def collect_tag_data(events):
++    results = {}
++
++    for event in events:
++        tags = results.setdefault(event.group_id, {})
++
++        for key, value in event.get_tags():
++            values = tags.setdefault(key, {})
++
++            if value in values:
++                times_seen, first_seen, last_seen = values[value]
++                values[value] = (times_seen + 1, event.datetime, last_seen)
++            else:
++                values[value] = (1, event.datetime, event.datetime)
++
++    return results
++
++
++def repair_tag_data(caches, project, events):
++    for group_id, keys in collect_tag_data(events).items():
++        for key, values in keys.items():
++            GroupTagKey.objects.get_or_create(
++                project_id=project.id,
++                group_id=group_id,
++                key=key,
++            )
++
++            # XXX: `{first,last}_seen` columns don't totally replicate the
++            # ingestion logic (but actually represent a more accurate value.)
++            # See GH-5289 for more details.
++            for value, (times_seen, first_seen, last_seen) in values.items():
++                instance, created = GroupTagValue.objects.get_or_create(
++                    project_id=project.id,
++                    group_id=group_id,
++                    key=key,
++                    value=value,
++                    defaults={
++                        'first_seen': first_seen,
++                        'last_seen': last_seen,
++                        'times_seen': times_seen,
++                    },
++                )
++
++                if not created:
++                    instance.update(
++                        first_seen=first_seen,
++                        times_seen=F('times_seen') + times_seen,
++                    )
++
++
++def collect_release_data(caches, project, events):
++    results = {}
++
++    for event in events:
++        release = event.get_tag('sentry:release')
++
++        if not release:
++            continue
++
++        # XXX: It's not really clear what the canonical source is for
++        # environment between the tag and the data attribute, but I'm going
++        # with data attribute for now. Right now it seems like they are
++        # intended to both be present and the same value, but I'm not really
++        # sure that has always been the case for existing values.
++        # NOTE: ``GroupRelease.environment`` is not nullable, but an empty
++        # string is OK.
++        environment = event.data.get('environment', '')
++
++        key = (
++            event.group_id,
++            environment,
++            caches[Release](
++                project.organization_id,
++                release,
++            ).id,
++        )
++
++        if key in results:
++            first_seen, last_seen = results[key]
++            results[key] = (event.datetime, last_seen)
++        else:
++            results[key] = (event.datetime, event.datetime)
++
++    return results
++
++
++def repair_group_release_data(caches, project, events):
++    attributes = collect_release_data(caches, project, events).items()
++    for (group_id, environment, release_id), (first_seen, last_seen) in attributes:
++        instance, created = GroupRelease.objects.get_or_create(
++            project_id=project.id,
++            group_id=group_id,
++            environment=environment,
++            release_id=release_id,
++            defaults={
++                'first_seen': first_seen,
++                'last_seen': last_seen,
++            },
++        )
++
++        if not created:
++            instance.update(first_seen=first_seen)
++
++
++def get_event_user_from_interface(value):
++    return EventUser(
++        ident=value.get('id'),
++        email=value.get('email'),
++        username=value.get('valuename'),
++        ip_address=value.get('ip_address'),
++    )
++
++
++def collect_tsdb_data(caches, project, events):
++    counters = defaultdict(
++        lambda: defaultdict(
++            lambda: defaultdict(int),
++        ),
++    )
++
++    sets = defaultdict(
++        lambda: defaultdict(
++            lambda: defaultdict(set),
++        ),
++    )
++
++    frequencies = defaultdict(
++        lambda: defaultdict(
++            lambda: defaultdict(
++                lambda: defaultdict(int),
++            ),
++        ),
++    )
++
++    for event in events:
++        counters[event.datetime][tsdb.models.group][event.group_id] += 1
++
++        user = event.data.get('sentry.interfaces.User')
++        if user:
++            sets[event.datetime][tsdb.models.users_affected_by_group][event.group_id].add(
++                get_event_user_from_interface(user).tag_value,
++            )
++
++        environment = caches[Environment](
++            project.organization_id,
++            event.data.get('environment', ''),
++        )
++
++        frequencies[event.datetime][tsdb.models.frequent_environments_by_group][event.group_id][environment.id] += 1
++
++        release = event.get_tag('sentry:release')
++        if release:
++            # TODO: I'm also not sure if "environment" here is correct, see
++            # similar comment above during creation.
++            grouprelease = caches[GroupRelease](
++                event.group_id,
++                event.data.get('environment', ''),
++                caches[Release](
++                    project.organization_id,
++                    release,
++                ).id,
++            )
++
++            frequencies[event.datetime][tsdb.models.frequent_releases_by_group][event.group_id][grouprelease.id] += 1
++
++    return counters, sets, frequencies
++
++
++def repair_tsdb_data(caches, project, events):
++    counters, sets, frequencies = collect_tsdb_data(caches, project, events)
++
++    for timestamp, data in counters.items():
++        for model, keys in data.items():
++            for key, value in keys.items():
++                tsdb.incr(model, key, timestamp, value)
++
++    for timestamp, data in sets.items():
++        for model, keys in data.items():
++            for key, values in keys.items():
++                # TODO: This should use `record_multi` rather than `record`.
++                tsdb.record(model, key, values, timestamp)
++
++    for timestamp, data in frequencies.items():
++        tsdb.record_frequency_multi(data.items(), timestamp)
++
++
++def repair_denormalizations(caches, project, events):
++    repair_tag_data(caches, project, events)
++    repair_group_release_data(caches, project, events)
++    repair_tsdb_data(caches, project, events)
++
++
++def update_tag_value_counts(id_list):
++    instances = GroupTagKey.objects.filter(group_id__in=id_list)
++    for instance in instances:
++        instance.update(
++            values_seen=GroupTagValue.objects.filter(
++                project_id=instance.project_id,
++                group_id=instance.group_id,
++                key=instance.key,
++            ).count(),
++        )
++
++
++@instrumented_task(name='sentry.tasks.unmerge', queue='unmerge')
++def unmerge(project_id, source_id, destination_id, fingerprints, actor_id, cursor=None, batch_size=500):
++    # XXX: If a ``GroupHash`` is unmerged *again* while this operation is
++    # already in progress, some events from the fingerprint associated with the
++    # hash may not be migrated to the new destination! We could solve this with
++    # an exclusive lock on the ``GroupHash`` record (I think) as long as
++    # nothing in the ``EventManager`` is going to try and preempt that. (I'm
++    # not 100% sure that's the case.)
++
++    # XXX: The queryset chunking logic below is awfully similar to
++    # ``RangeQuerySetWrapper``. Ideally that could be refactored to be able to
++    # be run without iteration by passing around a state object and we could
++    # just use that here instead.
++
++    # On the first iteration of this loop, we clear out all of the
++    # denormalizations from the source group so that we can have a clean slate
++    # for the new, repaired data.
++    if cursor is None:
++        truncate_denormalizations(source_id)
++
++    project = Project.objects.get(id=project_id)
++
++    # TODO: It might make sense to fetch the source group to assert that it is
++    # contained within the project, even though we don't actually directy use
++    # it anywhere.
++
++    # We fetch the events in descending order by their primary key to get the
++    # best approximation of the most recently received events.
++    queryset = Event.objects.filter(
++        project_id=project_id,
++        group_id=source_id,
++    ).order_by('-id')
++
++    if cursor is not None:
++        queryset = queryset.filter(id__lt=cursor)
++
++    events = list(queryset[:batch_size])
++
++    # If there are no more events to process, we're done with the migration.
++    if not events:
++        update_tag_value_counts([source_id, destination_id])
++        return destination_id
++
++    Event.objects.bind_nodes(events, 'data')
++
++    caches = get_caches()
++
++    destination_id = migrate_events(
++        caches,
++        project,
++        source_id,
++        destination_id,
++        fingerprints,
++        filter(
++            lambda event: get_fingerprint(event) in fingerprints,
++            events,
++        ),
++        actor_id,
++    )
++
++    repair_denormalizations(
++        caches,
++        project,
++        events,
++    )
++
++    return unmerge.delay(
++        project_id,
++        source_id,
++        destination_id,
++        fingerprints,
++        actor_id,
++        cursor=events[-1].id,
++        batch_size=batch_size,
++    )
+diff --git a/tests/sentry/tasks/test_unmerge.py b/tests/sentry/tasks/test_unmerge.py
+new file mode 100644
+index 0000000000..5574bb3887
+--- /dev/null
++++ b/tests/sentry/tasks/test_unmerge.py
+@@ -0,0 +1,657 @@
++from __future__ import absolute_import
++
++import functools
++import itertools
++import logging
++import uuid
++from collections import OrderedDict
++from datetime import datetime, timedelta
++
++import pytz
++
++from sentry.app import tsdb
++from sentry.event_manager import ScoreClause
++from sentry.models import (
++    Activity, Environment, EnvironmentProject, Event, EventMapping, Group,
++    GroupHash, GroupRelease, GroupTagKey, GroupTagValue, Release, UserReport
++)
++from sentry.tasks.unmerge import (
++    get_caches, get_event_user_from_interface, get_fingerprint,
++    get_group_backfill_attributes, get_group_creation_attributes, unmerge
++)
++from sentry.testutils import TestCase
++from sentry.utils.dates import to_timestamp
++
++
++class UnmergeTestCase(TestCase):
++    def test_get_group_creation_attributes(self):
++        now = datetime(2017, 5, 3, 6, 6, 6, tzinfo=pytz.utc)
++        events = [
++            Event(
++                platform='javascript',
++                message='Hello from JavaScript',
++                datetime=now,
++                data={
++                    'type': 'default',
++                    'metadata': {},
++                    'tags': [
++                        ['level', 'info'],
++                        ['logger', 'javascript'],
++                    ],
++                },
++            ),
++            Event(
++                platform='python',
++                message='Hello from Python',
++                datetime=now - timedelta(hours=1),
++                data={
++                    'type': 'default',
++                    'metadata': {},
++                    'tags': [
++                        ['level', 'error'],
++                        ['logger', 'python'],
++                    ],
++                },
++            ),
++            Event(
++                platform='java',
++                message='Hello from Java',
++                datetime=now - timedelta(hours=2),
++                data={
++                    'type': 'default',
++                    'metadata': {},
++                    'tags': [
++                        ['level', 'debug'],
++                        ['logger', 'java'],
++                    ],
++                },
++            ),
++        ]
++
++        assert get_group_creation_attributes(
++            get_caches(),
++            events,
++        ) == {
++            'active_at': now - timedelta(hours=2),
++            'first_seen': now - timedelta(hours=2),
++            'last_seen': now,
++            'platform': 'java',
++            'message': 'Hello from JavaScript',
++            'level': logging.INFO,
++            'score': ScoreClause.calculate(3, now),
++            'logger': 'java',
++            'times_seen': 3,
++            'first_release': None,
++            'culprit': '',
++            'data': {
++                'type': 'default',
++                'last_received': to_timestamp(now),
++                'metadata': {},
++            },
++        }
++
++    def test_get_group_backfill_attributes(self):
++        now = datetime(2017, 5, 3, 6, 6, 6, tzinfo=pytz.utc)
++        assert get_group_backfill_attributes(
++            get_caches(),
++            Group(
++                active_at=now,
++                first_seen=now,
++                last_seen=now,
++                platform='javascript',
++                message='Hello from JavaScript',
++                level=logging.INFO,
++                score=ScoreClause.calculate(3, now),
++                logger='javascript',
++                times_seen=1,
++                first_release=None,
++                culprit='',
++                data={
++                    'type': 'default',
++                    'last_received': to_timestamp(now),
++                    'metadata': {},
++                },
++            ),
++            [
++                Event(
++                    platform='python',
++                    message='Hello from Python',
++                    datetime=now - timedelta(hours=1),
++                    data={
++                        'type': 'default',
++                        'metadata': {},
++                        'tags': [
++                            ['level', 'error'],
++                            ['logger', 'python'],
++                        ],
++                    },
++                ),
++                Event(
++                    platform='java',
++                    message='Hello from Java',
++                    datetime=now - timedelta(hours=2),
++                    data={
++                        'type': 'default',
++                        'metadata': {},
++                        'tags': [
++                            ['level', 'debug'],
++                            ['logger', 'java'],
++                        ],
++                    },
++                ),
++            ],
++        ) == {
++            'active_at': now - timedelta(hours=2),
++            'first_seen': now - timedelta(hours=2),
++            'platform': 'java',
++            'score': ScoreClause.calculate(3, now),
++            'logger': 'java',
++            'times_seen': 3,
++            'first_release': None,
++        }
++
++    def test_unmerge(self):
++        now = datetime(2017, 5, 3, 6, 6, 6, tzinfo=pytz.utc)
++
++        def shift(i):
++            return timedelta(seconds=1 << i)
++
++        project = self.create_project()
++        source = self.create_group(project)
++
++        sequence = itertools.count(0)
++        tag_values = itertools.cycle(['red', 'green', 'blue'])
++        user_values = itertools.cycle([
++            {'id': 1},
++            {'id': 2},
++        ])
++
++        EnvironmentProject.objects.create(
++            environment=Environment.objects.create(
++                organization_id=project.organization_id,
++                name='production',
++            ),
++            project=project,
++        )
++
++        def create_message_event(template, parameters):
++            i = next(sequence)
++
++            event_id = uuid.UUID(
++                fields=(
++                    i,
++                    0x0,
++                    0x1000,
++                    0x80,
++                    0x80,
++                    0x808080808080,
++                ),
++            ).hex
++
++            event = Event.objects.create(
++                project_id=project.id,
++                group_id=source.id,
++                event_id=event_id,
++                message='%s' % (id,),
++                datetime=now + shift(i),
++                data={
++                    'environment': 'production',
++                    'type': 'default',
++                    'metadata': {
++                        'title': template % parameters,
++                    },
++                    'sentry.interfaces.Message': {
++                        'message': template,
++                        'params': parameters,
++                        'formatted': template % parameters,
++                    },
++                    'sentry.interfaces.User': next(user_values),
++                    'tags': [
++                        ['color', next(tag_values)],
++                        ['environment', 'production'],
++                        ['sentry:release', 'version'],
++                    ],
++                },
++            )
++
++            with self.tasks():
++                Group.objects.add_tags(
++                    source,
++                    tags=event.get_tags(),
++                )
++
++            EventMapping.objects.create(
++                project_id=project.id,
++                group_id=source.id,
++                event_id=event_id,
++                date_added=event.datetime,
++            )
++
++            UserReport.objects.create(
++                project_id=project.id,
++                group_id=source.id,
++                event_id=event_id,
++                name='Log Hat',
++                email='ceo@corptron.com',
++                comments='Quack',
++            )
++
++            return event
++
++        events = OrderedDict()
++
++        for event in (create_message_event('This is message #%s.', i) for i in xrange(10)):
++            events.setdefault(get_fingerprint(event), []).append(event)
++
++        for event in (create_message_event('This is message #%s!', i) for i in xrange(10, 17)):
++            events.setdefault(get_fingerprint(event), []).append(event)
++
++        assert len(events) == 2
++        assert sum(map(len, events.values())) == 17
++
++        # XXX: This is super contrived considering that it doesn't actually go
++        # through the event pipeline, but them's the breaks, eh?
++        for fingerprint in events.keys():
++            GroupHash.objects.create(
++                project=project,
++                group=source,
++                hash=fingerprint,
++            )
++
++        assert set(GroupTagKey.objects.filter(group=source).values_list('key', 'values_seen')) == set([
++            (u'color', 3),
++            (u'environment', 1),
++            (u'sentry:release', 1),
++        ])
++
++        assert set(
++            GroupTagValue.objects.filter(
++                group_id=source.id,
++            ).values_list('key', 'value', 'times_seen')
++        ) == set([
++            (u'color', u'red', 6),
++            (u'color', u'green', 6),
++            (u'color', u'blue', 5),
++            (u'environment', u'production', 17),
++            (u'sentry:release', u'version', 17),
++        ])
++
++        with self.tasks():
++            unmerge.delay(
++                source.project_id,
++                source.id,
++                None,
++                [events.keys()[1]],
++                None,
++                batch_size=5,
++            )
++
++        source_activity = Activity.objects.get(
++            group_id=source.id,
++            type=Activity.UNMERGE_SOURCE,
++        )
++
++        destination = Group.objects.get(
++            id=source_activity.data['destination_id'],
++        )
++
++        assert source_activity.data == {
++            'destination_id': destination.id,
++            'fingerprints': [events.keys()[1]],
++        }
++
++        assert source.id != destination.id
++        assert source.project == destination.project
++
++        assert Activity.objects.get(
++            group_id=destination.id,
++            type=Activity.UNMERGE_DESTINATION,
++        ).data == {
++            'source_id': source.id,
++            'fingerprints': [events.keys()[1]],
++        }
++
++        source_event_event_ids = map(
++            lambda event: event.event_id,
++            events.values()[0],
++        )
++
++        assert source.event_set.count() == 10
++
++        assert set(
++            EventMapping.objects.filter(
++                group_id=source.id,
++            ).values_list('event_id', flat=True)
++        ) == set(source_event_event_ids)
++
++        assert set(
++            UserReport.objects.filter(
++                group_id=source.id,
++            ).values_list('event_id', flat=True)
++        ) == set(source_event_event_ids)
++
++        assert set(
++            GroupHash.objects.filter(
++                group_id=source.id,
++            ).values_list('hash', flat=True)
++        ) == set([
++            events.keys()[0]
++        ])
++
++        assert set(
++            GroupRelease.objects.filter(
++                group_id=source.id,
++            ).values_list('environment', 'first_seen', 'last_seen')
++        ) == set([
++            (
++                u'production',
++                now + shift(0),
++                now + shift(9),
++            ),
++        ])
++
++        assert set(GroupTagKey.objects.filter(group=source).values_list('key', 'values_seen')) == set([
++            (u'color', 3),
++            (u'environment', 1),
++            (u'sentry:release', 1),
++        ])
++
++        assert set(
++            GroupTagValue.objects.filter(
++                group_id=source.id,
++            ).values_list('key', 'value', 'times_seen', 'first_seen', 'last_seen')
++        ) == set([
++            (
++                u'color',
++                u'red',
++                4,
++                now + shift(0),
++                now + shift(9),
++            ),
++            (
++                u'color',
++                u'green',
++                3,
++                now + shift(1),
++                now + shift(7),
++            ),
++            (
++                u'color',
++                u'blue',
++                3,
++                now + shift(2),
++                now + shift(8),
++            ),
++            (
++                u'environment',
++                u'production',
++                10,
++                now + shift(0),
++                now + shift(9),
++            ),
++            (
++                u'sentry:release',
++                u'version',
++                10,
++                now + shift(0),
++                now + shift(9),
++            ),
++        ])
++
++        destination_event_event_ids = map(
++            lambda event: event.event_id,
++            events.values()[1],
++        )
++
++        assert destination.event_set.count() == 7
++
++        assert set(
++            EventMapping.objects.filter(
++                group_id=destination.id,
++            ).values_list('event_id', flat=True)
++        ) == set(destination_event_event_ids)
++
++        assert set(
++            UserReport.objects.filter(
++                group_id=destination.id,
++            ).values_list('event_id', flat=True)
++        ) == set(destination_event_event_ids)
++
++        assert set(
++            GroupHash.objects.filter(
++                group_id=destination.id,
++            ).values_list('hash', flat=True)
++        ) == set([
++            events.keys()[1]
++        ])
++
++        assert set(
++            GroupRelease.objects.filter(
++                group_id=destination.id,
++            ).values_list('environment', 'first_seen', 'last_seen')
++        ) == set([
++            (
++                u'production',
++                now + shift(10),
++                now + shift(16),
++            ),
++        ])
++
++        assert set(GroupTagKey.objects.filter(group=destination).values_list('key', 'values_seen')) == set([
++            (u'color', 3),
++            (u'environment', 1),
++            (u'sentry:release', 1),
++        ])
++
++        assert set(
++            GroupTagValue.objects.filter(
++                group_id=destination.id,
++            ).values_list('key', 'value', 'times_seen', 'first_seen', 'last_seen')
++        ) == set([
++            (
++                u'color',
++                u'red',
++                2,
++                now + shift(12),
++                now + shift(15),
++            ),
++            (
++                u'color',
++                u'green',
++                3,
++                now + shift(10),
++                now + shift(16),
++            ),
++            (
++                u'color',
++                u'blue',
++                2,
++                now + shift(11),
++                now + shift(14),
++            ),
++            (
++                u'environment',
++                u'production',
++                7,
++                now + shift(10),
++                now + shift(16),
++            ),
++            (
++                u'sentry:release',
++                u'version',
++                7,
++                now + shift(10),
++                now + shift(16),
++            ),
++        ])
++
++        time_series = tsdb.get_range(
++            tsdb.models.group,
++            [source.id, destination.id],
++            now,
++            now + shift(16),
++        )
++
++        def get_expected_series_values(rollup, events, function=None):
++            if function is None:
++                function = lambda aggregate, event: (aggregate if aggregate is not None else 0) + 1
++
++            expected = {}
++            for event in events:
++                k = float((to_timestamp(event.datetime) // rollup_duration) * rollup_duration)
++                expected[k] = function(expected.get(k), event)
++
++            return expected
++
++        def assert_series_contains(expected, actual, default=0):
++            actual = dict(actual)
++
++            for key, value in expected.items():
++                assert actual[key] == value
++
++            for key in set(actual.keys()) - set(expected.keys()):
++                assert actual[key] == default
++
++        rollup_duration = time_series.values()[0][1][0] - time_series.values()[0][0][0]
++
++        assert_series_contains(
++            get_expected_series_values(rollup_duration, events.values()[0]),
++            time_series[source.id],
++            0,
++        )
++
++        assert_series_contains(
++            get_expected_series_values(rollup_duration, events.values()[1]),
++            time_series[destination.id],
++            0,
++        )
++
++        time_series = tsdb.get_distinct_counts_series(
++            tsdb.models.users_affected_by_group,
++            [source.id, destination.id],
++            now,
++            now + shift(16),
++        )
++
++        rollup_duration = time_series.values()[0][1][0] - time_series.values()[0][0][0]
++
++        def collect_by_user_tag(aggregate, event):
++            aggregate = aggregate if aggregate is not None else set()
++            aggregate.add(
++                get_event_user_from_interface(
++                    event.data['sentry.interfaces.User'],
++                ).tag_value,
++            )
++            return aggregate
++
++        assert_series_contains(
++            {
++                timestamp: len(values)
++                for timestamp, values in
++                get_expected_series_values(
++                    rollup_duration,
++                    events.values()[0],
++                    collect_by_user_tag,
++                ).items()
++            },
++            time_series[source.id],
++        )
++
++        assert_series_contains(
++            {
++                timestamp: len(values)
++                for timestamp, values in
++                get_expected_series_values(
++                    rollup_duration,
++                    events.values()[1],
++                    collect_by_user_tag,
++                ).items()
++            },
++            time_series[destination.id],
++        )
++
++        time_series = tsdb.get_most_frequent_series(
++            tsdb.models.frequent_releases_by_group,
++            [source.id, destination.id],
++            now,
++            now + shift(16),
++        )
++
++        rollup_duration = time_series.values()[0][1][0] - time_series.values()[0][0][0]
++
++        def collect_by_release(group, aggregate, event):
++            aggregate = aggregate if aggregate is not None else {}
++            release = GroupRelease.objects.get(
++                group_id=group.id,
++                environment=event.data['environment'],
++                release_id=Release.objects.get(
++                    organization_id=project.organization_id,
++                    version=event.get_tag('sentry:release'),
++                ).id,
++            ).id
++            aggregate[release] = aggregate.get(release, 0) + 1
++            return aggregate
++
++        assert_series_contains(
++            get_expected_series_values(
++                rollup_duration,
++                events.values()[0],
++                functools.partial(
++                    collect_by_release,
++                    source,
++                ),
++            ),
++            time_series[source.id],
++            {},
++        )
++
++        assert_series_contains(
++            get_expected_series_values(
++                rollup_duration,
++                events.values()[1],
++                functools.partial(
++                    collect_by_release,
++                    destination,
++                ),
++            ),
++            time_series[destination.id],
++            {},
++        )
++
++        time_series = tsdb.get_most_frequent_series(
++            tsdb.models.frequent_environments_by_group,
++            [source.id, destination.id],
++            now,
++            now + shift(16),
++        )
++
++        rollup_duration = time_series.values()[0][1][0] - time_series.values()[0][0][0]
++
++        def collect_by_environment(aggregate, event):
++            aggregate = aggregate if aggregate is not None else {}
++            environment = Environment.objects.get(
++                organization_id=project.organization_id,
++                name=event.data['environment'],
++            ).id
++            aggregate[environment] = aggregate.get(environment, 0) + 1
++            return aggregate
++
++        assert_series_contains(
++            get_expected_series_values(
++                rollup_duration,
++                events.values()[0],
++                collect_by_environment,
++            ),
++            time_series[source.id],
++            {},
++        )
++
++        assert_series_contains(
++            get_expected_series_values(
++                rollup_duration,
++                events.values()[1],
++                collect_by_environment,
++            ),
++            time_series[destination.id],
++            {},
++        )

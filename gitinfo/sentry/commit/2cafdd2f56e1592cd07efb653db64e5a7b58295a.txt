@@ -1,0 +1,1588 @@
+commit 2cafdd2f56e1592cd07efb653db64e5a7b58295a
+Author: Dan Fuller <dfuller@sentry.io>
+Date:   Mon Feb 11 16:49:35 2019 -0800
+
+    feat(api): Modify snuba search backend to support new search filters
+    
+    This continues the work from #11925 and adds new search filter capability to the snuba backend as
+    well. This is most of the work that needs to be done, but there are still some edge cases that I'll
+    follow up on in a (hopefully) final diff.
+
+diff --git a/src/sentry/api/event_search.py b/src/sentry/api/event_search.py
+index 97cd6696a5..17e4202b18 100644
+--- a/src/sentry/api/event_search.py
++++ b/src/sentry/api/event_search.py
+@@ -1,12 +1,13 @@
+ from __future__ import absolute_import
+ 
+ import re
+-import six
+-
+ from collections import namedtuple
+-from django.utils.functional import cached_property
++from datetime import datetime
+ 
++import six
++from django.utils.functional import cached_property
+ from parsimonious.exceptions import ParseError
++from parsimonious.nodes import Node
+ from parsimonious.grammar import Grammar, NodeVisitor
+ 
+ from sentry.search.utils import (
+@@ -15,6 +16,7 @@ from sentry.search.utils import (
+     parse_datetime_value,
+     InvalidQuery,
+ )
++from sentry.utils.dates import to_timestamp
+ from sentry.utils.snuba import SENTRY_SNUBA_MAP
+ 
+ WILDCARD_CHARS = re.compile(r'[\*\[\]\?]')
+@@ -90,7 +92,7 @@ rel_time_filter = search_key sep rel_date_format
+ # exact time filter for dates
+ specific_time_filter = search_key sep date_format
+ # Numeric comparison filter
+-numeric_filter  = search_key sep operator ~r"[0-9]+"
++numeric_filter  = search_key sep operator? ~r"[0-9]+(?=\s|$)"
+ 
+ # has filter for not null type checks
+ has_filter      = negation? "has" sep (search_key / search_value)
+@@ -122,7 +124,11 @@ SEARCH_MAP = dict({
+     'start': 'start',
+     'end': 'end',
+     'project_id': 'project_id',
++    'first_seen': 'first_seen',
++    'last_seen': 'last_seen',
++    'times_seen': 'times_seen',
+ }, **SENTRY_SNUBA_MAP)
++no_conversion = set(['project_id', 'start', 'end'])
+ 
+ 
+ class InvalidSearchQuery(Exception):
+@@ -147,6 +153,10 @@ class SearchKey(namedtuple('SearchKey', 'name')):
+         # assume custom tag if not listed
+         return 'tags[%s]' % (self.name,)
+ 
++    @cached_property
++    def is_tag(self):
++        return self.name not in SEARCH_MAP
++
+ 
+ class SearchValue(namedtuple('SearchValue', 'raw_value')):
+ 
+@@ -208,10 +218,16 @@ class SearchVisitor(NodeVisitor):
+ 
+     def visit_numeric_filter(self, node, children):
+         search_key, _, operator, search_value = children
+-        try:
+-            search_value = int(search_value.text)
+-        except ValueError:
+-            raise InvalidSearchQuery('Invalid numeric query: %s' % (search_key,))
++        # Tags are always strings
++        if not search_key.is_tag:
++            try:
++                search_value = int(search_value.text)
++            except ValueError:
++                raise InvalidSearchQuery('Invalid numeric query: %s' % (search_key,))
++        else:
++            search_value = search_value.text
++
++        operator = operator[0] if not isinstance(operator, Node) else '='
+ 
+         return SearchFilter(
+             search_key,
+@@ -363,6 +379,54 @@ def convert_endpoint_params(params):
+     ]
+ 
+ 
++def convert_search_filter_to_snuba_query(search_filter):
++    snuba_name = search_filter.key.snuba_name
++    value = search_filter.value.value
++
++    if snuba_name in no_conversion:
++        return
++    elif snuba_name == 'tags[environment]':
++        env_conditions = []
++        _envs = set(value if isinstance(value, (list, tuple)) else [value])
++        # the "no environment" environment is null in snuba
++        if '' in _envs:
++            _envs.remove('')
++            operator = 'IS NULL' if search_filter.operator == '=' else 'IS NOT NULL'
++            env_conditions.append(['tags[environment]', operator, None])
++
++        if _envs:
++            env_conditions.append(['tags[environment]', 'IN', list(_envs)])
++
++        return env_conditions
++
++    elif snuba_name == 'message':
++        # https://clickhouse.yandex/docs/en/query_language/functions/string_search_functions/#position-haystack-needle
++        # positionCaseInsensitive returns 0 if not found and an index of 1 or more if found
++        # so we should flip the operator here
++        operator = '=' if search_filter.operator == '!=' else '!='
++        # make message search case insensitive
++        return [['positionCaseInsensitive', ['message', "'%s'" % (value,)]], operator, 0]
++
++    else:
++        value = int(to_timestamp(value)) * 1000 if isinstance(value,
++                                                              datetime) and snuba_name != 'timestamp' else value
++
++        if search_filter.operator == '!=' or search_filter.operator == '=' and search_filter.value.value == '':
++            # Handle null columns on (in)equality comparisons. Any comparison between a value
++            # and a null will result to null. There are two cases we handle here:
++            # - A column doesn't equal a value. In this case, we need to convert the column to
++            # an empty string so that we don't exclude rows that have it set to null
++            # - Checking that a value isn't present. In some cases the column will be null,
++            # and in other cases an empty string. To generalize this we convert values in the
++            # column to an empty string and just check for that.
++            snuba_name = ['ifNull', [snuba_name, "''"]]
++
++        if search_filter.value.is_wildcard():
++            return [['match', [snuba_name, "'%s'" % (value,)]], search_filter.operator, 1]
++        else:
++            return [snuba_name, search_filter.operator, value]
++
++
+ def get_snuba_query_args(query=None, params=None):
+     # NOTE: this function assumes project permissions check already happened
+     parsed_filters = []
+@@ -384,52 +448,12 @@ def get_snuba_query_args(query=None, params=None):
+     }
+     for _filter in parsed_filters:
+         snuba_name = _filter.key.snuba_name
+-        value = _filter.value.value
+ 
+         if snuba_name in ('start', 'end'):
+-            kwargs[snuba_name] = value
+-
+-        elif snuba_name == 'tags[environment]':
+-            env_conditions = []
+-            _envs = set(value if isinstance(value, (list, tuple)) else [value])
+-            # the "no environment" environment is null in snuba
+-            if '' in _envs:
+-                _envs.remove('')
+-                env_conditions.append(['tags[environment]', 'IS NULL', None])
+-
+-            if _envs:
+-                env_conditions.append(['tags[environment]', 'IN', list(_envs)])
+-
+-            kwargs['conditions'].append(env_conditions)
+-
++            kwargs[snuba_name] = _filter.value.value
+         elif snuba_name == 'project_id':
+-            kwargs['filter_keys'][snuba_name] = value
+-
+-        elif snuba_name == 'message':
+-            # https://clickhouse.yandex/docs/en/query_language/functions/string_search_functions/#position-haystack-needle
+-            # positionCaseInsensitive returns 0 if not found and an index of 1 or more if found
+-            # so we should flip the operator here
+-            operator = '=' if _filter.operator == '!=' else '!='
+-            # make message search case insensitive
+-            kwargs['conditions'].append(
+-                [['positionCaseInsensitive', ['message', "'%s'" % (value,)]], operator, 0]
+-            )
+-
++            kwargs['filter_keys'][snuba_name] = _filter.value.value
+         else:
+-            if _filter.operator == '!=' or _filter.operator == '=' and _filter.value.value == '':
+-                # Handle null columns on (in)equality comparisons. Any comparison between a value
+-                # and a null will result to null. There are two cases we handle here:
+-                # - A column doesn't equal a value. In this case, we need to convert the column to
+-                # an empty string so that we don't exclude rows that have it set to null
+-                # - Checking that a value isn't present. In some cases the column will be null,
+-                # and in other cases an empty string. To generalize this we convert values in the
+-                # column to an empty string and just check for that.
+-                snuba_name = ['ifNull', [snuba_name, "''"]]
+-
+-            if _filter.value.is_wildcard():
+-                kwargs['conditions'].append(
+-                    [['match', [snuba_name, "'%s'" % (value,)]], _filter.operator, 1]
+-                )
+-            else:
+-                kwargs['conditions'].append([snuba_name, _filter.operator, value])
++            converted_filter = convert_search_filter_to_snuba_query(_filter)
++            kwargs['conditions'].append(converted_filter)
+     return kwargs
+diff --git a/src/sentry/api/issue_search.py b/src/sentry/api/issue_search.py
+index bc95e44bbe..3af84487cb 100644
+--- a/src/sentry/api/issue_search.py
++++ b/src/sentry/api/issue_search.py
+@@ -23,13 +23,14 @@ class IssueSearchVisitor(SearchVisitor):
+         'bookmarked_by': ['bookmarks'],
+         'subscribed_by': ['subscribed'],
+         'first_release': ['first-release', 'firstRelease'],
+-        'age': ['firstSeen'],
++        'first_seen': ['age', 'firstSeen'],
+         'last_seen': ['lastSeen'],
+         'active_at': ['activeSince'],
+         # TODO: Special case this in the backends, since they currently rely
+         # on date_from and date_to explicitly
+         'date': ['event.timestamp'],
+         'times_seen': ['timesSeen'],
++        'timestamp': ['event.timestamp'],
+     }
+ 
+     @cached_property
+diff --git a/src/sentry/search/django/backend.py b/src/sentry/search/django/backend.py
+index b3f5e91d3d..4ef0628a2d 100644
+--- a/src/sentry/search/django/backend.py
++++ b/src/sentry/search/django/backend.py
+@@ -431,10 +431,12 @@ class DjangoSearchBackend(SearchBackend):
+         # actual backend.
+         return self._query(projects, retention_window_start, group_queryset, tags,
+                            environments, sort_by, limit, cursor, count_hits,
+-                           paginator_options, **parameters)
++                           paginator_options, search_filters, use_new_filters,
++                           **parameters)
+ 
+     def _query(self, projects, retention_window_start, group_queryset, tags, environments,
+-               sort_by, limit, cursor, count_hits, paginator_options, **parameters):
++               sort_by, limit, cursor, count_hits, paginator_options, search_filters,
++               use_new_filters, **parameters):
+ 
+         from sentry.models import (Group, Event, GroupEnvironment, Release)
+ 
+diff --git a/src/sentry/search/snuba/backend.py b/src/sentry/search/snuba/backend.py
+index 8a5ab0edbf..8a8c81e9d0 100644
+--- a/src/sentry/search/snuba/backend.py
++++ b/src/sentry/search/snuba/backend.py
+@@ -9,6 +9,7 @@ from datetime import timedelta, datetime
+ from django.utils import timezone
+ 
+ from sentry import options
++from sentry.api.event_search import convert_search_filter_to_snuba_query
+ from sentry.api.paginator import DateTimePaginator, SequencePaginator, Paginator
+ from sentry.event_manager import ALLOWED_FUTURE_DELTA
+ from sentry.models import Release, Group, GroupEnvironment
+@@ -56,6 +57,10 @@ aggregation_defs = {
+     # Only makes sense with WITH TOTALS, returns 1 for an individual group.
+     'total': ['uniq', 'issue'],
+ }
++issue_only_fields = set([
++    'query', 'status', 'bookmarked_by', 'assigned_to', 'unassigned',
++    'subscribed_by', 'active_at',
++])
+ 
+ 
+ class SnubaConditionBuilder(object):
+@@ -128,7 +133,8 @@ class ScalarCondition(Condition):
+ 
+ class SnubaSearchBackend(ds.DjangoSearchBackend):
+     def _query(self, projects, retention_window_start, group_queryset, tags, environments,
+-               sort_by, limit, cursor, count_hits, paginator_options, **parameters):
++               sort_by, limit, cursor, count_hits, paginator_options, search_filters,
++               use_new_filters, **parameters):
+ 
+         # TODO: Product decision: we currently search Group.message to handle
+         # the `query` parameter, because that's what we've always done. We could
+@@ -317,6 +323,8 @@ class SnubaSearchBackend(ds.DjangoSearchBackend):
+                 limit=sample_size,
+                 offset=0,
+                 get_sample=True,
++                search_filters=search_filters,
++                use_new_filters=use_new_filters,
+                 **parameters
+             )
+             snuba_count = len(snuba_groups)
+@@ -357,6 +365,8 @@ class SnubaSearchBackend(ds.DjangoSearchBackend):
+                 candidate_ids=candidate_ids,
+                 limit=chunk_limit,
+                 offset=offset,
++                search_filters=search_filters,
++                use_new_filters=use_new_filters,
+                 **parameters
+             )
+             metrics.timing('snuba.search.num_snuba_results', len(snuba_groups))
+@@ -455,7 +465,8 @@ class SnubaSearchBackend(ds.DjangoSearchBackend):
+ 
+ def snuba_search(start, end, project_ids, environment_ids, tags,
+                  sort_field, cursor=None, candidate_ids=None, limit=None,
+-                 offset=0, get_sample=False, **parameters):
++                 offset=0, get_sample=False, search_filters=None,
++                 use_new_filters=False, **parameters):
+     """
+     This function doesn't strictly benefit from or require being pulled out of the main
+     query method above, but the query method is already large and this function at least
+@@ -478,25 +489,37 @@ def snuba_search(start, end, project_ids, environment_ids, tags,
+     if candidate_ids is not None:
+         filters['issue'] = candidate_ids
+ 
+-    having = SnubaConditionBuilder({
+-        'age_from': ScalarCondition('first_seen', '>'),
+-        'age_to': ScalarCondition('first_seen', '<'),
+-        'last_seen_from': ScalarCondition('last_seen', '>'),
+-        'last_seen_to': ScalarCondition('last_seen', '<'),
+-        'times_seen': CallbackCondition(
+-            lambda times_seen: ('times_seen', '=', times_seen),
+-        ),
+-        'times_seen_lower': ScalarCondition('times_seen', '>'),
+-        'times_seen_upper': ScalarCondition('times_seen', '<'),
+-    }).build(parameters)
+-
+     conditions = []
+-    for tag, val in sorted(tags.items()):
+-        col = u'tags[{}]'.format(tag)
+-        if val == ANY:
+-            conditions.append((col, '!=', ''))
+-        else:
+-            conditions.append((col, '=', val))
++    if use_new_filters:
++        having = []
++        for search_filter in search_filters:
++            if search_filter.key.name in issue_only_fields:
++                # Don't filter on issue fields here, they're not available
++                continue
++            converted_filter = convert_search_filter_to_snuba_query(search_filter)
++            if search_filter.key.name in aggregation_defs:
++                having.append(converted_filter)
++            else:
++                conditions.append(converted_filter)
++    else:
++        having = SnubaConditionBuilder({
++            'age_from': ScalarCondition('first_seen', '>'),
++            'age_to': ScalarCondition('first_seen', '<'),
++            'last_seen_from': ScalarCondition('last_seen', '>'),
++            'last_seen_to': ScalarCondition('last_seen', '<'),
++            'times_seen': CallbackCondition(
++                lambda times_seen: ('times_seen', '=', times_seen),
++            ),
++            'times_seen_lower': ScalarCondition('times_seen', '>'),
++            'times_seen_upper': ScalarCondition('times_seen', '<'),
++        }).build(parameters)
++
++        for tag, val in sorted(tags.items()):
++            col = u'tags[{}]'.format(tag)
++            if val == ANY:
++                conditions.append((col, '!=', ''))
++            else:
++                conditions.append((col, '=', val))
+ 
+     extra_aggregations = dependency_aggregations.get(sort_field, [])
+     required_aggregations = set([sort_field, 'total'] + extra_aggregations)
+diff --git a/tests/sentry/api/test_event_search.py b/tests/sentry/api/test_event_search.py
+index 38dd5293e7..c101c492cf 100644
+--- a/tests/sentry/api/test_event_search.py
++++ b/tests/sentry/api/test_event_search.py
+@@ -410,28 +410,42 @@ class ParseSearchQueryTest(TestCase):
+ 
+     def test_numeric_filter(self):
+         # test numeric format
+-        assert parse_search_query('some_number:>500') == [
++        assert parse_search_query('times_seen:500') == [
+             SearchFilter(
+-                key=SearchKey(name='some_number'),
++                key=SearchKey(name='times_seen'),
++                operator="=",
++                value=SearchValue(raw_value=500),
++            ),
++        ]
++        assert parse_search_query('times_seen:>500') == [
++            SearchFilter(
++                key=SearchKey(name='times_seen'),
+                 operator=">",
+                 value=SearchValue(raw_value=500),
+             ),
+         ]
+-        assert parse_search_query('some_number:<500') == [
++        assert parse_search_query('times_seen:<500') == [
+             SearchFilter(
+-                key=SearchKey(name='some_number'),
++                key=SearchKey(name='times_seen'),
+                 operator="<",
+                 value=SearchValue(raw_value=500),
+             ),
+         ]
+         # Non numeric shouldn't match
+-        assert parse_search_query('some_number:<hello') == [
++        assert parse_search_query('times_seen:<hello') == [
+             SearchFilter(
+-                key=SearchKey(name='some_number'),
++                key=SearchKey(name='times_seen'),
+                 operator="=",
+                 value=SearchValue(raw_value="<hello"),
+             ),
+         ]
++        assert parse_search_query('times_seen:<512.1.0') == [
++            SearchFilter(
++                key=SearchKey(name='times_seen'),
++                operator="=",
++                value=SearchValue(raw_value="<512.1.0"),
++            ),
++        ]
+ 
+ 
+ class GetSnubaQueryArgsTest(TestCase):
+diff --git a/tests/sentry/search/django/tests.py b/tests/sentry/search/django/tests.py
+index a6f5e7e236..e45339b8e8 100644
+--- a/tests/sentry/search/django/tests.py
++++ b/tests/sentry/search/django/tests.py
+@@ -320,28 +320,37 @@ class DjangoSearchBackendTest(TestCase):
+ 
+     def test_tags(self):
+         results = self.make_query(
+-            tags={'environment': 'staging'})
++            search_filter_query='environment:staging',
++            tags={'environment': 'staging'},
++        )
+         assert set(results) == set([self.group2])
+ 
+         results = self.make_query(
+-            tags={'environment': 'example.com'})
++            search_filter_query='environment:example.com',
++            tags={'environment': 'example.com'},
++        )
+         assert set(results) == set([])
+ 
+         results = self.make_query(
+-            tags={'environment': ANY})
++            search_filter_query='has:environment',
++            tags={'environment': ANY},
++        )
+         assert set(results) == set([self.group2, self.group1])
+ 
+         results = self.make_query(
+-            tags={'environment': 'staging',
+-                  'server': 'example.com'})
++            search_filter_query='environment:staging server:example.com',
++            tags={'environment': 'staging', 'server': 'example.com'},
++        )
+         assert set(results) == set([self.group2])
+ 
+         results = self.make_query(
+-            tags={'environment': 'staging',
+-                  'server': ANY})
++            search_filter_query='environment:staging has:server',
++            tags={'environment': 'staging', 'server': ANY},
++        )
+         assert set(results) == set([self.group2])
+ 
+         results = self.make_query(
++            search_filter_query='environment:staging server:bar.example.com',
+             tags={'environment': 'staging',
+                   'server': 'bar.example.com'})
+         assert set(results) == set([])
+diff --git a/tests/snuba/search/test_backend.py b/tests/snuba/search/test_backend.py
+index b46515ef5a..8af4cb2842 100644
+--- a/tests/snuba/search/test_backend.py
++++ b/tests/snuba/search/test_backend.py
+@@ -9,6 +9,10 @@ from django.utils import timezone
+ from hashlib import md5
+ 
+ from sentry import options
++from sentry.api.issue_search import (
++    convert_query_values,
++    parse_search_query,
++)
+ from sentry.models import (
+     Environment, GroupAssignee, GroupBookmark, GroupStatus, GroupSubscription,
+     Release, ReleaseEnvironment, ReleaseProjectEnvironment
+@@ -19,7 +23,13 @@ from sentry.search.snuba.backend import SnubaSearchBackend
+ from sentry.testutils import SnubaTestCase
+ 
+ 
++def date_to_query_format(date):
++    return date.strftime('%Y-%m-%dT%H:%M:%S')
++
++
+ class SnubaSearchTest(SnubaTestCase):
++    use_new_filters = False
++
+     def setUp(self):
+         super(SnubaSearchTest, self).setUp()
+ 
+@@ -40,7 +50,7 @@ class SnubaSearchTest(SnubaTestCase):
+             event_id='a' * 32,
+             group=self.group1,
+             datetime=self.base_datetime - timedelta(days=31),
+-            message='group1',
++            message='foo',
+             stacktrace={
+                 'frames': [{
+                     'module': 'group1'
+@@ -78,7 +88,7 @@ class SnubaSearchTest(SnubaTestCase):
+             event_id='b' * 32,
+             group=self.group2,
+             datetime=self.base_datetime - timedelta(days=30),
+-            message='group2',
++            message='bar',
+             stacktrace={
+                 'frames': [{
+                     'module': 'group2'
+@@ -131,7 +141,7 @@ class SnubaSearchTest(SnubaTestCase):
+             event_id='a' * 32,
+             group=self.group_p2,
+             datetime=self.base_datetime - timedelta(days=31),
+-            message='group1',
++            message='foo',
+             stacktrace={
+                 'frames': [{
+                     'module': 'group_p2'
+@@ -156,86 +166,113 @@ class SnubaSearchTest(SnubaTestCase):
+ 
+         return event
+ 
++    def build_search_filter(self, query, projects=None, user=None):
++        user = user if user is not None else self.user
++        projects = projects if projects is not None else [self.project]
++        return convert_query_values(parse_search_query(query), projects, user)
++
++    def make_query(self, projects=None, search_filter_query=None, **kwargs):
++        search_filters = []
++        if search_filter_query is not None:
++            search_filters = self.build_search_filter(search_filter_query, projects)
++        return self.backend.query(
++            projects if projects is not None else [self.project],
++            use_new_filters=self.use_new_filters,
++            search_filters=search_filters,
++            **kwargs
++        )
++
+     def test_query(self):
+-        results = self.backend.query([self.project], query='foo')
++        results = self.make_query(search_filter_query='foo', query='foo')
+         assert set(results) == set([self.group1])
+ 
+-        results = self.backend.query([self.project], query='bar')
++        results = self.make_query(search_filter_query='bar', query='bar')
+         assert set(results) == set([self.group2])
+ 
+     def test_query_multi_project(self):
+         self.set_up_multi_project()
+-        results = self.backend.query([self.project, self.project2], query='foo')
++        results = self.make_query(
++            [self.project, self.project2],
++            search_filter_query='foo',
++            query='foo',
++        )
+         assert set(results) == set([self.group1, self.group_p2])
+ 
+     def test_query_with_environment(self):
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+-            query='foo')
++            search_filter_query='foo',
++            query='foo',
++        )
+         assert set(results) == set([self.group1])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+-            query='bar')
++            search_filter_query='bar',
++            query='bar',
++        )
+         assert set(results) == set([])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['staging']],
+-            query='bar')
++            search_filter_query='bar',
++            query='bar',
++        )
+         assert set(results) == set([self.group2])
+ 
+     def test_multi_environments(self):
+         self.set_up_multi_project()
+-        results = self.backend.query(
++        results = self.make_query(
+             [self.project, self.project2],
+             environments=[
+                 self.environments['production'],
+-                self.environments['staging']
++                self.environments['staging'],
+             ])
+         assert set(results) == set([self.group1, self.group2, self.group_p2])
+ 
+     def test_query_with_environment_multi_project(self):
+         self.set_up_multi_project()
+-        results = self.backend.query(
++        results = self.make_query(
+             [self.project, self.project2],
+             environments=[self.environments['production']],
+-            query='foo')
++            search_filter_query='foo',
++            query='foo',
++        )
+         assert set(results) == set([self.group1, self.group_p2])
+ 
+-        results = self.backend.query(
++        results = self.make_query(
+             [self.project, self.project2],
+             environments=[self.environments['production']],
+-            query='bar')
++            search_filter_query='bar',
++            query='bar',
++        )
+         assert set(results) == set([])
+ 
+     def test_sort(self):
+-        results = self.backend.query([self.project], sort_by='date')
++        results = self.make_query(sort_by='date')
+         assert list(results) == [self.group1, self.group2]
+ 
+-        results = self.backend.query([self.project], sort_by='new')
++        results = self.make_query(sort_by='new')
+         assert list(results) == [self.group2, self.group1]
+ 
+-        results = self.backend.query([self.project], sort_by='freq')
++        results = self.make_query(sort_by='freq')
+         assert list(results) == [self.group1, self.group2]
+ 
+-        results = self.backend.query([self.project], sort_by='priority')
++        results = self.make_query(sort_by='priority')
+         assert list(results) == [self.group1, self.group2]
+ 
+     def test_sort_multi_project(self):
+         self.set_up_multi_project()
+-        results = self.backend.query([self.project, self.project2], sort_by='date')
++        results = self.make_query([self.project, self.project2], sort_by='date')
+         assert list(results) == [self.group1, self.group_p2, self.group2]
+ 
+-        results = self.backend.query([self.project, self.project2], sort_by='new')
++        results = self.make_query([self.project, self.project2], sort_by='new')
+         assert list(results) == [self.group2, self.group_p2, self.group1]
+ 
+-        results = self.backend.query([self.project, self.project2], sort_by='freq')
++        results = self.make_query([self.project, self.project2], sort_by='freq')
+         assert list(results) == [self.group1, self.group_p2, self.group2]
+ 
+-        results = self.backend.query([self.project, self.project2], sort_by='priority')
++        results = self.make_query([self.project, self.project2], sort_by='priority')
+         assert list(results) == [self.group1, self.group2, self.group_p2]
+ 
+     def test_sort_with_environment(self):
+@@ -254,150 +291,174 @@ class SnubaSearchTest(SnubaTestCase):
+                 tags={'environment': 'production'}
+             )
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+             sort_by='date',
+         )
+         assert list(results) == [self.group2, self.group1]
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+             sort_by='new',
+         )
+         assert list(results) == [self.group2, self.group1]
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+             sort_by='freq',
+         )
+         assert list(results) == [self.group2, self.group1]
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+             sort_by='priority',
+         )
+         assert list(results) == [self.group2, self.group1]
+ 
+     def test_status(self):
+-        results = self.backend.query([self.project], status=GroupStatus.UNRESOLVED)
++        results = self.make_query(
++            search_filter_query='is:unresolved',
++            status=GroupStatus.UNRESOLVED,
++        )
+         assert set(results) == set([self.group1])
+ 
+-        results = self.backend.query([self.project], status=GroupStatus.RESOLVED)
++        results = self.make_query(
++            search_filter_query='is:resolved',
++            status=GroupStatus.RESOLVED,
++        )
+         assert set(results) == set([self.group2])
+ 
+     def test_status_with_environment(self):
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+-            status=GroupStatus.UNRESOLVED)
++            search_filter_query='is:unresolved',
++            status=GroupStatus.UNRESOLVED,
++        )
+         assert set(results) == set([self.group1])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['staging']],
+-            status=GroupStatus.RESOLVED)
++            search_filter_query='is:resolved',
++            status=GroupStatus.RESOLVED,
++        )
+         assert set(results) == set([self.group2])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+-            status=GroupStatus.RESOLVED)
++            status=GroupStatus.RESOLVED,
++            search_filter_query='is:resolved',
++        )
+         assert set(results) == set([])
+ 
+     def test_tags(self):
+-        results = self.backend.query(
+-            [self.project],
+-            tags={'environment': 'staging'})
++        results = self.make_query(
++            search_filter_query='environment:staging',
++            tags={'environment': 'staging'},
++        )
+         assert set(results) == set([self.group2])
+ 
+-        results = self.backend.query(
+-            [self.project],
+-            tags={'environment': 'example.com'})
++        results = self.make_query(
++            search_filter_query='environment:example.com',
++            tags={'environment': 'example.com'},
++        )
+         assert set(results) == set([])
+ 
+-        results = self.backend.query(
+-            [self.project],
+-            tags={'environment': ANY})
++        results = self.make_query(
++            search_filter_query='has:environment',
++            tags={'environment': ANY},
++        )
+         assert set(results) == set([self.group2, self.group1])
+ 
+-        results = self.backend.query(
+-            [self.project],
+-            tags={'environment': 'staging',
+-                  'server': 'example.com'})
++        results = self.make_query(
++            search_filter_query='environment:staging server:example.com',
++            tags={'environment': 'staging', 'server': 'example.com'},
++        )
+         assert set(results) == set([self.group2])
+ 
+-        results = self.backend.query(
+-            [self.project],
+-            tags={'environment': 'staging',
+-                  'server': ANY})
++        results = self.make_query(
++            search_filter_query='url:"http://example.com"',
++            tags={'url': 'http://example.com'},
++        )
+         assert set(results) == set([self.group2])
+ 
+-        results = self.backend.query(
+-            [self.project],
+-            tags={'environment': 'staging',
+-                  'server': 'bar.example.com'})
++        results = self.make_query(
++            search_filter_query='environment:staging has:server',
++            tags={'environment': 'staging', 'server': ANY},
++        )
++        assert set(results) == set([self.group2])
++
++        results = self.make_query(
++            search_filter_query='environment:staging server:bar.example.com',
++            tags={'environment': 'staging', 'server': 'bar.example.com'},
++        )
+         assert set(results) == set([])
+ 
+     def test_tags_with_environment(self):
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+-            tags={'server': 'example.com'})
++            search_filter_query='server:example.com',
++            tags={'server': 'example.com'},
++        )
+         assert set(results) == set([self.group1])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['staging']],
+-            tags={'server': 'example.com'})
++            search_filter_query='server:example.com',
++            tags={'server': 'example.com'},
++        )
+         assert set(results) == set([self.group2])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['staging']],
+-            tags={'server': ANY})
++            search_filter_query='has:server',
++            tags={'server': ANY},
++        )
+         assert set(results) == set([self.group2])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
++            search_filter_query='url:"http://example.com"',
+             tags={'url': 'http://example.com'})
+         assert set(results) == set([])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['staging']],
+-            tags={'url': 'http://example.com'})
++            search_filter_query='url:"http://example.com"',
++            tags={'url': 'http://example.com'},
++        )
+         assert set(results) == set([self.group2])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['staging']],
+-            tags={'server': 'bar.example.com'})
++            search_filter_query='server:bar.example.com',
++            tags={'server': 'bar.example.com'},
++        )
+         assert set(results) == set([])
+ 
+     def test_bookmarked_by(self):
+-        results = self.backend.query([self.project], bookmarked_by=self.user)
++        results = self.make_query(
++            bookmarked_by=self.user,
++            search_filter_query='bookmarks:%s' % self.user.username,
++        )
+         assert set(results) == set([self.group2])
+ 
+     def test_bookmarked_by_with_environment(self):
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['staging']],
+-            bookmarked_by=self.user)
++            bookmarked_by=self.user,
++            search_filter_query='bookmarks:%s' % self.user.username,
++        )
+         assert set(results) == set([self.group2])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+-            bookmarked_by=self.user)
++            bookmarked_by=self.user,
++            search_filter_query='bookmarks:%s' % self.user.username,
++        )
+         assert set(results) == set([])
+ 
+     def test_project(self):
+-        results = self.backend.query([self.create_project(name='other')])
++        results = self.make_query([self.create_project(name='other')])
+         assert set(results) == set([])
+ 
+     def test_pagination(self):
+@@ -497,52 +558,86 @@ class SnubaSearchTest(SnubaTestCase):
+         assert list(results) == []
+         assert results.hits == 1  # TODO this is actually wrong because of the cursor
+ 
++    def test_active_at_filter(self):
++        results = self.make_query(
++            active_at_from=self.group2.active_at,
++            active_at_inclusive=True,
++            search_filter_query='activeSince:>=%s' % date_to_query_format(self.group2.active_at),
++        )
++        assert set(results) == set([self.group2])
++
++        results = self.make_query(
++            active_at_to=self.group1.active_at + timedelta(minutes=1),
++            active_at_inclusive=True,
++            search_filter_query='activeSince:<=%s' % date_to_query_format(
++                self.group1.active_at + timedelta(minutes=1),
++            ),
++        )
++        assert set(results) == set([self.group1])
++
++        results = self.make_query(
++            active_at_from=self.group1.active_at,
++            active_at_from_inclusive=True,
++            active_at_to=self.group1.active_at + timedelta(minutes=1),
++            active_at_to_inclusive=True,
++            search_filter_query='activeSince:>=%s activeSince:<=%s' % (
++                date_to_query_format(self.group1.active_at),
++                date_to_query_format(self.group1.active_at + timedelta(minutes=1)),
++            )
++        )
++        assert set(results) == set([self.group1])
++
+     def test_age_filter(self):
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             age_from=self.group2.first_seen,
+             age_from_inclusive=True,
++            search_filter_query='firstSeen:>=%s' % date_to_query_format(self.group2.first_seen),
+         )
+         assert set(results) == set([self.group2])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             age_to=self.group1.first_seen + timedelta(minutes=1),
+             age_to_inclusive=True,
++            search_filter_query='firstSeen:<=%s' % date_to_query_format(
++                self.group1.first_seen + timedelta(minutes=1),
++            ),
+         )
+         assert set(results) == set([self.group1])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             age_from=self.group1.first_seen,
+             age_from_inclusive=True,
+             age_to=self.group1.first_seen + timedelta(minutes=1),
+             age_to_inclusive=True,
++            search_filter_query='firstSeen:>=%s firstSeen:<=%s' % (
++                date_to_query_format(self.group1.first_seen),
++                date_to_query_format(self.group1.first_seen + timedelta(minutes=1)),
++            )
+         )
+         assert set(results) == set([self.group1])
+ 
+     def test_age_filter_with_environment(self):
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+             age_from=self.group1.first_seen,
+             age_from_inclusive=True,
++            search_filter_query='firstSeen:>=%s' % date_to_query_format(self.group1.first_seen),
+         )
+         assert set(results) == set([self.group1])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+             age_to=self.group1.first_seen,
+             age_to_inclusive=True,
++            search_filter_query='firstSeen:<=%s' % date_to_query_format(self.group1.first_seen),
+         )
+         assert set(results) == set([self.group1])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+             age_from=self.group1.first_seen,
+             age_from_inclusive=False,
++            search_filter_query='firstSeen:>%s' % date_to_query_format(self.group1.first_seen),
+         )
+         assert set(results) == set([])
+ 
+@@ -559,87 +654,86 @@ class SnubaSearchTest(SnubaTestCase):
+             }
+         )
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+             age_from=self.group1.first_seen,
+             age_from_inclusive=False,
++            search_filter_query='firstSeen:>%s' % date_to_query_format(self.group1.first_seen),
+         )
+         assert set(results) == set([])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['development']],
+             age_from=self.group1.first_seen,
+             age_from_inclusive=False,
++            search_filter_query='firstSeen:>%s' % date_to_query_format(self.group1.first_seen),
+         )
+         assert set(results) == set([self.group1])
+ 
+     def test_times_seen_filter(self):
+-        results = self.backend.query(
++        results = self.make_query(
+             [self.project],
+             times_seen=2,
++            search_filter_query='times_seen:2',
+         )
+         assert set(results) == set([self.group1])
+ 
+-        results = self.backend.query(
++        results = self.make_query(
+             [self.project],
+             times_seen_lower=2,
++            search_filter_query='times_seen:>=2',
+         )
+         assert set(results) == set([self.group1])
+ 
+-        results = self.backend.query(
++        results = self.make_query(
+             [self.project],
+             times_seen_upper=1,
++            search_filter_query='times_seen:<=1',
+         )
+         assert set(results) == set([self.group2])
+ 
+     def test_last_seen_filter(self):
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             last_seen_from=self.group1.last_seen,
+             last_seen_from_inclusive=True,
++            search_filter_query='lastSeen:>=%s' % date_to_query_format(self.group1.last_seen),
+         )
+         assert set(results) == set([self.group1])
+ 
+-        results = self.backend.query(
+-            [self.project],
+-            last_seen_to=self.group2.last_seen + timedelta(minutes=1),
+-            last_seen_to_inclusive=True,
+-        )
+-        assert set(results) == set([self.group2])
+-
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             last_seen_from=self.group1.last_seen,
+             last_seen_from_inclusive=True,
+             last_seen_to=self.group1.last_seen + timedelta(minutes=1),
+             last_seen_to_inclusive=True,
++            search_filter_query='lastSeen:>=%s lastSeen:<=%s' % (
++                date_to_query_format(self.group1.last_seen),
++                date_to_query_format(self.group1.last_seen + timedelta(minutes=1)),
++            )
+         )
+         assert set(results) == set([self.group1])
+ 
+     def test_last_seen_filter_with_environment(self):
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+             last_seen_from=self.group1.last_seen,
+             last_seen_from_inclusive=True,
++            search_filter_query='lastSeen:>=%s' % date_to_query_format(self.group1.last_seen),
+         )
+         assert set(results) == set([self.group1])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+             last_seen_to=self.group1.last_seen,
+             last_seen_to_inclusive=True,
++            search_filter_query='lastSeen:<=%s' % date_to_query_format(self.group1.last_seen),
+         )
+         assert set(results) == set([self.group1])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+             last_seen_from=self.group1.last_seen,
+             last_seen_from_inclusive=False,
++            search_filter_query='lastSeen:>%s' % date_to_query_format(self.group1.last_seen),
+         )
+         assert set(results) == set([])
+ 
+@@ -658,20 +752,19 @@ class SnubaSearchTest(SnubaTestCase):
+ 
+         self.group1.update(last_seen=self.group1.last_seen + timedelta(days=1))
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+             last_seen_from=self.group1.last_seen,
+             last_seen_from_inclusive=False,
++            search_filter_query='lastSeen:>%s' % date_to_query_format(self.group1.last_seen),
+         )
+         assert set(results) == set([])
+ 
+-        results = self.backend.query(
+-            [self.project],
+-            date_to=self.group1.last_seen + timedelta(days=1),
++        results = self.make_query(
+             environments=[self.environments['development']],
+             last_seen_from=self.group1.last_seen,
+             last_seen_from_inclusive=False,
++            search_filter_query='lastSeen:>%s' % date_to_query_format(self.group1.last_seen),
+         )
+         assert set(results) == set()
+ 
+@@ -681,26 +774,32 @@ class SnubaSearchTest(SnubaTestCase):
+             environments=[self.environments['development']],
+             last_seen_from=self.group1.last_seen,
+             last_seen_from_inclusive=True,
++            search_filter_query='lastSeen:>=%s' % date_to_query_format(self.group1.last_seen),
+         )
+         assert set(results) == set([self.group1])
+ 
+     def test_date_filter(self):
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             date_from=self.event2.datetime,
++            search_filter_query='timestamp:>=%s' % date_to_query_format(self.event2.datetime),
+         )
+         assert set(results) == set([self.group1, self.group2])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             date_to=self.event1.datetime + timedelta(minutes=1),
++            search_filter_query='timestamp:<=%s' % date_to_query_format(
++                self.event1.datetime + timedelta(minutes=1),
++            ),
+         )
+         assert set(results) == set([self.group1])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             date_from=self.event1.datetime,
+             date_to=self.event2.datetime + timedelta(minutes=1),
++            search_filter_query='timestamp:>=%s timestamp:<=%s' % (
++                date_to_query_format(self.event1.datetime),
++                date_to_query_format(self.event2.datetime + timedelta(minutes=1)),
++            )
+         )
+         assert set(results) == set([self.group1, self.group2])
+ 
+@@ -732,33 +831,45 @@ class SnubaSearchTest(SnubaTestCase):
+         assert set(results) == set([self.group2])
+ 
+     def test_unassigned(self):
+-        results = self.backend.query([self.project], unassigned=True)
++        results = self.make_query(
++            unassigned=True,
++            search_filter_query='is:unassigned',
++        )
+         assert set(results) == set([self.group1])
+ 
+-        results = self.backend.query([self.project], unassigned=False)
++        results = self.make_query(
++            unassigned=False,
++            search_filter_query='is:assigned',
++        )
+         assert set(results) == set([self.group2])
+ 
+     def test_unassigned_with_environment(self):
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+-            unassigned=True)
++            unassigned=True,
++            search_filter_query='is:unassigned',
++        )
+         assert set(results) == set([self.group1])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['staging']],
+-            unassigned=False)
++            unassigned=False,
++            search_filter_query='is:assigned',
++        )
+         assert set(results) == set([self.group2])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+-            unassigned=False)
++            unassigned=False,
++            search_filter_query='is:assigned',
++        )
+         assert set(results) == set([])
+ 
+     def test_assigned_to(self):
+-        results = self.backend.query([self.project], assigned_to=self.user)
++        results = self.make_query(
++            assigned_to=self.user,
++            search_filter_query='assigned:%s' % self.user.username,
++        )
+         assert set(results) == set([self.group2])
+ 
+         # test team assignee
+@@ -770,12 +881,18 @@ class SnubaSearchTest(SnubaTestCase):
+         ga.update(team=self.team, user=None)
+         assert GroupAssignee.objects.get(id=ga.id).user is None
+ 
+-        results = self.backend.query([self.project], assigned_to=self.user)
++        results = self.make_query(
++            assigned_to=self.user,
++            search_filter_query='assigned:%s' % self.user.username,
++        )
+         assert set(results) == set([self.group2])
+ 
+         # test when there should be no results
+         other_user = self.create_user()
+-        results = self.backend.query([self.project], assigned_to=other_user)
++        results = self.make_query(
++            assigned_to=other_user,
++            search_filter_query='assigned:%s' % other_user.username
++        )
+         assert set(results) == set([])
+ 
+         owner = self.create_user()
+@@ -787,41 +904,49 @@ class SnubaSearchTest(SnubaTestCase):
+         )
+ 
+         # test that owners don't see results for all teams
+-        results = self.backend.query([self.project], assigned_to=owner)
++        results = self.make_query(
++            assigned_to=owner,
++            search_filter_query='assigned:%s' % owner.username
++        )
+         assert set(results) == set([])
+ 
+     def test_assigned_to_with_environment(self):
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['staging']],
+-            assigned_to=self.user)
++            assigned_to=self.user,
++            search_filter_query='assigned:%s' % self.user.username
++        )
+         assert set(results) == set([self.group2])
+ 
+-        results = self.backend.query(
+-            [self.project],
++        results = self.make_query(
+             environments=[self.environments['production']],
+-            assigned_to=self.user)
++            assigned_to=self.user,
++            search_filter_query='assigned:%s' % self.user.username
++        )
+         assert set(results) == set([])
+ 
+     def test_subscribed_by(self):
+-        results = self.backend.query(
++        results = self.make_query(
+             [self.group1.project],
+             subscribed_by=self.user,
++            search_filter_query='subscribed:%s' % self.user.username
+         )
+         assert set(results) == set([self.group1])
+ 
+     def test_subscribed_by_with_environment(self):
+-        results = self.backend.query(
++        results = self.make_query(
+             [self.group1.project],
+             environments=[self.environments['production']],
+             subscribed_by=self.user,
++            search_filter_query='subscribed:%s' % self.user.username
+         )
+         assert set(results) == set([self.group1])
+ 
+-        results = self.backend.query(
++        results = self.make_query(
+             [self.group1.project],
+             environments=[self.environments['staging']],
+             subscribed_by=self.user,
++            search_filter_query='subscribed:%s' % self.user.username
+         )
+         assert set(results) == set([])
+ 
+@@ -882,11 +1007,14 @@ class SnubaSearchTest(SnubaTestCase):
+ 
+     @mock.patch('sentry.utils.snuba.raw_query')
+     def test_snuba_not_called_optimization(self, query_mock):
+-        assert self.backend.query([self.project], query='foo').results == [self.group1]
++        assert self.make_query(query='foo', search_filter_query='foo').results == [self.group1]
+         assert not query_mock.called
+ 
+-        assert self.backend.query(
+-            [self.project], query='foo', sort_by='date', last_seen_from=timezone.now()
++        assert self.make_query(
++            search_filter_query='last_seen:>%s foo' % date_to_query_format(timezone.now()),
++            query='foo',
++            sort_by='date',
++            last_seen_from=timezone.now(),
+         ).results == []
+         assert query_mock.called
+ 
+@@ -924,11 +1052,15 @@ class SnubaSearchTest(SnubaTestCase):
+             'sample': 1,
+         }
+ 
+-        self.backend.query([self.project], query='foo')
++        self.make_query(query='foo', search_filter_query='foo')
+         assert not query_mock.called
+ 
+-        self.backend.query([self.project], query='foo', sort_by='date',
+-                           last_seen_from=timezone.now())
++        self.make_query(
++            search_filter_query='last_seen:>%s foo' % date_to_query_format(timezone.now()),
++            query='foo',
++            last_seen_from=timezone.now(),
++            sort_by='date',
++        )
+         assert query_mock.call_args == mock.call(
+             orderby=['-last_seen', 'issue'],
+             aggregations=[
+@@ -939,7 +1071,11 @@ class SnubaSearchTest(SnubaTestCase):
+             **common_args
+         )
+ 
+-        self.backend.query([self.project], query='foo', sort_by='priority')
++        self.make_query(
++            search_filter_query='foo',
++            query='foo',
++            sort_by='priority',
++        )
+         assert query_mock.call_args == mock.call(
+             orderby=['-priority', 'issue'],
+             aggregations=[
+@@ -952,7 +1088,12 @@ class SnubaSearchTest(SnubaTestCase):
+             **common_args
+         )
+ 
+-        self.backend.query([self.project], query='foo', sort_by='freq', times_seen=5)
++        self.make_query(
++            search_filter_query='times_seen:5 foo',
++            query='foo',
++            times_seen=5,
++            sort_by='freq',
++        )
+         assert query_mock.call_args == mock.call(
+             orderby=['-times_seen', 'issue'],
+             aggregations=[
+@@ -963,7 +1104,12 @@ class SnubaSearchTest(SnubaTestCase):
+             **common_args
+         )
+ 
+-        self.backend.query([self.project], query='foo', sort_by='new', age_from=timezone.now())
++        self.make_query(
++            search_filter_query='age:>%s foo' % date_to_query_format(timezone.now()),
++            query='foo',
++            age_from=timezone.now(),
++            sort_by='new',
++        )
+         assert query_mock.call_args == mock.call(
+             orderby=['-first_seen', 'issue'],
+             aggregations=[
+@@ -979,17 +1125,20 @@ class SnubaSearchTest(SnubaTestCase):
+         options.set('snuba.search.max-pre-snuba-candidates', 1)
+         try:
+             # normal queries work as expected
+-            results = self.backend.query([self.project], query='foo')
++            results = self.make_query(query='foo', search_filter_query='foo')
+             assert set(results) == set([self.group1])
+-            results = self.backend.query([self.project], query='bar')
++            results = self.make_query(query='bar', search_filter_query='bar')
+             assert set(results) == set([self.group2])
+ 
+             # no candidate matches in Sentry, immediately return empty paginator
+-            results = self.backend.query([self.project], query='NO MATCHES IN SENTRY')
++            results = self.make_query(
++                search_filter_query='NO MATCHES IN SENTRY',
++                query='NO MATCHES IN SENTRY',
++            )
+             assert set(results) == set()
+ 
+             # too many candidates, skip pre-filter, requires >1 postfilter queries
+-            results = self.backend.query([self.project])
++            results = self.make_query()
+             assert set(results) == set([self.group1, self.group2])
+         finally:
+             options.set('snuba.search.max-pre-snuba-candidates', prev_max_pre)
+@@ -999,8 +1148,8 @@ class SnubaSearchTest(SnubaTestCase):
+         options.set('snuba.search.pre-snuba-candidates-optimizer', True)
+ 
+         try:
+-            results = self.backend.query(
+-                [self.project],
++            results = self.make_query(
++                search_filter_query='server:example.com',
+                 environments=[self.environments['production']],
+                 tags={'server': 'example.com'})
+             assert set(results) == set([self.group1])
+@@ -1008,12 +1157,12 @@ class SnubaSearchTest(SnubaTestCase):
+             options.set('snuba.search.pre-snuba-candidates-optimizer', prev_optimizer_enabled)
+ 
+     def test_search_out_of_range(self):
+-        results = self.backend.query(
+-            [self.project],
+-            date_from=datetime(2000, 1, 1, 0, 0, 0, tzinfo=pytz.utc),
+-            date_to=datetime(2000, 1, 1, 1, 0, 0, tzinfo=pytz.utc),
++        the_date = datetime(2000, 1, 1, 0, 0, 0, tzinfo=pytz.utc)
++        results = self.make_query(
++            search_filter_query='event.timestamp:>%s event.timestamp:<%s' % (the_date, the_date),
++            date_from=the_date,
++            date_to=the_date,
+         )
+-
+         assert set(results) == set([])
+ 
+     def test_hits_estimate(self):
+@@ -1053,8 +1202,8 @@ class SnubaSearchTest(SnubaTestCase):
+                 # Too small to pass all django candidates down to snuba
+                 'snuba.search.max-pre-snuba-candidates': 5,
+                 'snuba.search.hits-sample-size': 50}):
+-            first_results = self.backend.query(
+-                [self.project],
++            first_results = self.make_query(
++                search_filter_query='is:unresolved match:1',
+                 status=GroupStatus.UNRESOLVED,
+                 tags={'match': '1'},
+                 limit=10,
+@@ -1068,8 +1217,8 @@ class SnubaSearchTest(SnubaTestCase):
+ 
+             # When searching for the same tags, we should get the same set of
+             # hits as the sampling is based on the hash of the query.
+-            second_results = self.backend.query(
+-                [self.project],
++            second_results = self.make_query(
++                search_filter_query='is:unresolved match:1',
+                 status=GroupStatus.UNRESOLVED,
+                 tags={'match': '1'},
+                 limit=10,
+@@ -1080,8 +1229,8 @@ class SnubaSearchTest(SnubaTestCase):
+ 
+             # When using a different search, we should get a different sample
+             # but still should have some hits.
+-            third_results = self.backend.query(
+-                [self.project],
++            third_results = self.make_query(
++                search_filter_query='is:unresolved match:0',
+                 status=GroupStatus.UNRESOLVED,
+                 tags={'match': '0'},
+                 limit=10,
+@@ -1090,3 +1239,111 @@ class SnubaSearchTest(SnubaTestCase):
+ 
+             assert third_results.hits > 10
+             assert third_results.results != second_results.results
++
++
++class SnubaSearchBackendWithSearchFiltersTest(SnubaSearchTest):
++    use_new_filters = True
++
++    @mock.patch('sentry.utils.snuba.raw_query')
++    def test_optimized_aggregates(self, query_mock):
++        # TODO this test is annoyingly fragile and breaks in hard-to-see ways
++        # any time anything about the snuba query changes
++        # XXX: Copy/pasting this because the query changes differently depending
++        # on whether we're using the new search filters or not.
++        query_mock.return_value = {'data': [], 'totals': {'total': 0}}
++
++        def Any(cls):
++            class Any(object):
++                def __eq__(self, other):
++                    return isinstance(other, cls)
++            return Any()
++
++        DEFAULT_LIMIT = 100
++        chunk_growth = options.get('snuba.search.chunk-growth-rate')
++        limit = int(DEFAULT_LIMIT * chunk_growth)
++
++        common_args = {
++            'start': Any(datetime),
++            'end': Any(datetime),
++            'filter_keys': {
++                'project_id': [self.project.id],
++                'issue': [self.group1.id]
++            },
++            'referrer': 'search',
++            'groupby': ['issue'],
++            'conditions': [[['positionCaseInsensitive', ['message', "'foo'"]], '!=', 0]],
++            'selected_columns': [],
++            'limit': limit,
++            'offset': 0,
++            'totals': True,
++            'turbo': False,
++            'sample': 1,
++        }
++
++        self.make_query(query='foo', search_filter_query='foo')
++        assert not query_mock.called
++
++        self.make_query(
++            search_filter_query='last_seen:>=%s foo' % date_to_query_format(timezone.now()),
++            query='foo',
++            last_seen_from=timezone.now(),
++            sort_by='date',
++        )
++        assert query_mock.call_args == mock.call(
++            orderby=['-last_seen', 'issue'],
++            aggregations=[
++                ['uniq', 'issue', 'total'],
++                ['toUInt64(max(timestamp)) * 1000', '', 'last_seen']
++            ],
++            having=[['last_seen', '>=', Any(int)]],
++            **common_args
++        )
++
++        self.make_query(
++            search_filter_query='foo',
++            query='foo',
++            sort_by='priority',
++        )
++        assert query_mock.call_args == mock.call(
++            orderby=['-priority', 'issue'],
++            aggregations=[
++                ['(toUInt64(log(times_seen) * 600)) + last_seen', '', 'priority'],
++                ['count()', '', 'times_seen'],
++                ['uniq', 'issue', 'total'],
++                ['toUInt64(max(timestamp)) * 1000', '', 'last_seen']
++            ],
++            having=[],
++            **common_args
++        )
++
++        self.make_query(
++            search_filter_query='times_seen:5 foo',
++            query='foo',
++            times_seen=5,
++            sort_by='freq',
++        )
++        assert query_mock.call_args == mock.call(
++            orderby=['-times_seen', 'issue'],
++            aggregations=[
++                ['count()', '', 'times_seen'],
++                ['uniq', 'issue', 'total'],
++            ],
++            having=[['times_seen', '=', 5]],
++            **common_args
++        )
++
++        self.make_query(
++            search_filter_query='age:>=%s foo' % date_to_query_format(timezone.now()),
++            query='foo',
++            age_from=timezone.now(),
++            sort_by='new',
++        )
++        assert query_mock.call_args == mock.call(
++            orderby=['-first_seen', 'issue'],
++            aggregations=[
++                ['toUInt64(min(timestamp)) * 1000', '', 'first_seen'],
++                ['uniq', 'issue', 'total'],
++            ],
++            having=[['first_seen', '>=', Any(int)]],
++            **common_args
++        )

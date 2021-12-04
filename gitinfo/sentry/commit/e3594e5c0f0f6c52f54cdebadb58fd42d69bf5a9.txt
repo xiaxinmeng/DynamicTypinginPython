@@ -1,0 +1,379 @@
+commit e3594e5c0f0f6c52f54cdebadb58fd42d69bf5a9
+Author: Markus Unterwaditzer <markus@unterwaditzer.net>
+Date:   Thu Jul 2 16:57:31 2020 +0200
+
+    ref(pii): Do not compute entire projectconfig for post-processing datascrubbing (#19667)
+    
+    
+    
+    This avoids double-fetching of organization options at the very least, and some unnecessary CPU work too.
+    
+    Fix SENTRY-FNS since we do the project fetching once now which sort of avoids the race.
+
+diff --git a/src/sentry/api/endpoints/relay_projectconfigs.py b/src/sentry/api/endpoints/relay_projectconfigs.py
+index a90e70216e..9943dc72b9 100644
+--- a/src/sentry/api/endpoints/relay_projectconfigs.py
++++ b/src/sentry/api/endpoints/relay_projectconfigs.py
+@@ -64,9 +64,10 @@ class RelayProjectConfigsEndpoint(Endpoint):
+                     orgs = {o.id: o for o in orgs if request.relay.has_org_access(o)}
+             else:
+                 orgs = {}
+-            org_options = {
+-                i: OrganizationOption.objects.get_all_values(i) for i in six.iterkeys(orgs)
+-            }
++
++            with metrics.timer("relay_project_configs.fetching_org_options.duration"):
++                for org_id in six.iterkeys(orgs):
++                    OrganizationOption.objects.get_all_values(org_id)
+ 
+         with Hub.current.start_span(op="relay_fetch_keys"):
+             project_keys = {}
+@@ -97,7 +98,6 @@ class RelayProjectConfigsEndpoint(Endpoint):
+                 with metrics.timer("relay_project_configs.get_config.duration"):
+                     project_config = config.get_project_config(
+                         project,
+-                        org_options=org_options.get(organization.id) or {},
+                         full_config=full_config_requested,
+                         project_keys=project_keys.get(project.id) or [],
+                     )
+diff --git a/src/sentry/datascrubbing.py b/src/sentry/datascrubbing.py
+index d1f1d9f71f..ac139f63a9 100644
+--- a/src/sentry/datascrubbing.py
++++ b/src/sentry/datascrubbing.py
+@@ -6,7 +6,8 @@ import six
+ import sentry_relay
+ from rest_framework import serializers
+ 
+-from sentry.utils import metrics
++from sentry.utils import metrics, json
++from sentry.utils.safe import safe_execute
+ 
+ 
+ def _escape_key(key):
+@@ -19,17 +20,71 @@ def _escape_key(key):
+     return u"'{}'".format(key.replace("'", "''"))
+ 
+ 
+-def get_all_pii_configs(project_config):
++def get_pii_config(project):
++    def _decode(value):
++        if value:
++            return safe_execute(json.loads, value)
++
++    # Order of merging is important here. We want to apply organization rules
++    # before project rules. For example:
++    #
++    # * Organization rule: remove substrings "mypassword"
++    # * Project rule: remove substrings "my"
++    #
++    # If we were to apply project rules before organization rules, "password"
++    # would leak. We effectively disabled an organization rule using a project rule.
++    #
++    # Of course organization rules can also break project rules the same way,
++    # but we communicate in the UI that organization options take precedence
++    # here.
++    return _merge_pii_configs(
++        [
++            ("organization:", _decode(project.organization.get_option("sentry:relay_pii_config"))),
++            ("project:", _decode(project.get_option("sentry:relay_pii_config"))),
++        ]
++    )
++
++
++def get_datascrubbing_settings(project):
++    org = project.organization
++    rv = {}
++
++    exclude_fields_key = "sentry:safe_fields"
++    rv["excludeFields"] = org.get_option(exclude_fields_key, []) + project.get_option(
++        exclude_fields_key, []
++    )
++
++    rv["scrubData"] = org.get_option("sentry:require_scrub_data", False) or project.get_option(
++        "sentry:scrub_data", True
++    )
++
++    rv["scrubIpAddresses"] = org.get_option(
++        "sentry:require_scrub_ip_address", False
++    ) or project.get_option("sentry:scrub_ip_address", False)
++
++    sensitive_fields_key = "sentry:sensitive_fields"
++    rv["sensitiveFields"] = org.get_option(sensitive_fields_key, []) + project.get_option(
++        sensitive_fields_key, []
++    )
++
++    rv["scrubDefaults"] = org.get_option(
++        "sentry:require_scrub_defaults", False
++    ) or project.get_option("sentry:scrub_defaults", True)
++
++    return rv
++
++
++def get_all_pii_configs(project):
+     # Note: This logic is duplicated in Relay store.
+-    pii_config = project_config.config["piiConfig"]
++    pii_config = get_pii_config(project)
+     if pii_config:
+         yield pii_config
+ 
+-    yield sentry_relay.convert_datascrubbing_config(project_config.config["datascrubbingSettings"])
++    yield sentry_relay.convert_datascrubbing_config(get_datascrubbing_settings(project))
+ 
+ 
+-def scrub_data(project_config, event):
+-    for config in get_all_pii_configs(project_config):
++def scrub_data(project, event):
++    for config in get_all_pii_configs(project):
+         metrics.timing(
+             "datascrubbing.config.num_applications", len(config.get("applications") or ())
+         )
+@@ -46,7 +101,7 @@ def scrub_data(project_config, event):
+     return event
+ 
+ 
+-def merge_pii_configs(prefixes_and_configs):
++def _merge_pii_configs(prefixes_and_configs):
+     """
+     Merge two PII configs into one, prefixing all custom rules with a prefix in the name.
+ 
+diff --git a/src/sentry/relay/config.py b/src/sentry/relay/config.py
+index d6cb124a0e..206b673560 100644
+--- a/src/sentry/relay/config.py
++++ b/src/sentry/relay/config.py
+@@ -13,13 +13,11 @@ from sentry.constants import ObjectStatus
+ from sentry.grouping.api import get_grouping_config_dict_for_project
+ from sentry.interfaces.security import DEFAULT_DISALLOWED_SOURCES
+ from sentry.message_filters import get_all_filters
+-from sentry.models.organizationoption import OrganizationOption
+-from sentry.utils.safe import safe_execute
+ from sentry.utils.data_filters import FilterTypes, FilterStatKeys, get_filter_key
+ from sentry.utils.http import get_origins
+ from sentry.utils.sdk import configure_scope
+ from sentry.relay.utils import to_camel_case_name
+-from sentry.datascrubbing import merge_pii_configs
++from sentry.datascrubbing import get_pii_config, get_datascrubbing_settings
+ 
+ 
+ def get_project_key_config(project_key):
+@@ -78,22 +76,20 @@ def get_quotas(project, keys=None):
+     return [quota.to_json() for quota in quotas.get_quotas(project, keys=keys)]
+ 
+ 
+-def get_project_config(project, org_options=None, full_config=True, project_keys=None):
++def get_project_config(project, full_config=True, project_keys=None):
+     """
+     Constructs the ProjectConfig information.
+ 
+     :param project: The project to load configuration for. Ensure that
+         organization is bound on this object; otherwise it will be loaded from
+         the database.
+-    :param org_options: Inject preloaded organization options for faster loading.
+-        If ``None``, options are lazy-loaded from the database.
+     :param full_config: True if only the full config is required, False
+         if only the restricted (for external relays) is required
+         (default True, i.e. full configuration)
+-    :param project_keys: Pre-fetched project keys for performance, similar to
+-        org_options. However, if no project keys are provided it is assumed
+-        that the config does not need to contain auth information (this is the
+-        case when used in python's StoreView)
++    :param project_keys: Pre-fetched project keys for performance. However, if
++        no project keys are provided it is assumed that the config does not
++        need to contain auth information (this is the case when used in
++        python's StoreView)
+ 
+     :return: a ProjectConfig object for the given project
+     """
+@@ -105,9 +101,6 @@ def get_project_config(project, org_options=None, full_config=True, project_keys
+ 
+     public_keys = get_public_key_configs(project, full_config, project_keys=project_keys)
+ 
+-    if org_options is None:
+-        org_options = OrganizationOption.objects.get_all_values(project.organization_id)
+-
+     with Hub.current.start_span(op="get_public_config"):
+         now = datetime.utcnow().replace(tzinfo=utc)
+         cfg = {
+@@ -120,10 +113,12 @@ def get_project_config(project, org_options=None, full_config=True, project_keys
+             "config": {
+                 "allowedDomains": list(get_origins(project)),
+                 "trustedRelays": [
+-                    r["public_key"] for r in org_options.get("sentry:trusted-relays", []) if r
++                    r["public_key"]
++                    for r in project.organization.get_option("sentry:trusted-relays", [])
++                    if r
+                 ],
+-                "piiConfig": _get_pii_config(project),
+-                "datascrubbingSettings": _get_datascrubbing_settings(project, org_options),
++                "piiConfig": get_pii_config(project),
++                "datascrubbingSettings": get_datascrubbing_settings(project),
+             },
+             "organizationId": project.organization_id,
+             "projectId": project.id,  # XXX: Unused by Relay, required by Python store
+@@ -262,59 +257,6 @@ class ProjectConfig(_ConfigBase):
+         super(ProjectConfig, self).__init__(**kwargs)
+ 
+ 
+-def _get_pii_config(project):
+-    def _decode(value):
+-        if value:
+-            return safe_execute(utils.json.loads, value)
+-
+-    # Order of merging is important here. We want to apply organization rules
+-    # before project rules. For example:
+-    #
+-    # * Organization rule: remove substrings "mypassword"
+-    # * Project rule: remove substrings "my"
+-    #
+-    # If we were to apply project rules before organization rules, "password"
+-    # would leak. We effectively disabled an organization rule using a project rule.
+-    #
+-    # Of course organization rules can also break project rules the same way,
+-    # but we communicate in the UI that organization options take precedence
+-    # here.
+-    return merge_pii_configs(
+-        [
+-            ("organization:", _decode(project.organization.get_option("sentry:relay_pii_config"))),
+-            ("project:", _decode(project.get_option("sentry:relay_pii_config"))),
+-        ]
+-    )
+-
+-
+-def _get_datascrubbing_settings(project, org_options):
+-    rv = {}
+-
+-    exclude_fields_key = "sentry:safe_fields"
+-    rv["excludeFields"] = org_options.get(exclude_fields_key, []) + project.get_option(
+-        exclude_fields_key, []
+-    )
+-
+-    rv["scrubData"] = org_options.get("sentry:require_scrub_data", False) or project.get_option(
+-        "sentry:scrub_data", True
+-    )
+-
+-    rv["scrubIpAddresses"] = org_options.get(
+-        "sentry:require_scrub_ip_address", False
+-    ) or project.get_option("sentry:scrub_ip_address", False)
+-
+-    sensitive_fields_key = "sentry:sensitive_fields"
+-    rv["sensitiveFields"] = org_options.get(sensitive_fields_key, []) + project.get_option(
+-        sensitive_fields_key, []
+-    )
+-
+-    rv["scrubDefaults"] = org_options.get(
+-        "sentry:require_scrub_defaults", False
+-    ) or project.get_option("sentry:scrub_defaults", True)
+-
+-    return rv
+-
+-
+ def _load_filter_settings(flt, project):
+     """
+     Returns the filter settings for the specified project
+diff --git a/src/sentry/tasks/store.py b/src/sentry/tasks/store.py
+index a1c9835092..353af61db7 100644
+--- a/src/sentry/tasks/store.py
++++ b/src/sentry/tasks/store.py
+@@ -13,7 +13,6 @@ from sentry_sdk.tracing import Span
+ from sentry_relay.processing import StoreNormalizer
+ 
+ from sentry import features, reprocessing, options
+-from sentry.relay.config import get_project_config
+ from sentry.datascrubbing import scrub_data
+ from sentry.constants import DEFAULT_STORE_NORMALIZER_ARGS
+ from sentry.attachments import attachment_cache
+@@ -461,9 +460,7 @@ def _do_process_event(
+             with metrics.timer(
+                 "tasks.store.datascrubbers.scrub", tags={"from_symbolicate": from_symbolicate}
+             ):
+-                project_config = get_project_config(project)
+-
+-                new_data = safe_execute(scrub_data, project_config=project_config, event=data.data)
++                new_data = safe_execute(scrub_data, project=project, event=data.data)
+ 
+                 # XXX(markus): When datascrubbing is finally "totally stable", we might want
+                 # to drop the event if it crashes to avoid saving PII
+diff --git a/src/sentry/web/api.py b/src/sentry/web/api.py
+index d9b5610e78..c72ff9c00c 100644
+--- a/src/sentry/web/api.py
++++ b/src/sentry/web/api.py
+@@ -272,7 +272,7 @@ def process_event(event_manager, project, key, remote_addr, helper, attachments,
+         )
+         raise APIForbidden("An event with the same ID already exists (%s)" % (event_id,))
+ 
+-    data = scrub_data(project_config, dict(data))
++    data = scrub_data(project, dict(data))
+ 
+     # mutates data (strips a lot of context if not queued)
+     helper.insert_data_to_database(data, start_time=start_time, attachments=attachments)
+diff --git a/tests/sentry/test_datascrubbing.py b/tests/sentry/test_datascrubbing.py
+index e71685beb0..dfd5677a7a 100644
+--- a/tests/sentry/test_datascrubbing.py
++++ b/tests/sentry/test_datascrubbing.py
+@@ -5,11 +5,10 @@ import copy
+ import pytest
+ 
+ from sentry.datascrubbing import scrub_data
+-from sentry.relay.config import ProjectConfig
+ 
+ 
+ def merge_pii_configs(prefixes_and_configs):
+-    from sentry.datascrubbing import merge_pii_configs as f
++    from sentry.datascrubbing import _merge_pii_configs as f
+ 
+     prefixes_and_configs_bak = copy.deepcopy(prefixes_and_configs)
+     rv = f(prefixes_and_configs)
+@@ -19,26 +18,27 @@ def merge_pii_configs(prefixes_and_configs):
+     return rv
+ 
+ 
++@pytest.mark.django_db
+ @pytest.mark.parametrize("field", [u"aaa", u"aää", u"a a", u"a\na", u"a'a"])
+-def test_scrub_data(field):
+-    project_config = ProjectConfig(
+-        None,
+-        config={
+-            "datascrubbingSettings": {
+-                "excludeFields": [],
+-                "scrubData": True,
+-                "scrubIpAddresses": False,
+-                "sensitiveFields": ["a"],
+-                "scrubDefaults": False,
+-            },
+-            "piiConfig": {
+-                "applications": {
+-                    "debug_meta.images.*.code_file": ["@userpath:replace"],
+-                    "debug_meta.images.*.debug_file": ["@userpath:replace"],
+-                }
+-            },
+-        },
++def test_scrub_data(field, default_project):
++    project = default_project
++    organization = project.organization
++
++    organization.update_option(
++        "sentry:relay_pii_config",
++        """
++    {
++        "applications": {
++            "debug_meta.images.*.code_file": ["@userpath:replace"],
++            "debug_meta.images.*.debug_file": ["@userpath:replace"]
++        }
++    }
++    """,
+     )
++    organization.update_option("sentry:safe_fields", [])
++    organization.update_option("sentry:sensitive_fields", ["a"])
++    organization.update_option("sentry:scrub_ip_address", False)
++    organization.update_option("sentry:require_scrub_data", True)
+ 
+     event = {
+         "extra": {field: "pls remove"},
+@@ -49,7 +49,7 @@ def test_scrub_data(field):
+         },
+     }
+ 
+-    new_event = scrub_data(project_config, event)
++    new_event = scrub_data(project, event)
+ 
+     assert new_event == (
+         {

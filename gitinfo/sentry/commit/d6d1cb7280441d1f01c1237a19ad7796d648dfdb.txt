@@ -1,0 +1,870 @@
+commit d6d1cb7280441d1f01c1237a19ad7796d648dfdb
+Author: Jan Michael Auer <jan.auer@sentry.io>
+Date:   Fri May 17 11:59:40 2019 +0200
+
+    Revert "ref(native): Remove all references to symcaches and cficaches (#13248)" (#13265)
+    
+    This reverts commit 4ae98be455cd51cc37c23c3b5ff58e8f296c24b3.
+
+diff --git a/src/sentry/deletions/defaults/project.py b/src/sentry/deletions/defaults/project.py
+index 9647c9977b..4ac5e034ad 100644
+--- a/src/sentry/deletions/defaults/project.py
++++ b/src/sentry/deletions/defaults/project.py
+@@ -44,11 +44,8 @@ class ProjectDeletionTask(ModelDeletionTask):
+         # in bulk
+         # Release needs to handle deletes after Group is cleaned up as the foreign
+         # key is protected
+-        model_list = (
+-            models.Group,
+-            models.ReleaseProject,
+-            models.ReleaseProjectEnvironment,
+-            models.ProjectDebugFile)
++        model_list = (models.Group, models.ReleaseProject, models.ReleaseProjectEnvironment, models.ProjectDebugFile,
++                      models.ProjectSymCacheFile)
+         relations.extend(
+             [ModelRelation(m, {'project_id': instance.id}, ModelDeletionTask) for m in model_list]
+         )
+diff --git a/src/sentry/models/debugfile.py b/src/sentry/models/debugfile.py
+index 66bcd9a801..bd269b945e 100644
+--- a/src/sentry/models/debugfile.py
++++ b/src/sentry/models/debugfile.py
+@@ -20,10 +20,13 @@ import logging
+ import tempfile
+ 
+ from jsonfield import JSONField
+-from django.db import models
++from django.db import models, transaction, IntegrityError
+ from django.db.models.fields.related import OneToOneRel
+ 
+-from symbolic import Archive, SymbolicError, ObjectErrorUnsupportedObject
++from symbolic import Archive, SymbolicError, ObjectErrorUnsupportedObject, \
++    SYMCACHE_LATEST_VERSION, SymCache, SymCacheErrorMissingDebugInfo, \
++    SymCacheErrorMissingDebugSection, CfiCache, CfiErrorMissingDebugInfo, \
++    CFICACHE_LATEST_VERSION
+ 
+ from sentry import options
+ from sentry.cache import default_cache
+@@ -33,7 +36,9 @@ from sentry.db.models import FlexibleForeignKey, Model, \
+ from sentry.models.file import File
+ from sentry.reprocessing import resolve_processing_issue, \
+     bump_reprocessing_revision
++from sentry.utils import metrics
+ from sentry.utils.zip import safe_extract_zip
++from sentry.utils.decorators import classproperty
+ 
+ 
+ logger = logging.getLogger(__name__)
+@@ -187,12 +192,39 @@ class ProjectDebugFile(Model):
+ 
+         return ''
+ 
++    @property
++    def supports_caches(self):
++        return ProjectSymCacheFile.computes_from(self) \
++            or ProjectCfiCacheFile.computes_from(self)
++
+     @property
+     def features(self):
+         return frozenset((self.data or {}).get('features', []))
+ 
+     def delete(self, *args, **kwargs):
+-        super(ProjectDebugFile, self).delete(*args, **kwargs)
++        dif_id = self.id
++
++        with transaction.atomic():
++            # First, delete the debug file entity. This ensures no other
++            # worker can attach caches to it. Integrity checks are deferred
++            # within this transaction, so existing caches stay intact.
++            super(ProjectDebugFile, self).delete(*args, **kwargs)
++
++            # Explicitly select referencing caches and delete them. Using
++            # the backref does not work, since `dif.id` is None after the
++            # delete.
++            symcaches = ProjectSymCacheFile.objects \
++                .filter(debug_file_id=dif_id) \
++                .select_related('cache_file')
++            for symcache in symcaches:
++                symcache.delete()
++
++            cficaches = ProjectCfiCacheFile.objects \
++                .filter(debug_file_id=dif_id) \
++                .select_related('cache_file')
++            for cficache in cficaches:
++                cficache.delete()
++
+         self.file.delete()
+ 
+ 
+@@ -218,6 +250,46 @@ class ProjectCacheFile(Model):
+         unique_together = (('project', 'debug_file'),)
+         app_label = 'sentry'
+ 
++    @classproperty
++    def ignored_errors(cls):
++        """Returns a set of errors that can safely be ignored during conversion.
++        These errors should be expected by bad input data and do not indicate a
++        programming error.
++        """
++        raise NotImplementedError
++
++    @classproperty
++    def required_features(cls):
++        """Returns a set of features object files must have in order to support
++        generating this cache.
++        """
++        raise NotImplementedError
++
++    @classproperty
++    def cache_cls(cls):
++        """Returns the class of the raw cache referenced by this model. It can
++        be used to load caches from the file system or to convert object files.
++        """
++        raise NotImplementedError
++
++    @classproperty
++    def cache_name(cls):
++        """Returns the name of the cache class in lower case. Can be used for
++        file extensions, cache keys, logs, etc.
++        """
++        return cls.cache_cls.__name__.lower()
++
++    @classmethod
++    def computes_from(cls, debug_file):
++        """Indicates whether the cache can be computed from the given DIF."""
++        return set(cls.required_features) <= debug_file.features
++
++    @property
++    def outdated(self):
++        """Indicates whether this cache is outdated and needs to be recomputed.
++        """
++        raise NotImplemented
++
+     def delete(self, *args, **kwargs):
+         super(ProjectCacheFile, self).delete(*args, **kwargs)
+         self.cache_file.delete()
+@@ -229,6 +301,29 @@ class ProjectSymCacheFile(ProjectCacheFile):
+     class Meta(ProjectCacheFile.Meta):
+         db_table = 'sentry_projectsymcachefile'
+ 
++    @classproperty
++    def ignored_errors(cls):
++        return (SymCacheErrorMissingDebugSection, SymCacheErrorMissingDebugInfo)
++
++    @classproperty
++    def required_features(cls):
++        return ('debug',)
++
++    @classproperty
++    def cache_cls(cls):
++        return SymCache
++
++    @classmethod
++    def computes_from(cls, debug_file):
++        if debug_file.data is None:
++            # Compatibility with legacy DIFs before features were introduced
++            return debug_file.file_format in ('breakpad', 'macho', 'elf')
++        return super(ProjectSymCacheFile, cls).computes_from(debug_file)
++
++    @property
++    def outdated(self):
++        return self.version != SYMCACHE_LATEST_VERSION
++
+ 
+ class ProjectCfiCacheFile(ProjectCacheFile):
+     """Cache for stack unwinding information: CfiCache."""
+@@ -236,6 +331,22 @@ class ProjectCfiCacheFile(ProjectCacheFile):
+     class Meta(ProjectCacheFile.Meta):
+         db_table = 'sentry_projectcficachefile'
+ 
++    @classproperty
++    def ignored_errors(cls):
++        return (CfiErrorMissingDebugInfo,)
++
++    @classproperty
++    def required_features(cls):
++        return ('unwind',)
++
++    @classproperty
++    def cache_cls(cls):
++        return CfiCache
++
++    @property
++    def outdated(self):
++        return self.version != CFICACHE_LATEST_VERSION
++
+ 
+ def clean_redundant_difs(project, debug_id):
+     """Deletes redundant debug files from the database and file storage. A debug
+@@ -276,7 +387,7 @@ def create_dif_from_id(project, meta, fileobj=None, file=None):
+         checksum = file.checksum
+     elif fileobj is not None:
+         h = hashlib.sha1()
+-        while True:
++        while 1:
+             chunk = fileobj.read(16384)
+             if not chunk:
+                 break
+@@ -428,7 +539,7 @@ def create_debug_file_from_dif(to_create, project):
+     return rv
+ 
+ 
+-def create_files_from_dif_zip(fileobj, project):
++def create_files_from_dif_zip(fileobj, project, update_caches=True):
+     """Creates all missing debug files from the given zip file.  This
+     returns a list of all files created.
+     """
+@@ -451,6 +562,16 @@ def create_files_from_dif_zip(fileobj, project):
+ 
+         rv = create_debug_file_from_dif(to_create, project)
+ 
++        # Trigger generation of symcaches and cficaches to avoid dogpiling when
++        # events start coming in.
++        if update_caches:
++            from sentry.tasks.symcache_update import symcache_update
++            ids_to_update = [six.text_type(dif.debug_id) for dif in rv
++                             if dif.supports_caches]
++            if ids_to_update:
++                symcache_update.delay(project_id=project.id,
++                                      debug_ids=ids_to_update)
++
+         # Uploading new dsysm changes the reprocessing revision
+         bump_reprocessing_revision(project)
+ 
+@@ -467,6 +588,37 @@ class DIFCache(object):
+     def get_project_path(self, project):
+         return os.path.join(self.cache_path, six.text_type(project.id))
+ 
++    def update_caches(self, project, debug_ids):
++        """Updates symcaches and cficaches for all debug files matching the
++        given debug ids, if the respective files support any of those caches.
++        """
++        # XXX: Worst case, this might download the same DIF twice.
++        self._get_caches_impl(project, debug_ids, ProjectSymCacheFile)
++        self._get_caches_impl(project, debug_ids, ProjectCfiCacheFile)
++
++    def get_symcaches(self, project, debug_ids, on_dif_referenced=None,
++                      with_conversion_errors=False):
++        """Loads symcaches for the given debug IDs from the file system cache or
++        blob store."""
++        cachefiles, conversion_errors = self._get_caches_impl(
++            project, debug_ids, ProjectSymCacheFile, on_dif_referenced)
++
++        symcaches = self._load_cachefiles_via_fs(project, cachefiles, SymCache)
++        if with_conversion_errors:
++            return symcaches, dict((k, v) for k, v in conversion_errors.items())
++        return symcaches
++
++    def get_cficaches(self, project, debug_ids, on_dif_referenced=None,
++                      with_conversion_errors=False):
++        """Loads cficaches for the given debug IDs from the file system cache or
++        blob store."""
++        cachefiles, conversion_errors = self._get_caches_impl(
++            project, debug_ids, ProjectCfiCacheFile, on_dif_referenced)
++        cficaches = self._load_cachefiles_via_fs(project, cachefiles, CfiCache)
++        if with_conversion_errors:
++            return cficaches, dict((k, v) for k, v in conversion_errors.items())
++        return cficaches
++
+     def fetch_difs(self, project, debug_ids, features=None):
+         """Given some ids returns an id to path mapping for where the
+         debug symbol files are on the FS.
+@@ -487,6 +639,185 @@ class DIFCache(object):
+ 
+         return rv
+ 
++    def _get_caches_impl(self, project, debug_ids, cls, on_dif_referenced=None):
++        # Fetch debug files first and invoke the callback if we need
++        debug_ids = [six.text_type(debug_id).lower() for debug_id in debug_ids]
++        debug_files = ProjectDebugFile.objects.find_by_debug_ids(
++            project, debug_ids, features=cls.required_features)
++
++        # Notify the caller that we have used a symbol file
++        if on_dif_referenced is not None:
++            for debug_file in six.itervalues(debug_files):
++                on_dif_referenced(debug_file)
++
++        # Now find all the cache files we already have
++        found_ids = [d.id for d in six.itervalues(debug_files)]
++        existing_caches = cls.objects \
++            .filter(project=project, debug_file_id__in=found_ids) \
++            .select_related('cache_file', 'debug_file__debug_id')
++
++        # Check for missing and out-of-date cache files. Outdated files are
++        # removed to be re-created immediately.
++        caches = []
++        to_update = debug_files.copy()
++        for cache_file in existing_caches:
++            if cache_file.outdated:
++                cache_file.delete()
++            else:
++                debug_id = cache_file.debug_file.debug_id
++                to_update.pop(debug_id, None)
++                caches.append((debug_id, cache_file, None))
++
++        # If any cache files need to be updated, do that now
++        if to_update:
++            updated_cachefiles, conversion_errors = self._update_cachefiles(
++                project, to_update.values(), cls)
++            caches.extend(updated_cachefiles)
++        else:
++            conversion_errors = {}
++
++        return caches, conversion_errors
++
++    def _update_cachefiles(self, project, debug_files, cls):
++        rv = []
++        conversion_errors = {}
++
++        for debug_file in debug_files:
++            debug_id = debug_file.debug_id
++
++            # Find all the known bad files we could not convert last time. We
++            # use the debug identifier and file checksum to identify the source
++            # DIF for historic reasons (debug_file.id would do, too).
++            cache_key = 'scbe:%s:%s' % (debug_id, debug_file.file.checksum)
++            err = default_cache.get(cache_key)
++            if err is not None:
++                conversion_errors[debug_id] = err
++                continue
++
++            # Download the original debug symbol and convert the object file to
++            # a cache. This can either yield a cache object, an error or none of
++            # the above. THE FILE DOWNLOAD CAN TAKE SIGNIFICANT TIME.
++            with debug_file.file.getfile(as_tempfile=True) as tf:
++                file, cache, err = self._update_cachefile(debug_file, tf.name, cls)
++
++            # Store this conversion error so that we can skip subsequent
++            # conversions. There might be concurrent conversions running for the
++            # same debug file, however.
++            if err is not None:
++                default_cache.set(cache_key, err, CONVERSION_ERROR_TTL)
++                conversion_errors[debug_id] = err
++                continue
++
++            if file is not None or cache is not None:
++                rv.append((debug_id, file, cache))
++
++        return rv, conversion_errors
++
++    def _update_cachefile(self, debug_file, path, cls):
++        debug_id = debug_file.debug_id
++
++        # Skip silently if this cache cannot be computed from the given DIF
++        if not cls.computes_from(debug_file):
++            return None, None, None
++
++        # Locate the object inside the Archive. Since we have keyed debug
++        # files by debug_id, we expect a corresponding object. Otherwise, we
++        # fail silently, just like with missing symbols.
++        try:
++            archive = Archive.open(path)
++            obj = archive.get_object(debug_id=debug_id)
++            if obj is None:
++                return None, None, None
++
++            # Check features from the actual object file, if this is a legacy
++            # DIF where features have not been extracted yet.
++            if (debug_file.data or {}).get('features') is None:
++                if not set(cls.required_features) <= obj.features:
++                    return None, None, None
++
++            cache = cls.cache_cls.from_object(obj)
++        except SymbolicError as e:
++            if not isinstance(e, cls.ignored_errors):
++                logger.error('dsymfile.%s-build-error' % cls.cache_name,
++                             exc_info=True, extra=dict(debug_id=debug_id))
++
++            metrics.incr('%s.failed' % cls.cache_name, tags={
++                'error': e.__class__.__name__,
++            }, skip_internal=False)
++
++            return None, None, e.message
++
++        file = File.objects.create(name=debug_id, type='project.%s' % cls.cache_name)
++        file.putfile(cache.open_stream())
++
++        # Try to insert the new Cache into the database. This only fail if
++        # (1) another process has concurrently added the same sym cache, or if
++        # (2) the debug symbol was deleted, either due to a newer upload or via
++        # the API.
++        try:
++            with transaction.atomic():
++                return cls.objects.create(
++                    project=debug_file.project,
++                    cache_file=file,
++                    debug_file=debug_file,
++                    checksum=debug_file.file.checksum,
++                    version=cache.version,
++                ), cache, None
++        except IntegrityError:
++            file.delete()
++
++        # Check for a concurrently inserted cache and use that instead. This
++        # could have happened (1) due to a concurrent insert, or (2) a new
++        # upload that has already succeeded to compute a cache. The latter
++        # case is extremely unlikely.
++        cache_file = cls.objects \
++            .filter(project=debug_file.project, debug_file__debug_id=debug_id) \
++            .select_related('cache_file') \
++            .order_by('-id') \
++            .first()
++
++        if cache_file is not None:
++            return cache_file, None, None
++
++        # There was no new cache, indicating that the debug file has been
++        # replaced with a newer version. Another job will create the
++        # corresponding cache eventually. To prevent querying the database
++        # another time, simply use the in-memory cache for now:
++        return None, cache, None
++
++    def _load_cachefiles_via_fs(self, project, cachefiles, cls):
++        rv = {}
++        base = self.get_project_path(project)
++        cls_name = cls.__name__.lower()
++
++        for debug_id, model, cache in cachefiles:
++            # If we're given a cache instance, use that over accessing the file
++            # system or potentially even blob storage.
++            if cache is not None:
++                rv[debug_id] = cache
++                continue
++            elif model is None:
++                raise RuntimeError('missing %s file to load from fs' % cls_name)
++
++            # Try to locate a cached instance from the file system and bump the
++            # timestamp to indicate it is still being used. Otherwise, download
++            # from the blob store and place it in the cache folder.
++            cachefile_name = '%s_%s.%s' % (model.id, model.version, cls_name)
++            cachefile_path = os.path.join(base, cachefile_name)
++            try:
++                stat = os.stat(cachefile_path)
++            except OSError as e:
++                if e.errno != errno.ENOENT:
++                    raise
++                model.cache_file.save_to(cachefile_path)
++            else:
++                now = int(time.time())
++                if stat.st_ctime < now - ONE_DAY:
++                    os.utime(cachefile_path, (now, now))
++
++            rv[debug_id] = cls.open(cachefile_path)
++        return rv
++
+     def clear_old_entries(self):
+         try:
+             cache_folders = os.listdir(self.cache_path)
+diff --git a/src/sentry/tasks/symcache_update.py b/src/sentry/tasks/symcache_update.py
+index 0ba8a0e7d1..022592a42a 100644
+--- a/src/sentry/tasks/symcache_update.py
++++ b/src/sentry/tasks/symcache_update.py
+@@ -1,6 +1,7 @@
+ from __future__ import absolute_import
+ 
+ from sentry.tasks.base import instrumented_task
++from sentry.models import Project, ProjectDebugFile
+ 
+ 
+ @instrumented_task(
+@@ -9,4 +10,9 @@ from sentry.tasks.base import instrumented_task
+     soft_time_limit=60,
+ )
+ def symcache_update(project_id, debug_ids, **kwargs):
+-    pass  # Noop. TODO(ja): Remove once unused.
++    try:
++        project = Project.objects.get(id=project_id)
++    except Project.DoesNotExist:
++        return
++
++    ProjectDebugFile.difcache.update_caches(project, debug_ids)
+diff --git a/tests/sentry/models/test_debugfile.py b/tests/sentry/models/test_debugfile.py
+index 61d5090da3..4b3915091a 100644
+--- a/tests/sentry/models/test_debugfile.py
++++ b/tests/sentry/models/test_debugfile.py
+@@ -8,8 +8,11 @@ from six import BytesIO, text_type
+ from django.core.files.uploadedfile import SimpleUploadedFile
+ from django.core.urlresolvers import reverse
+ 
++from symbolic import SYMCACHE_LATEST_VERSION
++
+ from sentry.testutils import APITestCase, TestCase
+-from sentry.models import debugfile, File, ProjectDebugFile, DifMeta
++from sentry.models import debugfile, File, ProjectDebugFile, ProjectSymCacheFile, \
++    ProjectCfiCacheFile, DifMeta
+ 
+ # This is obviously a freely generated UUID and not the checksum UUID.
+ # This is permissible if users want to send different UUIDs
+@@ -29,11 +32,45 @@ class DebugFileTest(TestCase):
+             features=['debug', 'unwind'],
+         )
+ 
++        symcache_file = self.create_file(
++            name='baz.symcache',
++            size=42,
++            headers={'Content-Type': 'application/x-sentry-symcache'},
++            checksum='dc1e3f3e411979d336c3057cce64294f3420f93a',
++        )
++
++        symcache = ProjectSymCacheFile.objects.create(
++            project=self.project,
++            cache_file=symcache_file,
++            debug_file=dif,
++            checksum='dc1e3f3e411979d336c3057cce64294f3420f93a',
++            version=SYMCACHE_LATEST_VERSION,
++        )
++
++        cficache_file = self.create_file(
++            name='baz.cficache',
++            size=42,
++            headers={'Content-Type': 'application/x-sentry-cficache'},
++            checksum='dc1e3f3e411979d336c3057cce64294f3420f93a',
++        )
++
++        cficache = ProjectCfiCacheFile.objects.create(
++            project=self.project,
++            cache_file=cficache_file,
++            debug_file=dif,
++            checksum='dc1e3f3e411979d336c3057cce64294f3420f93a',
++            version=SYMCACHE_LATEST_VERSION,
++        )
++
+         dif_id = dif.id
+         dif.delete()
+ 
+         assert not ProjectDebugFile.objects.filter(id=dif_id).exists()
+         assert not File.objects.filter(id=dif.file.id).exists()
++        assert not ProjectSymCacheFile.objects.filter(id=symcache.id).exists()
++        assert not File.objects.filter(id=symcache_file.id).exists()
++        assert not ProjectCfiCacheFile.objects.filter(id=cficache.id).exists()
++        assert not File.objects.filter(id=cficache_file.id).exists()
+ 
+     def test_find_dif_by_debug_id(self):
+         debug_id1 = 'dfb8e43a-f242-3d73-a453-aeb6a777ef75'
+@@ -285,3 +322,327 @@ class DebugFilesClearTest(APITestCase):
+ 
+         # But it's gone now
+         assert not os.path.isfile(difs[PROGUARD_UUID])
++
++
++class SymCacheTest(TestCase):
++    def test_get_symcache(self):
++        debug_id = '67e9247c-814e-392b-a027-dbde6748fcbf'
++        dif = self.create_dif_from_path(
++            path=os.path.join(os.path.dirname(__file__), 'fixtures', 'crash.dsym'),
++            debug_id=debug_id,
++            features=['debug'],
++        )
++
++        file = self.create_file_from_path(
++            path=os.path.join(os.path.dirname(__file__), 'fixtures', 'v1.symcache'),
++            type='project.symcache'
++        )
++
++        ProjectSymCacheFile.objects.create(
++            project=self.project,
++            cache_file=file,
++            debug_file=dif,
++            checksum=dif.file.checksum,
++            # XXX: This version does not correspond to the actual file version,
++            # but is sufficient to avoid update behavior
++            version=SYMCACHE_LATEST_VERSION,
++        )
++
++        symcaches = ProjectDebugFile.difcache.get_symcaches(self.project, [debug_id])
++        assert debug_id in symcaches
++        assert symcaches[debug_id].debug_id == debug_id
++
++    def test_miss_symcache_without_feature(self):
++        debug_id = '67e9247c-814e-392b-a027-dbde6748fcbf'
++        self.create_dif_from_path(
++            path=os.path.join(os.path.dirname(__file__), 'fixtures', 'crash.dsym'),
++            debug_id=debug_id,
++        )
++        self.create_dif_from_path(
++            path=os.path.join(os.path.dirname(__file__), 'fixtures', 'crash.dsym'),
++            debug_id=debug_id,
++            features=[],
++        )
++
++        # XXX: Explicit empty set denotes DIF without features. Since at least
++        # one file has declared features, get_symcaches will rather not use the
++        # other untagged file.
++        symcaches = ProjectDebugFile.difcache.get_symcaches(self.project, [debug_id])
++        assert debug_id not in symcaches
++
++    def test_create_symcache_without_feature(self):
++        debug_id = '67e9247c-814e-392b-a027-dbde6748fcbf'
++        self.create_dif_from_path(
++            path=os.path.join(os.path.dirname(__file__), 'fixtures', 'crash.dsym'),
++            debug_id=debug_id,
++            file_format='macho',  # XXX: Needed for legacy compatibility check
++        )
++
++        symcaches = ProjectDebugFile.difcache.get_symcaches(self.project, [debug_id])
++        assert debug_id in symcaches
++        assert symcaches[debug_id].debug_id == debug_id
++
++    def test_create_symcache_with_feature(self):
++        debug_id = '67e9247c-814e-392b-a027-dbde6748fcbf'
++        self.create_dif_from_path(
++            path=os.path.join(os.path.dirname(__file__), 'fixtures', 'crash.dsym'),
++            debug_id=debug_id,
++            features=['debug'],
++        )
++
++        symcaches = ProjectDebugFile.difcache.get_symcaches(self.project, [debug_id])
++        assert debug_id in symcaches
++        assert symcaches[debug_id].debug_id == debug_id
++
++    def test_skip_symcache_without_feature(self):
++        debug_id = '1ddb3423-950a-3646-b17b-d4360e6acfc9'
++        self.create_dif_from_path(
++            path=os.path.join(os.path.dirname(__file__), 'fixtures', 'crash'),
++            debug_id=debug_id,
++            file_format='macho',
++        )
++
++        symcaches = ProjectDebugFile.difcache.get_symcaches(self.project, [debug_id])
++        assert not symcaches
++
++    def test_update_symcache(self):
++        debug_id = '67e9247c-814e-392b-a027-dbde6748fcbf'
++        dif = self.create_dif_from_path(
++            path=os.path.join(os.path.dirname(__file__), 'fixtures', 'crash.dsym'),
++            debug_id=debug_id,
++        )
++
++        file = self.create_file_from_path(
++            path=os.path.join(os.path.dirname(__file__), 'fixtures', 'v1.symcache'),
++            headers={'Content-Type': 'application/x-sentry-symcache'},
++            type='project.symcache'
++        )
++
++        # Create an outdated SymCache to replace
++        old_cache = ProjectSymCacheFile.objects.create(
++            project=self.project,
++            cache_file=file,
++            debug_file=dif,
++            checksum=dif.file.checksum,
++            version=1,
++        )
++
++        symcaches = ProjectDebugFile.difcache.get_symcaches(self.project, [debug_id])
++        assert debug_id in symcaches
++        assert symcaches[debug_id].debug_id == debug_id
++        assert symcaches[debug_id].is_latest_version
++        assert not ProjectSymCacheFile.objects.filter(id=old_cache.id, version=1).exists()
++
++    def test_get_symcache_on_referenced(self):
++        debug_id = '67e9247c-814e-392b-a027-dbde6748fcbf'
++        dif = self.create_dif_from_path(
++            path=os.path.join(os.path.dirname(__file__), 'fixtures', 'crash.dsym'),
++            debug_id=debug_id,
++            features=['debug']
++        )
++
++        referenced_ids = []
++
++        def dif_referenced(dif):
++            referenced_ids.append(dif.id)
++
++        ProjectDebugFile.difcache.get_symcaches(
++            self.project,
++            [debug_id],
++            on_dif_referenced=dif_referenced
++        )
++        assert referenced_ids == [dif.id]
++
++    def test_symcache_conversion_error(self):
++        debug_id = '67e9247c-814e-392b-a027-dbde6748fcbf'
++        self.create_dif_file(
++            debug_id=debug_id,
++            features=['debug']
++        )
++
++        symcaches, errors = ProjectDebugFile.difcache.get_symcaches(
++            self.project,
++            [debug_id],
++            with_conversion_errors=True
++        )
++        assert debug_id not in symcaches
++        assert debug_id in errors
++
++    def test_delete_symcache(self):
++        dif = self.create_dif_file(
++            debug_id='dfb8e43a-f242-3d73-a453-aeb6a777ef75-feedface',
++            features=['debug']
++        )
++
++        cache_file = self.create_file(
++            name='baz.symc',
++            size=42,
++            headers={'Content-Type': 'application/x-sentry-symcache'},
++            checksum='dc1e3f3e411979d336c3057cce64294f3420f93a',
++            type='project.symcache'
++        )
++
++        symcache = ProjectSymCacheFile.objects.create(
++            project=self.project,
++            cache_file=cache_file,
++            debug_file=dif,
++            checksum=dif.file.checksum,
++            version=SYMCACHE_LATEST_VERSION,
++        )
++
++        symcache.delete()
++        assert not File.objects.filter(id=cache_file.id).exists()
++        assert not ProjectSymCacheFile.objects.filter(id=symcache.id).exists()
++
++
++class CfiCacheTest(TestCase):
++    def test_get_cficache(self):
++        debug_id = '1ddb3423-950a-3646-b17b-d4360e6acfc9'
++        dif = self.create_dif_from_path(
++            path=os.path.join(os.path.dirname(__file__), 'fixtures', 'crash'),
++            debug_id=debug_id,
++            features=['unwind'],
++        )
++
++        file = self.create_file_from_path(
++            path=os.path.join(os.path.dirname(__file__), 'fixtures', 'v1.cficache'),
++            type='project.cficache'
++        )
++
++        ProjectCfiCacheFile.objects.create(
++            project=self.project,
++            cache_file=file,
++            debug_file=dif,
++            checksum=dif.file.checksum,
++            # XXX: This version does not correspond to the actual file version,
++            # but is sufficient to avoid update behavior
++            version=SYMCACHE_LATEST_VERSION,
++        )
++
++        cficaches = ProjectDebugFile.difcache.get_cficaches(self.project, [debug_id])
++        assert debug_id in cficaches
++
++    def test_miss_cficache_without_feature(self):
++        debug_id = '1ddb3423-950a-3646-b17b-d4360e6acfc9'
++        self.create_dif_from_path(
++            path=os.path.join(os.path.dirname(__file__), 'fixtures', 'crash'),
++            debug_id=debug_id,
++            features=[],
++        )
++
++        # XXX: Explicit empty set denotes DIF without features. Since at least
++        # one file has declared features, get_cficaches will rather not use the
++        # other untagged file.
++        cficaches = ProjectDebugFile.difcache.get_cficaches(self.project, [debug_id])
++        assert debug_id not in cficaches
++
++    def test_create_cficache_with_feature(self):
++        debug_id = '1ddb3423-950a-3646-b17b-d4360e6acfc9'
++        self.create_dif_from_path(
++            path=os.path.join(os.path.dirname(__file__), 'fixtures', 'crash'),
++            debug_id=debug_id,
++            features=['unwind'],
++        )
++
++        cficaches = ProjectDebugFile.difcache.get_cficaches(self.project, [debug_id])
++        assert debug_id in cficaches
++
++    def test_skip_cficache_without_feature(self):
++        debug_id = '67e9247c-814e-392b-a027-dbde6748fcbf'
++        self.create_dif_from_path(
++            path=os.path.join(os.path.dirname(__file__), 'fixtures', 'crash.dsym'),
++            debug_id=debug_id,
++            file_format='macho',
++        )
++
++        symcaches = ProjectDebugFile.difcache.get_cficaches(self.project, [debug_id])
++        assert not symcaches
++
++    def test_update_cficache(self):
++        debug_id = '1ddb3423-950a-3646-b17b-d4360e6acfc9'
++        dif = self.create_dif_from_path(
++            path=os.path.join(os.path.dirname(__file__), 'fixtures', 'crash'),
++            debug_id=debug_id,
++            features=['unwind'],
++        )
++
++        file = self.create_file_from_path(
++            path=os.path.join(os.path.dirname(__file__), 'fixtures', 'v1.symcache'),
++            headers={'Content-Type': 'application/x-sentry-cficache'},
++            type='project.cficache'
++        )
++
++        # Create an outdated CfiCache to replace
++        old_cache = ProjectCfiCacheFile.objects.create(
++            project=self.project,
++            cache_file=file,
++            debug_file=dif,
++            checksum=dif.file.checksum,
++            version=0,
++        )
++
++        cficaches = ProjectDebugFile.difcache.get_cficaches(self.project, [debug_id])
++        assert debug_id in cficaches
++        assert cficaches[debug_id].is_latest_version
++        assert not ProjectCfiCacheFile.objects.filter(id=old_cache.id, version=0).exists()
++
++    def test_get_cficache_on_referenced(self):
++        debug_id = '1ddb3423-950a-3646-b17b-d4360e6acfc9'
++        dif = self.create_dif_from_path(
++            path=os.path.join(os.path.dirname(__file__), 'fixtures', 'crash'),
++            debug_id=debug_id,
++            features=['unwind'],
++        )
++
++        referenced_ids = []
++
++        def dif_referenced(dif):
++            referenced_ids.append(dif.id)
++
++        ProjectDebugFile.difcache.get_cficaches(
++            self.project,
++            [debug_id],
++            on_dif_referenced=dif_referenced
++        )
++        assert referenced_ids == [dif.id]
++
++    def test_cficache_conversion_error(self):
++        debug_id = '1ddb3423-950a-3646-b17b-d4360e6acfc9'
++        self.create_dif_file(
++            debug_id=debug_id,
++            features=['unwind'],
++        )
++
++        cficaches, errors = ProjectDebugFile.difcache.get_cficaches(
++            self.project,
++            [debug_id],
++            with_conversion_errors=True
++        )
++        assert debug_id not in cficaches
++        assert debug_id in errors
++
++    def test_delete_cficache(self):
++        dif = self.create_dif_file(
++            debug_id='dfb8e43a-f242-3d73-a453-aeb6a777ef75-feedface',
++            features=['unwind'],
++        )
++
++        cache_file = self.create_file(
++            name='baz.symc',
++            size=42,
++            headers={'Content-Type': 'application/x-sentry-cficache'},
++            checksum='dc1e3f3e411979d336c3057cce64294f3420f93a',
++            type='project.cficache'
++        )
++
++        cficache = ProjectCfiCacheFile.objects.create(
++            project=self.project,
++            cache_file=cache_file,
++            debug_file=dif,
++            checksum=dif.file.checksum,
++            version=SYMCACHE_LATEST_VERSION,
++        )
++
++        cficache.delete()
++        assert not File.objects.filter(id=cache_file.id).exists()
++        assert not ProjectCfiCacheFile.objects.filter(id=cficache.id).exists()

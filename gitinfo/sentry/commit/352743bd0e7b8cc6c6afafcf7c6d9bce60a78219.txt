@@ -1,0 +1,278 @@
+commit 352743bd0e7b8cc6c6afafcf7c6d9bce60a78219
+Author: ted kaemming <ted@kaemming.com>
+Date:   Wed Apr 11 15:44:25 2018 -0700
+
+    ref(services): Prioritize primary backend requests over secondary backends (#8008)
+
+diff --git a/src/sentry/utils/concurrent.py b/src/sentry/utils/concurrent.py
+index 4566be994d..cff2da9ae1 100644
+--- a/src/sentry/utils/concurrent.py
++++ b/src/sentry/utils/concurrent.py
+@@ -2,7 +2,7 @@ from __future__ import absolute_import
+ 
+ import logging
+ import threading
+-from Queue import Full, Queue
++from Queue import Full, PriorityQueue
+ from concurrent.futures import Future
+ 
+ 
+@@ -14,7 +14,7 @@ class ThreadedExecutor(object):
+     This executor provides a method of executing callables in a threaded worker
+     pool. The number of outstanding requests can be limited by the ``maxsize``
+     parameter, which has the same behavior as the parameter of the same name
+-    for the ``Queue`` constructor.
++    for the ``PriorityQueue`` constructor.
+ 
+     All threads are daemon threads and will remain alive until the main thread
+     exits. Any items remaining in the queue at this point may not be executed!
+@@ -30,7 +30,7 @@ class ThreadedExecutor(object):
+         self.__worker_count = worker_count
+         self.__workers = set([])
+         self.__started = False
+-        self.__queue = Queue(maxsize)
++        self.__queue = PriorityQueue(maxsize)
+ 
+     def start(self):
+         assert not self.__started
+@@ -38,7 +38,7 @@ class ThreadedExecutor(object):
+         def worker():
+             queue = self.__queue
+             while True:
+-                function, future = queue.get(True)
++                priority, (function, future) = queue.get(True)
+                 if not future.set_running_or_notify_cancel():
+                     continue
+                 try:
+@@ -57,10 +57,14 @@ class ThreadedExecutor(object):
+ 
+         self.__started = True
+ 
+-    def submit(self, callable, *args, **kwargs):
++    def submit(self, callable, priority=0, block=True, timeout=None):
+         """\
+         Enqueue a task to be executed, returning a ``Future``.
+ 
++        Tasks can be prioritized by providing a value for the ``priority``
++        argument, which follows the same specification as the standard library
++        ``Queue.PriorityQueue`` (lowest valued entries are retrieved first.)
++
+         If the worker pool has not already been started, calling this method
+         will cause all of the worker threads to start running.
+         """
+@@ -68,8 +72,9 @@ class ThreadedExecutor(object):
+             self.start()
+ 
+         future = Future()
++        task = (priority, (callable, future))
+         try:
+-            self.__queue.put((callable, future), *args, **kwargs)
++            self.__queue.put(task, block=block, timeout=timeout)
+         except Full as error:
+             if future.set_running_or_notify_cancel():
+                 future.set_exception(error)
+diff --git a/src/sentry/utils/services.py b/src/sentry/utils/services.py
+index d695b7c86f..e58a9c532b 100644
+--- a/src/sentry/utils/services.py
++++ b/src/sentry/utils/services.py
+@@ -4,8 +4,8 @@ import functools
+ import inspect
+ import itertools
+ import logging
++import operator
+ 
+-from collections import OrderedDict
+ from django.utils.functional import empty, LazyObject
+ 
+ from sentry.utils import warnings
+@@ -163,9 +163,12 @@ class ServiceDelegator(Service):
+       request is rejected and the future will raise ``Queue.Full`` when
+       attempting to retrieve the result.)
+     - The ``callback_func`` is called after all futures have completed, either
+-      successfully or unsuccessfully. The function is parameters are the method
+-      name, calling arguments (as returned by ``inspect.getcallargs``) and a
+-      mapping of backend name to ``Future`` objects.
++      successfully or unsuccessfully. The function parameters are:
++      - the method name (as a string),
++      - the calling arguments (as returned by ``inspect.getcallargs``),
++      - the backend names (as returned by the selector function),
++      - a list of results (as either a ``Future``, or ``None`` if the backend
++        was invalid) of the same length and ordering as the backend names.
+     """
+ 
+     class InvalidBackend(Exception):
+@@ -235,32 +238,67 @@ class ServiceDelegator(Service):
+             #    arguments that are supported by all backends.
+             callargs = inspect.getcallargs(base_value, None, *args, **kwargs)
+ 
+-            results = OrderedDict()
+-            for i, backend_name in enumerate(self.__selector_func(attribute_name, callargs)):
+-                is_primary = i == 0
++            selected_backend_names = list(self.__selector_func(attribute_name, callargs))
++            if not len(selected_backend_names) > 0:
++                raise self.InvalidBackend('No backends returned by selector!')
++
++            # Ensure that the primary backend is actually registered -- we
++            # don't want to schedule any work on the secondaries if the primary
++            # request is going to fail anyway.
++            if selected_backend_names[0] not in self.__backends:
++                raise self.InvalidBackend(
++                    '{!r} is not a registered backend.'.format(
++                        selected_backend_names[0]))
++
++            call_backend_method = operator.methodcaller(attribute_name, *args, **kwargs)
++
++            # Enqueue all of the secondary backend requests first since these
++            # are non-blocking queue insertions. (Since the primary backend
++            # executor queue insertion can block, if that queue was full the
++            # secondary requests would have to wait unnecessarily to be queued
++            # until the after the primary request can be enqueued.)
++            # NOTE: If the same backend is both the primary backend *and* in
++            # the secondary backend list -- this is unlikely, but possible --
++            # this means that one of the secondary requests will be queued and
++            # executed before the primary request is queued.  This is such a
++            # strange usage pattern that I don't think it's worth optimizing
++            # for.)
++            results = [None] * len(selected_backend_names)
++            for i, backend_name in enumerate(selected_backend_names[1:], 1):
+                 try:
+                     backend, executor = self.__backends[backend_name]
+                 except KeyError:
+-                    if is_primary:
+-                        raise self.InvalidBackend(
+-                            '{!r} is not a registered backend.'.format(backend_name))
+-                    else:
+-                        logger.warning(
+-                            '%r is not a registered backend and will be ignored.',
+-                            backend_name,
+-                            exc_info=True)
+-                        continue
+-
+-                results[backend_name] = executor.submit(
+-                    functools.partial(getattr(backend, attribute_name), *args, **kwargs),
+-                    block=is_primary,
+-                )
++                    logger.warning(
++                        '%r is not a registered backend and will be ignored.',
++                        backend_name,
++                        exc_info=True)
++                else:
++                    results[i] = executor.submit(
++                        functools.partial(call_backend_method, backend),
++                        priority=1,
++                        block=False,
++                    )
++
++            # The primary backend is scheduled last since it may block the
++            # calling thread. (We don't have to protect this from ``KeyError``
++            # since we already ensured that the primary backend exists.)
++            backend, executor = self.__backends[selected_backend_names[0]]
++            results[0] = executor.submit(
++                functools.partial(call_backend_method, backend),
++                priority=0,
++                block=True,
++            )
+ 
+             if self.__callback_func is not None:
+-                FutureSet(results.values()).add_done_callback(
+-                    lambda *a, **k: self.__callback_func(attribute_name, callargs, results)
++                FutureSet(filter(None, results)).add_done_callback(
++                    lambda *a, **k: self.__callback_func(
++                        attribute_name,
++                        callargs,
++                        selected_backend_names,
++                        results,
++                    )
+                 )
+ 
+-            return results.values()[0].result()
++            return results[0].result()
+ 
+         return execute
+diff --git a/tests/sentry/utils/test_concurrent.py b/tests/sentry/utils/test_concurrent.py
+index 5aeaf1d3a4..aaecb315d4 100644
+--- a/tests/sentry/utils/test_concurrent.py
++++ b/tests/sentry/utils/test_concurrent.py
+@@ -1,8 +1,12 @@
+ from __future__ import absolute_import
+ 
+ import mock
++import pytest
++from Queue import Full
+ from concurrent.futures import Future
+-from sentry.utils.concurrent import FutureSet
++from threading import Event
++
++from sentry.utils.concurrent import FutureSet, ThreadedExecutor
+ 
+ 
+ def test_future_set_callback_success():
+@@ -67,3 +71,68 @@ def test_future_broken_callback():
+ 
+     assert callback.call_count == 1
+     assert callback.call_args == mock.call(future_set)
++
++
++def test_threaded_executor():
++    executor = ThreadedExecutor(worker_count=1, maxsize=2)
++
++    def waiter(ready, waiting, result):
++        ready.set()
++        waiting.wait()
++        return result
++
++    initial_ready = Event()
++    initial_waiting = Event()
++    initial_future = executor.submit(
++        lambda: waiter(initial_ready, initial_waiting, 1),
++        block=True,
++        timeout=1,
++    )
++
++    # wait until the worker has removed this item from the queue
++    assert initial_ready.wait(timeout=1), 'waiter not ready'
++    assert initial_future.running(), 'waiter did not get marked as started'
++
++    low_priority_ready = Event()
++    low_priority_waiting = Event()
++    low_priority_future = executor.submit(
++        lambda: waiter(low_priority_ready, low_priority_waiting, 2),
++        block=True,
++        timeout=1,
++        priority=10,
++    )
++    assert not low_priority_future.done(), 'future should not be done (indicative of a full queue)'
++
++    high_priority_ready = Event()
++    high_priority_waiting = Event()
++    high_priority_future = executor.submit(
++        lambda: waiter(high_priority_ready, high_priority_waiting, 3),
++        block=True,
++        timeout=1,
++        priority=0,
++    )
++    assert not high_priority_future.done(), 'future should not be done (indicative of a full queue)'
++
++    queue_full_future = executor.submit(lambda: None, block=False)
++    assert queue_full_future.done()
++    with pytest.raises(Full):
++        queue_full_future.result()  # will not block if completed
++
++    initial_waiting.set()  # let the task finish
++    assert initial_future.result(timeout=1) is 1
++    assert initial_future.done()
++
++    assert high_priority_ready.wait(timeout=1)  # this should be the next task to execute
++    assert high_priority_future.running()
++    assert not low_priority_future.running()
++
++    high_priority_waiting.set()  # let the task finish
++    assert high_priority_future.result(timeout=1) is 3
++    assert high_priority_future.done()
++
++    assert low_priority_ready.wait(timeout=1)  # this should be the next task to execute
++    assert low_priority_future.running()
++
++    low_priority_waiting.set()  # let the task finish
++    assert low_priority_future.result(timeout=1) is 2
++    assert low_priority_future.done()

@@ -1,0 +1,520 @@
+commit 095f7c806f5bd8f4fa1ab2cebe31ed03d32ab84e
+Author: Wes McKinney <wesmckinn@gmail.com>
+Date:   Tue Feb 7 15:58:50 2012 -0500
+
+    ENH: optimized Cython groupby routines for aggregating 2D blocks, added vbenchmark, GH #745
+
+diff --git a/RELEASE.rst b/RELEASE.rst
+index dc77cc56b..a1a9343bf 100644
+--- a/RELEASE.rst
++++ b/RELEASE.rst
+@@ -175,6 +175,8 @@ pandas 0.7.0
+   - Add option to Series.to_csv to omit the index (PR #684)
+   - Add ``delimiter`` as an alternative to ``sep`` in ``read_csv`` and other
+     parsing functions
++  - Substantially improved performance of groupby on DataFrames with many
++    columns by aggregating blocks of columns all at once (GH #745)
+ 
+ **Bug fixes**
+ 
+diff --git a/pandas/core/common.py b/pandas/core/common.py
+index e5aed4ef0..8ab5cefec 100644
+--- a/pandas/core/common.py
++++ b/pandas/core/common.py
+@@ -531,6 +531,28 @@ def is_float_dtype(arr_or_dtype):
+         tipo = arr_or_dtype.dtype.type
+     return issubclass(tipo, np.floating)
+ 
++
++def _ensure_float64(arr):
++    if arr.dtype != np.float64:
++        arr = arr.astype(np.float64)
++    return arr
++
++def _ensure_int64(arr):
++    if arr.dtype != np.int64:
++        arr = arr.astype(np.int64)
++    return arr
++
++def _ensure_int32(arr):
++    if arr.dtype != np.int32:
++        arr = arr.astype(np.int32)
++    return arr
++
++def _ensure_object(arr):
++    if arr.dtype != np.object_:
++        arr = arr.astype('O')
++    return arr
++
++
+ def save(obj, path):
+     """
+     Pickle (serialize) object to input file path
+diff --git a/pandas/core/groupby.py b/pandas/core/groupby.py
+index eff0ebb81..c32807c9d 100644
+--- a/pandas/core/groupby.py
++++ b/pandas/core/groupby.py
+@@ -6,7 +6,7 @@ import numpy as np
+ from pandas.core.frame import DataFrame
+ from pandas.core.generic import NDFrame
+ from pandas.core.index import Index, MultiIndex
+-from pandas.core.internals import BlockManager
++from pandas.core.internals import BlockManager, make_block
+ from pandas.core.series import Series
+ from pandas.core.panel import Panel
+ from pandas.util.decorators import cache_readonly, Appender
+@@ -156,7 +156,7 @@ class GroupBy(object):
+         return tuple(ping.ngroups for ping in self.groupings)
+ 
+     def __getattr__(self, attr):
+-        if hasattr(self.obj, attr):
++        if hasattr(self.obj, attr) and attr != '_cache':
+             return self._make_wrapper(attr)
+         raise AttributeError("'%s' object has no attribute '%s'" %
+                              (type(self).__name__, attr))
+@@ -352,9 +352,7 @@ class GroupBy(object):
+             if not issubclass(obj.dtype.type, (np.number, np.bool_)):
+                 continue
+ 
+-            if obj.dtype != np.float64:
+-                obj = obj.astype('f8')
+-
++            obj = com._ensure_float64(obj)
+             result, counts = cython_aggregate(obj, comp_ids,
+                                               max_group, how=how)
+             mask = counts > 0
+@@ -395,10 +393,7 @@ class GroupBy(object):
+     def _group_index(self):
+         result = get_group_index([ping.labels for ping in self.groupings],
+                                  self._group_shape)
+-
+-        if result.dtype != np.int64:  # pragma: no cover
+-            result = result.astype('i8')
+-        return result
++        return com._ensure_int64(result)
+ 
+     def _get_multi_index(self, mask, obs_ids):
+         masked = [labels for _, labels in
+@@ -642,9 +637,7 @@ class Grouping(object):
+         if self._was_factor:  # pragma: no cover
+             raise Exception('Should not call this method grouping by level')
+         else:
+-            values = self.grouper
+-            if values.dtype != np.object_:
+-                values = values.astype('O')
++            values = com._ensure_object(self.grouper)
+ 
+             # khash
+             rizer = lib.Factorizer(len(values))
+@@ -955,6 +948,73 @@ class DataFrameGroupBy(GroupBy):
+ 
+             yield val, slicer(val)
+ 
++
++    def _cython_agg_general(self, how):
++
++        group_index = self._group_index
++        comp_ids, obs_group_ids = _compress_group_index(group_index)
++        max_group = len(obs_group_ids)
++
++        obj = self._obj_with_exclusions
++        if self.axis == 1:
++            obj = obj.T
++
++        new_blocks = []
++
++        for block in obj._data.blocks:
++            values = block.values.T
++            if not issubclass(values.dtype.type, (np.number, np.bool_)):
++                continue
++
++            values = com._ensure_float64(values)
++            result, counts = cython_aggregate(values, comp_ids,
++                                              max_group, how=how)
++
++            mask = counts > 0
++            if len(mask) > 0:
++                result = result[mask]
++            newb = make_block(result.T, block.items, block.ref_items)
++            new_blocks.append(newb)
++
++        if len(new_blocks) == 0:
++            raise GroupByError('No numeric types to aggregate')
++
++        agg_axis = 0 if self.axis == 1 else 1
++        agg_labels = self._obj_with_exclusions._get_axis(agg_axis)
++
++        if sum(len(x.items) for x in new_blocks) == len(agg_labels):
++            output_keys = agg_labels
++        else:
++            output_keys = []
++            for b in new_blocks:
++                output_keys.extend(b.items)
++            try:
++                output_keys.sort()
++            except TypeError:  # pragma
++                pass
++
++            if isinstance(agg_labels, MultiIndex):
++                output_keys = MultiIndex.from_tuples(output_keys,
++                                                     names=agg_labels.names)
++
++        if not self.as_index:
++            index = np.arange(new_blocks[0].values.shape[1])
++            mgr = BlockManager(new_blocks, [output_keys, index])
++            result = DataFrame(mgr)
++            group_levels = self._get_group_levels(mask, obs_group_ids)
++            for i, (name, labels) in enumerate(group_levels):
++                result.insert(i, name, labels)
++            result = result.consolidate()
++        else:
++            index = self._get_multi_index(mask, obs_group_ids)
++            mgr = BlockManager(new_blocks, [output_keys, index])
++            result = DataFrame(mgr)
++
++        if self.axis == 1:
++            result = result.T
++
++        return result
++
+     @cache_readonly
+     def _obj_with_exclusions(self):
+         if self._column is not None:
+@@ -1282,8 +1342,9 @@ def generate_groups(data, group_index, ngroups, axis=0, factory=lambda x: x):
+     -------
+     generator
+     """
+-    indexer = lib.groupsort_indexer(group_index.astype('i4'),
+-                                    ngroups)[0]
++    group_index = com._ensure_int32(group_index)
++
++    indexer = lib.groupsort_indexer(group_index, ngroups)[0]
+     group_index = group_index.take(indexer)
+ 
+     if isinstance(data, BlockManager):
+@@ -1312,8 +1373,7 @@ def generate_groups(data, group_index, ngroups, axis=0, factory=lambda x: x):
+         def _get_slice(slob):
+             return sorted_data[slob]
+ 
+-    starts, ends = lib.generate_slices(group_index.astype('i4'),
+-                                       ngroups)
++    starts, ends = lib.generate_slices(group_index, ngroups)
+ 
+     for i, (start, end) in enumerate(zip(starts, ends)):
+         # Since I'm now compressing the group ids, it's now not "possible" to
+@@ -1385,14 +1445,27 @@ class _KeyMapper(object):
+ 
+ def cython_aggregate(values, group_index, ngroups, how='add'):
+     agg_func = _cython_functions[how]
++    if values.ndim == 1:
++        squeeze = True
++        values = values[:, None]
++        out_shape = (ngroups, 1)
++    else:
++        squeeze = False
++        out_shape = (ngroups, values.shape[1])
++
+     trans_func = _cython_transforms.get(how, lambda x: x)
+ 
+-    result = np.empty(ngroups, dtype=np.float64)
++    result = np.empty(out_shape, dtype=np.float64)
+     result.fill(np.nan)
+ 
+     counts = np.zeros(ngroups, dtype=np.int32)
++
+     agg_func(result, counts, values, group_index)
+     result = trans_func(result)
++
++    if squeeze:
++        result = result.squeeze()
++
+     return result, counts
+ 
+ _cython_functions = {
+diff --git a/pandas/src/groupby.pyx b/pandas/src/groupby.pyx
+index 87626e6cf..652f379b7 100644
+--- a/pandas/src/groupby.pyx
++++ b/pandas/src/groupby.pyx
+@@ -221,107 +221,166 @@ def groupsort_indexer(ndarray[int32_t] index, Py_ssize_t ngroups):
+ 
+ @cython.boundscheck(False)
+ @cython.wraparound(False)
+-def group_add(ndarray[float64_t] out,
++def group_add(ndarray[float64_t, ndim=2] out,
+               ndarray[int32_t] counts,
+-              ndarray[float64_t] values,
++              ndarray[float64_t, ndim=2] values,
+               ndarray[int32_t] labels):
++    '''
++    Only aggregates on axis=0
++    '''
+     cdef:
+-        Py_ssize_t i, lab
++        Py_ssize_t i, j, N, K, lab
+         float64_t val, count
+-        ndarray[float64_t] sumx, nobs
++        ndarray[float64_t, ndim=2] sumx, nobs
+ 
+     nobs = np.zeros_like(out)
+     sumx = np.zeros_like(out)
+ 
+-    for i in range(len(values)):
+-        lab = labels[i]
+-        if lab < 0:
+-            continue
++    N, K = (<object> values).shape
+ 
+-        counts[lab] += 1
+-        val = values[i]
++    if K > 1:
++        for i in range(N):
++            lab = labels[i]
++            if lab < 0:
++                continue
++
++            counts[lab] += 1
++            for j in range(K):
++                val = values[i, j]
+ 
+-        # not nan
+-        if val == val:
+-            nobs[lab] += 1
+-            sumx[lab] += val
++                # not nan
++                if val == val:
++                    nobs[lab, j] += 1
++                    sumx[lab, j] += val
++    else:
++        for i in range(N):
++            lab = labels[i]
++            if lab < 0:
++                continue
++
++            counts[lab] += 1
++            val = values[i, 0]
++
++            # not nan
++            if val == val:
++                nobs[lab, 0] += 1
++                sumx[lab, 0] += val
+ 
+     for i in range(len(counts)):
+-        if nobs[i] == 0:
+-            out[i] = nan
+-        else:
+-            out[i] = sumx[i]
++        for j in range(K):
++            if nobs[i, j] == 0:
++                out[i, j] = nan
++            else:
++                out[i, j] = sumx[i, j]
+ 
+ @cython.boundscheck(False)
+ @cython.wraparound(False)
+-def group_mean(ndarray[float64_t] out,
++def group_mean(ndarray[float64_t, ndim=2] out,
+                ndarray[int32_t] counts,
+-               ndarray[float64_t] values,
++               ndarray[float64_t, ndim=2] values,
+                ndarray[int32_t] labels):
+     cdef:
+-        Py_ssize_t i, lab
++        Py_ssize_t i, j, N, K, lab
+         float64_t val, count
+-        ndarray[float64_t] sumx, nobs
++        ndarray[float64_t, ndim=2] sumx, nobs
+ 
+     nobs = np.zeros_like(out)
+     sumx = np.zeros_like(out)
+ 
+-    for i in range(len(values)):
+-        lab = labels[i]
+-        if lab < 0:
+-            continue
++    N, K = (<object> values).shape
+ 
+-        val = values[i]
+-        counts[lab] += 1
++    if K > 1:
++        for i in range(N):
++            lab = labels[i]
++            if lab < 0:
++                continue
++
++            counts[lab] += 1
++            for j in range(K):
++                val = values[i, j]
++                # not nan
++                if val == val:
++                    nobs[lab, j] += 1
++                    sumx[lab, j] += val
++    else:
++        for i in range(N):
++            lab = labels[i]
++            if lab < 0:
++                continue
+ 
+-        # not nan
+-        if val == val:
+-            nobs[lab] += 1
+-            sumx[lab] += val
++            counts[lab] += 1
++            val = values[i, 0]
++            # not nan
++            if val == val:
++                nobs[lab, 0] += 1
++                sumx[lab, 0] += val
+ 
+     for i in range(len(counts)):
+-        count = nobs[i]
+-        if count == 0:
+-            out[i] = nan
+-        else:
+-            out[i] = sumx[i] / count
++        for j in range(K):
++            count = nobs[i, j]
++            if nobs[i, j] == 0:
++                out[i, j] = nan
++            else:
++                out[i, j] = sumx[i, j] / count
+ 
+ @cython.boundscheck(False)
+ @cython.wraparound(False)
+-def group_var(ndarray[float64_t] out,
++def group_var(ndarray[float64_t, ndim=2] out,
+               ndarray[int32_t] counts,
+-              ndarray[float64_t] values,
++              ndarray[float64_t, ndim=2] values,
+               ndarray[int32_t] labels):
+     cdef:
+-        Py_ssize_t i, lab
++        Py_ssize_t i, j, N, K, lab
+         float64_t val, ct
+-        ndarray[float64_t] nobs, sumx, sumxx
++        ndarray[float64_t, ndim=2] nobs, sumx, sumxx
+ 
+     nobs = np.zeros_like(out)
+     sumx = np.zeros_like(out)
+     sumxx = np.zeros_like(out)
+ 
+-    for i in range(len(values)):
+-        lab = <Py_ssize_t> labels[i]
+-        if lab < 0:
+-            continue
++    N, K = (<object> values).shape
+ 
+-        val = values[i]
+-        counts[lab] += 1
++    if K > 1:
++        for i in range(N):
++
++            lab = labels[i]
++            if lab < 0:
++                continue
++
++            counts[lab] += 1
++
++            for j in range(K):
++                val = values[i, j]
++
++                # not nan
++                if val == val:
++                    nobs[lab, j] += 1
++                    sumx[lab, j] += val
++                    sumxx[lab, j] += val * val
++    else:
++        for i in range(N):
++
++            lab = labels[i]
++            if lab < 0:
++                continue
++
++            counts[lab] += 1
++            val = values[i, 0]
++            # not nan
++            if val == val:
++                nobs[lab, 0] += 1
++                sumx[lab, 0] += val
++                sumxx[lab, 0] += val * val
+ 
+-        # not nan
+-        if val == val:
+-            nobs[lab] += 1
+-            sumx[lab] += val
+-            sumxx[lab] += val * val
+ 
+     for i in range(len(counts)):
+-        ct = nobs[i]
+-        if ct < 2:
+-            out[i] = nan
+-        else:
+-            out[i] = ((ct * sumxx[i] - sumx[i] * sumx[i]) /
+-                      (ct * ct - ct))
++        for j in range(K):
++            ct = nobs[i, j]
++            if ct < 2:
++                out[i, j] = nan
++            else:
++                out[i, j] = ((ct * sumxx[i, j] - sumx[i, j] * sumx[i, j]) /
++                             (ct * ct - ct))
+ 
+ def group_count(ndarray[int32_t] values, Py_ssize_t size):
+     cdef:
+diff --git a/pandas/src/reduce.pyx b/pandas/src/reduce.pyx
+index 6f595adf9..588cd1161 100644
+--- a/pandas/src/reduce.pyx
++++ b/pandas/src/reduce.pyx
+@@ -152,6 +152,8 @@ cdef class SeriesGrouper:
+ 
+                 if i == n - 1 or lab != labels[i + 1]:
+                     if lab == -1:
++                        islider.advance(group_size)
++                        vslider.advance(group_size)
+                         group_size = 0
+                         continue
+ 
+diff --git a/pandas/tests/test_tseries.py b/pandas/tests/test_tseries.py
+index 24798fd62..5f8f5c226 100644
+--- a/pandas/tests/test_tseries.py
++++ b/pandas/tests/test_tseries.py
+@@ -266,6 +266,22 @@ def test_arrmap():
+     result = lib.arrmap_object(values, lambda x: x in ['foo', 'bar'])
+     assert(result.dtype == np.bool_)
+ 
++def test_series_grouper():
++    from pandas import Series
++    obj = Series(np.random.randn(10))
++    dummy = obj[:0]
++
++    labels = np.array([-1, -1, -1, 0, 0, 0, 1, 1, 1, 1], dtype='i4')
++
++    grouper = lib.SeriesGrouper(obj, np.mean, labels, 2, dummy)
++    result, counts = grouper.get_result()
++
++    expected = np.array([obj[3:6].mean(), obj[6:].mean()])
++    assert_almost_equal(result, expected)
++
++    exp_counts = np.array([3, 4], dtype=np.int32)
++    assert_almost_equal(counts, exp_counts)
++
+ class TestTypeInference(unittest.TestCase):
+ 
+     def test_length_zero(self):
+diff --git a/vb_suite/groupby.py b/vb_suite/groupby.py
+index 5c507b9cf..974f01f79 100644
+--- a/vb_suite/groupby.py
++++ b/vb_suite/groupby.py
+@@ -47,3 +47,13 @@ groupby_series_simple_cython = \
+     Benchmark('simple_series.groupby(key1).sum()', setup,
+               start_date=datetime(2011, 3, 1))
+ 
++#----------------------------------------------------------------------
++# 2d grouping, aggregate many columns
++
++setup = common_setup + """
++labels = np.random.randint(0, 100, size=1000)
++df = DataFrame(randn(1000, 1000))
++"""
++
++groupby_frame_cython_many_columns = Benchmark('df.groupby(labels).sum()', setup,
++                                              start_date=datetime(2011, 8, 1))

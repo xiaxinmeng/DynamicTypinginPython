@@ -1,0 +1,706 @@
+commit 24744fbdab7a89b3deb9cc28edbb3d4d4622a384
+Author: Matt Robenolt <matt@ydekproductions.com>
+Date:   Mon Sep 24 19:38:33 2018 -0700
+
+    fix(security): Apply IP validation within urllib3
+    
+    This is being done in a pretty convoluted way, but there are a lot of
+    important bits here and a small amount of refactoring so the code can be
+    somewhat readible.
+    
+    The problem today is that the current BlacklistAdapter checked with
+    `is_safe_hostname` before passing along the hostname to `urllib3` to
+    make the connection. This means that it was possible for a DNS
+    resolution to successfully return "safe" IPs, then when handed off to
+    urllib3, it queried DNS again, yielding a potentially unsafe IP.
+    
+    This fixes it in the most minimal way and overriding urllib3's internal
+    mechanisms for DNS resolution. This starts now by changing
+    BlacklistAdapter's core purpose in life is to start the chain of
+    replacing the PoolManager, which in turn replaces every thing else that
+    cascades from this, resulting in a mixin which replaces the connection's
+    `_new_conn` method. Which allows swapping out the `create_connection`
+    function with our own which validates our DNS at the point of creating
+    the socket.
+    
+    The result of this is that requests now can't be spoofed by rebinding
+    DNS between the time it's checked and the time it's resolved when
+    creating the socket, so we can guarantee that a safe IP will yield a
+    safe socket. Another side effect is that requests will be slightly
+    faster since only 1 DNS lookup is now needed rather than 2.
+
+diff --git a/src/sentry/http.py b/src/sentry/http.py
+index 50b2f99536..3352beca93 100644
+--- a/src/sentry/http.py
++++ b/src/sentry/http.py
+@@ -7,23 +7,16 @@ sentry.utils.http
+ """
+ from __future__ import absolute_import
+ 
+-import sentry
+-
+-import ipaddress
+ import six
+-import socket
+-import requests
+ import warnings
+ import time
+ import logging
+-from ssl import wrap_socket
+ 
+ from sentry import options
+ from django.core.exceptions import SuspiciousOperation
+ from collections import namedtuple
+ from django.conf import settings
+-from requests.adapters import HTTPAdapter
+-from requests.exceptions import SSLError, RequestException, Timeout, ReadTimeout
++from requests.exceptions import RequestException, Timeout, ReadTimeout
+ from six.moves.urllib.parse import urlparse
+ 
+ from sentry.models import EventError
+@@ -32,6 +25,10 @@ from sentry.utils.cache import cache
+ from sentry.utils.hashlib import md5_text
+ from sentry.utils.strings import truncatechars
+ 
++# Importing for backwards compatible API
++from sentry.net.socket import safe_socket_connect, is_valid_url, is_safe_hostname  # NOQA
++from sentry.net.http import SafeSession
++
+ logger = logging.getLogger(__name__)
+ 
+ # TODO(dcramer): we want to change these to be constants so they are easier
+@@ -55,15 +52,6 @@ except ImportError:
+         pass
+ 
+ 
+-USER_AGENT = u'sentry/{version} (https://sentry.io)'.format(
+-    version=sentry.VERSION,
+-)
+-
+-DISALLOWED_IPS = {
+-    ipaddress.ip_network(six.text_type(i), strict=False) for i in settings.SENTRY_DISALLOWED_IPS
+-}
+-
+-
+ class BadSource(Exception):
+     error_type = EventError.UNKNOWN_ERROR
+ 
+@@ -83,103 +71,6 @@ def get_server_hostname():
+     return urlparse(options.get('system.url-prefix')).hostname
+ 
+ 
+-def is_valid_url(url):
+-    """
+-    Tests a URL to ensure it doesn't appear to be a blacklisted IP range.
+-    """
+-    return is_safe_hostname(urlparse(url).hostname)
+-
+-
+-def is_safe_hostname(hostname):
+-    """
+-    Tests a hostname to ensure it doesn't appear to be a blacklisted IP range.
+-    """
+-    # If we have no disallowed ips, we can skip any further validation
+-    # and there's no point in doing a DNS lookup to validate against
+-    # an empty list.
+-    if not DISALLOWED_IPS:
+-        return True
+-
+-    if not hostname:
+-        return False
+-
+-    server_hostname = get_server_hostname()
+-
+-    if hostname == server_hostname:
+-        return True
+-
+-    # NOTE: The use of `socket.gethostbyname` is slightly flawed.
+-    # `gethostbyname` doesn't handle octal IP addresses correctly, nor
+-    # does it fetch all of the IP addresses for the record.
+-    # `getaddrinfo` does the correct thing with octals here, and also returns all
+-    # ip addresses for the hostname.
+-    #
+-    # WARNING: This behavior is only correct on Linux. On OSX, `getaddrinfo` also
+-    # returns the wrong IP.
+-    #
+-    # The following should all technically resolve to `127.0.0.1`:
+-    # Python 2.7.11 Linux
+-    # >>> socket.gethostbyname('0177.0000.0000.0001')
+-    # '177.0.0.1'
+-    # >>> socket.getaddrinfo('0177.0000.0000.0001', 0)[0]
+-    # (2, 1, 6, '', ('127.0.0.1', 0))
+-    # Python 2.7.11 macOS
+-    # >>> socket.gethostbyname('0177.0000.0000.0001')
+-    # '177.0.0.1'
+-    # >>> socket.getaddrinfo('0177.0000.0000.0001', None)[0]
+-    # (2, 2, 17, '', ('177.0.0.1', 0))
+-    try:
+-        ip_addresses = set(addr for _, _, _, _, addr in socket.getaddrinfo(hostname, 0))
+-    except socket.gaierror:
+-        return False
+-
+-    for addr in ip_addresses:
+-        ip_address = addr[0]
+-        if ip_address == server_hostname:
+-            return True
+-
+-        ip_address = ipaddress.ip_address(six.text_type(ip_address))
+-        for ip_network in DISALLOWED_IPS:
+-            if ip_address in ip_network:
+-                return False
+-
+-    return True
+-
+-
+-class BlacklistAdapter(HTTPAdapter):
+-    def send(self, request, *args, **kwargs):
+-        if not is_valid_url(request.url):
+-            raise RestrictedIPAddress('%s matches the URL blacklist' % (request.url, ))
+-        return super(BlacklistAdapter, self).send(request, *args, **kwargs)
+-
+-
+-class Session(requests.Session):
+-    def request(self, *args, **kwargs):
+-        kwargs.setdefault('timeout', 30)
+-        try:
+-            response = requests.Session.request(self, *args, **kwargs)
+-        # Our version of requests does not transform ZeroReturnError into an
+-        # appropriately generically catchable exception
+-        except ZeroReturnError as exc:
+-            import sys
+-            exc_tb = sys.exc_info()[2]
+-            six.reraise(SSLError, exc, exc_tb)
+-            del exc_tb
+-        # requests' attempts to use chardet internally when no encoding is found
+-        # and we want to avoid that slow behavior
+-        if not response.encoding:
+-            response.encoding = 'utf-8'
+-        return response
+-
+-
+-class SafeSession(Session):
+-    def __init__(self):
+-        requests.Session.__init__(self)
+-        self.headers.update({'User-Agent': USER_AGENT})
+-        self.mount('https://', BlacklistAdapter())
+-        self.mount('http://', BlacklistAdapter())
+-
+-
+ build_session = SafeSession
+ 
+ 
+@@ -275,7 +166,7 @@ def fetch_file(
+ 
+     logger.debug('Fetching %r from the internet', url)
+ 
+-    http_session = build_session()
++    http_session = SafeSession()
+     response = None
+ 
+     try:
+@@ -374,18 +265,3 @@ def fetch_file(
+             response.close()
+ 
+     return UrlResult(url, result[0], result[1], result[2], result[3])
+-
+-
+-def safe_socket_connect(address, timeout=30, ssl=False):
+-    """
+-    Creates a socket and connects to address, but prevents connecting to
+-    our disallowed IP blocks.
+-    """
+-    if not is_safe_hostname(address[0]):
+-        raise RestrictedIPAddress('%s matches the hostname blacklist' % address[0])
+-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+-    s.settimeout(timeout)
+-    s.connect(address)
+-    if not ssl:
+-        return s
+-    return wrap_socket(s)
+diff --git a/src/sentry/lang/native/systemsymbols.py b/src/sentry/lang/native/systemsymbols.py
+index 6940fd6700..79b720c5f0 100644
+--- a/src/sentry/lang/native/systemsymbols.py
++++ b/src/sentry/lang/native/systemsymbols.py
+@@ -5,7 +5,7 @@ import logging
+ from requests.exceptions import RequestException
+ 
+ from sentry import options
+-from sentry.http import Session
++from sentry.net.http import Session
+ from sentry.lang.native.utils import sdk_info_to_sdk_id
+ 
+ MAX_ATTEMPTS = 3
+diff --git a/src/sentry/net/__init__.py b/src/sentry/net/__init__.py
+new file mode 100644
+index 0000000000..c3961685ab
+--- /dev/null
++++ b/src/sentry/net/__init__.py
+@@ -0,0 +1 @@
++from __future__ import absolute_import
+diff --git a/src/sentry/net/http.py b/src/sentry/net/http.py
+new file mode 100644
+index 0000000000..9ea7d1ae97
+--- /dev/null
++++ b/src/sentry/net/http.py
+@@ -0,0 +1,151 @@
++from __future__ import absolute_import
++
++from socket import error as SocketError, timeout as SocketTimeout
++
++from requests import Session as _Session
++from requests.adapters import HTTPAdapter, DEFAULT_POOLBLOCK
++from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
++from urllib3.connection import HTTPConnection, HTTPSConnection
++from urllib3.exceptions import NewConnectionError, ConnectTimeoutError
++from urllib3.poolmanager import PoolManager
++
++from sentry import VERSION as SENTRY_VERSION
++from sentry.net.socket import safe_create_connection
++
++
++class SafeConnectionMixin(object):
++    """
++    HACK(mattrobenolt): Most of this is yanked out of core urllib3
++    to override `_new_conn` with the ability to create our own socket.
++    """
++
++    # These `host` properties need rebound otherwise `self._dns_host` doesn't
++    # get set correctly.
++    @property
++    def host(self):
++        """
++        Getter method to remove any trailing dots that indicate the hostname is an FQDN.
++        In general, SSL certificates don't include the trailing dot indicating a
++        fully-qualified domain name, and thus, they don't validate properly when
++        checked against a domain name that includes the dot. In addition, some
++        servers may not expect to receive the trailing dot when provided.
++        However, the hostname with trailing dot is critical to DNS resolution; doing a
++        lookup with the trailing dot will properly only resolve the appropriate FQDN,
++        whereas a lookup without a trailing dot will search the system's search domain
++        list. Thus, it's important to keep the original host around for use only in
++        those cases where it's appropriate (i.e., when doing DNS lookup to establish the
++        actual TCP connection across which we're going to send HTTP requests).
++        """
++        return self._dns_host.rstrip('.')
++
++    @host.setter
++    def host(self, value):
++        """
++        Setter for the `host` property.
++        We assume that only urllib3 uses the _dns_host attribute; httplib itself
++        only uses `host`, and it seems reasonable that other libraries follow suit.
++        """
++        self._dns_host = value
++
++    # Mostly yanked from https://github.com/urllib3/urllib3/blob/1.22/urllib3/connection.py#L127
++    def _new_conn(self):
++        """ Establish a socket connection and set nodelay settings on it.
++        :return: New socket connection.
++        """
++        extra_kw = {}
++        if self.source_address:
++            extra_kw['source_address'] = self.source_address
++
++        if self.socket_options:
++            extra_kw['socket_options'] = self.socket_options
++
++        try:
++            # HACK(mattrobenolt): All of this is to replace this one line
++            # to establish our own connection.
++            conn = safe_create_connection(
++                (self._dns_host, self.port), self.timeout, **extra_kw)
++
++        except SocketTimeout as e:
++            raise ConnectTimeoutError(
++                self, "Connection to %s timed out. (connect timeout=%s)" %
++                (self.host, self.timeout))
++
++        except SocketError as e:
++            raise NewConnectionError(
++                self, "Failed to establish a new connection: %s" % e)
++
++        return conn
++
++
++class SafeHTTPConnection(SafeConnectionMixin, HTTPConnection):
++    pass
++
++
++class SafeHTTPSConnection(SafeConnectionMixin, HTTPSConnection):
++    pass
++
++
++class SafeHTTPConnectionPool(HTTPConnectionPool):
++    ConnectionCls = SafeHTTPConnection
++
++
++class SafeHTTPSConnectionPool(HTTPSConnectionPool):
++    ConnectionCls = SafeHTTPSConnection
++
++
++class SafePoolManager(PoolManager):
++    """
++    This custom PoolManager is needed to override
++    pool_classes_by_scheme which allows us to set which
++    ConnectionPool classes to create.
++    """
++
++    def __init__(self, *args, **kwargs):
++        PoolManager.__init__(self, *args, **kwargs)
++        self.pool_classes_by_scheme = {
++            'http': SafeHTTPConnectionPool,
++            'https': SafeHTTPSConnectionPool,
++        }
++
++
++class BlacklistAdapter(HTTPAdapter):
++    """
++    We need a custom HTTPAdapter to initialize our custom SafePoolManager
++    rather than the default PoolManager.
++    """
++
++    def init_poolmanager(self, connections, maxsize, block=DEFAULT_POOLBLOCK, **pool_kwargs):
++        self._pool_connections = connections
++        self._pool_maxsize = maxsize
++        self._pool_block = block
++        self.poolmanager = SafePoolManager(
++            num_pools=connections,
++            maxsize=maxsize,
++            block=block,
++            strict=True,
++            **pool_kwargs)
++
++
++USER_AGENT = u'sentry/{version} (https://sentry.io)'.format(
++    version=SENTRY_VERSION,
++)
++
++
++class Session(_Session):
++    def request(self, *args, **kwargs):
++        kwargs.setdefault('timeout', 30)
++        response = _Session.request(self, *args, **kwargs)
++        # requests' attempts to use chardet internally when no encoding is found
++        # and we want to avoid that slow behavior
++        if not response.encoding:
++            response.encoding = 'utf-8'
++        return response
++
++
++class SafeSession(Session):
++    def __init__(self):
++        Session.__init__(self)
++        self.headers.update({'User-Agent': USER_AGENT})
++        adapter = BlacklistAdapter()
++        self.mount('https://', adapter)
++        self.mount('http://', adapter)
+diff --git a/src/sentry/net/socket.py b/src/sentry/net/socket.py
+new file mode 100644
+index 0000000000..080be97e57
+--- /dev/null
++++ b/src/sentry/net/socket.py
+@@ -0,0 +1,138 @@
++from __future__ import absolute_import
++
++import six
++import ipaddress
++import socket
++from functools32 import lru_cache
++from ssl import wrap_socket
++from six.moves.urllib.parse import urlparse
++
++from django.conf import settings
++from urllib3.util.connection import allowed_gai_family, _set_socket_options
++
++from sentry.exceptions import RestrictedIPAddress
++
++
++DISALLOWED_IPS = frozenset(
++    ipaddress.ip_network(six.text_type(i), strict=False)
++    for i in settings.SENTRY_DISALLOWED_IPS
++)
++
++
++@lru_cache(maxsize=100)
++def is_ipaddress_allowed(ip):
++    """
++    Test if a given IP address is allowed or not
++    based on the DISALLOWED_IPS rules.
++    """
++    if not DISALLOWED_IPS:
++        return True
++    if isinstance(ip, six.binary_type):
++        ip = ip.decode()
++    ip_address = ipaddress.ip_address(ip)
++    for ip_network in DISALLOWED_IPS:
++        if ip_address in ip_network:
++            return False
++    return True
++
++
++def is_valid_url(url):
++    """
++    Tests a URL to ensure it doesn't appear to be a blacklisted IP range.
++    """
++    return is_safe_hostname(urlparse(url).hostname)
++
++
++def is_safe_hostname(hostname):
++    """
++    Tests a hostname to ensure it doesn't appear to be a blacklisted IP range.
++    """
++    # If we have no disallowed ips, we can skip any further validation
++    # and there's no point in doing a DNS lookup to validate against
++    # an empty list.
++    if not DISALLOWED_IPS:
++        return True
++
++    if not hostname:
++        return False
++
++    # Using the value from allowed_gai_family() in the context of getaddrinfo lets
++    # us select whether to work with IPv4 DNS records, IPv6 records, or both.
++    # The original create_connection function always returns all records.
++    family = allowed_gai_family()
++
++    try:
++        for _, _, _, _, address in socket.getaddrinfo(hostname, 0, family, socket.SOCK_STREAM):
++            # Only one bad apple will spoil the entire lookup, so be nice.
++            if not is_ipaddress_allowed(address[0]):
++                return False
++    except socket.gaierror:
++        # If we fail to resolve, automatically bad
++        return False
++
++    return True
++
++
++# Mostly yanked from https://github.com/urllib3/urllib3/blob/1.22/urllib3/util/connection.py#L36
++def safe_create_connection(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT,
++                           source_address=None, socket_options=None):
++    host, port = address
++    if host.startswith('['):
++        host = host.strip('[]')
++    err = None
++
++    # Using the value from allowed_gai_family() in the context of getaddrinfo lets
++    # us select whether to work with IPv4 DNS records, IPv6 records, or both.
++    # The original create_connection function always returns all records.
++    family = allowed_gai_family()
++
++    for res in socket.getaddrinfo(host, port, family, socket.SOCK_STREAM):
++        af, socktype, proto, canonname, sa = res
++
++        # HACK(mattrobenolt): This is the only code that diverges
++        ip = sa[0]
++        if not is_ipaddress_allowed(ip):
++            # I am explicitly choosing to be overly aggressive here. This means
++            # the first IP that matches that hits our restricted set of IP networks,
++            # we reject all records. In theory, there might be IP addresses that
++            # are safe, but if one record is straddling safe and unsafe IPs, it's
++            # suspicious.
++            if host == ip:
++                raise RestrictedIPAddress('(%s) matches the URL blacklist' % ip)
++            raise RestrictedIPAddress('(%s/%s) matches the URL blacklist' % (host, ip))
++
++        sock = None
++        try:
++            sock = socket.socket(af, socktype, proto)
++
++            # If provided, set socket level options before connecting.
++            _set_socket_options(sock, socket_options)
++
++            if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
++                sock.settimeout(timeout)
++            if source_address:
++                sock.bind(source_address)
++            sock.connect(sa)
++            return sock
++
++        except socket.error as e:
++            err = e
++            if sock is not None:
++                sock.close()
++                sock = None
++
++    if err is not None:
++        raise err
++
++    raise socket.error("getaddrinfo returns an empty list")
++
++
++def safe_socket_connect(address, timeout=30, ssl=False):
++    """
++    Creates a socket and connects to address, but prevents connecting to
++    our disallowed IP blocks.
++    """
++    sock = safe_create_connection(address, timeout)
++    if ssl:
++        sock = wrap_socket(sock)
++    return sock
+diff --git a/src/sentry/testutils/helpers/__init__.py b/src/sentry/testutils/helpers/__init__.py
+index f2f3433784..10803c4ae3 100644
+--- a/src/sentry/testutils/helpers/__init__.py
++++ b/src/sentry/testutils/helpers/__init__.py
+@@ -14,3 +14,4 @@ from .link_header import *  # NOQA
+ from .task_runner import *  # NOQA
+ from .options import *  # NOQA
+ from .query import *  # NOQA
++from .socket import *  # NOQA
+diff --git a/src/sentry/testutils/helpers/socket.py b/src/sentry/testutils/helpers/socket.py
+new file mode 100644
+index 0000000000..106711f90e
+--- /dev/null
++++ b/src/sentry/testutils/helpers/socket.py
+@@ -0,0 +1,20 @@
++from __future__ import absolute_import
++
++import six
++import ipaddress
++from sentry.net import socket as net_socket
++
++__all__ = ['override_blacklist']
++
++
++def override_blacklist(*ip_addresses):
++    def decorator(func):
++        def wrapper(*args, **kwargs):
++            disallowed_ips = frozenset(net_socket.DISALLOWED_IPS)
++            net_socket.DISALLOWED_IPS = frozenset(
++                ipaddress.ip_network(six.text_type(ip)) for ip in ip_addresses
++            )
++            func(*args, **kwargs)
++            net_socket.DISALLOWED_IPS = disallowed_ips
++        return wrapper
++    return decorator
+diff --git a/tests/sentry/net/__init__.py b/tests/sentry/net/__init__.py
+new file mode 100644
+index 0000000000..c3961685ab
+--- /dev/null
++++ b/tests/sentry/net/__init__.py
+@@ -0,0 +1 @@
++from __future__ import absolute_import
+diff --git a/tests/sentry/net/test_socket.py b/tests/sentry/net/test_socket.py
+new file mode 100644
+index 0000000000..ae550bc14a
+--- /dev/null
++++ b/tests/sentry/net/test_socket.py
+@@ -0,0 +1,35 @@
++from __future__ import absolute_import
++
++import pytest
++from mock import patch
++from django.core.exceptions import SuspiciousOperation
++
++from sentry.testutils import TestCase
++from sentry.testutils.helpers import override_blacklist
++
++from sentry.net.socket import (
++    is_ipaddress_allowed,
++    is_safe_hostname,
++    safe_socket_connect,
++)
++
++
++class SocketTest(TestCase):
++    @override_blacklist('10.0.0.0/8', '127.0.0.1')
++    def test_is_ipaddress_allowed(self):
++        assert is_ipaddress_allowed('127.0.0.1') is False
++        assert is_ipaddress_allowed('10.0.1.1') is False
++        assert is_ipaddress_allowed('1.1.1.1') is True
++
++    @override_blacklist('10.0.0.0/8', '127.0.0.1')
++    @patch('socket.getaddrinfo')
++    def test_is_safe_hostname(self, mock_getaddrinfo):
++        mock_getaddrinfo.return_value = [(2, 1, 6, '', ('81.0.0.1', 0))]
++        assert is_safe_hostname('example.com') is True
++        mock_getaddrinfo.return_value = [(2, 1, 6, '', ('127.0.0.1', 0))]
++        assert is_safe_hostname('example.com') is False
++
++    @override_blacklist('127.0.0.1')
++    def test_safe_socket_connect(self):
++        with pytest.raises(SuspiciousOperation):
++            safe_socket_connect(('127.0.0.1', 80))
+diff --git a/tests/sentry/test_http.py b/tests/sentry/test_http.py
+index 265537d142..8fa114b211 100644
+--- a/tests/sentry/test_http.py
++++ b/tests/sentry/test_http.py
+@@ -1,6 +1,5 @@
+ from __future__ import absolute_import
+ 
+-import ipaddress
+ import platform
+ import responses
+ import pytest
+@@ -8,22 +7,11 @@ import tempfile
+ 
+ from django.core.exceptions import SuspiciousOperation
+ from mock import patch
++from urllib3.util.connection import HAS_IPV6
+ 
+ from sentry import http
+ from sentry.testutils import TestCase
+-
+-
+-def stub_blacklist(ip_addresses):
+-    def decorator(func):
+-        def wrapper(*args, **kwargs):
+-            disallowed_ips = set(http.DISALLOWED_IPS)
+-            http.DISALLOWED_IPS = set(
+-                ipaddress.ip_network(ip) for ip in ip_addresses
+-            )
+-            func(*args, **kwargs)
+-            http.DISALLOWED_IPS = disallowed_ips
+-        return wrapper
+-    return decorator
++from sentry.testutils.helpers import override_blacklist
+ 
+ 
+ class HttpTest(TestCase):
+@@ -43,8 +31,8 @@ class HttpTest(TestCase):
+ 
+     # XXX(dcramer): we can't use responses here as it hooks Session.send
+     # @responses.activate
+-    @stub_blacklist([u'127.0.0.1', u'::1', u'10.0.0.0/8'])
+-    def test_ip_blacklist(self):
++    @override_blacklist('127.0.0.1', '::1', '10.0.0.0/8')
++    def test_ip_blacklist_ipv4(self):
+         with pytest.raises(SuspiciousOperation):
+             http.safe_urlopen('http://127.0.0.1')
+         with pytest.raises(SuspiciousOperation):
+@@ -52,21 +40,32 @@ class HttpTest(TestCase):
+         with pytest.raises(SuspiciousOperation):
+             # '2130706433' is dword for '127.0.0.1'
+             http.safe_urlopen('http://2130706433')
++
++    @pytest.mark.skipif(not HAS_IPV6, reason='needs ipv6')
++    @override_blacklist('::1')
++    def test_ip_blacklist_ipv6(self):
++        with pytest.raises(SuspiciousOperation):
++            http.safe_urlopen('http://[::1]')
++
++    @pytest.mark.skipif(HAS_IPV6, reason='stub for non-ipv6 systems')
++    @override_blacklist('::1')
++    @patch('socket.getaddrinfo')
++    def test_ip_blacklist_ipv6_fallback(self, mock_getaddrinfo):
++        mock_getaddrinfo.return_value = [(10, 1, 6, '', ('::1', 0, 0, 0))]
+         with pytest.raises(SuspiciousOperation):
+-            # ipv6
+             http.safe_urlopen('http://[::1]')
+ 
+     @pytest.mark.skipif(
+         platform.system() == 'Darwin',
+         reason='macOS is always broken, see comment in sentry/http.py'
+     )
+-    @stub_blacklist([u'127.0.0.1'])
++    @override_blacklist('127.0.0.1')
+     def test_garbage_ip(self):
+         with pytest.raises(SuspiciousOperation):
+             # '0177.0000.0000.0001' is an octal for '127.0.0.1'
+             http.safe_urlopen('http://0177.0000.0000.0001')
+ 
+-    @stub_blacklist([u'127.0.0.1'])
++    @override_blacklist('127.0.0.1')
+     def test_safe_socket_connect(self):
+         with pytest.raises(SuspiciousOperation):
+             http.safe_socket_connect(('127.0.0.1', 80))

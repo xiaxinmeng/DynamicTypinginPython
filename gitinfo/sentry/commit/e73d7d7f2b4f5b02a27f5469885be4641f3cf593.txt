@@ -1,0 +1,229 @@
+commit e73d7d7f2b4f5b02a27f5469885be4641f3cf593
+Author: Jan Michael Auer <jan.auer@sentry.io>
+Date:   Fri Feb 14 10:47:26 2020 +0100
+
+    ref(relay): Clean up project config generation and add a fast path (#17045)
+    
+    Contains some cleanup of the projectconfig endpoint and generation, along with a fast path for detecting disabled projects based on their visibility attribute.
+
+diff --git a/src/sentry/api/endpoints/relay_projectconfigs.py b/src/sentry/api/endpoints/relay_projectconfigs.py
+index 171d5bcaca..7ee340a3e6 100644
+--- a/src/sentry/api/endpoints/relay_projectconfigs.py
++++ b/src/sentry/api/endpoints/relay_projectconfigs.py
+@@ -12,7 +12,7 @@ from sentry.api.permissions import RelayPermission
+ from sentry.api.authentication import RelayAuthentication
+ from sentry.relay import config, projectconfig_cache
+ from sentry.models import Project, ProjectKey, Organization, OrganizationOption
+-from sentry.utils import metrics, json
++from sentry.utils import metrics
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -53,11 +53,8 @@ class RelayProjectConfigsEndpoint(Endpoint):
+             org_ids = set(project.organization_id for project in six.itervalues(projects))
+             if org_ids:
+                 with metrics.timer("relay_project_configs.fetching_orgs.duration"):
+-                    orgs = {
+-                        o.id: o
+-                        for o in Organization.objects.get_many_from_cache(org_ids)
+-                        if request.relay.has_org_access(o)
+-                    }
++                    orgs = Organization.objects.get_many_from_cache(org_ids)
++                    orgs = {o.id: o for o in orgs if request.relay.has_org_access(o)}
+             else:
+                 orgs = {}
+             org_options = {
+@@ -89,28 +86,16 @@ class RelayProjectConfigsEndpoint(Endpoint):
+             project.organization = organization
+             project._organization_cache = organization
+ 
+-            org_opts = org_options.get(organization.id) or {}
+-
+             with Hub.current.start_span(op="get_config"):
+                 with metrics.timer("relay_project_configs.get_config.duration"):
+                     project_config = config.get_project_config(
+                         project,
+-                        org_options=org_opts,
++                        org_options=org_options.get(organization.id) or {},
+                         full_config=full_config_requested,
+-                        project_keys=project_keys.get(project.id, []),
++                        project_keys=project_keys.get(project.id) or [],
+                     )
+ 
+-            configs[six.text_type(project_id)] = serialized_config = project_config.to_dict()
+-
+-            config_size = len(json.dumps(serialized_config))
+-            metrics.timing("relay_project_configs.config_size", config_size)
+-
+-            # Log if we see huge project configs
+-            if config_size >= PROJECT_CONFIG_SIZE_THRESHOLD:
+-                logger.info(
+-                    "relay.project_config.huge_config",
+-                    extra={"project_id": project_id, "size": config_size},
+-                )
++            configs[six.text_type(project_id)] = project_config.to_dict()
+ 
+         if full_config_requested:
+             projectconfig_cache.set_many(configs)
+diff --git a/src/sentry/relay/config.py b/src/sentry/relay/config.py
+index 51fade3937..d25d2842f2 100644
+--- a/src/sentry/relay/config.py
++++ b/src/sentry/relay/config.py
+@@ -8,11 +8,11 @@ from sentry_sdk import Hub
+ from datetime import datetime
+ from pytz import utc
+ 
++from sentry import quotas, utils
++from sentry.constants import ObjectStatus
+ from sentry.grouping.api import get_grouping_config_dict_for_project
+ from sentry.interfaces.security import DEFAULT_DISALLOWED_SOURCES
+ from sentry.message_filters import get_all_filters
+-from sentry import quotas, utils
+-
+ from sentry.models.organizationoption import OrganizationOption
+ from sentry.utils.data_filters import FilterTypes, FilterStatKeys, get_filter_key
+ from sentry.utils.http import get_origins
+@@ -25,6 +25,51 @@ def get_project_key_config(project_key):
+     return {"dsn": project_key.dsn_public}
+ 
+ 
++def get_public_key_configs(project, full_config, project_keys=None):
++    public_keys = []
++
++    for project_key in project_keys or ():
++        key = {"publicKey": project_key.public_key, "isEnabled": project_key.status == 0}
++
++        if full_config:
++            key["quotas"] = [q.to_json() for q in quotas.get_quotas(project, key=project_key)]
++            key["numericId"] = project_key.id
++
++        public_keys.append(key)
++
++    return public_keys
++
++
++def get_filter_settings(project):
++    filter_settings = {}
++
++    for flt in get_all_filters():
++        filter_id = get_filter_key(flt)
++        settings = _load_filter_settings(flt, project)
++        filter_settings[filter_id] = settings
++
++    invalid_releases = project.get_option(u"sentry:{}".format(FilterTypes.RELEASES))
++    if invalid_releases:
++        filter_settings["releases"] = {"releases": invalid_releases}
++
++    blacklisted_ips = project.get_option("sentry:blacklisted_ips")
++    if blacklisted_ips:
++        filter_settings["clientIps"] = {"blacklistedIps": blacklisted_ips}
++
++    error_messages = project.get_option(u"sentry:{}".format(FilterTypes.ERROR_MESSAGES))
++    if error_messages:
++        filter_settings["errorMessages"] = {"patterns": error_messages}
++
++    csp_disallowed_sources = []
++    if bool(project.get_option("sentry:csp_ignored_sources_defaults", True)):
++        csp_disallowed_sources += DEFAULT_DISALLOWED_SOURCES
++    csp_disallowed_sources += project.get_option("sentry:csp_ignored_sources", [])
++    if csp_disallowed_sources:
++        filter_settings["csp"] = {"disallowedSources": csp_disallowed_sources}
++
++    return filter_settings
++
++
+ def get_project_config(project, org_options=None, full_config=True, project_keys=None):
+     """
+     Constructs the ProjectConfig information.
+@@ -47,27 +92,18 @@ def get_project_config(project, org_options=None, full_config=True, project_keys
+     with configure_scope() as scope:
+         scope.set_tag("project", project.id)
+ 
+-    public_keys = []
++    if project.status != ObjectStatus.VISIBLE:
++        return {"disabled": True}
+ 
+-    for project_key in project_keys or ():
+-        key = {"publicKey": project_key.public_key, "isEnabled": project_key.status == 0}
+-        if full_config:
+-            key["numericId"] = project_key.id
+-
+-            key["quotas"] = [
+-                quota.to_json() for quota in quotas.get_quotas(project, key=project_key)
+-            ]
+-        public_keys.append(key)
+-
+-    now = datetime.utcnow().replace(tzinfo=utc)
++    public_keys = get_public_key_configs(project, full_config, project_keys=project_keys)
+ 
+     if org_options is None:
+         org_options = OrganizationOption.objects.get_all_values(project.organization_id)
+ 
+     with Hub.current.start_span(op="get_public_config"):
+-
++        now = datetime.utcnow().replace(tzinfo=utc)
+         cfg = {
+-            "disabled": project.status > 0,
++            "disabled": False,
+             "slug": project.slug,
+             "lastFetch": now,
+             "lastChange": project.get_option("sentry:relay-rev-lastchange", now),
+@@ -90,42 +126,12 @@ def get_project_config(project, org_options=None, full_config=True, project_keys
+     # internally. Do not expose it to external Relays.
+     cfg["organizationId"] = project.organization_id
+ 
+-    project_cfg = cfg["config"]
+-
+     with Hub.current.start_span(op="get_filter_settings"):
+-        # get the filter settings for this project
+-        filter_settings = {}
+-        project_cfg["filterSettings"] = filter_settings
+-
+-        for flt in get_all_filters():
+-            filter_id = get_filter_key(flt)
+-            settings = _load_filter_settings(flt, project)
+-            filter_settings[filter_id] = settings
+-
+-        invalid_releases = project.get_option(u"sentry:{}".format(FilterTypes.RELEASES))
+-        if invalid_releases:
+-            filter_settings["releases"] = {"releases": invalid_releases}
+-
+-        blacklisted_ips = project.get_option("sentry:blacklisted_ips")
+-        if blacklisted_ips:
+-            filter_settings["clientIps"] = {"blacklistedIps": blacklisted_ips}
+-
+-        error_messages = project.get_option(u"sentry:{}".format(FilterTypes.ERROR_MESSAGES))
+-        if error_messages:
+-            filter_settings["errorMessages"] = {"patterns": error_messages}
+-
+-        csp_disallowed_sources = []
+-        if bool(project.get_option("sentry:csp_ignored_sources_defaults", True)):
+-            csp_disallowed_sources += DEFAULT_DISALLOWED_SOURCES
+-        csp_disallowed_sources += project.get_option("sentry:csp_ignored_sources", [])
+-        if csp_disallowed_sources:
+-            filter_settings["csp"] = {"disallowedSources": csp_disallowed_sources}
+-
++        cfg["config"]["filterSettings"] = get_filter_settings(project)
+     with Hub.current.start_span(op="get_grouping_config_dict_for_project"):
+-        project_cfg["groupingConfig"] = get_grouping_config_dict_for_project(project)
+-
++        cfg["config"]["groupingConfig"] = get_grouping_config_dict_for_project(project)
+     with Hub.current.start_span(op="get_event_retention"):
+-        project_cfg["eventRetention"] = quotas.get_event_retention(project.organization)
++        cfg["config"]["eventRetention"] = quotas.get_event_retention(project.organization)
+ 
+     return ProjectConfig(project, **cfg)
+ 
+diff --git a/src/sentry/web/api.py b/src/sentry/web/api.py
+index 451397f8e9..61bbebf2db 100644
+--- a/src/sentry/web/api.py
++++ b/src/sentry/web/api.py
+@@ -424,6 +424,8 @@ class APIView(BaseView):
+             # implicitly fetched from database.
+             project.organization = Organization.objects.get_from_cache(id=project.organization_id)
+ 
++            # XXX: This never returns a disabled project since visibility of the
++            # project is already verified in `_get_project_from_id`.
+             project_config = get_project_config(project)
+ 
+             helper.context.bind_project(project_config.project)

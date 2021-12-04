@@ -1,0 +1,1518 @@
+commit 40665022a823eb2e2d934f8b5b0e4b8ad1a78aba
+Author: Chris Fuller <cfuller@sentry.io>
+Date:   Mon Jan 6 10:03:42 2020 -0500
+
+    ref(search): Refactor issue search backend (#15972)
+    
+    * Refactor into queryexecutor composition method
+    
+    * Moving executors to its own file
+    
+    * Renaming SnubaSearchBackend to EventsDatasetSnubaSearchBackend
+    
+    * Moving first_release version->id translation into query so we can short circuit snuba queries on no match
+    
+    * Adding in parameters for abstract method interface
+
+diff --git a/src/sentry/api/endpoints/organization_group_index.py b/src/sentry/api/endpoints/organization_group_index.py
+index 12ce4fa66e..71d35d2610 100644
+--- a/src/sentry/api/endpoints/organization_group_index.py
++++ b/src/sentry/api/endpoints/organization_group_index.py
+@@ -21,13 +21,13 @@ from sentry.api.serializers import serialize
+ from sentry.api.serializers.models.group import StreamGroupSerializerSnuba
+ from sentry.api.utils import get_date_range_from_params, InvalidParams
+ from sentry.models import Group, GroupStatus
+-from sentry.search.snuba.backend import SnubaSearchBackend
++from sentry.search.snuba.backend import EventsDatasetSnubaSearchBackend
+ from sentry.utils.validators import normalize_event_id
+ 
+ ERR_INVALID_STATS_PERIOD = "Invalid stats_period. Valid choices are '', '24h', and '14d'"
+ 
+ 
+-search = SnubaSearchBackend(**settings.SENTRY_SEARCH_OPTIONS)
++search = EventsDatasetSnubaSearchBackend(**settings.SENTRY_SEARCH_OPTIONS)
+ 
+ 
+ class OrganizationGroupIndexEndpoint(OrganizationEventsEndpointBase):
+diff --git a/src/sentry/conf/server.py b/src/sentry/conf/server.py
+index 7baa8fa9fa..568d06feeb 100644
+--- a/src/sentry/conf/server.py
++++ b/src/sentry/conf/server.py
+@@ -1049,7 +1049,9 @@ SENTRY_TAGSTORE = os.environ.get("SENTRY_TAGSTORE", "sentry.tagstore.snuba.Snuba
+ SENTRY_TAGSTORE_OPTIONS = {}
+ 
+ # Search backend
+-SENTRY_SEARCH = os.environ.get("SENTRY_SEARCH", "sentry.search.snuba.SnubaSearchBackend")
++SENTRY_SEARCH = os.environ.get(
++    "SENTRY_SEARCH", "sentry.search.snuba.EventsDatasetSnubaSearchBackend"
++)
+ SENTRY_SEARCH_OPTIONS = {}
+ # SENTRY_SEARCH_OPTIONS = {
+ #     'urls': ['http://localhost:9200/'],
+diff --git a/src/sentry/runner/initializer.py b/src/sentry/runner/initializer.py
+index d1810c2740..394bbef6d5 100644
+--- a/src/sentry/runner/initializer.py
++++ b/src/sentry/runner/initializer.py
+@@ -570,7 +570,7 @@ def validate_snuba():
+         return
+ 
+     has_all_snuba_required_backends = (
+-        settings.SENTRY_SEARCH == "sentry.search.snuba.SnubaSearchBackend"
++        settings.SENTRY_SEARCH == "sentry.search.snuba.EventsDatasetSnubaSearchBackend"
+         and settings.SENTRY_TAGSTORE == "sentry.tagstore.snuba.SnubaTagStorage"
+         and
+         # TODO(mattrobenolt): Remove ServiceDelegator check
+diff --git a/src/sentry/search/snuba/backend.py b/src/sentry/search/snuba/backend.py
+index 8e407117e9..7f561c59a7 100644
+--- a/src/sentry/search/snuba/backend.py
++++ b/src/sentry/search/snuba/backend.py
+@@ -1,6 +1,8 @@
+ from __future__ import absolute_import
+ 
++from abc import ABCMeta, abstractmethod
+ import functools
++import six
+ from datetime import timedelta
+ 
+ from django.db.models import Q
+@@ -8,48 +10,10 @@ from django.utils import timezone
+ 
+ from sentry import quotas
+ from sentry.api.event_search import InvalidSearchQuery
+-from sentry.api.paginator import Paginator
+-from sentry.models import Group, Release, GroupEnvironment
++from sentry.models import Release, GroupEnvironment, Group, GroupStatus, GroupSubscription
+ from sentry.search.base import SearchBackend
+ from sentry.search.snuba.executors import PostgresSnubaQueryExecutor
+ 
+-datetime_format = "%Y-%m-%dT%H:%M:%S+00:00"
+-
+-EMPTY_RESULT = Paginator(Group.objects.none()).get_result()
+-
+-# mapping from query parameter sort name to underlying scoring aggregation name
+-sort_strategies = {
+-    "date": "last_seen",
+-    "freq": "times_seen",
+-    "new": "first_seen",
+-    "priority": "priority",
+-}
+-
+-dependency_aggregations = {"priority": ["last_seen", "times_seen"]}
+-
+-aggregation_defs = {
+-    "times_seen": ["count()", ""],
+-    "first_seen": ["multiply(toUInt64(min(timestamp)), 1000)", ""],
+-    "last_seen": ["multiply(toUInt64(max(timestamp)), 1000)", ""],
+-    # https://github.com/getsentry/sentry/blob/804c85100d0003cfdda91701911f21ed5f66f67c/src/sentry/event_manager.py#L241-L271
+-    "priority": ["toUInt64(plus(multiply(log(times_seen), 600), last_seen))", ""],
+-    # Only makes sense with WITH TOTALS, returns 1 for an individual group.
+-    "total": ["uniq", "group_id"],
+-}
+-issue_only_fields = set(
+-    [
+-        "query",
+-        "status",
+-        "bookmarked_by",
+-        "assigned_to",
+-        "unassigned",
+-        "subscribed_by",
+-        "active_at",
+-        "first_release",
+-        "first_seen",
+-    ]
+-)
+-
+ 
+ def assigned_to_filter(actor, projects):
+     from sentry.models import OrganizationMember, OrganizationMemberTeam, Team
+@@ -153,7 +117,8 @@ class QuerySetBuilder(object):
+         return queryset
+ 
+ 
+-class SnubaSearchBackend(SearchBackend):
++@six.add_metaclass(ABCMeta)
++class SnubaSearchBackendBase(SearchBackend):
+     def query(
+         self,
+         projects,
+@@ -167,8 +132,6 @@ class SnubaSearchBackend(SearchBackend):
+         date_from=None,
+         date_to=None,
+     ):
+-        from sentry.models import Group, GroupStatus, GroupSubscription
+-
+         search_filters = search_filters if search_filters is not None else []
+ 
+         # ensure projects are from same org
+@@ -178,6 +141,67 @@ class SnubaSearchBackend(SearchBackend):
+         if paginator_options is None:
+             paginator_options = {}
+ 
++        # filter out groups which are beyond the retention period
++        retention = quotas.get_event_retention(organization=projects[0].organization)
++        if retention:
++            retention_window_start = timezone.now() - timedelta(days=retention)
++        else:
++            retention_window_start = None
++
++        group_queryset = self._build_group_queryset(
++            projects=projects,
++            environments=environments,
++            search_filters=search_filters,
++            retention_window_start=retention_window_start,
++            date_from=date_from,
++            date_to=date_to,
++        )
++
++        query_executor = self._get_query_executor(
++            group_queryset=group_queryset,
++            projects=projects,
++            environments=environments,
++            search_filters=search_filters,
++            date_from=date_from,
++            date_to=date_to,
++        )
++
++        return query_executor.query(
++            projects=projects,
++            retention_window_start=retention_window_start,
++            group_queryset=group_queryset,
++            environments=environments,
++            sort_by=sort_by,
++            limit=limit,
++            cursor=cursor,
++            count_hits=count_hits,
++            paginator_options=paginator_options,
++            search_filters=search_filters,
++            date_from=date_from,
++            date_to=date_to,
++        )
++
++    def _build_group_queryset(
++        self, projects, environments, search_filters, retention_window_start, *args, **kwargs
++    ):
++        """This method should return a QuerySet of the Group model.
++        How you implement it is up to you, but we generally take in the various search parameters
++        and filter Group's down using the field's we want to query on in Postgres."""
++
++        group_queryset = self._initialize_group_queryset(
++            projects, environments, retention_window_start, search_filters
++        )
++        qs_builder_conditions = self._get_queryset_conditions(
++            projects, environments, search_filters
++        )
++        group_queryset = QuerySetBuilder(qs_builder_conditions).build(
++            group_queryset, search_filters
++        )
++        return group_queryset
++
++    def _initialize_group_queryset(
++        self, projects, environments, retention_window_start, search_filters
++    ):
+         group_queryset = Group.objects.filter(project__in=projects).exclude(
+             status__in=[
+                 GroupStatus.PENDING_DELETION,
+@@ -186,7 +210,36 @@ class SnubaSearchBackend(SearchBackend):
+             ]
+         )
+ 
+-        qs_builder_conditions = {
++        if retention_window_start:
++            group_queryset = group_queryset.filter(last_seen__gte=retention_window_start)
++
++        if environments is not None:
++            environment_ids = [environment.id for environment in environments]
++            group_queryset = group_queryset.filter(
++                groupenvironment__environment_id__in=environment_ids
++            )
++        return group_queryset
++
++    @abstractmethod
++    def _get_queryset_conditions(self, projects, environments, search_filters):
++        """This method should return a dict of query set fields and a "Condition" to apply on that field."""
++        raise NotImplementedError
++
++    @abstractmethod
++    def _get_query_executor(
++        self, group_queryset, projects, environments, search_filters, date_from, date_to
++    ):
++        """This method should return an implementation of the AbstractQueryExecutor
++        We will end up calling .query() on the class returned by this method"""
++        raise NotImplementedError
++
++
++class EventsDatasetSnubaSearchBackend(SnubaSearchBackendBase):
++    def _get_query_executor(self, *args, **kwargs):
++        return PostgresSnubaQueryExecutor()
++
++    def _get_queryset_conditions(self, projects, environments, search_filters):
++        queryset_conditions = {
+             "status": QCallbackCondition(lambda status: Q(status=status)),
+             "bookmarked_by": QCallbackCondition(
+                 lambda user: Q(bookmark_set__project__in=projects, bookmark_set__user=user)
+@@ -207,29 +260,9 @@ class SnubaSearchBackend(SearchBackend):
+             "active_at": ScalarCondition("active_at"),
+         }
+ 
+-        group_queryset = QuerySetBuilder(qs_builder_conditions).build(
+-            group_queryset, search_filters
+-        )
+-        # filter out groups which are beyond the retention period
+-        retention = quotas.get_event_retention(organization=projects[0].organization)
+-        if retention:
+-            retention_window_start = timezone.now() - timedelta(days=retention)
+-        else:
+-            retention_window_start = None
+-        # TODO: This could be optimized when building querysets to identify
+-        # criteria that are logically impossible (e.g. if the upper bound
+-        # for last seen is before the retention window starts, no results
+-        # exist.)
+-        if retention_window_start:
+-            group_queryset = group_queryset.filter(last_seen__gte=retention_window_start)
+-
+-        # TODO: It's possible `first_release` could be handled by Snuba.
+         if environments is not None:
+             environment_ids = [environment.id for environment in environments]
+-            group_queryset = group_queryset.filter(
+-                groupenvironment__environment_id__in=environment_ids
+-            )
+-            group_queryset = QuerySetBuilder(
++            queryset_conditions.update(
+                 {
+                     "first_release": QCallbackCondition(
+                         lambda version: Q(
+@@ -247,9 +280,9 @@ class SnubaSearchBackend(SearchBackend):
+                         {"groupenvironment__environment_id__in": environment_ids},
+                     ),
+                 }
+-            ).build(group_queryset, search_filters)
++            )
+         else:
+-            group_queryset = QuerySetBuilder(
++            queryset_conditions.update(
+                 {
+                     "first_release": QCallbackCondition(
+                         lambda release_version: Q(
+@@ -276,26 +309,13 @@ class SnubaSearchBackend(SearchBackend):
+                     ),
+                     "first_seen": ScalarCondition("first_seen"),
+                 }
+-            ).build(group_queryset, search_filters)
+-
+-        query_executor = PostgresSnubaQueryExecutor()
++            )
++        return queryset_conditions
+ 
+-        return query_executor.query(
+-            projects,
+-            retention_window_start,
+-            group_queryset,
+-            environments,
+-            sort_by,
+-            limit,
+-            cursor,
+-            count_hits,
+-            paginator_options,
+-            search_filters,
+-            date_from,
+-            date_to,
+-        )
+ 
++class SnubaSearchBackend(EventsDatasetSnubaSearchBackend):
++    """ IMPORTANT!!! Retaining backwards compatible for getsentry while we rename this class.
++    We will deploy with `SnubaSearchBackend` pointing to `EventsDatasetSnubaSearchBackend`, and then deploy getsentry to use `EventsDatasetSnubaSearchBackend`
++    and then delete this class."""
+ 
+-# This class will have logic to use the groups dataset, and to also determine which QueryBackend to use.
+-class SnubaGroupsSearchBackend(SearchBackend):
+     pass
+diff --git a/src/sentry/search/snuba/executors.py b/src/sentry/search/snuba/executors.py
+index 97f6be90b6..43fa588f8b 100644
+--- a/src/sentry/search/snuba/executors.py
++++ b/src/sentry/search/snuba/executors.py
+@@ -1,5 +1,10 @@
+ from __future__ import absolute_import
++
++from abc import ABCMeta, abstractmethod, abstractproperty
++
++import logging
+ import time
++import six
+ from datetime import timedelta
+ from hashlib import md5
+ 
+@@ -11,43 +16,6 @@ from sentry.api.paginator import DateTimePaginator, SequencePaginator, Paginator
+ from sentry.constants import ALLOWED_FUTURE_DELTA
+ from sentry.models import Group
+ from sentry.utils import snuba, metrics
+-from sentry.snuba.dataset import Dataset
+-
+-
+-EMPTY_RESULT = Paginator(Group.objects.none()).get_result()
+-
+-# mapping from query parameter sort name to underlying scoring aggregation name
+-sort_strategies = {
+-    "date": "last_seen",
+-    "freq": "times_seen",
+-    "new": "first_seen",
+-    "priority": "priority",
+-}
+-
+-dependency_aggregations = {"priority": ["last_seen", "times_seen"]}
+-
+-aggregation_defs = {
+-    "times_seen": ["count()", ""],
+-    "first_seen": ["multiply(toUInt64(min(timestamp)), 1000)", ""],
+-    "last_seen": ["multiply(toUInt64(max(timestamp)), 1000)", ""],
+-    # https://github.com/getsentry/sentry/blob/804c85100d0003cfdda91701911f21ed5f66f67c/src/sentry/event_manager.py#L241-L271
+-    "priority": ["toUInt64(plus(multiply(log(times_seen), 600), last_seen))", ""],
+-    # Only makes sense with WITH TOTALS, returns 1 for an individual group.
+-    "total": ["uniq", "group_id"],
+-}
+-issue_only_fields = set(
+-    [
+-        "query",
+-        "status",
+-        "bookmarked_by",
+-        "assigned_to",
+-        "unassigned",
+-        "subscribed_by",
+-        "active_at",
+-        "first_release",
+-        "first_seen",
+-    ]
+-)
+ 
+ 
+ def get_search_filter(search_filters, name, operator):
+@@ -71,6 +39,7 @@ def get_search_filter(search_filters, name, operator):
+     return found_val
+ 
+ 
++@six.add_metaclass(ABCMeta)
+ class AbstractQueryExecutor:
+     """This class serves as a template for Query Executors.
+     We subclass it in order to implement query methods (we use it to implement two classes: joined Postgres+Snuba queries, and Snuba only queries)
+@@ -78,6 +47,33 @@ class AbstractQueryExecutor:
+     which can now just build query parameters and use the appropriate query executor to run the query
+     """
+ 
++    TABLE_ALIAS = ""
++
++    @abstractproperty
++    def aggregation_defs(self):
++        """This method should return a dict of key:value
++        where key is a field name for your aggregation
++        and value is the aggregation function"""
++        raise NotImplementedError
++
++    @abstractproperty
++    def dependency_aggregations(self):
++        """This method should return a dict of key:value
++        where key is an aggregation_def field name
++        and value is a list of aggregation field names that the 'key' aggregation requires."""
++        raise NotImplementedError
++
++    @property
++    def empty_result(self):
++        return Paginator(Group.objects.none()).get_result()
++
++    @property
++    @abstractmethod
++    def dataset(self):
++        """"This function should return an enum from snuba.Dataset (like snuba.Dataset.Events)"""
++        raise NotImplementedError
++
++    @abstractmethod
+     def query(
+         self,
+         projects,
+@@ -93,112 +89,167 @@ class AbstractQueryExecutor:
+         date_from,
+         date_to,
+     ):
++        """This function runs your actual query and returns the results
++        We usually return a paginator object, which contains the results and the number of hits"""
+         raise NotImplementedError
+ 
++    def snuba_search(
++        self,
++        start,
++        end,
++        project_ids,
++        environment_ids,
++        sort_field,
++        cursor=None,
++        group_ids=None,
++        limit=None,
++        offset=0,
++        get_sample=False,
++        search_filters=None,
++    ):
++        """
++        Returns a tuple of:
++        * a sorted list of (group_id, group_score) tuples sorted descending by score,
++        * the count of total results (rows) available for this query.
++        """
+ 
+-def snuba_search(
+-    start,
+-    end,
+-    project_ids,
+-    environment_ids,
+-    sort_field,
+-    cursor=None,
+-    candidate_ids=None,
+-    limit=None,
+-    offset=0,
+-    get_sample=False,
+-    search_filters=None,
+-):
+-    """
+-    This function doesn't strictly benefit from or require being pulled out of the main
+-    query method above, but the query method is already large and this function at least
+-    extracts most of the Snuba-specific logic.
+-
+-    Returns a tuple of:
+-     * a sorted list of (group_id, group_score) tuples sorted descending by score,
+-     * the count of total results (rows) available for this query.
+-    """
+-    filters = {"project_id": project_ids}
++        filters = {"project_id": project_ids}
+ 
+-    if environment_ids is not None:
+-        filters["environment"] = environment_ids
++        if environment_ids is not None:
++            filters["environment"] = environment_ids
+ 
+-    if candidate_ids:
+-        filters["group_id"] = sorted(candidate_ids)
++        if group_ids:
++            filters["group_id"] = sorted(group_ids)
+ 
+-    conditions = []
+-    having = []
+-    for search_filter in search_filters:
+-        if (
+-            # Don't filter on issue fields here, they're not available
+-            search_filter.key.name in issue_only_fields
+-            or
+-            # We special case date
+-            search_filter.key.name == "date"
+-        ):
+-            continue
+-        converted_filter = convert_search_filter_to_snuba_query(search_filter)
+-
+-        # Ensure that no user-generated tags that clashes with aggregation_defs is added to having
+-        if search_filter.key.name in aggregation_defs and not search_filter.key.is_tag:
+-            having.append(converted_filter)
++        conditions = []
++        having = []
++        for search_filter in search_filters:
++            if (
++                # Don't filter on postgres fields here, they're not available
++                search_filter.key.name in self.postgres_only_fields
++                or
++                # We special case date
++                search_filter.key.name == "date"
++            ):
++                continue
++            converted_filter = convert_search_filter_to_snuba_query(search_filter)
++            converted_filter = self._transform_converted_filter(
++                search_filter, converted_filter, project_ids, environment_ids
++            )
++            if converted_filter is not None:
++                # Ensure that no user-generated tags that clashes with aggregation_defs is added to having
++                if search_filter.key.name in self.aggregation_defs and not search_filter.key.is_tag:
++                    having.append(converted_filter)
++                else:
++                    conditions.append(converted_filter)
++
++        extra_aggregations = self.dependency_aggregations.get(sort_field, [])
++        required_aggregations = set([sort_field, "total"] + extra_aggregations)
++        for h in having:
++            alias = h[0]
++            required_aggregations.add(alias)
++
++        aggregations = []
++        for alias in required_aggregations:
++            aggregations.append(self.aggregation_defs[alias] + [alias])
++
++        if cursor is not None:
++            having.append((sort_field, ">=" if cursor.is_prev else "<=", cursor.value))
++
++        selected_columns = []
++        if get_sample:
++            query_hash = md5(repr(conditions)).hexdigest()[:8]
++            selected_columns.append(
++                ("cityHash64", ("'{}'".format(query_hash), "group_id"), "sample")
++            )
++            sort_field = "sample"
++            orderby = [sort_field]
++            referrer = "search_sample"
+         else:
+-            conditions.append(converted_filter)
+-
+-    extra_aggregations = dependency_aggregations.get(sort_field, [])
+-    required_aggregations = set([sort_field, "total"] + extra_aggregations)
+-    for h in having:
+-        alias = h[0]
+-        required_aggregations.add(alias)
+-
+-    aggregations = []
+-    for alias in required_aggregations:
+-        aggregations.append(aggregation_defs[alias] + [alias])
+-
+-    if cursor is not None:
+-        having.append((sort_field, ">=" if cursor.is_prev else "<=", cursor.value))
+-
+-    selected_columns = []
+-    if get_sample:
+-        query_hash = md5(repr(conditions)).hexdigest()[:8]
+-        selected_columns.append(("cityHash64", ("'{}'".format(query_hash), "group_id"), "sample"))
+-        sort_field = "sample"
+-        orderby = [sort_field]
+-        referrer = "search_sample"
+-    else:
+-        # Get the top matching groups by score, i.e. the actual search results
+-        # in the order that we want them.
+-        orderby = ["-{}".format(sort_field), "group_id"]  # ensure stable sort within the same score
+-        referrer = "search"
+-
+-    snuba_results = snuba.dataset_query(
+-        dataset=Dataset.Events,
+-        start=start,
+-        end=end,
+-        selected_columns=selected_columns,
+-        groupby=["group_id"],
+-        conditions=conditions,
+-        having=having,
+-        filter_keys=filters,
+-        aggregations=aggregations,
+-        orderby=orderby,
+-        referrer=referrer,
+-        limit=limit,
+-        offset=offset,
+-        totals=True,  # Needs to have totals_mode=after_having_exclusive so we get groups matching HAVING only
+-        turbo=get_sample,  # Turn off FINAL when in sampling mode
+-        sample=1,  # Don't use clickhouse sampling, even when in turbo mode.
+-    )
+-    rows = snuba_results["data"]
+-    total = snuba_results["totals"]["total"]
+-
+-    if not get_sample:
+-        metrics.timing("snuba.search.num_result_groups", len(rows))
+-
+-    return [(row["group_id"], row[sort_field]) for row in rows], total
++            # Get the top matching groups by score, i.e. the actual search results
++            # in the order that we want them.
++            orderby = [
++                "-{}".format(sort_field),
++                "group_id",
++            ]  # ensure stable sort within the same score
++            referrer = "search"
++
++        snuba_results = snuba.dataset_query(
++            dataset=self.dataset,
++            start=start,
++            end=end,
++            selected_columns=selected_columns,
++            groupby=["group_id"],
++            conditions=conditions,
++            having=having,
++            filter_keys=filters,
++            aggregations=aggregations,
++            orderby=orderby,
++            referrer=referrer,
++            limit=limit,
++            offset=offset,
++            totals=True,  # Needs to have totals_mode=after_having_exclusive so we get groups matching HAVING only
++            turbo=get_sample,  # Turn off FINAL when in sampling mode
++            sample=1,  # Don't use clickhouse sampling, even when in turbo mode.
++        )
++        rows = snuba_results["data"]
++        total = snuba_results["totals"]["total"]
++
++        if not get_sample:
++            metrics.timing("snuba.search.num_result_groups", len(rows))
++
++        return [(row["group_id"], row[sort_field]) for row in rows], total
++
++    def _transform_converted_filter(
++        self, search_filter, converted_filter, project_ids, environment_ids=None
++    ):
++        """This method serves as a hook - after we convert the search_filter into a snuba compatible filter (which converts it in a general dataset ambigious method),
++            we may want to transform the query - maybe change the value (time formats, translate value into id (like turning Release `version` into `id`) or vice versa),  alias fields, etc.
++            By default, no transformation is done.
++        """
++        return converted_filter
+ 
+ 
+ class PostgresSnubaQueryExecutor(AbstractQueryExecutor):
++    ISSUE_FIELD_NAME = "group_id"
++
++    logger = logging.getLogger("sentry.search.postgressnuba")
++    dependency_aggregations = {"priority": ["last_seen", "times_seen"]}
++    postgres_only_fields = set(
++        [
++            "query",
++            "status",
++            "bookmarked_by",
++            "assigned_to",
++            "unassigned",
++            "subscribed_by",
++            "active_at",
++            "first_release",
++            "first_seen",
++        ]
++    )
++    sort_strategies = {
++        "date": "last_seen",
++        "freq": "times_seen",
++        "new": "first_seen",
++        "priority": "priority",
++    }
++
++    aggregation_defs = {
++        "times_seen": ["count()", ""],
++        "first_seen": ["multiply(toUInt64(min(timestamp)), 1000)", ""],
++        "last_seen": ["multiply(toUInt64(max(timestamp)), 1000)", ""],
++        # https://github.com/getsentry/sentry/blob/804c85100d0003cfdda91701911f21ed5f66f67c/src/sentry/event_manager.py#L241-L271
++        "priority": ["toUInt64(plus(multiply(log(times_seen), 600), last_seen))", ""],
++        # Only makes sense with WITH TOTALS, returns 1 for an individual group.
++        "total": ["uniq", ISSUE_FIELD_NAME],
++    }
++
++    @property
++    @abstractmethod
++    def dataset(self):
++        return snuba.Dataset.Events
++
+     def query(
+         self,
+         projects,
+@@ -237,7 +288,7 @@ class PostgresSnubaQueryExecutor(AbstractQueryExecutor):
+                 not [
+                     sf
+                     for sf in search_filters
+-                    if sf.key.name not in issue_only_fields.union(["date"])
++                    if sf.key.name not in self.postgres_only_fields.union(["date"])
+                 ]
+             ):
+                 group_queryset = group_queryset.order_by("-last_seen")
+@@ -250,13 +301,8 @@ class PostgresSnubaQueryExecutor(AbstractQueryExecutor):
+         # apparently `retention_window_start` can be None(?), so we need a
+         # fallback.
+         retention_date = max(filter(None, [retention_window_start, now - timedelta(days=90)]))
+-
+-        # TODO: We should try and consolidate all this logic together a little
+-        # better, maybe outside the backend. Should be easier once we're on
+-        # just the new search filters
+         start_params = [date_from, retention_date, get_search_filter(search_filters, "date", ">")]
+         start = max(filter(None, start_params))
+-
+         end = max([retention_date, end])
+ 
+         if start == retention_date and end == retention_date:
+@@ -264,26 +310,26 @@ class PostgresSnubaQueryExecutor(AbstractQueryExecutor):
+             # so this entire search was against a time range that is outside of
+             # retention. We'll return empty results to maintain backwards compatibility
+             # with Django search (for now).
+-            return EMPTY_RESULT
++            return self.empty_result
+ 
+         if start >= end:
+             # TODO: This maintains backwards compatibility with Django search, but
+             # in the future we should find a way to notify the user that their search
+             # is invalid.
+-            return EMPTY_RESULT
++            return self.empty_result
+ 
+         # Here we check if all the django filters reduce the set of groups down
+         # to something that we can send down to Snuba in a `group_id IN (...)`
+         # clause.
+         max_candidates = options.get("snuba.search.max-pre-snuba-candidates")
+         too_many_candidates = False
+-        candidate_ids = list(group_queryset.values_list("id", flat=True)[: max_candidates + 1])
+-        metrics.timing("snuba.search.num_candidates", len(candidate_ids))
+-        if not candidate_ids:
++        group_ids = list(group_queryset.values_list("id", flat=True)[: max_candidates + 1])
++        metrics.timing("snuba.search.num_candidates", len(group_ids))
++        if not group_ids:
+             # no matches could possibly be found from this point on
+             metrics.incr("snuba.search.no_candidates", skip_internal=False)
+-            return EMPTY_RESULT
+-        elif len(candidate_ids) > max_candidates:
++            return self.empty_result
++        elif len(group_ids) > max_candidates:
+             # If the pre-filter query didn't include anything to significantly
+             # filter down the number of results (from 'first_release', 'query',
+             # 'status', 'bookmarked_by', 'assigned_to', 'unassigned',
+@@ -295,79 +341,41 @@ class PostgresSnubaQueryExecutor(AbstractQueryExecutor):
+             # post-filtering.
+             metrics.incr("snuba.search.too_many_candidates", skip_internal=False)
+             too_many_candidates = True
+-            candidate_ids = []
++            group_ids = []
+ 
+-        sort_field = sort_strategies[sort_by]
++        sort_field = self.sort_strategies[sort_by]
+         chunk_growth = options.get("snuba.search.chunk-growth-rate")
+         max_chunk_size = options.get("snuba.search.max-chunk-size")
+         chunk_limit = limit
+         offset = 0
+         num_chunks = 0
+-        hits = None
+-
+-        paginator_results = EMPTY_RESULT
++        hits = self.calculate_hits(
++            group_ids,
++            too_many_candidates,
++            sort_field,
++            projects,
++            retention_window_start,
++            group_queryset,
++            environments,
++            sort_by,
++            limit,
++            cursor,
++            count_hits,
++            paginator_options,
++            search_filters,
++            start,
++            end,
++        )
++        if count_hits and hits == 0:
++            return self.empty_result
++
++        paginator_results = self.empty_result
+         result_groups = []
+         result_group_ids = set()
+ 
+         max_time = options.get("snuba.search.max-total-chunk-time-seconds")
+         time_start = time.time()
+ 
+-        if count_hits and (too_many_candidates or cursor is not None):
+-            # If we had too many candidates to reasonably pass down to snuba,
+-            # or if we have a cursor that bisects the overall result set (such
+-            # that our query only sees results on one side of the cursor) then
+-            # we need an alternative way to figure out the total hits that this
+-            # query has.
+-
+-            # To do this, we get a sample of groups matching the snuba side of
+-            # the query, and see how many of those pass the post-filter in
+-            # postgres. This should give us an estimate of the total number of
+-            # snuba matches that will be overall matches, which we can use to
+-            # get an estimate for X-Hits.
+-
+-            # The sampling is not simple random sampling. It will return *all*
+-            # matching groups if there are less than N groups matching the
+-            # query, or it will return a random, deterministic subset of N of
+-            # the groups if there are more than N overall matches. This means
+-            # that the "estimate" is actually an accurate result when there are
+-            # less than N matching groups.
+-
+-            # The number of samples required to achieve a certain error bound
+-            # with a certain confidence interval can be calculated from a
+-            # rearrangement of the normal approximation (Wald) confidence
+-            # interval formula:
+-            #
+-            # https://en.wikipedia.org/wiki/Binomial_proportion_confidence_interval
+-            #
+-            # Effectively if we want the estimate to be within +/- 10% of the
+-            # real value with 95% confidence, we would need (1.96^2 * p*(1-p))
+-            # / 0.1^2 samples. With a starting assumption of p=0.5 (this
+-            # requires the most samples) we would need 96 samples to achieve
+-            # +/-10% @ 95% confidence.
+-
+-            sample_size = options.get("snuba.search.hits-sample-size")
+-            snuba_groups, snuba_total = snuba_search(
+-                start=start,
+-                end=end,
+-                project_ids=[p.id for p in projects],
+-                environment_ids=environments and [environment.id for environment in environments],
+-                sort_field=sort_field,
+-                limit=sample_size,
+-                offset=0,
+-                get_sample=True,
+-                search_filters=search_filters,
+-            )
+-            snuba_count = len(snuba_groups)
+-            if snuba_count == 0:
+-                return EMPTY_RESULT
+-            else:
+-                filtered_count = group_queryset.filter(
+-                    id__in=[gid for gid, _ in snuba_groups]
+-                ).count()
+-
+-                hit_ratio = filtered_count / float(snuba_count)
+-                hits = int(hit_ratio * snuba_total)
+-
+         # Do smaller searches in chunks until we have enough results
+         # to answer the query (or hit the end of possible results). We do
+         # this because a common case for search is to return 100 groups
+@@ -380,18 +388,18 @@ class PostgresSnubaQueryExecutor(AbstractQueryExecutor):
+             # grow the chunk size on each iteration to account for huge projects
+             # and weird queries, up to a max size
+             chunk_limit = min(int(chunk_limit * chunk_growth), max_chunk_size)
+-            # but if we have candidate_ids always query for at least that many items
+-            chunk_limit = max(chunk_limit, len(candidate_ids))
++            # but if we have group_ids always query for at least that many items
++            chunk_limit = max(chunk_limit, len(group_ids))
+ 
+             # {group_id: group_score, ...}
+-            snuba_groups, total = snuba_search(
++            snuba_groups, total = self.snuba_search(
+                 start=start,
+                 end=end,
+                 project_ids=[p.id for p in projects],
+                 environment_ids=environments and [environment.id for environment in environments],
+                 sort_field=sort_field,
+                 cursor=cursor,
+-                candidate_ids=candidate_ids,
++                group_ids=group_ids,
+                 limit=chunk_limit,
+                 offset=offset,
+                 search_filters=search_filters,
+@@ -404,11 +412,11 @@ class PostgresSnubaQueryExecutor(AbstractQueryExecutor):
+             if not snuba_groups:
+                 break
+ 
+-            if candidate_ids:
++            if group_ids:
+                 # pre-filtered candidates were passed down to Snuba, so we're
+                 # finished with filtering and these are the only results. Note
+                 # that because we set the chunk size to at least the size of
+-                # the candidate_ids, we know we got all of them (ie there are
++                # the group_ids, we know we got all of them (ie there are
+                 # no more chunks after the first)
+                 result_groups = snuba_groups
+                 if count_hits and hits is None:
+@@ -433,17 +441,17 @@ class PostgresSnubaQueryExecutor(AbstractQueryExecutor):
+                     result_group_ids.add(group_id)
+                     result_groups.append((group_id, group_score))
+ 
++            # break the query loop for one of three reasons:
++            # * we started with Postgres candidates and so only do one Snuba query max
++            # * the paginator is returning enough results to satisfy the query (>= the limit)
++            # * there are no more groups in Snuba to post-filter
+             # TODO do we actually have to rebuild this SequencePaginator every time
+             # or can we just make it after we've broken out of the loop?
+             paginator_results = SequencePaginator(
+                 [(score, id) for (id, score) in result_groups], reverse=True, **paginator_options
+             ).get_result(limit, cursor, known_hits=hits)
+ 
+-            # break the query loop for one of three reasons:
+-            # * we started with Postgres candidates and so only do one Snuba query max
+-            # * the paginator is returning enough results to satisfy the query (>= the limit)
+-            # * there are no more groups in Snuba to post-filter
+-            if candidate_ids or len(paginator_results.results) >= limit or not more_results:
++            if group_ids or len(paginator_results.results) >= limit or not more_results:
+                 break
+ 
+         # HACK: We're using the SequencePaginator to mask the complexities of going
+@@ -472,6 +480,87 @@ class PostgresSnubaQueryExecutor(AbstractQueryExecutor):
+ 
+         return paginator_results
+ 
++    def calculate_hits(
++        self,
++        group_ids,
++        too_many_candidates,
++        sort_field,
++        projects,
++        retention_window_start,
++        group_queryset,
++        environments,
++        sort_by,
++        limit,
++        cursor,
++        count_hits,
++        paginator_options,
++        search_filters,
++        start,
++        end,
++    ):
++        """
++        This method should return an integer representing the number of hits (results) of your search.
++        It will return 0 if hits were calculated and there are none.
++        It will return None if hits were not calculated.
++        """
++        if count_hits is False:
++            return None
++        elif too_many_candidates or cursor is not None:
++            # If we had too many candidates to reasonably pass down to snuba,
++            # or if we have a cursor that bisects the overall result set (such
++            # that our query only sees results on one side of the cursor) then
++            # we need an alternative way to figure out the total hits that this
++            # query has.
++
++            # To do this, we get a sample of groups matching the snuba side of
++            # the query, and see how many of those pass the post-filter in
++            # postgres. This should give us an estimate of the total number of
++            # snuba matches that will be overall matches, which we can use to
++            # get an estimate for X-Hits.
++
++            # The sampling is not simple random sampling. It will return *all*
++            # matching groups if there are less than N groups matching the
++            # query, or it will return a random, deterministic subset of N of
++            # the groups if there are more than N overall matches. This means
++            # that the "estimate" is actually an accurate result when there are
++            # less than N matching groups.
++
++            # The number of samples required to achieve a certain error bound
++            # with a certain confidence interval can be calculated from a
++            # rearrangement of the normal approximation (Wald) confidence
++            # interval formula:
++            #
++            # https://en.wikipedia.org/wiki/Binomial_proportion_confidence_interval
++            #
++            # Effectively if we want the estimate to be within +/- 10% of the
++            # real value with 95% confidence, we would need (1.96^2 * p*(1-p))
++            # / 0.1^2 samples. With a starting assumption of p=0.5 (this
++            # requires the most samples) we would need 96 samples to achieve
++            # +/-10% @ 95% confidence.
++
++            sample_size = options.get("snuba.search.hits-sample-size")
++            snuba_groups, snuba_total = self.snuba_search(
++                start=start,
++                end=end,
++                project_ids=[p.id for p in projects],
++                environment_ids=environments and [environment.id for environment in environments],
++                sort_field=sort_field,
++                limit=sample_size,
++                offset=0,
++                get_sample=True,
++                search_filters=search_filters,
++            )
++            snuba_count = len(snuba_groups)
++            if snuba_count == 0:
++                # Maybe check for 0 hits and return EMPTY_RESULT in ::query? self.empty_result
++                return 0
++            else:
++                filtered_count = group_queryset.filter(
++                    id__in=[gid for gid, _ in snuba_groups]
++                ).count()
++
++                hit_ratio = filtered_count / float(snuba_count)
++                hits = int(hit_ratio * snuba_total)
++                return hits
+ 
+-class SnubaOnlyQueryExecutor(AbstractQueryExecutor):
+-    pass
++        return None
+diff --git a/src/sentry/testutils/cases.py b/src/sentry/testutils/cases.py
+index 963befc035..79b760e95e 100644
+--- a/src/sentry/testutils/cases.py
++++ b/src/sentry/testutils/cases.py
+@@ -769,13 +769,29 @@ class SnubaTestCase(BaseTestCase):
+         self.snuba_eventstream = SnubaEventStream()
+         self.snuba_tagstore = SnubaTagStorage()
+         assert requests.post(settings.SENTRY_SNUBA + "/tests/events/drop").status_code == 200
++        assert (
++            requests.post(settings.SENTRY_SNUBA + "/tests/groupedmessage/drop").status_code == 200
++        )
+         assert requests.post(settings.SENTRY_SNUBA + "/tests/transactions/drop").status_code == 200
+ 
+     def store_event(self, *args, **kwargs):
+         with contextlib.nested(
+             mock.patch("sentry.eventstream.insert", self.snuba_eventstream.insert)
+         ):
+-            return Factories.store_event(*args, **kwargs)
++            stored_event = Factories.store_event(*args, **kwargs)
++            stored_group = stored_event.group
++            if stored_group is not None:
++                self.store_group(stored_group)
++            return stored_event
++
++    def store_group(self, group):
++        data = [self.__wrap_group(group)]
++        assert (
++            requests.post(
++                settings.SENTRY_SNUBA + "/tests/groupedmessage/insert", data=json.dumps(data)
++            ).status_code
++            == 200
++        )
+ 
+     def __wrap_event(self, event, data, primary_hash):
+         # TODO: Abstract and combine this with the stream code in
+@@ -792,6 +808,61 @@ class SnubaTestCase(BaseTestCase):
+             "primary_hash": primary_hash,
+         }
+ 
++    def to_snuba_time_format(self, datetime_value):
++        date_format = "%Y-%m-%d %H:%M:%S%z"
++        return datetime_value.strftime(date_format)
++
++    def __wrap_group(self, group):
++        return {
++            "event": "change",
++            "kind": "insert",
++            "table": "sentry_groupedmessage",
++            "columnnames": [
++                "id",
++                "logger",
++                "level",
++                "message",
++                "status",
++                "times_seen",
++                "last_seen",
++                "first_seen",
++                "data",
++                "score",
++                "project_id",
++                "time_spent_total",
++                "time_spent_count",
++                "resolved_at",
++                "active_at",
++                "is_public",
++                "platform",
++                "num_comments",
++                "first_release_id",
++                "short_id",
++            ],
++            "columnvalues": [
++                group.id,
++                group.logger,
++                group.level,
++                group.message,
++                group.status,
++                group.times_seen,
++                self.to_snuba_time_format(group.last_seen),
++                self.to_snuba_time_format(group.first_seen),
++                group.data,
++                group.score,
++                group.project.id,
++                group.time_spent_total,
++                group.time_spent_count,
++                group.resolved_at,
++                self.to_snuba_time_format(group.active_at),
++                group.is_public,
++                group.platform,
++                group.num_comments,
++                group.first_release.id if group.first_release else None,
++                group.short_id,
++            ],
++        }
++
+     def create_event(self, *args, **kwargs):
+         """\
+         Takes the results from the existing `create_event` method and
+diff --git a/src/sentry/utils/pytest/sentry.py b/src/sentry/utils/pytest/sentry.py
+index 28c7e9205e..ffd8009b36 100644
+--- a/src/sentry/utils/pytest/sentry.py
++++ b/src/sentry/utils/pytest/sentry.py
+@@ -98,7 +98,7 @@ def pytest_configure(config):
+     settings.CACHES = {"default": {"BACKEND": "django.core.cache.backends.locmem.LocMemCache"}}
+ 
+     if os.environ.get("USE_SNUBA", False):
+-        settings.SENTRY_SEARCH = "sentry.search.snuba.SnubaSearchBackend"
++        settings.SENTRY_SEARCH = "sentry.search.snuba.EventsDatasetSnubaSearchBackend"
+         settings.SENTRY_TSDB = "sentry.tsdb.redissnuba.RedisSnubaTSDB"
+         settings.SENTRY_EVENTSTREAM = "sentry.eventstream.snuba.SnubaEventStream"
+ 
+diff --git a/src/sentry/utils/snuba.py b/src/sentry/utils/snuba.py
+index 4683788517..633fe12f9d 100644
+--- a/src/sentry/utils/snuba.py
++++ b/src/sentry/utils/snuba.py
+@@ -52,6 +52,8 @@ OVERRIDE_OPTIONS = {
+ SENTRY_SNUBA_MAP = {
+     col.value.alias: col.value.event_name for col in Columns if col.value.event_name is not None
+ }
++
++
+ TRANSACTIONS_SENTRY_SNUBA_MAP = {
+     col.value.alias: col.value.transaction_name
+     for col in Columns
+@@ -932,6 +934,7 @@ def constrain_column_to_dataset(col, dataset, value=None):
+     """
+     if col.startswith("tags["):
+         return col
++
+     # Special case for the type condition as we only want
+     # to drop it when we are querying transactions.
+     if dataset == Dataset.Transactions and col == "event.type" and value == "transaction":
+@@ -942,6 +945,7 @@ def constrain_column_to_dataset(col, dataset, value=None):
+         return DATASETS[dataset][col]
+     if col in DATASET_FIELDS[dataset]:
+         return col
++
+     return u"tags[{}]".format(col)
+ 
+ 
+diff --git a/tests/snuba/search/test_backend.py b/tests/snuba/search/test_backend.py
+index a951fa0373..21c14b7860 100644
+--- a/tests/snuba/search/test_backend.py
++++ b/tests/snuba/search/test_backend.py
+@@ -17,7 +17,7 @@ from sentry.models import (
+     GroupStatus,
+     GroupSubscription,
+ )
+-from sentry.search.snuba.backend import SnubaSearchBackend
++from sentry.search.snuba.backend import EventsDatasetSnubaSearchBackend
+ from sentry.testutils import SnubaTestCase, TestCase, xfail_if_not_postgres
+ from sentry.testutils.helpers.datetime import iso_format
+ from sentry.utils.snuba import Dataset, SENTRY_SNUBA_MAP, SnubaError
+@@ -27,10 +27,13 @@ def date_to_query_format(date):
+     return date.strftime("%Y-%m-%dT%H:%M:%S")
+ 
+ 
+-class SnubaSearchTest(TestCase, SnubaTestCase):
++class EventsSnubaSearchTest(TestCase, SnubaTestCase):
++    @property
++    def backend(self):
++        return EventsDatasetSnubaSearchBackend()
++
+     def setUp(self):
+-        super(SnubaSearchTest, self).setUp()
+-        self.backend = SnubaSearchBackend()
++        super(EventsSnubaSearchTest, self).setUp()
+         self.base_datetime = (datetime.utcnow() - timedelta(days=3)).replace(tzinfo=pytz.utc)
+ 
+         event1_timestamp = iso_format(self.base_datetime - timedelta(days=21))
+@@ -69,6 +72,7 @@ class SnubaSearchTest(TestCase, SnubaTestCase):
+         self.group1.times_seen = 5
+         self.group1.status = GroupStatus.UNRESOLVED
+         self.group1.save()
++        self.store_group(self.group1)
+ 
+         self.event2 = self.store_event(
+             data={
+@@ -90,6 +94,7 @@ class SnubaSearchTest(TestCase, SnubaTestCase):
+         self.group2.status = GroupStatus.RESOLVED
+         self.group2.times_seen = 10
+         self.group2.save()
++        self.store_group(self.group2)
+ 
+         GroupBookmark.objects.create(user=self.user, group=self.group2, project=self.group2.project)
+ 
+@@ -109,7 +114,7 @@ class SnubaSearchTest(TestCase, SnubaTestCase):
+         }
+ 
+     def store_event(self, data, *args, **kwargs):
+-        event = super(SnubaSearchTest, self).store_event(data, *args, **kwargs)
++        event = super(EventsSnubaSearchTest, self).store_event(data, *args, **kwargs)
+         environment_name = data.get("environment")
+         if environment_name:
+             GroupEnvironment.objects.filter(
+@@ -138,6 +143,7 @@ class SnubaSearchTest(TestCase, SnubaTestCase):
+         self.group_p2.times_seen = 6
+         self.group_p2.last_seen = self.base_datetime - timedelta(days=1)
+         self.group_p2.save()
++        self.store_group(self.group_p2)
+ 
+     def build_search_filter(self, query, projects=None, user=None, environments=None):
+         user = user if user is not None else self.user
+@@ -251,20 +257,6 @@ class SnubaSearchTest(TestCase, SnubaTestCase):
+         results = self.make_query(sort_by="priority")
+         assert list(results) == [self.group1, self.group2]
+ 
+-    def test_sort_multi_project(self):
+-        self.set_up_multi_project()
+-        results = self.make_query([self.project, self.project2], sort_by="date")
+-        assert list(results) == [self.group1, self.group_p2, self.group2]
+-
+-        results = self.make_query([self.project, self.project2], sort_by="new")
+-        assert list(results) == [self.group2, self.group_p2, self.group1]
+-
+-        results = self.make_query([self.project, self.project2], sort_by="freq")
+-        assert list(results) == [self.group1, self.group_p2, self.group2]
+-
+-        results = self.make_query([self.project, self.project2], sort_by="priority")
+-        assert list(results) == [self.group1, self.group2, self.group_p2]
+-
+     def test_sort_with_environment(self):
+         for dt in [
+             self.group1.first_seen + timedelta(days=1),
+@@ -1003,6 +995,7 @@ class SnubaSearchTest(TestCase, SnubaTestCase):
+             group.times_seen = 5
+             group.status = GroupStatus.UNRESOLVED if i % 3 == 0 else GroupStatus.RESOLVED
+             group.save()
++            self.store_group(group)
+ 
+         # Sample should estimate there are roughly 66 overall matching groups
+         # based on a random sample of 100 (or $sample_size) of the total 200
+@@ -1060,6 +1053,7 @@ class SnubaSearchTest(TestCase, SnubaTestCase):
+ 
+         self.group1.first_release = release_1
+         self.group1.save()
++        self.store_group(self.group1)
+ 
+         results = self.make_query(search_filter_query="first_release:%s" % release_1.version)
+         assert set(results) == set([self.group1])
+@@ -1091,6 +1085,144 @@ class SnubaSearchTest(TestCase, SnubaTestCase):
+         )
+         assert set(results) == set([self.group1])
+ 
++    def test_query_enclosed_in_quotes(self):
++        results = self.make_query(search_filter_query='"foo"')
++        assert set(results) == set([self.group1])
++
++        results = self.make_query(search_filter_query='"bar"')
++        assert set(results) == set([self.group2])
++
++    @xfail_if_not_postgres("Wildcard searching only supported in Postgres")
++    def test_wildcard(self):
++        escaped_event = self.store_event(
++            data={
++                "fingerprint": ["hello-there"],
++                "event_id": "f" * 32,
++                "message": "somet[hing]",
++                "environment": "production",
++                "tags": {"server": "example.net"},
++                "timestamp": iso_format(self.base_datetime),
++                "stacktrace": {"frames": [{"module": "group1"}]},
++            },
++            project_id=self.project.id,
++        )
++        # Note: Adding in `environment:production` so that we make sure we query
++        # in both snuba and postgres
++        results = self.make_query(search_filter_query="environment:production so*t")
++        assert set(results) == set([escaped_event.group])
++        # Make sure it's case insensitive
++        results = self.make_query(search_filter_query="environment:production SO*t")
++        assert set(results) == set([escaped_event.group])
++        results = self.make_query(search_filter_query="environment:production so*zz")
++        assert set(results) == set()
++        results = self.make_query(search_filter_query="environment:production [hing]")
++        assert set(results) == set([escaped_event.group])
++        results = self.make_query(search_filter_query="environment:production s*]")
++        assert set(results) == set([escaped_event.group])
++        results = self.make_query(search_filter_query="environment:production server:example.*")
++        assert set(results) == set([self.group1, escaped_event.group])
++        results = self.make_query(search_filter_query="environment:production !server:*net")
++        assert set(results) == set([self.group1])
++        # TODO: Disabling tests that use [] syntax for the moment. Re-enable
++        # these if we decide to add back in, or remove if this comment has been
++        # here a while.
++        # results = self.make_query(
++        #     search_filter_query='environment:production [s][of][mz]',
++        # )
++        # assert set(results) == set([escaped_event.group])
++        # results = self.make_query(
++        #     search_filter_query='environment:production [z][of][mz]',
++        # )
++        # assert set(results) == set()
++
++    def test_null_tags(self):
++        tag_event = self.store_event(
++            data={
++                "fingerprint": ["hello-there"],
++                "event_id": "f" * 32,
++                "message": "something",
++                "environment": "production",
++                "tags": {"server": "example.net"},
++                "timestamp": iso_format(self.base_datetime),
++                "stacktrace": {"frames": [{"module": "group1"}]},
++            },
++            project_id=self.project.id,
++        )
++        no_tag_event = self.store_event(
++            data={
++                "fingerprint": ["hello-there-2"],
++                "event_id": "5" * 32,
++                "message": "something",
++                "environment": "production",
++                "timestamp": iso_format(self.base_datetime),
++                "stacktrace": {"frames": [{"module": "group2"}]},
++            },
++            project_id=self.project.id,
++        )
++        results = self.make_query(search_filter_query="environment:production !server:*net")
++        assert set(results) == set([self.group1, no_tag_event.group])
++        results = self.make_query(search_filter_query="environment:production server:*net")
++        assert set(results) == set([tag_event.group])
++        results = self.make_query(search_filter_query="environment:production !server:example.net")
++        assert set(results) == set([self.group1, no_tag_event.group])
++        results = self.make_query(search_filter_query="environment:production server:example.net")
++        assert set(results) == set([tag_event.group])
++        results = self.make_query(search_filter_query="environment:production has:server")
++        assert set(results) == set([self.group1, tag_event.group])
++        results = self.make_query(search_filter_query="environment:production !has:server")
++        assert set(results) == set([no_tag_event.group])
++
++    def test_null_promoted_tags(self):
++        tag_event = self.store_event(
++            data={
++                "fingerprint": ["hello-there"],
++                "event_id": "f" * 32,
++                "message": "something",
++                "environment": "production",
++                "tags": {"logger": "csp"},
++                "timestamp": iso_format(self.base_datetime),
++                "stacktrace": {"frames": [{"module": "group1"}]},
++            },
++            project_id=self.project.id,
++        )
++        no_tag_event = self.store_event(
++            data={
++                "fingerprint": ["hello-there-2"],
++                "event_id": "5" * 32,
++                "message": "something",
++                "environment": "production",
++                "timestamp": iso_format(self.base_datetime),
++                "stacktrace": {"frames": [{"module": "group2"}]},
++            },
++            project_id=self.project.id,
++        )
++        results = self.make_query(search_filter_query="environment:production !logger:*sp")
++        assert set(results) == set([self.group1, no_tag_event.group])
++        results = self.make_query(search_filter_query="environment:production logger:*sp")
++        assert set(results) == set([tag_event.group])
++        results = self.make_query(search_filter_query="environment:production !logger:csp")
++        assert set(results) == set([self.group1, no_tag_event.group])
++        results = self.make_query(search_filter_query="environment:production logger:csp")
++        assert set(results) == set([tag_event.group])
++        results = self.make_query(search_filter_query="environment:production has:logger")
++        assert set(results) == set([tag_event.group])
++        results = self.make_query(search_filter_query="environment:production !has:logger")
++        assert set(results) == set([self.group1, no_tag_event.group])
++
++    def test_sort_multi_project(self):
++        self.set_up_multi_project()
++        results = self.make_query([self.project, self.project2], sort_by="date")
++        assert list(results) == [self.group1, self.group_p2, self.group2]
++
++        results = self.make_query([self.project, self.project2], sort_by="new")
++        assert list(results) == [self.group2, self.group_p2, self.group1]
++
++        results = self.make_query([self.project, self.project2], sort_by="freq")
++        assert list(results) == [self.group1, self.group_p2, self.group2]
++
++        results = self.make_query([self.project, self.project2], sort_by="priority")
++        assert list(results) == [self.group1, self.group2, self.group_p2]
++
+     def test_first_release_any_or_no_environments(self):
+         # test scenarios for tickets:
+         # SEN-571
+@@ -1224,130 +1356,6 @@ class SnubaSearchTest(TestCase, SnubaTestCase):
+         )
+         assert set(results) == set([group_a])
+ 
+-    def test_query_enclosed_in_quotes(self):
+-        results = self.make_query(search_filter_query='"foo"')
+-        assert set(results) == set([self.group1])
+-
+-        results = self.make_query(search_filter_query='"bar"')
+-        assert set(results) == set([self.group2])
+-
+-    @xfail_if_not_postgres("Wildcard searching only supported in Postgres")
+-    def test_wildcard(self):
+-        escaped_event = self.store_event(
+-            data={
+-                "fingerprint": ["hello-there"],
+-                "event_id": "f" * 32,
+-                "message": "somet[hing]",
+-                "environment": "production",
+-                "tags": {"server": "example.net"},
+-                "timestamp": iso_format(self.base_datetime),
+-                "stacktrace": {"frames": [{"module": "group1"}]},
+-            },
+-            project_id=self.project.id,
+-        )
+-        # Note: Adding in `environment:production` so that we make sure we query
+-        # in both snuba and postgres
+-        results = self.make_query(search_filter_query="environment:production so*t")
+-        assert set(results) == set([escaped_event.group])
+-        # Make sure it's case insensitive
+-        results = self.make_query(search_filter_query="environment:production SO*t")
+-        assert set(results) == set([escaped_event.group])
+-        results = self.make_query(search_filter_query="environment:production so*zz")
+-        assert set(results) == set()
+-        results = self.make_query(search_filter_query="environment:production [hing]")
+-        assert set(results) == set([escaped_event.group])
+-        results = self.make_query(search_filter_query="environment:production s*]")
+-        assert set(results) == set([escaped_event.group])
+-        results = self.make_query(search_filter_query="environment:production server:example.*")
+-        assert set(results) == set([self.group1, escaped_event.group])
+-        results = self.make_query(search_filter_query="environment:production !server:*net")
+-        assert set(results) == set([self.group1])
+-        # TODO: Disabling tests that use [] syntax for the moment. Re-enable
+-        # these if we decide to add back in, or remove if this comment has been
+-        # here a while.
+-        # results = self.make_query(
+-        #     search_filter_query='environment:production [s][of][mz]',
+-        # )
+-        # assert set(results) == set([escaped_event.group])
+-        # results = self.make_query(
+-        #     search_filter_query='environment:production [z][of][mz]',
+-        # )
+-        # assert set(results) == set()
+-
+-    def test_null_tags(self):
+-        tag_event = self.store_event(
+-            data={
+-                "fingerprint": ["hello-there"],
+-                "event_id": "f" * 32,
+-                "message": "something",
+-                "environment": "production",
+-                "tags": {"server": "example.net"},
+-                "timestamp": iso_format(self.base_datetime),
+-                "stacktrace": {"frames": [{"module": "group1"}]},
+-            },
+-            project_id=self.project.id,
+-        )
+-        no_tag_event = self.store_event(
+-            data={
+-                "fingerprint": ["hello-there-2"],
+-                "event_id": "5" * 32,
+-                "message": "something",
+-                "environment": "production",
+-                "timestamp": iso_format(self.base_datetime),
+-                "stacktrace": {"frames": [{"module": "group2"}]},
+-            },
+-            project_id=self.project.id,
+-        )
+-        results = self.make_query(search_filter_query="environment:production !server:*net")
+-        assert set(results) == set([self.group1, no_tag_event.group])
+-        results = self.make_query(search_filter_query="environment:production server:*net")
+-        assert set(results) == set([tag_event.group])
+-        results = self.make_query(search_filter_query="environment:production !server:example.net")
+-        assert set(results) == set([self.group1, no_tag_event.group])
+-        results = self.make_query(search_filter_query="environment:production server:example.net")
+-        assert set(results) == set([tag_event.group])
+-        results = self.make_query(search_filter_query="environment:production has:server")
+-        assert set(results) == set([self.group1, tag_event.group])
+-        results = self.make_query(search_filter_query="environment:production !has:server")
+-        assert set(results) == set([no_tag_event.group])
+-
+-    def test_null_promoted_tags(self):
+-        tag_event = self.store_event(
+-            data={
+-                "fingerprint": ["hello-there"],
+-                "event_id": "f" * 32,
+-                "message": "something",
+-                "environment": "production",
+-                "tags": {"logger": "csp"},
+-                "timestamp": iso_format(self.base_datetime),
+-                "stacktrace": {"frames": [{"module": "group1"}]},
+-            },
+-            project_id=self.project.id,
+-        )
+-        no_tag_event = self.store_event(
+-            data={
+-                "fingerprint": ["hello-there-2"],
+-                "event_id": "5" * 32,
+-                "message": "something",
+-                "environment": "production",
+-                "timestamp": iso_format(self.base_datetime),
+-                "stacktrace": {"frames": [{"module": "group2"}]},
+-            },
+-            project_id=self.project.id,
+-        )
+-        results = self.make_query(search_filter_query="environment:production !logger:*sp")
+-        assert set(results) == set([self.group1, no_tag_event.group])
+-        results = self.make_query(search_filter_query="environment:production logger:*sp")
+-        assert set(results) == set([tag_event.group])
+-        results = self.make_query(search_filter_query="environment:production !logger:csp")
+-        assert set(results) == set([self.group1, no_tag_event.group])
+-        results = self.make_query(search_filter_query="environment:production logger:csp")
+-        assert set(results) == set([tag_event.group])
+-        results = self.make_query(search_filter_query="environment:production has:logger")
+-        assert set(results) == set([tag_event.group])
+-        results = self.make_query(search_filter_query="environment:production !has:logger")
+-        assert set(results) == set([self.group1, no_tag_event.group])
+-
+     def test_all_fields_do_not_error(self):
+         # Just a sanity check to make sure that all fields can be successfully
+         # searched on without returning type errors and other schema related

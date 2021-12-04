@@ -1,0 +1,809 @@
+commit ba906f60340ac21b780519364b75f1d96def2980
+Author: Dan Fuller <dfuller@sentry.io>
+Date:   Fri Oct 18 17:52:24 2019 -0700
+
+    feat(api): Support sending an incident alert via email (SEN-960)
+    
+    This implements `EmailActionHandler` so that we'll fire off emails to users/teams. Also refactors to
+    pass in the project to `ActionHandler` classes, since it's helpful to know the specific project that
+    this was triggered on, rather than calculating from the incident, which might be incorrect in the
+    future.
+
+diff --git a/src/sentry/incidents/action_handlers.py b/src/sentry/incidents/action_handlers.py
+index 47edfd0327..d6e4e966d2 100644
+--- a/src/sentry/incidents/action_handlers.py
++++ b/src/sentry/incidents/action_handlers.py
+@@ -3,15 +3,20 @@ from __future__ import absolute_import
+ import abc
+ 
+ import six
++from django.core.urlresolvers import reverse
+ 
+-from sentry.incidents.models import AlertRuleTriggerAction
++from sentry.incidents.models import AlertRuleTriggerAction, QueryAggregations, TriggerStatus
++from sentry.utils.email import MessageBuilder
++from sentry.utils.http import absolute_uri
++from sentry.utils.linksign import generate_signed_link
+ 
+ 
+ @six.add_metaclass(abc.ABCMeta)
+ class ActionHandler(object):
+-    def __init__(self, action, incident):
++    def __init__(self, action, incident, project):
+         self.action = action
+         self.incident = incident
++        self.project = project
+ 
+     @abc.abstractmethod
+     def fire(self):
+@@ -24,8 +29,96 @@ class ActionHandler(object):
+ 
+ @AlertRuleTriggerAction.register_type_handler(AlertRuleTriggerAction.Type.EMAIL)
+ class EmailActionHandler(ActionHandler):
++    query_aggregations_display = {
++        QueryAggregations.TOTAL: "Total Events",
++        QueryAggregations.UNIQUE_USERS: "Total Unique Users",
++    }
++    status_display = {TriggerStatus.ACTIVE: "Fired", TriggerStatus.RESOLVED: "Resolved"}
++
++    def get_targets(self):
++        target = self.action.target
++        if not target:
++            return []
++        targets = []
++        if self.action.target_type in (
++            AlertRuleTriggerAction.TargetType.USER.value,
++            AlertRuleTriggerAction.TargetType.TEAM.value,
++        ):
++            alert_settings = self.project.get_member_alert_settings("mail:alert")
++            disabled_users = set(
++                user_id for user_id, setting in alert_settings.items() if setting == 0
++            )
++            if self.action.target_type == AlertRuleTriggerAction.TargetType.USER.value:
++                if target.id not in disabled_users:
++                    targets = [(target.id, target.email)]
++            elif self.action.target_type == AlertRuleTriggerAction.TargetType.TEAM.value:
++                targets = target.member_set.values_list("user_id", "user__email")
++                targets = [
++                    (user_id, email) for user_id, email in targets if user_id not in disabled_users
++                ]
++        # TODO: We need some sort of verification system to make sure we're not being
++        # used as an email relay.
++        # elif self.action.target_type == AlertRuleTriggerAction.TargetType.SPECIFIC.value:
++        #     emails = [target]
++        return targets
++
+     def fire(self):
+-        pass
++        self.email_users(TriggerStatus.ACTIVE)
+ 
+     def resolve(self):
+-        pass
++        self.email_users(TriggerStatus.RESOLVED)
++
++    def email_users(self, status):
++        email_context = self.generate_email_context(status)
++        for user_id, email in self.get_targets():
++            email_context["unsubscribe_link"] = self.generate_unsubscribe_link(user_id)
++            self.build_message(email_context, status, user_id).send_async(to=[email])
++
++    def build_message(self, context, status, user_id):
++        context["unsubscribe_link"] = self.generate_unsubscribe_link(user_id)
++        display = self.status_display[status]
++        return MessageBuilder(
++            subject=u"Incident Alert Rule {} for Project {}".format(display, self.project.slug),
++            template=u"sentry/emails/incidents/trigger.txt",
++            html_template=u"sentry/emails/incidents/trigger.html",
++            type="incident.alert_rule_{}".format(display.lower()),
++            context=context,
++        )
++
++    def generate_unsubscribe_link(self, user_id):
++        return generate_signed_link(
++            user_id,
++            "sentry-account-email-unsubscribe-project",
++            kwargs={"project_id": self.project.id},
++        )
++
++    def generate_email_context(self, status):
++        trigger = self.action.alert_rule_trigger
++        alert_rule = trigger.alert_rule
++        return {
++            "link": absolute_uri(
++                reverse(
++                    "sentry-incident",
++                    kwargs={
++                        "organization_slug": self.incident.organization.slug,
++                        "incident_id": self.incident.identifier,
++                    },
++                )
++            ),
++            "rule_link": absolute_uri(
++                reverse(
++                    "sentry-alert-rule",
++                    kwargs={
++                        "organization_slug": self.incident.organization.slug,
++                        "alert_rule_id": self.action.alert_rule_trigger.alert_rule_id,
++                    },
++                )
++            ),
++            "incident_name": self.incident.title,
++            "aggregate": self.query_aggregations_display[QueryAggregations(alert_rule.aggregation)],
++            "query": alert_rule.query,
++            "threshold": trigger.alert_threshold
++            if status == TriggerStatus.ACTIVE
++            else trigger.resolve_threshold,
++            "status": self.status_display[status],
++        }
+diff --git a/src/sentry/incidents/models.py b/src/sentry/incidents/models.py
+index a019d1ceac..3faa307620 100644
+--- a/src/sentry/incidents/models.py
++++ b/src/sentry/incidents/models.py
+@@ -425,20 +425,20 @@ class AlertRuleTriggerAction(Model):
+             # ok to contact this email.
+             return self.target_identifier
+ 
+-    def build_handler(self, incident):
++    def build_handler(self, incident, project):
+         type = AlertRuleTriggerAction.Type(self.type)
+         if type in self.handlers:
+-            return self.handlers[type](self, incident)
++            return self.handlers[type](self, incident, project)
+         else:
+             metrics.incr("alert_rule_trigger.unhandled_type.{}".format(self.type))
+ 
+-    def fire(self, incident):
+-        handler = self.build_handler(incident)
++    def fire(self, incident, project):
++        handler = self.build_handler(incident, project)
+         if handler:
+             return handler.fire()
+ 
+-    def resolve(self, incident):
+-        handler = self.build_handler(incident)
++    def resolve(self, incident, project):
++        handler = self.build_handler(incident, project)
+         if handler:
+             return handler.resolve()
+ 
+diff --git a/src/sentry/incidents/subscription_processor.py b/src/sentry/incidents/subscription_processor.py
+index f9bf0eee5d..c267e51b30 100644
+--- a/src/sentry/incidents/subscription_processor.py
++++ b/src/sentry/incidents/subscription_processor.py
+@@ -246,6 +246,7 @@ class SubscriptionProcessor(object):
+                 kwargs={
+                     "action_id": action.id,
+                     "incident_id": incident_trigger.incident_id,
++                    "project_id": self.subscription.project_id,
+                     "method": method,
+                 },
+                 countdown=5,
+diff --git a/src/sentry/incidents/tasks.py b/src/sentry/incidents/tasks.py
+index 3ca0ca2441..e7807ad0f0 100644
+--- a/src/sentry/incidents/tasks.py
++++ b/src/sentry/incidents/tasks.py
+@@ -20,6 +20,7 @@ from sentry.incidents.models import (
+     IncidentStatus,
+     IncidentSuspectCommit,
+ )
++from sentry.models import Project
+ from sentry.snuba.query_subscription_consumer import register_subscriber
+ from sentry.tasks.base import instrumented_task, retry
+ from sentry.utils.email import MessageBuilder
+@@ -181,16 +182,24 @@ def handle_snuba_query_update(subscription_update, subscription):
+     default_retry_delay=60,
+     max_retries=5,
+ )
+-def handle_trigger_action(action_id, incident_id, method):
++def handle_trigger_action(action_id, incident_id, project_id, method):
+     try:
+-        action = AlertRuleTriggerAction.objects.get(id=action_id)
++        action = AlertRuleTriggerAction.objects.select_related(
++            "alert_rule_trigger", "alert_rule_trigger__alert_rule"
++        ).get(id=action_id)
+     except AlertRuleTriggerAction.DoesNotExist:
+         metrics.incr("incidents.alert_rules.skipping_missing_action")
+         return
+     try:
+-        incident = Incident.objects.get(id=incident_id)
++        incident = Incident.objects.select_related("organization").get(id=incident_id)
+     except Incident.DoesNotExist:
+         metrics.incr("incidents.alert_rules.skipping_missing_incident")
+         return
+ 
+-    getattr(action, method)(incident)
++    try:
++        project = Project.objects.get(id=project_id)
++    except Project.DoesNotExist:
++        metrics.incr("incidents.alert_rules.skipping_missing_project")
++        return
++
++    getattr(action, method)(incident, project)
+diff --git a/src/sentry/templates/sentry/emails/incidents/trigger.html b/src/sentry/templates/sentry/emails/incidents/trigger.html
+new file mode 100644
+index 0000000000..14da28c62e
+--- /dev/null
++++ b/src/sentry/templates/sentry/emails/incidents/trigger.html
+@@ -0,0 +1,36 @@
++{% extends "sentry/emails/activity/generic.html" %}
++
++{% load sentry_avatars %}
++{% load sentry_helpers %}
++{% load sentry_assets %}
++
++{% block activity %}
++    <h3>
++        <a href="{{ link }}">Alert Rule Trigger {{ status }} on Incident {{ incident_name }}.</a>
++    </h3>
++
++
++  {% if enhanced_privacy %}
++    <div class="notice">
++      Details about this incident alert are not shown in this email since enhanced privacy
++      controls are enabled. For more details about this incident, <a href="{{ link }}">view on Sentry.</a>
++    </div>
++
++  {% else %}
++      <table >
++        <tr>
++            <td>Rule: <a href="{{ rule_link }}">{{ rule_link }}</a></td>
++        </tr>
++        <tr>
++          <td>Aggregate: {{ aggregate }} </td>
++        </tr>
++        <tr>
++          <td>Query: {{ query }}</td>
++        </tr>
++        <tr>
++          <td>Threshold: {{ threshold }}</td>
++        </tr>
++        </tr>
++      </table>
++  {% endif %}
++{% endblock %}
+diff --git a/src/sentry/templates/sentry/emails/incidents/trigger.txt b/src/sentry/templates/sentry/emails/incidents/trigger.txt
+new file mode 100644
+index 0000000000..040f7d78c0
+--- /dev/null
++++ b/src/sentry/templates/sentry/emails/incidents/trigger.txt
+@@ -0,0 +1,22 @@
++{% spaceless %}
++{% autoescape off %}
++# Alert Rule Trigger {{ status }} on Incident {{ incident_name }}.
++
++{% if enhanced_privacy %}
++Details about this incident alert are not shown in this email since enhanced privacy
++controls are enabled. For more details about this incident alert, view on Sentry:
++{{ incident_link }}.
++{% else %}
++Incident: {{ link }}
++Rule: {{ rule_link }}
++
++Aggregate: {{ aggregate }}
++Query: {{ query }}
++Threshold: {{ threshold }}
++
++{% endif %}
++
++Unsubscribe: {{ unsubscribe_link }}
++
++{% endautoescape %}
++{% endspaceless %}
+diff --git a/src/sentry/testutils/factories.py b/src/sentry/testutils/factories.py
+index b40c601c8a..83f8b5d88c 100644
+--- a/src/sentry/testutils/factories.py
++++ b/src/sentry/testutils/factories.py
+@@ -22,8 +22,14 @@ from uuid import uuid4
+ 
+ from sentry.event_manager import EventManager
+ from sentry.constants import SentryAppStatus
+-from sentry.incidents.logic import create_alert_rule
++from sentry.incidents.logic import (
++    create_alert_rule,
++    create_alert_rule_trigger,
++    create_alert_rule_trigger_action,
++)
+ from sentry.incidents.models import (
++    AlertRuleThresholdType,
++    AlertRuleTriggerAction,
+     Incident,
+     IncidentGroup,
+     IncidentProject,
+@@ -961,3 +967,31 @@ class Factories(object):
+             include_all_projects=include_all_projects,
+             excluded_projects=excluded_projects,
+         )
++
++    @staticmethod
++    def create_alert_rule_trigger(
++        alert_rule,
++        label=None,
++        threshold_type=AlertRuleThresholdType.ABOVE,
++        alert_threshold=100,
++        resolve_threshold=10,
++    ):
++        if not label:
++            label = petname.Generate(2, " ", letters=10).title()
++
++        return create_alert_rule_trigger(
++            alert_rule, label, threshold_type, alert_threshold, resolve_threshold
++        )
++
++    @staticmethod
++    def create_alert_rule_trigger_action(
++        trigger,
++        type=AlertRuleTriggerAction.Type.EMAIL,
++        target_type=AlertRuleTriggerAction.TargetType.USER,
++        target_identifier=None,
++        target_display=None,
++        integration=None,
++    ):
++        return create_alert_rule_trigger_action(
++            trigger, type, target_type, target_identifier, target_display, integration
++        )
+diff --git a/src/sentry/testutils/fixtures.py b/src/sentry/testutils/fixtures.py
+index d572cf28e2..6394c8a11b 100644
+--- a/src/sentry/testutils/fixtures.py
++++ b/src/sentry/testutils/fixtures.py
+@@ -1,5 +1,7 @@
+ from __future__ import absolute_import, print_function, unicode_literals
+ 
++import six
++
+ from sentry.models import Activity, OrganizationMember, OrganizationMemberTeam
+ from sentry.incidents.models import IncidentActivityType
+ 
+@@ -232,6 +234,24 @@ class Fixtures(object):
+             projects = [self.project]
+         return Factories.create_alert_rule(organization, projects, *args, **kwargs)
+ 
++    def create_alert_rule_trigger(self, alert_rule=None, *args, **kwargs):
++        if not alert_rule:
++            alert_rule = self.create_alert_rule()
++        return Factories.create_alert_rule_trigger(alert_rule, *args, **kwargs)
++
++    def create_alert_rule_trigger_action(
++        self, alert_rule_trigger=None, target_identifier=None, *args, **kwargs
++    ):
++        if not alert_rule_trigger:
++            alert_rule_trigger = self.create_alert_rule_trigger()
++
++        if not target_identifier:
++            target_identifier = six.text_type(self.user.id)
++
++        return Factories.create_alert_rule_trigger_action(
++            alert_rule_trigger, target_identifier=target_identifier, **kwargs
++        )
++
+     @pytest.fixture(autouse=True)
+     def _init_insta_snapshot(self, insta_snapshot):
+         self.insta_snapshot = insta_snapshot
+diff --git a/src/sentry/web/debug_urls.py b/src/sentry/web/debug_urls.py
+index 1fa0ee7f7d..1f751a0a7b 100644
+--- a/src/sentry/web/debug_urls.py
++++ b/src/sentry/web/debug_urls.py
+@@ -5,6 +5,7 @@ from django.views.generic import TemplateView
+ 
+ import sentry.web.frontend.debug.mail
+ 
++from sentry.web.frontend.debug.debug_alert_rule_trigger_email import DebugAlertRuleTriggerEmailView
+ from sentry.web.frontend.debug.debug_assigned_email import (
+     DebugAssignedEmailView,
+     DebugSelfAssignedEmailView,
+@@ -107,6 +108,7 @@ urlpatterns = patterns(
+     url(r"^debug/mail/sso-linked/$", DebugSsoLinkedEmailView.as_view()),
+     url(r"^debug/mail/sso-unlinked/$", DebugSsoUnlinkedEmailView.as_view()),
+     url(r"^debug/mail/sso-unlinked/no-password$", DebugSsoUnlinkedNoPasswordEmailView.as_view()),
++    url(r"^debug/mail/alert-rule-trigger$", DebugAlertRuleTriggerEmailView.as_view()),
+     url(r"^debug/mail/incident-activity$", DebugIncidentActivityEmailView.as_view()),
+     url(r"^debug/mail/setup-2fa/$", DebugSetup2faEmailView.as_view()),
+     url(r"^debug/embed/error-page/$", DebugErrorPageEmbedView.as_view()),
+diff --git a/src/sentry/web/frontend/debug/debug_alert_rule_trigger_email.py b/src/sentry/web/frontend/debug/debug_alert_rule_trigger_email.py
+new file mode 100644
+index 0000000000..dd2b9b4b58
+--- /dev/null
++++ b/src/sentry/web/frontend/debug/debug_alert_rule_trigger_email.py
+@@ -0,0 +1,39 @@
++from __future__ import absolute_import, print_function
++
++from django.views.generic import View
++
++from sentry.incidents.models import (
++    Incident,
++    AlertRule,
++    AlertRuleTrigger,
++    AlertRuleTriggerAction,
++    TriggerStatus,
++)
++from sentry.models.project import Project
++from sentry.models.organization import Organization
++from sentry.incidents.action_handlers import EmailActionHandler
++
++from .mail import MailPreview
++
++
++class DebugAlertRuleTriggerEmailView(View):
++    def get(self, request):
++        organization = Organization(slug="myorg")
++        project = Project(id=30, slug="myproj")
++
++        incident = Incident(identifier=123, organization=organization, title="Something broke")
++        alert_rule = AlertRule(
++            id=1, organization=organization, aggregation=1, query="is:unresolved"
++        )
++        alert_rule_trigger = AlertRuleTrigger(
++            id=5, alert_rule=alert_rule, alert_threshold=100, resolve_threshold=50
++        )
++        action = AlertRuleTriggerAction(id=10, alert_rule_trigger=alert_rule_trigger)
++
++        handler = EmailActionHandler(action, incident, project)
++        email = handler.build_message(
++            handler.generate_email_context(TriggerStatus.ACTIVE), TriggerStatus.ACTIVE, 1
++        )
++        return MailPreview(
++            html_template=email.html_template, text_template=email.template, context=email.context
++        ).render(request)
+diff --git a/src/sentry/web/urls.py b/src/sentry/web/urls.py
+index 0593a24d04..395817acb8 100644
+--- a/src/sentry/web/urls.py
++++ b/src/sentry/web/urls.py
+@@ -673,6 +673,11 @@ urlpatterns += patterns(
+         react_page_view,
+         name="sentry-incident",
+     ),
++    url(
++        r"^settings/(?P<organization_slug>[\w_-]+)/incident-rules/(?P<alert_rule_id>\d+)/$",
++        react_page_view,
++        name="sentry-alert-rule",
++    ),
+     url(
+         r"^(?P<organization_slug>[\w_-]+)/(?P<project_slug>[\w_-]+)/issues/(?P<group_id>\d+)/tags/(?P<key>[^\/]+)/export/$",
+         GroupTagExportView.as_view(),
+diff --git a/tests/sentry/incidents/test_action_handlers.py b/tests/sentry/incidents/test_action_handlers.py
+new file mode 100644
+index 0000000000..e46ca42ffd
+--- /dev/null
++++ b/tests/sentry/incidents/test_action_handlers.py
+@@ -0,0 +1,131 @@
++from __future__ import absolute_import
++
++import six
++from django.core import mail
++from django.core.urlresolvers import reverse
++from exam import fixture
++from freezegun import freeze_time
++
++from sentry.incidents.action_handlers import EmailActionHandler
++from sentry.incidents.models import AlertRuleTriggerAction, QueryAggregations, TriggerStatus
++from sentry.models import UserOption
++from sentry.testutils import TestCase
++from sentry.utils.http import absolute_uri
++
++
++class EmailActionHandlerGetTargetsTest(TestCase):
++    @fixture
++    def incident(self):
++        return self.create_incident()
++
++    def test_user(self):
++        action = self.create_alert_rule_trigger_action(
++            target_type=AlertRuleTriggerAction.TargetType.USER,
++            target_identifier=six.text_type(self.user.id),
++        )
++        handler = EmailActionHandler(action, self.incident, self.project)
++        assert handler.get_targets() == [(self.user.id, self.user.email)]
++
++    def test_user_alerts_disabled(self):
++        UserOption.objects.set_value(
++            user=self.user, key="mail:alert", value=0, project=self.project
++        )
++        action = self.create_alert_rule_trigger_action(
++            target_type=AlertRuleTriggerAction.TargetType.USER,
++            target_identifier=six.text_type(self.user.id),
++        )
++        handler = EmailActionHandler(action, self.incident, self.project)
++        assert handler.get_targets() == []
++
++    def test_team(self):
++        new_user = self.create_user()
++        self.create_team_membership(team=self.team, user=new_user)
++        action = self.create_alert_rule_trigger_action(
++            target_type=AlertRuleTriggerAction.TargetType.TEAM,
++            target_identifier=six.text_type(self.team.id),
++        )
++        handler = EmailActionHandler(action, self.incident, self.project)
++        assert set(handler.get_targets()) == set(
++            [(self.user.id, self.user.email), (new_user.id, new_user.email)]
++        )
++
++    def test_team_alert_disabled(self):
++        UserOption.objects.set_value(
++            user=self.user, key="mail:alert", value=0, project=self.project
++        )
++
++        new_user = self.create_user()
++        self.create_team_membership(team=self.team, user=new_user)
++        action = self.create_alert_rule_trigger_action(
++            target_type=AlertRuleTriggerAction.TargetType.TEAM,
++            target_identifier=six.text_type(self.team.id),
++        )
++        handler = EmailActionHandler(action, self.incident, self.project)
++        assert set(handler.get_targets()) == set([(new_user.id, new_user.email)])
++
++
++@freeze_time()
++class EmailActionHandlerGenerateEmailContextTest(TestCase):
++    def test(self):
++        status = TriggerStatus.ACTIVE
++        action = self.create_alert_rule_trigger_action()
++        incident = self.create_incident()
++        handler = EmailActionHandler(action, incident, self.project)
++        expected = {
++            "link": absolute_uri(
++                reverse(
++                    "sentry-incident",
++                    kwargs={
++                        "organization_slug": incident.organization.slug,
++                        "incident_id": incident.identifier,
++                    },
++                )
++            ),
++            "rule_link": absolute_uri(
++                reverse(
++                    "sentry-alert-rule",
++                    kwargs={
++                        "organization_slug": incident.organization.slug,
++                        "alert_rule_id": action.alert_rule_trigger.alert_rule_id,
++                    },
++                )
++            ),
++            "incident_name": incident.title,
++            "aggregate": handler.query_aggregations_display[
++                QueryAggregations(action.alert_rule_trigger.alert_rule.aggregation)
++            ],
++            "query": action.alert_rule_trigger.alert_rule.query,
++            "threshold": action.alert_rule_trigger.alert_threshold,
++            "status": handler.status_display[status],
++        }
++        assert expected == handler.generate_email_context(status)
++
++
++@freeze_time()
++class EmailActionHandlerFireTest(TestCase):
++    def test_user(self):
++        action = self.create_alert_rule_trigger_action(
++            target_identifier=six.text_type(self.user.id)
++        )
++        incident = self.create_incident()
++        handler = EmailActionHandler(action, incident, self.project)
++        with self.tasks():
++            handler.fire()
++        out = mail.outbox[0]
++        assert out.to == [self.user.email]
++        assert out.subject.startswith("Incident Alert Rule Fired")
++
++
++@freeze_time()
++class EmailActionHandlerResolveTest(TestCase):
++    def test_user(self):
++        action = self.create_alert_rule_trigger_action(
++            target_identifier=six.text_type(self.user.id)
++        )
++        incident = self.create_incident()
++        handler = EmailActionHandler(action, incident, self.project)
++        with self.tasks():
++            handler.resolve()
++        out = mail.outbox[0]
++        assert out.to == [self.user.email]
++        assert out.subject.startswith("Incident Alert Rule Resolved")
+diff --git a/tests/sentry/incidents/test_models.py b/tests/sentry/incidents/test_models.py
+index b1aaab8139..a4067a0f0f 100644
+--- a/tests/sentry/incidents/test_models.py
++++ b/tests/sentry/incidents/test_models.py
+@@ -175,7 +175,7 @@ class AlertRuleTriggerActionActivateTest(object):
+ 
+     def test_no_handler(self):
+         trigger = AlertRuleTriggerAction(type=AlertRuleTriggerAction.Type.EMAIL.value)
+-        assert trigger.fire(Mock()) is None
++        assert trigger.fire(Mock(), Mock()) is None
+ 
+     def test_handler(self):
+         mock_handler = Mock()
+@@ -184,7 +184,7 @@ class AlertRuleTriggerActionActivateTest(object):
+         type = AlertRuleTriggerAction.Type.EMAIL
+         AlertRuleTriggerAction.register_type_handler(type)(mock_handler)
+         trigger = AlertRuleTriggerAction(type=type.value)
+-        assert getattr(trigger, self.method)(Mock()) == mock_method.return_value
++        assert getattr(trigger, self.method)(Mock(), Mock()) == mock_method.return_value
+ 
+ 
+ class AlertRuleTriggerActionFireTest(AlertRuleTriggerActionActivateTest, unittest.TestCase):
+@@ -207,7 +207,7 @@ class AlertRuleTriggerActionActivateTest(TestCase):
+ 
+     def test_unhandled(self):
+         trigger = AlertRuleTriggerAction(type=AlertRuleTriggerAction.Type.EMAIL.value)
+-        trigger.build_handler(Mock())
++        trigger.build_handler(Mock(), Mock())
+         self.metrics.incr.assert_called_once_with("alert_rule_trigger.unhandled_type.0")
+ 
+     def test_handled(self):
+@@ -217,6 +217,7 @@ class AlertRuleTriggerActionActivateTest(TestCase):
+ 
+         trigger = AlertRuleTriggerAction(type=AlertRuleTriggerAction.Type.EMAIL.value)
+         incident = Mock()
+-        trigger.build_handler(incident)
+-        mock_handler.assert_called_once_with(trigger, incident)
++        project = Mock()
++        trigger.build_handler(incident, project)
++        mock_handler.assert_called_once_with(trigger, incident, project)
+         assert not self.metrics.incr.called
+diff --git a/tests/sentry/incidents/test_subscription_processor.py b/tests/sentry/incidents/test_subscription_processor.py
+index 2055931421..143dd94be3 100644
+--- a/tests/sentry/incidents/test_subscription_processor.py
++++ b/tests/sentry/incidents/test_subscription_processor.py
+@@ -160,7 +160,9 @@ class ProcessUpdateTest(TestCase):
+             .exists()
+         )
+ 
+-    def assert_action_handler_called_with_actions(self, incident, actions):
++    def assert_action_handler_called_with_actions(self, incident, actions, project=None):
++        project = self.project if project is None else project
++
+         if not actions:
+             if not incident:
+                 assert not self.email_action_handler.called
+@@ -169,17 +171,19 @@ class ProcessUpdateTest(TestCase):
+                     assert call_args[0][1] != incident
+         else:
+             self.email_action_handler.assert_has_calls(
+-                [call(action, incident) for action in actions], any_order=True
++                [call(action, incident, project) for action in actions], any_order=True
+             )
+ 
+-    def assert_actions_fired_for_incident(self, incident, actions=None):
++    def assert_actions_fired_for_incident(self, incident, actions=None, project=None):
+         actions = [] if actions is None else actions
+-        self.assert_action_handler_called_with_actions(incident, actions)
++        project = self.project if project is None else project
++        self.assert_action_handler_called_with_actions(incident, actions, project)
+         assert len(actions) == len(self.email_action_handler.return_value.fire.call_args_list)
+ 
+-    def assert_actions_resolved_for_incident(self, incident, actions=None):
++    def assert_actions_resolved_for_incident(self, incident, actions=None, project=None):
++        project = self.project if project is None else project
+         actions = [] if actions is None else actions
+-        self.assert_action_handler_called_with_actions(incident, actions)
++        self.assert_action_handler_called_with_actions(incident, actions, project)
+         assert len(actions) == len(self.email_action_handler.return_value.resolve.call_args_list)
+ 
+     def assert_no_active_incident(self, rule, subscription=None):
+@@ -476,7 +480,7 @@ class ProcessUpdateTest(TestCase):
+         self.assert_action_handler_called_with_actions(incident, [])
+         other_incident = self.assert_active_incident(rule, self.other_sub)
+         self.assert_trigger_exists_with_status(other_incident, self.trigger, TriggerStatus.ACTIVE)
+-        self.assert_actions_fired_for_incident(other_incident, [self.action])
++        self.assert_actions_fired_for_incident(other_incident, [self.action], self.other_project)
+ 
+         # Now we want to test that resolving is isolated. Send another update through
+         # for the first subscription.
+@@ -512,7 +516,7 @@ class ProcessUpdateTest(TestCase):
+         self.assert_trigger_exists_with_status(incident, self.trigger, TriggerStatus.ACTIVE)
+         self.assert_no_active_incident(rule, self.other_sub)
+         self.assert_trigger_exists_with_status(other_incident, self.trigger, TriggerStatus.RESOLVED)
+-        self.assert_actions_resolved_for_incident(other_incident, [self.action])
++        self.assert_actions_resolved_for_incident(other_incident, [self.action], self.other_project)
+ 
+         # This second update for the first subscription should resolve its incident now.
+         processor = self.send_update(
+diff --git a/tests/sentry/incidents/test_tasks.py b/tests/sentry/incidents/test_tasks.py
+index 6cbe1e9a1f..c10348343e 100644
+--- a/tests/sentry/incidents/test_tasks.py
++++ b/tests/sentry/incidents/test_tasks.py
+@@ -205,14 +205,20 @@ class HandleTriggerActionTest(TestCase):
+ 
+     def test_missing_trigger_action(self):
+         with self.tasks():
+-            handle_trigger_action.delay(1000, 1001, "hello")
++            handle_trigger_action.delay(1000, 1001, self.project.id, "hello")
+         self.metrics.incr.assert_called_once_with("incidents.alert_rules.skipping_missing_action")
+ 
+     def test_missing_incident(self):
+         with self.tasks():
+-            handle_trigger_action.delay(self.action.id, 1001, "hello")
++            handle_trigger_action.delay(self.action.id, 1001, self.project.id, "hello")
+         self.metrics.incr.assert_called_once_with("incidents.alert_rules.skipping_missing_incident")
+ 
++    def test_missing_project(self):
++        incident = self.create_incident()
++        with self.tasks():
++            handle_trigger_action.delay(self.action.id, incident.id, 1002, "hello")
++        self.metrics.incr.assert_called_once_with("incidents.alert_rules.skipping_missing_project")
++
+     def test(self):
+         with patch.object(AlertRuleTriggerAction, "handlers", new={}):
+             mock_handler = Mock()
+@@ -221,6 +227,6 @@ class HandleTriggerActionTest(TestCase):
+             )
+             incident = self.create_incident()
+             with self.tasks():
+-                handle_trigger_action.delay(self.action.id, incident.id, "fire")
+-            mock_handler.assert_called_once_with(self.action, incident)
++                handle_trigger_action.delay(self.action.id, incident.id, self.project.id, "fire")
++            mock_handler.assert_called_once_with(self.action, incident, self.project)
+             mock_handler.return_value.fire.assert_called_once_with()
+diff --git a/tests/snuba/incidents/test_tasks.py b/tests/snuba/incidents/test_tasks.py
+index a521e41d2b..fe3e95696a 100644
+--- a/tests/snuba/incidents/test_tasks.py
++++ b/tests/snuba/incidents/test_tasks.py
+@@ -7,9 +7,12 @@ from uuid import uuid4
+ import six
+ from confluent_kafka import Producer
+ from django.conf import settings
++from django.core import mail
+ from django.test.utils import override_settings
+ from exam import fixture
++from freezegun import freeze_time
+ 
++from sentry.incidents.action_handlers import EmailActionHandler
+ from sentry.incidents.logic import (
+     create_alert_rule,
+     create_alert_rule_trigger,
+@@ -22,6 +25,7 @@ from sentry.incidents.models import (
+     Incident,
+     IncidentStatus,
+     IncidentType,
++    TriggerStatus,
+ )
+ from sentry.incidents.tasks import INCIDENTS_SNUBA_SUBSCRIPTION_TYPE
+ from sentry.snuba.models import QueryAggregations
+@@ -30,6 +34,7 @@ from sentry.snuba.query_subscription_consumer import QuerySubscriptionConsumer,
+ from sentry.testutils import TestCase
+ 
+ 
++@freeze_time()
+ class HandleSnubaQueryUpdateTest(TestCase):
+     def setUp(self):
+         super(HandleSnubaQueryUpdateTest, self).setUp()
+@@ -75,6 +80,10 @@ class HandleSnubaQueryUpdateTest(TestCase):
+     def trigger(self):
+         return self.rule.alertruletrigger_set.get()
+ 
++    @fixture
++    def action(self):
++        return self.trigger.alertruletriggeraction_set.get()
++
+     @fixture
+     def producer(self):
+         cluster_name = settings.KAFKA_TOPICS[self.topic]["cluster"]
+@@ -119,14 +128,27 @@ class HandleSnubaQueryUpdateTest(TestCase):
+         self.producer.produce(self.topic, json.dumps(message))
+         self.producer.flush()
+ 
+-        def active_incident_exists():
++        def active_incident():
+             return Incident.objects.filter(
+                 type=IncidentType.ALERT_TRIGGERED.value,
+                 status=IncidentStatus.OPEN.value,
+                 alert_rule=self.rule,
+-            ).exists()
++            )
+ 
+         consumer = QuerySubscriptionConsumer("hi", topic=self.topic)
+-        with self.assertChanges(active_incident_exists, before=False, after=True), self.tasks():
+-            # TODO: Need to check that the email gets sent once we hook that up
++        with self.assertChanges(
++            lambda: active_incident().exists(), before=False, after=True
++        ), self.tasks():
+             consumer.run()
++
++        assert len(mail.outbox) == 1
++        handler = EmailActionHandler(self.action, active_incident().get(), self.project)
++        message = handler.build_message(
++            handler.generate_email_context(TriggerStatus.ACTIVE), TriggerStatus.ACTIVE, self.user.id
++        )
++
++        out = mail.outbox[0]
++        assert out.to == [self.user.email]
++        assert out.subject == message.subject
++        built_message = message.build(self.user.email)
++        assert out.body == built_message.body

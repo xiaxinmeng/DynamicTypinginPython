@@ -1,0 +1,234 @@
+commit f41ecd3300a47f78d972f70b973f1aad0586c4cf
+Author: Evan Purkhiser <evanpurkhiser@gmail.com>
+Date:   Wed Aug 30 14:15:48 2017 -0700
+
+    Implement support for redis clusters
+
+diff --git a/CHANGES b/CHANGES
+index 24d250fc8c..1c0c62bdb0 100644
+--- a/CHANGES
++++ b/CHANGES
+@@ -3,6 +3,10 @@ Version 8.20 (Unreleased)
+ - Make BitBucket repositories enabled by default
+ - Add raw data toggle for Additional Data
+ 
++- Add initial support for Redis Cluster.
++- Support a list of hosts in the ``redis.clusters`` configuration along side
++  the traditional dictionary style configuration.
++
+ Schema Changes
+ ~~~~~~~~~~~~~~
+ - Added index on ``ProjectPlatform(last_seen)`` column
+diff --git a/setup.py b/setup.py
+index b806d39261..225fff1267 100755
+--- a/setup.py
++++ b/setup.py
+@@ -146,6 +146,7 @@ install_requires = [
+     'rb>=1.7.0,<2.0.0',
+     'qrcode>=5.2.2,<6.0.0',
+     'python-u2flib-server>=4.0.1,<4.1.0',
++    'redis-py-cluster>=1.3.4,<1.4.0',
+ ]
+ 
+ saml_requires = [
+diff --git a/src/sentry/data/config/config.yml.default b/src/sentry/data/config/config.yml.default
+index f1149e9416..6c73685461 100644
+--- a/src/sentry/data/config/config.yml.default
++++ b/src/sentry/data/config/config.yml.default
+@@ -38,6 +38,18 @@ system.secret-key: '%(secret_key)s'
+ # The ``redis.clusters`` setting is used, unsurprisingly, to configure Redis
+ # clusters. These clusters can be then referred to by name when configuring
+ # backends such as the cache, digests, or TSDB backend.
++#
++# Two types of clusters are currently supported:
++#
++#   rb.Cluster
++#   A redis blaster cluster is the traditional cluster used by most services
++#   within sentry. This is the default type cluster type.
++#
++#   rediscluster.StrictRedisCluster
++#   An official Redis Cluster can be configured by marking the named group with
++#   the ``is_redis_cluster: True`` flag. In future versions of Sentry more
++#   services will require this type of cluster.
++#
+ redis.clusters:
+   default:
+     hosts:
+diff --git a/src/sentry/utils/redis.py b/src/sentry/utils/redis.py
+index 247ce43d71..3479e3df57 100644
+--- a/src/sentry/utils/redis.py
++++ b/src/sentry/utils/redis.py
+@@ -1,12 +1,14 @@
+ from __future__ import absolute_import
+ 
+ import functools
++import logging
+ import posixpath
+ import six
+ 
+ from threading import Lock
+ 
+ import rb
++import rediscluster
+ from pkg_resources import resource_string
+ from redis.client import Script
+ from redis.connection import ConnectionPool
+@@ -17,6 +19,8 @@ from sentry.utils import warnings
+ from sentry.utils.warnings import DeprecatedSettingWarning
+ from sentry.utils.versioning import Version, check_versions
+ 
++logger = logging.getLogger(__name__)
++
+ _pool_cache = {}
+ _pool_lock = Lock()
+ 
+@@ -53,27 +57,76 @@ def make_rb_cluster(*args, **kwargs):
+     return _make_rb_cluster(*args, **kwargs)
+ 
+ 
++class _RBCluster(object):
++    def supports(self, config):
++        return not config.get('is_redis_cluster', False)
++
++    def factory(self, **config):
++        # rb expects a dict of { host, port } dicts where the key is the host
++        # ID. Coerce the configuration into the correct format if necessary.
++        hosts = config['hosts']
++        hosts = {k: v for k, v in enumerate(hosts)} if isinstance(hosts, list) else hosts
++        config['hosts'] = hosts
++
++        return _make_rb_cluster(**config)
++
++    def __str__(self):
++        return 'Redis Blaster Cluster'
++
++
++class _RedisCluster(object):
++    def supports(self, config):
++        return config.get('is_redis_cluster', False)
++
++    def factory(self, **config):
++        # StrictRedisCluster expects a list of { host, port } dicts. Coerce the
++        # configuration into the correct format if necessary.
++        hosts = config.get('hosts')
++        hosts = hosts.values() if isinstance(hosts, dict) else hosts
++
++        # Redis cluster does not wait to attempt to connect, we don't want the
++        # application to fail to boot because of this, raise a KeyError
++        try:
++            return rediscluster.StrictRedisCluster(startup_nodes=hosts, decode_responses=True)
++        except rediscluster.exceptions.RedisClusterException:
++            logger.warning('Failed to connect to Redis Cluster', exc_info=True)
++            raise KeyError('Redis Cluster could not be initalized')
++
++    def __str__(self):
++        return 'Redis Cluster'
++
++
+ class ClusterManager(object):
+-    def __init__(self, options_manager):
++    def __init__(self, options_manager, cluster_type=_RBCluster):
+         self.__clusters = {}
+         self.__options_manager = options_manager
++        self.__cluster_type = cluster_type()
+ 
+     def get(self, key):
+         cluster = self.__clusters.get(key)
+ 
+-        if cluster is None:
+-            # TODO: This would probably be safer with a lock, but I'm not sure
+-            # that it's necessary.
+-            configuration = self.__options_manager.get('redis.clusters').get(key)
+-            if configuration is None:
+-                raise KeyError('Invalid cluster name: {}'.format(key))
++        if cluster:
++            return cluster
++
++        # TODO: This would probably be safer with a lock, but I'm not sure
++        # that it's necessary.
++        configuration = self.__options_manager.get('redis.clusters').get(key)
++        if configuration is None:
++            raise KeyError('Invalid cluster name: {}'.format(key))
++
++        if not self.__cluster_type.supports(configuration):
++            raise KeyError('Invalid cluster type, expected: {}'.format(self.__cluster_type))
+ 
+-            cluster = self.__clusters[key] = _make_rb_cluster(**configuration)
++        cluster = self.__clusters[key] = self.__cluster_type.factory(**configuration)
+ 
+         return cluster
+ 
+ 
++# TODO(epurkhiser): When migration of all rb cluster to true redis clusters has
++# completed, remove the rb ``clusters`` module variable and rename
++# redis_clusters to clusters.
+ clusters = ClusterManager(options.default_manager)
++redis_clusters = ClusterManager(options.default_manager, _RedisCluster)
+ 
+ 
+ def get_cluster_from_options(setting, options, cluster_manager=clusters):
+diff --git a/tests/sentry/utils/test_redis.py b/tests/sentry/utils/test_redis.py
+index 13cd1f5c03..e96f967843 100644
+--- a/tests/sentry/utils/test_redis.py
++++ b/tests/sentry/utils/test_redis.py
+@@ -1,11 +1,20 @@
+ from __future__ import absolute_import
+ 
+ import functools
++import logging
++import mock
+ import pytest
+ 
++from rediscluster.exceptions import RedisClusterException
++
+ from sentry.exceptions import InvalidConfiguration
+ from sentry.testutils.cases import TestCase
+-from sentry.utils.redis import (ClusterManager, _shared_pool, get_cluster_from_options)
++from sentry.utils.redis import (
++    ClusterManager, _shared_pool, get_cluster_from_options, _RedisCluster, logger
++)
++
++# Silence connection warnings
++logger.setLevel(logging.ERROR)
+ 
+ make_manager = functools.partial(
+     ClusterManager,
+@@ -28,10 +37,18 @@ make_manager = functools.partial(
+                     },
+                 }
+             },
++            'baz': {
++                'is_redis_cluster': True,
++                'hosts': {
++                    0: {},
++                },
++            },
+         },
+     },
+ )
+ 
++redis_cluster_exception = RedisClusterException('Failed to connect')
++
+ 
+ class ClusterManagerTestCase(TestCase):
+     def test_get(self):
+@@ -42,6 +59,19 @@ class ClusterManagerTestCase(TestCase):
+         with pytest.raises(KeyError):
+             manager.get('invalid')
+ 
++    @mock.patch('rediscluster.StrictRedisCluster')
++    def test_specific_cluster(self, cluster):
++        manager = make_manager(cluster_type=_RedisCluster)
++        assert manager.get('baz') is cluster.return_value
++        with pytest.raises(KeyError):
++            manager.get('foo')
++
++    @mock.patch('rediscluster.StrictRedisCluster', side_effect=redis_cluster_exception)
++    def test_failed_redis_cluster(self, cluster):
++        manager = make_manager(cluster_type=_RedisCluster)
++        with pytest.raises(KeyError):
++            manager.get('baz')
++
+ 
+ def test_get_cluster_from_options():
+     backend = object()

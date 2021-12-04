@@ -1,0 +1,190 @@
+commit 4030ae0e005d9f9a05e24c384777a2cdd74df74e
+Author: ted kaemming <ted@kaemming.com>
+Date:   Fri Apr 6 13:13:17 2018 -0700
+
+    fix: Add `GroupEnvironment` to merge and unmerge tasks (#7093)
+
+diff --git a/src/sentry/models/groupenvironment.py b/src/sentry/models/groupenvironment.py
+index 1d58c41dcf..ea74823a36 100644
+--- a/src/sentry/models/groupenvironment.py
++++ b/src/sentry/models/groupenvironment.py
+@@ -1,5 +1,6 @@
+ from __future__ import absolute_import
+ 
++from django.db.models.signals import post_delete
+ from sentry.db.models import BoundedPositiveIntegerField, Model, sane_repr
+ from sentry.utils.cache import cache
+ 
+@@ -23,9 +24,13 @@ class GroupEnvironment(Model):
+ 
+     __repr__ = sane_repr('group_id', 'environment_id')
+ 
++    @classmethod
++    def _get_cache_key(self, group_id, environment_id):
++        return 'groupenv:1:{}:{}'.format(group_id, environment_id)
++
+     @classmethod
+     def get_or_create(cls, group_id, environment_id, defaults=None):
+-        cache_key = 'groupenv:1:{}:{}'.format(group_id, environment_id)
++        cache_key = cls._get_cache_key(group_id, environment_id)
+         instance = cache.get(cache_key)
+         if instance is None:
+             instance, created = cls.objects.get_or_create(
+@@ -38,3 +43,14 @@ class GroupEnvironment(Model):
+             created = False
+ 
+         return instance, created
++
++post_delete.connect(
++    lambda instance, **kwargs: cache.delete(
++        GroupEnvironment._get_cache_key(
++            instance.group_id,
++            instance.environment_id,
++        ),
++    ),
++    sender=GroupEnvironment,
++    weak=False,
++)
+diff --git a/src/sentry/tasks/merge.py b/src/sentry/tasks/merge.py
+index b7fbf790b8..b56bf5cb54 100644
+--- a/src/sentry/tasks/merge.py
++++ b/src/sentry/tasks/merge.py
+@@ -39,6 +39,7 @@ def merge_group(
+         Activity,
+         Group,
+         GroupAssignee,
++        GroupEnvironment,
+         GroupHash,
+         GroupRuleStatus,
+         GroupSubscription,
+@@ -98,8 +99,9 @@ def merge_group(
+         )
+ 
+     model_list = tuple(EXTRA_MERGE_MODELS) + (
+-        Activity, GroupAssignee, GroupHash, GroupRuleStatus, GroupSubscription,
+-        EventMapping, Event, UserReport, GroupRedirect, GroupMeta,
++        Activity, GroupAssignee, GroupEnvironment, GroupHash, GroupRuleStatus,
++        GroupSubscription, EventMapping, Event, UserReport, GroupRedirect,
++        GroupMeta,
+     )
+ 
+     has_more = merge_objects(
+diff --git a/src/sentry/tasks/unmerge.py b/src/sentry/tasks/unmerge.py
+index af8cfc9115..453dd7326a 100644
+--- a/src/sentry/tasks/unmerge.py
++++ b/src/sentry/tasks/unmerge.py
+@@ -12,8 +12,8 @@ from sentry.event_manager import (
+     ScoreClause, generate_culprit, get_fingerprint_for_event, get_hashes_from_fingerprint, md5_from_hash
+ )
+ from sentry.models import (
+-    Activity, Environment, Event, EventMapping, EventUser, Group, GroupHash, GroupRelease,
+-    Project, Release, UserReport
++    Activity, Environment, Event, EventMapping, EventUser, Group,
++    GroupEnvironment, GroupHash, GroupRelease, Project, Release, UserReport
+ )
+ from sentry.similarity import features
+ from sentry.tasks.base import instrumented_task
+@@ -249,6 +249,13 @@ def truncate_denormalizations(group):
+         group_id=group.id,
+     ).delete()
+ 
++    # XXX: This can cause a race condition with the ``FirstSeenEventCondition``
++    # where notifications can be erroneously sent if they occur in this group
++    # before the reprocessing of the denormalizated data completes, since a new
++    # ``GroupEnvironment`` will be created.
++    for instance in GroupEnvironment.objects.filter(group_id=group.id):
++        instance.delete()
++
+     environment_ids = list(
+         Environment.objects.filter(
+             projects=group.project
+@@ -273,6 +280,31 @@ def truncate_denormalizations(group):
+     features.delete(group)
+ 
+ 
++def collect_group_environment_data(events):
++    """\
++    Find the first release for a each group and environment pair from a
++    date-descending sorted list of events.
++    """
++    results = {}
++    for event in events:
++        results[(event.group_id, get_environment_name(event))] = event.get_tag('sentry:release')
++    return results
++
++
++def repair_group_environment_data(caches, project, events):
++    for (group_id, env_name), first_release in collect_group_environment_data(events).items():
++        fields = {
++            'first_release_id': caches['Release'](project.organization_id, first_release).id,
++        }
++
++        GroupEnvironment.objects.create_or_update(
++            environment_id=caches['Environment'](project.organization_id, env_name).id,
++            group_id=group_id,
++            defaults=fields,
++            values=fields,
++        )
++
++
+ def collect_tag_data(events):
+     results = {}
+ 
+@@ -467,6 +499,7 @@ def repair_tsdb_data(caches, project, events):
+ 
+ 
+ def repair_denormalizations(caches, project, events):
++    repair_group_environment_data(caches, project, events)
+     repair_tag_data(caches, project, events)
+     repair_group_release_data(caches, project, events)
+     repair_tsdb_data(caches, project, events)
+diff --git a/tests/sentry/tasks/test_merge.py b/tests/sentry/tasks/test_merge.py
+index cfbe9120d5..f03e69a3be 100644
+--- a/tests/sentry/tasks/test_merge.py
++++ b/tests/sentry/tasks/test_merge.py
+@@ -6,7 +6,7 @@ from mock import patch
+ from sentry import tagstore
+ from sentry.tagstore.models import GroupTagValue
+ from sentry.tasks.merge import merge_group, rehash_group_events
+-from sentry.models import Event, Group, GroupMeta, GroupRedirect, UserReport
++from sentry.models import Event, Group, GroupEnvironment, GroupMeta, GroupRedirect, UserReport
+ from sentry.similarity import _make_index_backend
+ from sentry.testutils import TestCase
+ from sentry.utils import redis
+@@ -17,6 +17,36 @@ index = _make_index_backend(redis.clusters.get('default').get_local_client(0))
+ 
+ @patch('sentry.similarity.features.index', new=index)
+ class MergeGroupTest(TestCase):
++    def test_merge_group_environments(self):
++        group1 = self.create_group(self.project)
++
++        GroupEnvironment.objects.create(
++            group_id=group1.id,
++            environment_id=1,
++        )
++
++        group2 = self.create_group(self.project)
++
++        GroupEnvironment.objects.create(
++            group_id=group2.id,
++            environment_id=1,
++        )
++
++        GroupEnvironment.objects.create(
++            group_id=group2.id,
++            environment_id=2,
++        )
++
++        with self.tasks():
++            merge_group(group1.id, group2.id)
++
++        assert list(GroupEnvironment.objects.filter(
++            group_id=group2.id,
++        ).order_by('environment_id').values_list(
++            'environment_id',
++            flat=True,
++        )) == [1, 2]
++
+     def test_merge_with_event_integrity(self):
+         project1 = self.create_project()
+         group1 = self.create_group(project1)

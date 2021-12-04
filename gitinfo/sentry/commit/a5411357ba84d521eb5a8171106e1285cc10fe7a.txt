@@ -1,0 +1,689 @@
+commit a5411357ba84d521eb5a8171106e1285cc10fe7a
+Author: ted kaemming <ted@kaemming.com>
+Date:   Fri Jul 21 13:48:13 2017 -0700
+
+    Add the ability to query similarity index by event. (#5745)
+
+diff --git a/src/sentry/api/endpoints/group_similar_issues.py b/src/sentry/api/endpoints/group_similar_issues.py
+index 608a008f0f..d914564c45 100644
+--- a/src/sentry/api/endpoints/group_similar_issues.py
++++ b/src/sentry/api/endpoints/group_similar_issues.py
+@@ -16,7 +16,7 @@ class GroupSimilarIssuesEndpoint(GroupEndpoint):
+         # TODO(tkaemming): This should have a limit somewhere.
+         results = filter(
+             lambda (group_id, scores): group_id != group.id,
+-            features.query(group)
++            features.compare(group)
+         )
+ 
+         serialized_groups = apply_values(
+diff --git a/src/sentry/scripts/similarity/index.lua b/src/sentry/scripts/similarity/index.lua
+index 7f9f00f746..40f348d75f 100644
+--- a/src/sentry/scripts/similarity/index.lua
++++ b/src/sentry/scripts/similarity/index.lua
+@@ -281,44 +281,215 @@ local function collect_index_key_pairs(arguments, validator)
+ end
+ 
+ 
++-- Signature Matching
++
++local function parse_signatures(configuration, arguments)
++    --[[
++    Parses signatures from an argument table, collecting signatures until the
++    end of the table is reached. Signatures are expected to be an index name,
++    followed by the number of items specified by the `configuration.bands`
++    value. Signatures are returned as a table with an `index` key (string) and
++    a `buckets` key (table of strings).
++    ]]--
++    local entries = table.ireduce(
++        arguments,
++        function (state, token)
++            if state.active == nil then
++                -- When there is no active entry, we need to initialize
++                -- a new one. The first token is the index identifier.
++                state.active = {index = token, buckets = {}}
++            else
++                -- If there is an active entry, we need to add the
++                -- current token to the feature list.
++                table.insert(state.active.buckets, token)
++
++                -- When we've seen the same number of buckets as there
++                -- are bands, we're done recording and need to mark the
++                -- current entry as completed, and reset the current
++                -- active entry.
++                if #state.active.buckets == configuration.bands then
++                    table.insert(state.completed, state.active)
++                    state.active = nil
++                end
++            end
++            return state
++        end,
++        {active = nil, completed = {}}
++    )
++
++    -- If there are any entries in progress when we are completed, that
++    -- means the input was in an incorrect format and we should error
++    -- before we record any bad data.
++    assert(entries.active == nil, 'unexpected end of input')
++
++    return entries.completed
++end
++
++local function fetch_candidates(configuration, time_series, index, frequencies)
++    --[[
++    Fetch all possible keys that share some characteristics with the provided
++    frequencies. The frequencies should be structured as an array-like table,
++    with one table for each band that represents the number of times that
++    bucket has been associated with the target object. (This is also the output
++    structure of `fetch_bucket_frequencies`.) For example, a four-band
++    request with two recorded observations may be strucured like this:
++
++    {
++        {a=1, b=1},
++        {a=2},
++        {b=2},
++        {a=1, d=1},
++    }
++
++    Results are returned as table where the keys represent candidate keys.
++    ]]--
++    local candidates = {}  -- acts as a set
++    for band, buckets in ipairs(frequencies) do
++        for bucket, count in pairs(buckets) do
++            for _, time in ipairs(time_series) do
++                -- Fetch all other items that have been added to
++                -- the same bucket in this band during this time
++                -- period.
++                local members = redis.call(
++                    'SMEMBERS',
++                    get_bucket_membership_key(
++                        configuration,
++                        index,
++                        time,
++                        band,
++                        bucket
++                    )
++                )
++                for _, member in ipairs(members) do
++                    -- TODO: Count the number of bands that we've collided in
++                    -- to allow setting thresholds here.
++                    candidates[member] = true
++                end
++            end
++        end
++    end
++    return candidates
++end
++
++local function fetch_bucket_frequencies(configuration, time_series, index, key)
++    --[[
++    Fetches all of the bucket frequencies for a key from a specific index from
++    all active time series chunks. This returns an array-like table that
++    contains one table for each band that maps bucket identifiers to counts
++    across the entire time series.
++    ]]--
++    return table.imap(
++        range(1, configuration.bands),
++        function (band)
++            return table.ireduce(
++                table.imap(
++                    time_series,
++                    function (time)
++                        return redis_hgetall_response_to_table(
++                            redis.call(
++                                'HGETALL',
++                                get_bucket_frequency_key(
++                                    configuration,
++                                    index,
++                                    time,
++                                    band,
++                                    key
++                                )
++                            ),
++                            tonumber
++                        )
++                    end
++                ),
++                function (result, response)
++                    for bucket, count in pairs(response) do
++                        result[bucket] = (result[bucket] or 0) + count
++                    end
++                    return result
++                end,
++                {}
++            )
++        end
++    )
++end
++
++local function calculate_similarity(configuration, item_frequencies, candidate_frequencies)
++    --[[
++    Calculate the similarity between an item's frequency and an array-like
++    table of candidate frequencies. This returns a table of candidate keys to
++    and [0, 1] scores where 0 is totally dissimilar and 1 is exactly similar.
++    ]]--
++    local results = {}
++    for key, value in pairs(candidate_frequencies) do
++        table.insert(
++            results,
++            {
++                key,
++                table.ireduce(  -- sum, then avg
++                    table.imap(  -- calculate similarity
++                        table.izip(
++                            item_frequencies,
++                            value
++                        ),
++                        function (v)
++                            -- We calculate the "similarity" between two items
++                            -- by comparing how often their contents exist in
++                            -- the same buckets for a band.
++                            local dist = get_manhattan_distance(
++                                scale_to_total(v[1]),
++                                scale_to_total(v[2])
++                            )
++                            -- Since this is a measure of similarity (and not
++                            -- distance) we normalize the result to [0, 1]
++                            -- scale.
++                            return 1 - (dist / 2)
++                        end
++                    ),
++                    function (total, item)
++                        return total + item
++                    end,
++                    0
++                ) / configuration.bands
++            }
++        )
++    end
++    return results
++end
++
++local function fetch_similar(configuration, time_series, index, item_frequencies)
++    --[[
++    Fetch the items that are similar to an item's frequencies (as returned by
++    `fetch_bucket_frequencies`), returning a table of similar items keyed by
++    the candidate key where the value is on a [0, 1] similarity scale.
++    ]]--
++    local candidates = fetch_candidates(configuration, time_series, index, item_frequencies)
++    local candidate_frequencies = {}
++    for candidate_key, _ in pairs(candidates) do
++        candidate_frequencies[candidate_key] = fetch_bucket_frequencies(
++            configuration,
++            time_series,
++            index,
++            candidate_key
++        )
++    end
++
++    return calculate_similarity(
++        configuration,
++        item_frequencies,
++        candidate_frequencies
++    )
++end
++
+ -- Command Parsing
+ 
+ local commands = {
+     RECORD = takes_configuration(
+         function (configuration, arguments)
+             local key = arguments[1]
+-
+-            local entries = table.ireduce(
+-                table.slice(arguments, 2),
+-                function (state, token)
+-                    if state.active == nil then
+-                        -- When there is no active entry, we need to initialize
+-                        -- a new one. The first token is the index identifier.
+-                        state.active = {index = token, buckets = {}}
+-                    else
+-                        -- If there is an active entry, we need to add the
+-                        -- current token to the feature list.
+-                        table.insert(state.active.buckets, token)
+-
+-                        -- When we've seen the same number of buckets as there
+-                        -- are bands, we're done recording and need to mark the
+-                        -- current entry as completed, and reset the current
+-                        -- active entry.
+-                        if #state.active.buckets == configuration.bands then
+-                            table.insert(state.completed, state.active)
+-                            state.active = nil
+-                        end
+-                    end
+-                    return state
+-                end,
+-                {active = nil, completed = {}}
++            local signatures = parse_signatures(
++                configuration,
++                table.slice(arguments, 2)
+             )
+ 
+-            -- If there are any entries in progress when we are completed, that
+-            -- means the input was in an incorrect format and we should error
+-            -- before we record any bad data.
+-            assert(entries.active == nil, 'unexpected end of input')
+-
+             local time = math.floor(configuration.timestamp / configuration.interval)
+             local expiration = get_index_expiration_time(
+                 configuration.interval,
+@@ -327,7 +498,7 @@ local commands = {
+             )
+ 
+             return table.imap(
+-                entries.completed,
++                signatures,
+                 function (entry)
+                     local results = {}
+ 
+@@ -361,139 +532,84 @@ local commands = {
+             )
+         end
+     ),
+-    QUERY = takes_configuration(
++    CLASSIFY = takes_configuration(
+         function (configuration, arguments)
+-            local item_key = arguments[1]
+-            local indices = table.slice(arguments, 2)
+-
++            local signatures = parse_signatures(
++                configuration,
++                arguments
++            )
+             local time_series = get_active_indices(
+                 configuration.interval,
+                 configuration.retention,
+                 configuration.timestamp
+             )
+ 
+-            -- Fetch all of the bucket frequencies for a key from a specific
+-            -- index from all active time series chunks. This returns a table
+-            -- containing n tables (where n is the number of bands) mapping
+-            -- bucket identifiers to counts.
+-            local fetch_bucket_frequencies = function (index, key)
+-                return table.imap(
+-                    range(1, configuration.bands),
+-                    function (band)
+-                        return table.ireduce(
+-                            table.imap(
+-                                time_series,
+-                                function (time)
+-                                    return redis_hgetall_response_to_table(
+-                                        redis.call(
+-                                            'HGETALL',
+-                                            get_bucket_frequency_key(
+-                                                configuration,
+-                                                index,
+-                                                time,
+-                                                band,
+-                                                key
+-                                            )
+-                                        ),
+-                                        tonumber
+-                                    )
+-                                end
+-                            ),
+-                            function (result, response)
+-                                for bucket, count in pairs(response) do
+-                                    result[bucket] = (result[bucket] or 0) + count
+-                                end
+-                                return result
+-                            end,
+-                            {}
++            return table.imap(
++                signatures,
++                function (signature)
++                    local results = fetch_similar(
++                        configuration,
++                        time_series,
++                        signature.index,
++                        table.imap(
++                            signature.buckets,
++                            function (band)
++                                local item = {}
++                                item[band] = 1
++                                return item
++                            end
+                         )
+-                    end
+-                )
+-            end
++                    )
+ 
+-            local fetch_candidates = function (index, frequencies)
+-                local candidates = {}  -- acts as a set
+-                for band, buckets in ipairs(frequencies) do
+-                    for bucket, count in pairs(buckets) do
+-                        for _, time in ipairs(time_series) do
+-                            -- Fetch all other items that have been added to
+-                            -- the same bucket in this band during this time
+-                            -- period.
+-                            local members = redis.call(
+-                                'SMEMBERS',
+-                                get_bucket_membership_key(
+-                                    configuration,
+-                                    index,
+-                                    time,
+-                                    band,
+-                                    bucket
+-                                )
+-                            )
+-                            for _, member in ipairs(members) do
+-                                candidates[member] = true
+-                            end
++                    -- Sort the results in descending order (most similar first.)
++                    table.sort(
++                        results,
++                        function (left, right)
++                            return left[2] > right[2]
+                         end
+-                    end
++                    )
++
++                    return table.imap(
++                        results,
++                        function (item)
++                            return {
++                                item[1],
++                                string.format(
++                                    '%f',  -- converting floats to strings avoids truncation
++                                    item[2]
++                                ),
++                            }
++                        end
++                    )
+                 end
+-                return candidates
+-            end
++            )
++        end
++    ),
++    COMPARE = takes_configuration(
++        function (configuration, arguments)
++            local item_key = arguments[1]
++            local indices = table.slice(arguments, 2)
++
++            local time_series = get_active_indices(
++                configuration.interval,
++                configuration.retention,
++                configuration.timestamp
++            )
+ 
+             return table.imap(
+                 indices,
+                 function (index)
+-                    -- First, identify the which buckets that the key we are
+-                    -- querying is present in.
+-                    local item_frequencies = fetch_bucket_frequencies(index, item_key)
+-
+-                    -- Then, find all iterms that also exist within those
+-                    -- buckets and fetch their frequencies.
+-                    local candidates = fetch_candidates(index, item_frequencies)
+-                    local candidate_frequencies = {}
+-                    for candidate_key, _ in pairs(candidates) do
+-                        candidate_frequencies[candidate_key] = fetch_bucket_frequencies(
++                    local results = fetch_similar(
++                        configuration,
++                        time_series,
++                        index,
++                        fetch_bucket_frequencies(
++                            configuration,
++                            time_series,
+                             index,
+-                            candidate_key
+-                        )
+-                    end
+-
+-                    -- Then, calculate the similarity for each candidate based
+-                    -- on their frequencies.
+-                    local results = {}
+-                    for key, value in pairs(candidate_frequencies) do
+-                        table.insert(
+-                            results,
+-                            {
+-                                key,
+-                                table.ireduce(  -- sum, then avg
+-                                    table.imap(  -- calculate similarity
+-                                        table.izip(
+-                                            item_frequencies,
+-                                            value
+-                                        ),
+-                                        function (v)
+-                                            -- We calculate the "similarity"
+-                                            -- between two items by comparing
+-                                            -- how often their contents exist
+-                                            -- in the same buckets for a band.
+-                                            local dist = get_manhattan_distance(
+-                                                scale_to_total(v[1]),
+-                                                scale_to_total(v[2])
+-                                            )
+-                                            -- Since this is a measure of
+-                                            -- similarity (and not distance) we
+-                                            -- normalize the result to [0, 1]
+-                                            -- scale.
+-                                            return 1 - (dist / 2)
+-                                        end
+-                                    ),
+-                                    function (total, item)
+-                                        return total + item
+-                                    end,
+-                                    0
+-                                ) / configuration.bands
+-                            }
++                            item_key
+                         )
+-                    end
++                    )
+ 
+                     -- Sort the results in descending order (most similar first.)
+                     table.sort(
+diff --git a/src/sentry/similarity/features.py b/src/sentry/similarity/features.py
+index 87f54f54e3..c5db5188f9 100644
+--- a/src/sentry/similarity/features.py
++++ b/src/sentry/similarity/features.py
+@@ -57,8 +57,8 @@ class FeatureSet(object):
+         self.expected_encoding_errors = expected_encoding_errors
+         assert set(self.aliases) == set(self.features)
+ 
+-    def __get_scope(self, group):
+-        return '{}'.format(group.project_id)
++    def __get_scope(self, project):
++        return '{}'.format(project.id)
+ 
+     def __get_key(self, group):
+         return '{}'.format(group.id)
+@@ -105,17 +105,56 @@ class FeatureSet(object):
+                         features,
+                     ))
+         return self.index.record(
+-            self.__get_scope(event.group),
++            self.__get_scope(event.project),
+             self.__get_key(event.group),
+             items,
+             timestamp=to_timestamp(event.datetime),
+         )
+ 
+-    def query(self, group):
++    def classify(self, event):
++        items = []
++        for label, features in self.extract(event).items():
++            try:
++                features = map(self.encoder.dumps, features)
++            except Exception as error:
++                log = (
++                    logger.debug
++                    if isinstance(error, self.expected_encoding_errors) else
++                    functools.partial(
++                        logger.warning,
++                        exc_info=True
++                    )
++                )
++                log(
++                    'Could not encode features from %r for %r due to error: %r',
++                    event,
++                    label,
++                    error,
++                )
++            else:
++                if features:
++                    items.append((
++                        self.aliases[label],
++                        features,
++                    ))
++        results = self.index.classify(
++            self.__get_scope(event.project),
++            items,
++            timestamp=to_timestamp(event.datetime),
++        )
++        return zip(
++            map(
++                lambda (alias, characteristics): self.aliases.get_key(alias),
++                items,
++            ),
++            results,
++        )
++
++    def compare(self, group):
+         features = list(self.features.keys())
+ 
+-        results = self.index.query(
+-            self.__get_scope(group),
++        results = self.index.compare(
++            self.__get_scope(group.project),
+             self.__get_key(group),
+             [self.aliases[label] for label in features],
+         )
+@@ -145,16 +184,16 @@ class FeatureSet(object):
+         scopes = {}
+         for source in sources:
+             scopes.setdefault(
+-                self.__get_scope(source),
++                self.__get_scope(source.project),
+                 set(),
+             ).add(source)
+ 
+-        unsafe_scopes = set(scopes.keys()) - set([self.__get_scope(destination)])
++        unsafe_scopes = set(scopes.keys()) - set([self.__get_scope(destination.project)])
+         if unsafe_scopes and not allow_unsafe:
+             raise ValueError(
+                 'all groups must belong to same project if unsafe merges are not allowed')
+ 
+-        destination_scope = self.__get_scope(destination)
++        destination_scope = self.__get_scope(destination.project)
+         destination_key = self.__get_key(destination)
+ 
+         for source_scope, sources in scopes.items():
+@@ -187,6 +226,6 @@ class FeatureSet(object):
+     def delete(self, group):
+         key = self.__get_key(group)
+         return self.index.delete(
+-            self.__get_scope(group),
++            self.__get_scope(group.project),
+             [(self.aliases[label], key) for label in self.features.keys()],
+         )
+diff --git a/src/sentry/similarity/index.py b/src/sentry/similarity/index.py
+index 2efe5fcbf6..1c82bc14bb 100644
+--- a/src/sentry/similarity/index.py
++++ b/src/sentry/similarity/index.py
+@@ -23,12 +23,44 @@ class MinHashIndex(object):
+         self.interval = interval
+         self.retention = retention
+ 
+-    def query(self, scope, key, indices, timestamp=None):
++    def classify(self, scope, items, timestamp=None):
+         if timestamp is None:
+             timestamp = int(time.time())
+ 
+         arguments = [
+-            'QUERY',
++            'CLASSIFY',
++            timestamp,
++            self.namespace,
++            self.bands,
++            self.interval,
++            self.retention,
++            scope,
++        ]
++
++        for idx, features in items:
++            arguments.append(idx)
++            arguments.extend([
++                ','.join(map('{}'.format, b))
++                for b in
++                band(self.bands, self.signature_builder(features))
++            ])
++
++        return [
++            [(item, float(score)) for item, score in result]
++            for result in
++            index(
++                self.cluster.get_local_client_for_key(scope),
++                [],
++                arguments,
++            )
++        ]
++
++    def compare(self, scope, key, indices, timestamp=None):
++        if timestamp is None:
++            timestamp = int(time.time())
++
++        arguments = [
++            'COMPARE',
+             timestamp,
+             self.namespace,
+             self.bands,
+diff --git a/tests/sentry/similarity/test_index.py b/tests/sentry/similarity/test_index.py
+index 578d2a2d7d..d72c896ea2 100644
+--- a/tests/sentry/similarity/test_index.py
++++ b/tests/sentry/similarity/test_index.py
+@@ -10,7 +10,7 @@ from sentry.testutils import TestCase
+ from sentry.utils import redis
+ 
+ 
+-signature_builder = MinHashSignatureBuilder(16, 0xFFFF)
++signature_builder = MinHashSignatureBuilder(32, 0xFFFF)
+ 
+ 
+ class MinHashIndexTestCase(TestCase):
+@@ -19,7 +19,7 @@ class MinHashIndexTestCase(TestCase):
+             redis.clusters.get('default'),
+             'sim',
+             signature_builder,
+-            8,
++            16,
+             60 * 60,
+             12,
+         )
+@@ -31,15 +31,21 @@ class MinHashIndexTestCase(TestCase):
+         index.record('example', '4', [('index', 'mellow world')])
+         index.record('example', '5', [('index', 'pizza world')])
+ 
+-        results = index.query('example', '1', ['index'])[0]
++        results = index.compare('example', '1', ['index'])[0]
+         assert results[0] == ('1', 1.0)
+         assert results[1] == ('2', 1.0)  # identical contents
+         assert results[2][0] in ('3', '4')  # equidistant pairs, order doesn't really matter
+         assert results[3][0] in ('3', '4')
+         assert results[4][0] == '5'
+ 
++        results = index.classify('example', [('index', 'hello world')])[0]
++        assert results[0:2] == [('1', 1.0), ('2', 1.0)]
++        assert results[2][0] in ('3', '4')  # equidistant pairs, order doesn't really matter
++        assert results[3][0] in ('3', '4')
++        assert results[4][0] == '5'
++
+         index.delete('example', [('index', '3')])
+-        assert [key for key, _ in index.query('example', '1', ['index'])[0]] == [
++        assert [key for key, _ in index.compare('example', '1', ['index'])[0]] == [
+             '1', '2', '4', '5'
+         ]
+ 
+@@ -50,7 +56,7 @@ class MinHashIndexTestCase(TestCase):
+             8,
+             60 * 60,
+             12,
+-        ).query('example', '1', ['index']) == [[]]
++        ).compare('example', '1', ['index']) == [[]]
+ 
+     def test_export_import(self):
+         retention = 12

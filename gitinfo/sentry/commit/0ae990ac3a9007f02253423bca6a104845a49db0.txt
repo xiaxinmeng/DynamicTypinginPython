@@ -1,0 +1,169 @@
+commit 0ae990ac3a9007f02253423bca6a104845a49db0
+Author: Mark Story <mark@sentry.io>
+Date:   Thu May 23 11:29:51 2019 -0400
+
+     fix(integrations) Fix detached default identities (#13339)
+    
+    Not all IntegrationErrors have `code` attributes. We don't want to 500
+    when trying to log errors.
+    
+    When an integration is updated with a different user record, we should
+    sync the OrganizationIntegration.default_auth_id to the new Identity.
+    Failing to do so results in broken integration data.
+    
+    This scenario has come up a handful of times in production and can be
+    reproduced with the following scenario:
+    
+    1. Connect GitLab with 'bob' account. Their identity is recorded as the
+       default_auth_id.
+    2. Discover that bob doesn't have enough access to add project hooks.
+    3. Go through the connection flow again with 'sally' as they have enough
+       access. Sally will cause a conflict with bob as their external_id and
+       idp records will match.
+    4. Bob will be deleted and sally will be stored, but the organization
+       integration will not be updated.
+    
+    I've updated the existing test as I think the above scenario shows that
+    the previous test was incorrect.
+    
+    Fixes SEN-626
+
+diff --git a/src/sentry/integrations/pipeline.py b/src/sentry/integrations/pipeline.py
+index 54bccd52c3..abca835554 100644
+--- a/src/sentry/integrations/pipeline.py
++++ b/src/sentry/integrations/pipeline.py
+@@ -14,6 +14,8 @@ from sentry.pipeline import Pipeline
+ from sentry.web.helpers import render_to_response
+ from . import default_manager
+ 
++import six
++
+ 
+ def ensure_integration(key, data):
+     defaults = {
+@@ -43,7 +45,8 @@ class IntegrationPipeline(Pipeline):
+             self.get_logger().info(
+                 'build-integration.failure',
+                 extra={
+-                    'error_message': e.message,
++                    'error_message': six.text_type(e),
++                    'error_status': getattr(e, 'code', None),
+                     'provider_key': self.provider.key,
+                 }
+             )
+@@ -101,6 +104,7 @@ class IntegrationPipeline(Pipeline):
+                 'date_verified': timezone.now(),
+             }
+ 
++            new_id = None
+             try:
+                 identity_model, created = Identity.objects.get_or_create(
+                     idp=idp,
+@@ -108,8 +112,9 @@ class IntegrationPipeline(Pipeline):
+                     external_id=identity['external_id'],
+                     defaults=identity_data,
+                 )
+-
+-                if not created:
++                if created:
++                    new_id = identity_model.id
++                else:
+                     identity_model.update(**identity_data)
+             except IntegrityError:
+                 # If the external_id is already used for a different user or
+@@ -141,15 +146,18 @@ class IntegrationPipeline(Pipeline):
+                             )
+                 identity_model = Identity.reattach(
+                     idp, identity['external_id'], self.request.user, identity_data)
++                new_id = identity_model.id
+ 
+         default_auth_id = None
+         if self.provider.needs_default_identity:
+             if not (identity and identity_model):
+                 raise NotImplementedError('Integration requires an identity')
+-            default_auth_id = identity_model.id
++            default_auth_id = new_id
+ 
+         org_integration = self.integration.add_organization(
+-            self.organization, self.request.user, default_auth_id=default_auth_id)
++            self.organization,
++            self.request.user,
++            default_auth_id=default_auth_id)
+ 
+         return self._dialog_response(serialize(org_integration, self.request.user), True)
+ 
+diff --git a/src/sentry/models/integration.py b/src/sentry/models/integration.py
+index b92f528621..6354c76b2e 100644
+--- a/src/sentry/models/integration.py
++++ b/src/sentry/models/integration.py
+@@ -1,6 +1,6 @@
+ from __future__ import absolute_import
+ 
+-from django.db import models, IntegrityError, transaction
++from django.db import models, IntegrityError
+ from django.utils import timezone
+ 
+ from sentry.constants import ObjectStatus
+@@ -106,13 +106,16 @@ class Integration(Model):
+         Returns False if the OrganizationIntegration was not created
+         """
+         try:
+-            with transaction.atomic():
+-                integration = OrganizationIntegration.objects.create(
+-                    organization_id=organization.id,
+-                    integration_id=self.id,
+-                    default_auth_id=default_auth_id,
+-                    config={},
+-                )
++            org_integration, created = OrganizationIntegration.objects.get_or_create(
++                organization_id=organization.id,
++                integration_id=self.id,
++                defaults={
++                    'default_auth_id': default_auth_id,
++                    'config': {}
++                }
++            )
++            if not created and default_auth_id:
++                org_integration.update(default_auth_id=default_auth_id)
+         except IntegrityError:
+             return False
+         else:
+@@ -123,4 +126,4 @@ class Integration(Model):
+                 sender=self.__class__,
+             )
+ 
+-        return integration
++            return org_integration
+diff --git a/tests/sentry/integrations/test_pipeline.py b/tests/sentry/integrations/test_pipeline.py
+index 051f2c0196..e7e3a5ac03 100644
+--- a/tests/sentry/integrations/test_pipeline.py
++++ b/tests/sentry/integrations/test_pipeline.py
+@@ -163,7 +163,7 @@ class FinishPipelineTestCase(IntegrationTestCase):
+         assert org_integration.default_auth_id is not None
+         assert Identity.objects.filter(id=org_integration.default_auth_id).exists()
+ 
+-    def test_default_identity_does_not_update(self, *args):
++    def test_default_identity_does_update(self, *args):
+         self.provider.needs_default_identity = True
+         old_identity_id = 234567
+         integration = Integration.objects.create(
+@@ -198,17 +198,12 @@ class FinishPipelineTestCase(IntegrationTestCase):
+         resp = self.pipeline.finish_pipeline()
+         self.assertDialogSuccess(resp)
+ 
+-        integration = Integration.objects.get(
+-            provider=self.provider.key,
+-            external_id=self.external_id,
+-        )
+-
+         org_integration = OrganizationIntegration.objects.get(
+             organization_id=self.organization.id,
+             integration_id=integration.id,
+         )
+-        assert org_integration.default_auth_id == old_identity_id
+-        assert Identity.objects.filter(external_id='AccountId').exists()
++        identity = Identity.objects.get(external_id='AccountId')
++        assert org_integration.default_auth_id == identity.id
+ 
+     @patch('sentry.mediators.plugins.Migrator.call')
+     def test_disabled_plugin_when_fully_migrated(self, call, *args):

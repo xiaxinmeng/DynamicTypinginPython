@@ -1,0 +1,448 @@
+commit 76d48b85bdb58f708bceffb318e2d92a7091973c
+Author: Markus Unterwaditzer <markus@unterwaditzer.net>
+Date:   Wed Apr 1 17:20:27 2020 +0200
+
+    ref(utils.sdk): Route internal errors to another DSN, kill internal transport (#17448)
+    
+    We want to get rid of the Python store endpoint. Therefore we can no
+    longer use the internal transport to route Sentry's errors to itself,
+    and have to use a proper DSN instead.
+    
+    There is potential for infinite recursion when crashing while ingesting
+    our own errors. We used to break this recursion using both a file
+    blacklist and a thread local (`with NOOP_HUB`). Since Relay does not
+    report back to Sentry, that is partially obsolete. However, the ingest
+    and outcomes consumer are a part of the event pipeline that now need to
+    end up in the file blacklist since the thread local is ineffective.
+    
+    As discussed we are not moving forward with forcing sentry4sentry on everybody.
+    So our current best effort for recursion breaking is extended to look into the
+    current scope whether the project we are currently processing events for is the
+    internal one. If so, we disable instrumentation entirely.
+    
+    This additional safeguard is used for both the internal transport and the relay
+    transport, and as long as we don't see a dip in event volume this should be
+    safe. Then we can start increasing the sample rate. **After we have fully
+    sampled into Relay, this PR requires that the entire event pipeline is setting
+    the `project` tag consistently.** Or else there is risk for infinite recursion
+    again.
+    
+    I introduced a dedicated function for setting the current project (for
+    documentation purposes) and made sure it is used everywhere consistently.
+    
+    Note that it should not be necessary to register the option in the DB
+    before deploying this commit, as the option is only queried if
+    `relay_dsn` is set.
+
+diff --git a/src/sentry/coreapi.py b/src/sentry/coreapi.py
+index 86bc89816c..819520616e 100644
+--- a/src/sentry/coreapi.py
++++ b/src/sentry/coreapi.py
+@@ -25,7 +25,7 @@ from sentry.utils.auth import parse_auth_header
+ from sentry.utils.cache import cache_key_for_event
+ from sentry.utils.http import origin_from_request
+ from sentry.utils.strings import decompress
+-from sentry.utils.sdk import configure_scope
++from sentry.utils.sdk import configure_scope, set_current_project
+ from sentry.utils.canonical import CANONICAL_TYPES
+ 
+ 
+@@ -91,8 +91,7 @@ class ClientContext(object):
+     def bind_project(self, project):
+         self.project = project
+         self.project_id = project.id
+-        with configure_scope() as scope:
+-            scope.set_tag("project", project.id)
++        set_current_project(project.id)
+ 
+     def bind_auth(self, auth):
+         self.agent = auth.client
+diff --git a/src/sentry/eventstream/snuba.py b/src/sentry/eventstream/snuba.py
+index 4cd402eaad..f84f71d811 100644
+--- a/src/sentry/eventstream/snuba.py
++++ b/src/sentry/eventstream/snuba.py
+@@ -12,6 +12,7 @@ from sentry import quotas
+ from sentry.eventstream.base import EventStream
+ from sentry.utils import snuba, json
+ from sentry.utils.safe import get_path
++from sentry.utils.sdk import set_current_project
+ 
+ 
+ logger = logging.getLogger(__name__)
+@@ -88,6 +89,7 @@ class SnubaProtocolEventStream(EventStream):
+         skip_consume=False,
+     ):
+         project = event.project
++        set_current_project(project.id)
+         retention_days = quotas.get_event_retention(organization=project.organization)
+ 
+         event_data = event.get_raw_data()
+@@ -127,7 +129,7 @@ class SnubaProtocolEventStream(EventStream):
+                     "skip_consume": skip_consume,
+                 },
+             ),
+-            headers={'Received-Timestamp': six.text_type(received_timestamp)}
++            headers={"Received-Timestamp": six.text_type(received_timestamp)},
+         )
+ 
+     def start_delete_groups(self, project_id, group_ids):
+@@ -253,7 +255,7 @@ class SnubaEventStream(SnubaProtocolEventStream):
+                     "POST",
+                     "/tests/{}/eventstream".format(dataset),
+                     body=json.dumps(data),
+-                    headers={'X-Sentry-{}'.format(k): v for k, v in headers.items()},
++                    headers={"X-Sentry-{}".format(k): v for k, v in headers.items()},
+                 )
+                 if resp.status != 200:
+                     raise snuba.SnubaError("HTTP %s response from Snuba!" % resp.status)
+diff --git a/src/sentry/options/defaults.py b/src/sentry/options/defaults.py
+index 024bb8cc25..798dd71d6b 100644
+--- a/src/sentry/options/defaults.py
++++ b/src/sentry/options/defaults.py
+@@ -225,3 +225,9 @@ register("discover2.max_tags_to_combine", default=3, flags=FLAG_PRIORITIZE_DISK)
+ # Killswitch for datascrubbing after stacktrace processing. Set to False to
+ # disable datascrubbers.
+ register("processing.can-use-scrubbers", default=True)
++
++# Sampling option to move over from reporting using the internal transport to
++# using a separate DSN
++# 0 => use tried and true internal transport
++# 1 => use relay_dsn in settings.SENTRY_SDK_CONFIG
++register("store.use-relay-dsn-sample-rate", default=0.0)
+diff --git a/src/sentry/tasks/post_process.py b/src/sentry/tasks/post_process.py
+index 318c1846b0..d62b4f9eef 100644
+--- a/src/sentry/tasks/post_process.py
++++ b/src/sentry/tasks/post_process.py
+@@ -13,7 +13,7 @@ from sentry.tasks.base import instrumented_task
+ from sentry.utils import metrics
+ from sentry.utils.redis import redis_clusters
+ from sentry.utils.safe import safe_execute
+-from sentry.utils.sdk import configure_scope
++from sentry.utils.sdk import set_current_project
+ 
+ logger = logging.getLogger("sentry")
+ 
+@@ -119,6 +119,8 @@ def post_process_group(event, is_new, is_regression, is_new_group_environment, *
+     """
+     Fires post processing hooks for a group.
+     """
++    set_current_project(event.project_id)
++
+     from sentry.utils import snuba
+ 
+     with snuba.options_override({"consistent": True}):
+@@ -151,9 +153,6 @@ def post_process_group(event, is_new, is_regression, is_new_group_environment, *
+             event.group, _ = get_group_with_redirect(event.group_id)
+             event.group_id = event.group.id
+ 
+-        with configure_scope() as scope:
+-            scope.set_tag("project", event.project_id)
+-
+         # Re-bind Project and Org since we're pickling the whole Event object
+         # which may contain stale parent models.
+         event.project = Project.objects.get_from_cache(id=event.project_id)
+@@ -253,8 +252,7 @@ def plugin_post_process_group(plugin_slug, event, **kwargs):
+     """
+     Fires post processing hooks for a group.
+     """
+-    with configure_scope() as scope:
+-        scope.set_tag("project", event.project_id)
++    set_current_project(event.project_id)
+ 
+     from sentry.plugins.base import plugins
+ 
+diff --git a/src/sentry/tasks/store.py b/src/sentry/tasks/store.py
+index 8bdd673c6f..b62a39953a 100644
+--- a/src/sentry/tasks/store.py
++++ b/src/sentry/tasks/store.py
+@@ -21,7 +21,7 @@ from sentry.utils.safe import safe_execute
+ from sentry.stacktraces.processing import process_stacktraces, should_process_for_stacktraces
+ from sentry.utils.canonical import CanonicalKeyDict, CANONICAL_TYPES
+ from sentry.utils.dates import to_datetime
+-from sentry.utils.sdk import configure_scope
++from sentry.utils.sdk import set_current_project
+ from sentry.models import ProjectOption, Activity, Project
+ 
+ error_logger = logging.getLogger("sentry.errors.events")
+@@ -117,9 +117,7 @@ def _do_preprocess_event(cache_key, data, start_time, event_id, process_task, pr
+     original_data = data
+     data = CanonicalKeyDict(data)
+     project_id = data["project"]
+-
+-    with configure_scope() as scope:
+-        scope.set_tag("project", project_id)
++    set_current_project(project_id)
+ 
+     if project is None:
+         project = Project.objects.get_from_cache(id=project_id)
+@@ -209,6 +207,8 @@ def _do_symbolicate_event(cache_key, start_time, event_id, symbolicate_task, dat
+     data = CanonicalKeyDict(data)
+ 
+     project_id = data["project"]
++    set_current_project(project_id)
++
+     event_id = data["event_id"]
+ 
+     project = Project.objects.get_from_cache(id=project_id)
+@@ -389,13 +389,12 @@ def _do_process_event(
+     data = CanonicalKeyDict(data)
+ 
+     project_id = data["project"]
++    set_current_project(project_id)
++
+     event_id = data["event_id"]
+ 
+     project = Project.objects.get_from_cache(id=project_id)
+ 
+-    with configure_scope() as scope:
+-        scope.set_tag("project", project_id)
+-
+     has_changed = bool(data_has_changed)
+     new_process_behavior = bool(new_process_behavior)
+ 
+@@ -593,9 +592,12 @@ def process_event_from_reprocessing(
+ 
+ 
+ def delete_raw_event(project_id, event_id, allow_hint_clear=False):
++    set_current_project(project_id)
++
+     if event_id is None:
+         error_logger.error("process.failed_delete_raw_event", extra={"project_id": project_id})
+         return
++
+     from sentry.models import RawEvent, ReprocessingReport
+ 
+     RawEvent.objects.filter(project_id=project_id, event_id=event_id).delete()
+@@ -622,6 +624,8 @@ def create_failed_event(
+     """If processing failed we put the original data from the cache into a
+     raw event.  Returns `True` if a failed event was inserted
+     """
++    set_current_project(project_id)
++
+     # We can only create failed events for events that can potentially
+     # create failed events.
+     if not reprocessing.event_supports_reprocessing(data):
+@@ -703,6 +707,8 @@ def _do_save_event(
+     Saves an event to the database.
+     """
+ 
++    set_current_project(project_id)
++
+     from sentry.event_manager import EventManager, HashDiscarded
+ 
+     event_type = "none"
+@@ -724,6 +730,7 @@ def _do_save_event(
+         # the task.
+         if project_id is None:
+             project_id = data.pop("project")
++            set_current_project(project_id)
+ 
+         # We only need to delete raw events for events that support
+         # reprocessing.  If the data cannot be found we want to assume
+@@ -748,9 +755,6 @@ def _do_save_event(
+             )
+             return
+ 
+-        with configure_scope() as scope:
+-            scope.set_tag("project", project_id)
+-
+         event = None
+         try:
+             with metrics.timer("tasks.store.do_save_event.event_manager.save"):
+diff --git a/src/sentry/utils/sdk.py b/src/sentry/utils/sdk.py
+index 67bec5b1a6..6f0081248e 100644
+--- a/src/sentry/utils/sdk.py
++++ b/src/sentry/utils/sdk.py
+@@ -1,5 +1,6 @@
+ from __future__ import absolute_import, print_function
+ 
++import random
+ import inspect
+ import json
+ import logging
+@@ -21,7 +22,12 @@ from sentry import options
+ from sentry.utils import metrics
+ from sentry.utils.rust import RustInfoIntegration
+ 
+-UNSAFE_FILES = ("sentry/event_manager.py", "sentry/tasks/process_buffer.py")
++UNSAFE_FILES = (
++    "sentry/event_manager.py",
++    "sentry/tasks/process_buffer.py",
++    "sentry/ingest/ingest_consumer.py",
++    "sentry/ingest/outcomes_consumer.py",
++)
+ 
+ # Reexport sentry_sdk just in case we ever have to write another shim like we
+ # did for raven
+@@ -33,12 +39,33 @@ def is_current_event_safe():
+     Tests the current stack for unsafe locations that would likely cause
+     recursion if an attempt to send to Sentry was made.
+     """
++
++    with configure_scope() as scope:
++        project_id = scope._tags.get("project")
++
++        if project_id and project_id == settings.SENTRY_PROJECT:
++            return False
++
+     for _, filename, _, _, _, _ in inspect.stack():
+         if filename.endswith(UNSAFE_FILES):
+             return False
++
+     return True
+ 
+ 
++def set_current_project(project_id):
++    """
++    Set the current project on the SDK scope for outgoing crash reports.
++
++    This is a dedicated function because it is also important for the recursion
++    breaker to work. You really should set the project in every task that is
++    relevant to event processing, or that task may crash ingesting
++    sentry-internal errors, causing infinite recursion.
++    """
++    with configure_scope() as scope:
++        scope.set_tag("project", project_id)
++
++
+ def get_project_key():
+     from sentry.models import ProjectKey
+ 
+@@ -93,32 +120,58 @@ def configure_sdk():
+ 
+     # if this flag is set then the internal transport is disabled.  This is useful
+     # for local testing in case the real python SDK behavior should be enforced.
+-    if not sdk_options.pop("disable_internal_transport", False):
+-        internal_transport = InternalTransport()
++    #
++    # Make sure to pop all options that would be invalid for the SDK here
++    disable_internal_transport = sdk_options.pop("disable_internal_transport", False)
++    relay_dsn = sdk_options.pop("relay_dsn", None)
++    upstream_dsn = sdk_options.pop("dsn", None)
++
++    if upstream_dsn:
++        upstream_transport = make_transport(get_options(dsn=upstream_dsn, **sdk_options))
++    else:
+         upstream_transport = None
+-        if sdk_options.get("dsn"):
+-            upstream_transport = make_transport(get_options(sdk_options))
+ 
+-        def capture_event(event):
+-            if event.get("type") == "transaction" and options.get(
+-                "transaction-events.force-disable-internal-project"
+-            ):
++    if not disable_internal_transport:
++        internal_transport = InternalTransport()
++    else:
++        internal_transport = None
++
++    if relay_dsn:
++        relay_transport = make_transport(get_options(dsn=relay_dsn, **sdk_options))
++    else:
++        relay_transport = None
++
++    def capture_event(event):
++        if event.get("type") == "transaction" and options.get(
++            "transaction-events.force-disable-internal-project"
++        ):
++            return
++
++        # Upstream should get the event first because it is most isolated from
++        # the this sentry installation.
++        if upstream_transport:
++            # TODO(mattrobenolt): Bring this back safely.
++            # from sentry import options
++            # install_id = options.get('sentry:install-id')
++            # if install_id:
++            #     event.setdefault('tags', {})['install-id'] = install_id
++            upstream_transport.capture_event(event)
++
++        if relay_transport:
++            rate = options.get("store.use-relay-dsn-sample-rate")
++            if rate and random.random() < rate:
++                if is_current_event_safe():
++                    relay_transport.capture_event(event)
++                else:
++                    metrics.incr("internal.uncaptured.events.relay", skip_internal=False)
++                    sdk_logger.warn("internal-error.unsafe-stacktrace.relay")
+                 return
+ 
+-            # Make sure we log to upstream when available first
+-            if upstream_transport is not None:
+-                # TODO(mattrobenolt): Bring this back safely.
+-                # from sentry import options
+-                # install_id = options.get('sentry:install-id')
+-                # if install_id:
+-                #     event.setdefault('tags', {})['install-id'] = install_id
+-                upstream_transport.capture_event(event)
+-
++        if internal_transport:
+             internal_transport.capture_event(event)
+ 
+-        sdk_options["transport"] = capture_event
+-
+     sentry_sdk.init(
++        transport=capture_event,
+         integrations=[
+             DjangoIntegration(),
+             CeleryIntegration(),
+@@ -133,7 +186,7 @@ def configure_sdk():
+ def _create_noop_hub():
+     def transport(event):
+         with capture_internal_exceptions():
+-            metrics.incr("internal.uncaptured.events", skip_internal=False)
++            metrics.incr("internal.uncaptured.events.noop-hub", skip_internal=False)
+             sdk_logger.warn("internal-error.noop-hub")
+ 
+     return sentry_sdk.Hub(sentry_sdk.Client(transport=transport))
+@@ -166,7 +219,7 @@ class InternalTransport(Transport):
+         # execution flow into the celery job triggered by StoreView. In other
+         # words, UNSAFE_FILES is used in case the celery job for crashes and
+         # that error is captured by the SDK.
+-        with NOOP_HUB:
++        with sentry_sdk.Hub(NOOP_HUB):
+             return self._capture_event(event)
+ 
+     def _capture_event(self, event):
+diff --git a/tests/sentry/utils/test_sdk.py b/tests/sentry/utils/test_sdk.py
+index fac304623f..b7d2325ed5 100644
+--- a/tests/sentry/utils/test_sdk.py
++++ b/tests/sentry/utils/test_sdk.py
+@@ -4,10 +4,11 @@ from sentry_sdk import Hub
+ 
+ from django.conf import settings
+ from sentry.utils.sdk import configure_sdk, bind_organization_context
++from sentry.utils.compat import mock
+ from sentry.app import raven
+ 
+ from sentry.eventstore.models import Event
+-from sentry.testutils import TestCase
++from sentry.testutils import TestCase, assert_mock_called_once_with_partial
+ from sentry import nodestore
+ 
+ 
+@@ -25,6 +26,24 @@ class SentryInternalClientTest(TestCase):
+         assert event["event_id"] == event_id
+         assert event["logentry"]["formatted"] == "internal client test"
+ 
++    def test_recursion_breaker(self):
++        configure_sdk()
++        Hub.current.bind_client(Hub.main.client)
++
++        # If this test terminates at all then we avoided recursion.
++        with self.tasks():
++            with mock.patch(
++                "sentry.event_manager.EventManager.save", side_effect=ValueError("oh no!")
++            ) as save:
++                event_id = raven.captureMessage("internal client test")
++
++        event = nodestore.get(Event.generate_node_id(settings.SENTRY_PROJECT, event_id))
++        assert event is None
++
++        assert_mock_called_once_with_partial(
++            save, settings.SENTRY_PROJECT, cache_key=u"e:{}:1".format(event_id)
++        )
++
+     def test_encoding(self):
+         configure_sdk()
+         Hub.current.bind_client(Hub.main.client)

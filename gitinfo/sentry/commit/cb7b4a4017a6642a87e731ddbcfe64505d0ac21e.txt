@@ -1,0 +1,307 @@
+commit cb7b4a4017a6642a87e731ddbcfe64505d0ac21e
+Author: Jan Michael Auer <jan.auer@sentry.io>
+Date:   Fri Oct 25 10:00:08 2019 +0200
+
+    ref(relay): Optimize project config endpoint for bulk queries (#15258)
+    
+    Loads Organizations and their options in bulk to reduce duplication when computing project configs.
+
+diff --git a/src/sentry/api/endpoints/relay_projectconfigs.py b/src/sentry/api/endpoints/relay_projectconfigs.py
+index 564cf11a55..e5e2915ae2 100644
+--- a/src/sentry/api/endpoints/relay_projectconfigs.py
++++ b/src/sentry/api/endpoints/relay_projectconfigs.py
+@@ -7,7 +7,7 @@ from sentry.api.base import Endpoint
+ from sentry.api.permissions import RelayPermission
+ from sentry.api.authentication import RelayAuthentication
+ from sentry.relay import config
+-from sentry.models import Project, Organization
++from sentry.models import Project, Organization, OrganizationOption
+ 
+ 
+ class RelayProjectConfigsEndpoint(Endpoint):
+@@ -24,38 +24,43 @@ class RelayProjectConfigsEndpoint(Endpoint):
+         if full_config_requested and not relay.is_internal:
+             return Response("Relay unauthorized for full config information", 403)
+ 
+-        project_ids = request.relay_request_data.get("projects") or ()
+-        projects = {}
+-
+-        orgs = set()
+-
+-        # In the first iteration we fetch all configs that we know about
+-        # but only the project settings
++        project_ids = set(request.relay_request_data.get("projects") or ())
+         if project_ids:
+-            for project in Project.objects.filter(pk__in=project_ids):
+-                # for internal relays return the full, rich, configuration,
+-                # for external relays return the minimal config
+-                proj_config = config.get_project_config(
+-                    project.id, relay.is_internal and full_config_requested
+-                )
+-
+-                projects[six.text_type(project.id)] = proj_config
+-
+-                orgs.add(project.organization_id)
+-
+-        # In the second iteration we check if the project has access to
+-        # the org at all.
+-        if orgs:
+-            orgs = {o.id: o for o in Organization.objects.filter(pk__in=orgs)}
+-            for cfg in list(projects.values()):
+-                org = orgs.get(cfg.project.organization_id)
+-                if org is None or not request.relay.has_org_access(org):
+-                    projects.pop(six.text_type(cfg.project.id))
+-
+-        # Fill in configs that we failed the access check for or don't
+-        # exist.
+-        configs = {p_id: cfg.to_camel_case_dict() for p_id, cfg in six.iteritems(projects)}
++            projects = {p.id: p for p in Project.objects.filter(pk__in=project_ids)}
++        else:
++            projects = {}
++
++        # Preload all organizations and their options to prevent repeated
++        # database access when computing the project configuration.
++        org_ids = set(project.organization_id for project in six.itervalues(projects))
++        if org_ids:
++            orgs = {
++                o.id: o
++                for o in Organization.objects.filter(pk__in=org_ids)
++                if request.relay.has_org_access(o)
++            }
++        else:
++            orgs = {}
++        org_options = {i: OrganizationOption.objects.get_all_values(i) for i in six.iterkeys(orgs)}
++
++        configs = {}
+         for project_id in project_ids:
+-            configs.setdefault(six.text_type(project_id), None)
++            configs[six.text_type(project_id)] = None
++
++            project = projects.get(int(project_id))
++            if project is None:
++                continue
++
++            organization = orgs.get(project.organization_id)
++            if organization is None:
++                continue
++
++            project.organization = organization
++            org_opts = org_options.get(organization.id) or {}
++
++            project_config = config.get_project_config(
++                project, org_options=org_opts, full_config=full_config_requested
++            )
++            configs[six.text_type(project_id)] = project_config.to_camel_case_dict()
+ 
+         return Response({"configs": configs}, status=200)
+diff --git a/src/sentry/relay/config.py b/src/sentry/relay/config.py
+index c9a60b9f3b..d09d879593 100644
+--- a/src/sentry/relay/config.py
++++ b/src/sentry/relay/config.py
+@@ -7,19 +7,14 @@ import sentry.utils as utils
+ from datetime import datetime
+ from pytz import utc
+ 
+-from sentry.coreapi import APIError
+ from sentry.grouping.api import get_grouping_config_dict_for_project
+ from sentry.interfaces.security import DEFAULT_DISALLOWED_SOURCES
+ from sentry.message_filters import get_all_filters, get_filter_key
+ from sentry import quotas
+ 
+-from sentry.models.organization import Organization
+ from sentry.models.organizationoption import OrganizationOption
+-from sentry.models.project import Project
+-from sentry.models.projectoption import ProjectOption
+ from sentry.utils.data_filters import FilterTypes, FilterStatKeys
+ from sentry.utils.http import get_origins
+-from sentry.utils.outcomes import track_outcome, Outcome
+ from sentry.models.projectkey import ProjectKey
+ from sentry.utils.sdk import configure_scope
+ 
+@@ -29,26 +24,25 @@ def get_project_key_config(project_key):
+     return {"dsn": project_key.dsn_public}
+ 
+ 
+-def get_project_config(project_id, full_config=True, for_store=False):
++def get_project_config(project, org_options=None, full_config=True, for_store=False):
+     """
+     Constructs the ProjectConfig information.
+ 
+-    :param project_id: the project id as int or string
++    :param project: The project to load configuration for. Ensure that
++        organization is bound on this object; otherwise it will be loaded from
++        the database.
++    :param org_options: Inject preloaded organization options for faster loading.
++        If ``None``, options are lazy-loaded from the database.
+     :param full_config: True if only the full config is required, False
+         if only the restricted (for external relays) is required
+         (default True, i.e. full configuration)
+     :param for_store: If set to true, this omits all parameters that are not
+-        needed for store normalization. This is a temporary flag that should
+-        be removed once store has been moved to Relay. Most importantly, this
+-        avoids database accesses.
++        needed for Relay. This is a temporary flag that should be removed once
++        store has been moved to Relay. Most importantly, this avoids database
++        accesses.
+ 
+     :return: a ProjectConfig object for the given project
+     """
+-    project = _get_project_from_id(six.text_type(project_id))
+-
+-    if project is None:
+-        raise APIError("Invalid project id:{}".format(project_id))
+-
+     with configure_scope() as scope:
+         scope.set_tag("project", project.id)
+ 
+@@ -71,7 +65,8 @@ def get_project_config(project_id, full_config=True, for_store=False):
+ 
+     now = datetime.utcnow().replace(tzinfo=utc)
+ 
+-    org_options = OrganizationOption.objects.get_all_values(project.organization_id)
++    if org_options is None:
++        org_options = OrganizationOption.objects.get_all_values(project.organization_id)
+ 
+     cfg = {
+         "disabled": project.status > 0,
+@@ -97,17 +92,6 @@ def get_project_config(project_id, full_config=True, for_store=False):
+     # internally. Do not expose it to external Relays.
+     cfg["organization_id"] = project.organization_id
+ 
+-    # Explicitly bind Organization so we don't implicitly query it later
+-    # this just allows us to comfortably assure that `project.organization` is safe.
+-    # This also allows us to pull the object from cache, instead of being
+-    # implicitly fetched from database.
+-    project.organization = Organization.objects.get_from_cache(id=project.organization_id)
+-
+-    if project.organization is not None:
+-        org_options = OrganizationOption.objects.get_all_values(project.organization_id)
+-    else:
+-        org_options = {}
+-
+     project_cfg = cfg["config"]
+ 
+     # get the filter settings for this project
+@@ -383,19 +367,6 @@ def _to_camel_case_dict(obj):
+     }
+ 
+ 
+-def _get_project_from_id(project_id):
+-    if not project_id:
+-        return None
+-    if not project_id.isdigit():
+-        track_outcome(0, 0, None, Outcome.INVALID, "project_id")
+-        raise APIError("Invalid project_id: %r" % project_id)
+-    try:
+-        return Project.objects.get_from_cache(id=project_id)
+-    except Project.DoesNotExist:
+-        track_outcome(0, 0, None, Outcome.INVALID, "project_id")
+-        raise APIError("Invalid project_id: %r" % project_id)
+-
+-
+ def _load_filter_settings(flt, project):
+     """
+     Returns the filter settings for the specified project
+@@ -408,7 +379,7 @@ def _load_filter_settings(flt, project):
+     """
+     filter_id = flt.spec.id
+     filter_key = u"filters:{}".format(filter_id)
+-    setting = ProjectOption.objects.get_value(project=project, key=filter_key, default=None)
++    setting = project.get_option(filter_key)
+ 
+     return _filter_option_to_config_setting(flt, setting)
+ 
+diff --git a/src/sentry/web/api.py b/src/sentry/web/api.py
+index 7f133fb415..2a36279753 100644
+--- a/src/sentry/web/api.py
++++ b/src/sentry/web/api.py
+@@ -63,7 +63,7 @@ from sentry.lang.native.minidump import (
+     write_minidump_placeholder,
+     MINIDUMP_ATTACHMENT_TYPE,
+ )
+-from sentry.models import Project, File, EventAttachment
++from sentry.models import Project, File, EventAttachment, Organization
+ from sentry.signals import event_accepted, event_dropped, event_filtered, event_received
+ from sentry.quotas.base import RateLimit
+ from sentry.utils import json, metrics
+@@ -347,6 +347,19 @@ def _scrub_event_data(data, datascrubbing_settings):
+     return data
+ 
+ 
++def _get_project_from_id(project_id):
++    if not project_id:
++        return None
++    if not project_id.isdigit():
++        track_outcome(0, 0, None, Outcome.INVALID, "project_id")
++        raise APIError("Invalid project_id: %r" % project_id)
++    try:
++        return Project.objects.get_from_cache(id=project_id)
++    except Project.DoesNotExist:
++        track_outcome(0, 0, None, Outcome.INVALID, "project_id")
++        raise APIError("Invalid project_id: %r" % project_id)
++
++
+ class APIView(BaseView):
+     auth_helper_cls = ClientAuthHelper
+ 
+@@ -451,7 +464,15 @@ class APIView(BaseView):
+                 project_id, request, self.auth_helper_cls, helper
+             )
+ 
+-            project_config = get_project_config(project_id, for_store=True)
++            project = _get_project_from_id(six.text_type(project_id))
++
++            # Explicitly bind Organization so we don't implicitly query it later
++            # this just allows us to comfortably assure that `project.organization` is safe.
++            # This also allows us to pull the object from cache, instead of being
++            # implicitly fetched from database.
++            project.organization = Organization.objects.get_from_cache(id=project.organization_id)
++
++            project_config = get_project_config(project, for_store=True)
+ 
+             helper.context.bind_project(project_config.project)
+ 
+diff --git a/tests/sentry/event_manager/test_event_manager.py b/tests/sentry/event_manager/test_event_manager.py
+index f1bcf97a16..975472ca20 100644
+--- a/tests/sentry/event_manager/test_event_manager.py
++++ b/tests/sentry/event_manager/test_event_manager.py
+@@ -1059,7 +1059,7 @@ class EventManagerTest(TestCase):
+ 
+         data = {"exception": {"values": [item.value for item in items]}}
+ 
+-        project_config = get_project_config(self.project.id, for_store=True)
++        project_config = get_project_config(self.project, for_store=True)
+         manager = EventManager(data, project=self.project, project_config=project_config)
+ 
+         mock_is_valid_error_message.side_effect = [item.result for item in items]
+diff --git a/tests/sentry/utils/http/tests.py b/tests/sentry/utils/http/tests.py
+index 11cda37016..8edc5f9d83 100644
+--- a/tests/sentry/utils/http/tests.py
++++ b/tests/sentry/utils/http/tests.py
+@@ -255,7 +255,7 @@ class IsValidOriginTestCase(unittest.TestCase):
+ class IsValidIPTestCase(TestCase):
+     def is_valid_ip(self, ip, inputs):
+         self.project.update_option("sentry:blacklisted_ips", inputs)
+-        project_config = get_project_config(self.project.id)
++        project_config = get_project_config(self.project)
+         return is_valid_ip(project_config, ip)
+ 
+     def test_not_in_blacklist(self):
+@@ -277,7 +277,7 @@ class IsValidIPTestCase(TestCase):
+ class IsValidReleaseTestCase(TestCase):
+     def is_valid_release(self, value, inputs):
+         self.project.update_option(u"sentry:{}".format(FilterTypes.RELEASES), inputs)
+-        project_config = get_project_config(self.project.id)
++        project_config = get_project_config(self.project)
+         return is_valid_release(project_config, value)
+ 
+     def test_release_not_in_list(self):
+@@ -297,7 +297,7 @@ class IsValidReleaseTestCase(TestCase):
+ class IsValidErrorMessageTestCase(TestCase):
+     def is_valid_error_message(self, value, inputs):
+         self.project.update_option(u"sentry:{}".format(FilterTypes.ERROR_MESSAGES), inputs)
+-        project_config = get_project_config(self.project.id)
++        project_config = get_project_config(self.project)
+         return is_valid_error_message(project_config, value)
+ 
+     def test_error_class_not_in_list(self):

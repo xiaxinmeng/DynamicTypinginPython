@@ -1,0 +1,781 @@
+commit 8d275a2939ea76122dab72f30d049b9548cf8f74
+Author: Dan Fuller <dfuller@sentry.io>
+Date:   Wed Jun 19 17:56:47 2019 -0700
+
+    feat(api): Improve load times for incident list endpoint (SEN-764)
+    
+    This diff improves the load time of the incident list endpoint via parallelizing snuba queries and
+    batching postgres ones. This should make loading the endpoint much faster. Not everything is
+    batched, `_prepare_query_params` still makes individual queries to translate values. I'll work on
+    optmizing that later if necessary.
+    
+    Things done in this diff:
+     - Added `SnubaQueryParams`, which accepts all parameters from `raw_query`. This makes it easier
+       to pass a list of params to the bulk function.
+     - Added `bulk_raw_query`. This accepts a list of `SnubaQueryParams`, and performs the queries to
+       snuba in parallel via a thread pool. If only one query is passed we skip the threadpool and use
+       the old behaviour.
+     - Added bulk version of `build_incident_query_params`. This fetches query params for incidents in
+       two queries rather than 2N.
+     - Added bulk versions of `get_incident_event_stats` and `get_incident_aggregates`. These bulk
+       functions accept the results from `bulk_build_incident_query_params` directly, so that we can
+       share them and avoid unnecessary queries. They use `bulk_raw_query` to query snuba as well.
+     - Updated `IncidentSerializer` to use these new bulk functions.
+
+diff --git a/src/sentry/api/serializers/models/incident.py b/src/sentry/api/serializers/models/incident.py
+index 6e81048e75..fac782dcac 100644
+--- a/src/sentry/api/serializers/models/incident.py
++++ b/src/sentry/api/serializers/models/incident.py
+@@ -11,8 +11,9 @@ from sentry.api.serializers import (
+ )
+ from sentry.api.serializers.snuba import SnubaTSResultSerializer
+ from sentry.incidents.logic import (
+-    get_incident_aggregates,
+-    get_incident_event_stats,
++    bulk_build_incident_query_params,
++    bulk_get_incident_aggregates,
++    bulk_get_incident_event_stats,
+ )
+ from sentry.incidents.models import (
+     Incident,
+@@ -33,11 +34,15 @@ class IncidentSerializer(Serializer):
+ 
+         results = {}
+ 
+-        for incident in item_list:
++        incident_query_params_list = bulk_build_incident_query_params(item_list)
++        bulk_event_stats = bulk_get_incident_event_stats(item_list, incident_query_params_list)
++        bulk_aggregates = bulk_get_incident_aggregates(incident_query_params_list)
++
++        for incident, event_stats, aggregates in zip(item_list, bulk_event_stats, bulk_aggregates):
+             results[incident] = {
+                 'projects': incident_projects.get(incident.id, []),
+-                'event_stats': get_incident_event_stats(incident),
+-                'aggregates': get_incident_aggregates(incident),
++                'event_stats': event_stats,
++                'aggregates': aggregates,
+             }
+ 
+         return results
+diff --git a/src/sentry/incidents/logic.py b/src/sentry/incidents/logic.py
+index e5bae6dbc3..4ba488d510 100644
+--- a/src/sentry/incidents/logic.py
++++ b/src/sentry/incidents/logic.py
+@@ -1,5 +1,6 @@
+ from __future__ import absolute_import
+ 
++from collections import defaultdict
+ from datetime import timedelta
+ 
+ import six
+@@ -30,7 +31,8 @@ from sentry.incidents.tasks import (
+ )
+ from sentry.utils.committers import get_event_file_committers
+ from sentry.utils.snuba import (
+-    raw_query,
++    bulk_raw_query,
++    SnubaQueryParams,
+     SnubaTSResult,
+ )
+ 
+@@ -263,22 +265,36 @@ def create_event_stat_snapshot(incident, start, end):
+ 
+ 
+ def build_incident_query_params(incident, start=None, end=None):
+-    params = {
+-        'start': incident.date_started if start is None else start,
+-        'end': incident.current_end_date if end is None else end,
+-    }
+-    group_ids = list(IncidentGroup.objects.filter(
+-        incident=incident,
+-    ).values_list('group_id', flat=True))
+-    if group_ids:
+-        params['issue.id'] = group_ids
+-    project_ids = list(IncidentProject.objects.filter(
+-        incident=incident,
+-    ).values_list('project_id', flat=True))
+-    if project_ids:
+-        params['project_id'] = project_ids
++    return bulk_build_incident_query_params([incident], start=start, end=end)[0]
++
++
++def bulk_build_incident_query_params(incidents, start=None, end=None):
++    incident_groups = defaultdict(list)
++    for incident_id, group_id in IncidentGroup.objects.filter(
++        incident__in=incidents,
++    ).values_list('incident_id', 'group_id'):
++        incident_groups[incident_id].append(group_id)
++    incident_projects = defaultdict(list)
++    for incident_id, project_id in IncidentProject.objects.filter(
++        incident__in=incidents,
++    ).values_list('incident_id', 'project_id'):
++        incident_projects[incident_id].append(project_id)
++
++    query_args_list = []
++    for incident in incidents:
++        params = {
++            'start': incident.date_started if start is None else start,
++            'end': incident.current_end_date if end is None else end,
++        }
++        group_ids = incident_groups[incident.id]
++        if group_ids:
++            params['issue.id'] = group_ids
++        project_ids = incident_projects[incident.id]
++        if project_ids:
++            params['project_id'] = project_ids
++        query_args_list.append(get_snuba_query_args(incident.query, params))
+ 
+-    return get_snuba_query_args(incident.query, params)
++    return query_args_list
+ 
+ 
+ def get_incident_event_stats(incident, start=None, end=None, data_points=50):
+@@ -286,24 +302,33 @@ def get_incident_event_stats(incident, start=None, end=None, data_points=50):
+     Gets event stats for an incident. If start/end are provided, uses that time
+     period, otherwise uses the incident start/current_end.
+     """
+-    kwargs = build_incident_query_params(incident, start=start, end=end)
+-    rollup = max(int(incident.duration.total_seconds() / data_points), 1)
+-    return SnubaTSResult(
+-        raw_query(
++    query_params = bulk_build_incident_query_params([incident], start=start, end=end)
++    return bulk_get_incident_event_stats([incident], query_params, data_points=data_points)[0]
++
++
++def bulk_get_incident_event_stats(incidents, query_params_list, data_points=50):
++    snuba_params_list = [
++        SnubaQueryParams(
+             aggregations=[
+                 ('count()', '', 'count'),
+             ],
+             orderby='time',
+             groupby=['time'],
+-            rollup=rollup,
+-            referrer='incidents.get_incident_event_stats',
++            rollup=max(int(incident.duration.total_seconds() / data_points), 1),
+             limit=10000,
+-            **kwargs
+-        ),
+-        kwargs['start'],
+-        kwargs['end'],
+-        rollup,
+-    )
++            **query_param
++        ) for incident, query_param in zip(incidents, query_params_list)
++    ]
++    results = bulk_raw_query(snuba_params_list, referrer='incidents.get_incident_event_stats')
++    return [
++        SnubaTSResult(
++            result,
++            snuba_params.start,
++            snuba_params.end,
++            snuba_params.rollup,
++        )
++        for snuba_params, result in zip(snuba_params_list, results)
++    ]
+ 
+ 
+ def get_incident_aggregates(incident):
+@@ -312,16 +337,23 @@ def get_incident_aggregates(incident):
+     - count: Total count of events
+     - unique_users: Total number of unique users
+     """
+-    kwargs = build_incident_query_params(incident)
+-    return raw_query(
+-        aggregations=[
+-            ('count()', '', 'count'),
+-            ('uniq', 'tags[sentry:user]', 'unique_users'),
+-        ],
+-        referrer='incidents.get_incident_aggregates',
+-        limit=10000,
+-        **kwargs
+-    )['data'][0]
++    query_params = build_incident_query_params(incident)
++    return bulk_get_incident_aggregates([query_params])[0]
++
++
++def bulk_get_incident_aggregates(query_params_list):
++    snuba_params_list = [
++        SnubaQueryParams(
++            aggregations=[
++                ('count()', '', 'count'),
++                ('uniq', 'tags[sentry:user]', 'unique_users'),
++            ],
++            limit=10000,
++            **query_param
++        ) for query_param in query_params_list
++    ]
++    results = bulk_raw_query(snuba_params_list, referrer='incidents.get_incident_aggregates')
++    return [result['data'][0] for result in results]
+ 
+ 
+ def subscribe_to_incident(incident, user):
+diff --git a/src/sentry/utils/snuba.py b/src/sentry/utils/snuba.py
+index d777dc514a..443c4e429f 100644
+--- a/src/sentry/utils/snuba.py
++++ b/src/sentry/utils/snuba.py
+@@ -15,6 +15,7 @@ import six
+ import time
+ import urllib3
+ 
++from concurrent.futures import ThreadPoolExecutor
+ from django.conf import settings
+ 
+ from sentry import quotas
+@@ -240,6 +241,7 @@ _snuba_pool = connection_from_url(
+     timeout=30,
+     maxsize=10,
+ )
++_query_thread_pool = ThreadPoolExecutor(max_workers=10)
+ 
+ 
+ epoch_naive = datetime(1970, 1, 1, tzinfo=None)
+@@ -519,65 +521,38 @@ def transform_aliases_and_query(skip_conditions=False, **kwargs):
+     return result
+ 
+ 
+-def raw_query(start, end, groupby=None, conditions=None, filter_keys=None,
+-              aggregations=None, rollup=None, referrer=None,
+-              is_grouprelease=False, **kwargs):
+-    """
+-    Sends a query to snuba.
+-
+-    `start` and `end`: The beginning and end of the query time window (required)
+-
+-    `groupby`: A list of column names to group by.
+-
+-    `conditions`: A list of (column, operator, literal) conditions to be passed
+-    to the query. Conditions that we know will not have to be translated should
+-    be passed this way (eg tag[foo] = bar).
+-
+-    `filter_keys`: A dictionary of {col: [key, ...]} that will be converted
+-    into "col IN (key, ...)" conditions. These are used to restrict the query to
+-    known sets of project/issue/environment/release etc. Appropriate
+-    translations (eg. from environment model ID to environment name) are
+-    performed on the query, and the inverse translation performed on the
+-    result. The project_id(s) to restrict the query to will also be
+-    automatically inferred from these keys.
+-
+-    `aggregations` a list of (aggregation_function, column, alias) tuples to be
+-    passed to the query.
+-
+-    The rest of the args are passed directly into the query JSON unmodified.
+-    See the snuba schema for details.
+-    """
+-
++def _prepare_query_params(query_params):
+     # convert to naive UTC datetimes, as Snuba only deals in UTC
+     # and this avoids offset-naive and offset-aware issues
+-    start = naiveify_datetime(start)
+-    end = naiveify_datetime(end)
+-
+-    groupby = groupby or []
+-    conditions = conditions or []
+-    aggregations = aggregations or []
+-    filter_keys = filter_keys or {}
++    start = naiveify_datetime(query_params.start)
++    end = naiveify_datetime(query_params.end)
+ 
+     with timer('get_snuba_map'):
+-        forward, reverse = get_snuba_translators(filter_keys, is_grouprelease=is_grouprelease)
++        forward, reverse = get_snuba_translators(
++            query_params.filter_keys,
++            is_grouprelease=query_params.is_grouprelease,
++        )
+ 
+-    if 'project_id' in filter_keys:
++    if 'project_id' in query_params.filter_keys:
+         # If we are given a set of project ids, use those directly.
+-        project_ids = list(set(filter_keys['project_id']))
+-    elif filter_keys:
++        project_ids = list(set(query_params.filter_keys['project_id']))
++    elif query_params.filter_keys:
+         # Otherwise infer the project_ids from any related models
+         with timer('get_related_project_ids'):
+-            ids = [get_related_project_ids(k, filter_keys[k]) for k in filter_keys]
++            ids = [
++                get_related_project_ids(k, query_params.filter_keys[k])
++                for k in query_params.filter_keys
++            ]
+             project_ids = list(set.union(*map(set, ids)))
+     else:
+         project_ids = []
+ 
+-    for col, keys in six.iteritems(forward(deepcopy(filter_keys))):
++    for col, keys in six.iteritems(forward(deepcopy(query_params.filter_keys))):
+         if keys:
+             if len(keys) == 1 and None in keys:
+-                conditions.append((col, 'IS NULL', None))
++                query_params.conditions.append((col, 'IS NULL', None))
+             else:
+-                conditions.append((col, 'IN', keys))
++                query_params.conditions.append((col, 'IN', keys))
+ 
+     if not project_ids:
+         raise UnqualifiedQueryError(
+@@ -596,7 +571,7 @@ def raw_query(start, end, groupby=None, conditions=None, filter_keys=None,
+     # if `shrink_time_window` pushed `start` after `end` it means the user queried
+     # a Group for T1 to T2 when the group was only active for T3 to T4, so the query
+     # wouldn't return any results anyway
+-    new_start = shrink_time_window(filter_keys.get('issue'), start)
++    new_start = shrink_time_window(query_params.filter_keys.get('issue'), start)
+ 
+     # TODO (alexh) this is a quick emergency fix for an occasion where a search
+     # results in only 1 django candidate, which is then passed to snuba to
+@@ -609,55 +584,148 @@ def raw_query(start, end, groupby=None, conditions=None, filter_keys=None,
+     if start > end:
+         raise QueryOutsideGroupActivityError
+ 
+-    kwargs.update({
++    query_params.kwargs.update({
+         'from_date': start.isoformat(),
+         'to_date': end.isoformat(),
+-        'groupby': groupby,
+-        'conditions': conditions,
+-        'aggregations': aggregations,
++        'groupby': query_params.groupby,
++        'conditions': query_params.conditions,
++        'aggregations': query_params.aggregations,
+         'project': project_ids,
+-        'granularity': rollup,  # TODO name these things the same
++        'granularity': query_params.rollup,  # TODO name these things the same
+     })
+-    kwargs = {k: v for k, v in six.iteritems(kwargs) if v is not None}
++    kwargs = {k: v for k, v in six.iteritems(query_params.kwargs) if v is not None}
+ 
+     kwargs.update(OVERRIDE_OPTIONS)
++    return kwargs, forward, reverse
++
++
++class SnubaQueryParams(object):
++    """
++    Represents the information needed to make a query to Snuba.
++
++    `start` and `end`: The beginning and end of the query time window (required)
++
++    `groupby`: A list of column names to group by.
++
++    `conditions`: A list of (column, operator, literal) conditions to be passed
++    to the query. Conditions that we know will not have to be translated should
++    be passed this way (eg tag[foo] = bar).
++
++    `filter_keys`: A dictionary of {col: [key, ...]} that will be converted
++    into "col IN (key, ...)" conditions. These are used to restrict the query to
++    known sets of project/issue/environment/release etc. Appropriate
++    translations (eg. from environment model ID to environment name) are
++    performed on the query, and the inverse translation performed on the
++    result. The project_id(s) to restrict the query to will also be
++    automatically inferred from these keys.
++
++    `aggregations` a list of (aggregation_function, column, alias) tuples to be
++    passed to the query.
++
++    The rest of the args are passed directly into the query JSON unmodified.
++    See the snuba schema for details.
++    """
++
++    def __init__(
++        self, start, end, groupby=None, conditions=None, filter_keys=None,
++        aggregations=None, rollup=None, referrer=None, is_grouprelease=False,
++        **kwargs
++    ):
++        self.start = start
++        self.end = end
++        self.groupby = groupby or []
++        self.conditions = conditions or []
++        self.aggregations = aggregations or []
++        self.filter_keys = filter_keys or {}
++        self.rollup = rollup
++        self.referrer = referrer
++        self.is_grouprelease = is_grouprelease
++        self.kwargs = kwargs
++
+ 
++def raw_query(start, end, groupby=None, conditions=None, filter_keys=None,
++              aggregations=None, rollup=None, referrer=None,
++              is_grouprelease=False, **kwargs):
++    """
++    Sends a query to snuba.  See `SnubaQueryParams` docstring for param
++    descriptions.
++    """
++    snuba_params = SnubaQueryParams(
++        start=start,
++        end=end,
++        groupby=groupby,
++        conditions=conditions,
++        filter_keys=filter_keys,
++        aggregations=aggregations,
++        rollup=rollup,
++        is_grouprelease=is_grouprelease,
++        **kwargs
++    )
++    return bulk_raw_query([snuba_params], referrer=referrer)[0]
++
++
++def bulk_raw_query(snuba_param_list, referrer=None):
+     headers = {}
+     if referrer:
+         headers['referer'] = referrer
+ 
+-    try:
+-        with timer('snuba_query'):
+-            response = _snuba_pool.urlopen(
+-                'POST', '/query', body=json.dumps(kwargs), headers=headers)
+-    except urllib3.exceptions.HTTPError as err:
+-        raise SnubaError(err)
++    query_param_list = map(_prepare_query_params, snuba_param_list)
+ 
+-    try:
+-        body = json.loads(response.data)
+-    except ValueError:
+-        raise UnexpectedResponseError(u"Could not decode JSON response: {}".format(response.data))
+-
+-    if response.status != 200:
+-        if body.get('error'):
+-            error = body['error']
+-            if response.status == 429:
+-                raise RateLimitExceeded(error['message'])
+-            elif error['type'] == 'schema':
+-                raise SchemaValidationError(error['message'])
+-            elif error['type'] == 'clickhouse':
+-                raise clickhouse_error_codes_map.get(
+-                    error['code'],
+-                    QueryExecutionError,
+-                )(error['message'])
++    def snuba_query(params):
++        query_params, forward, reverse = params
++        try:
++            with timer('snuba_query'):
++                return (
++                    _snuba_pool.urlopen(
++                        'POST',
++                        '/query',
++                        body=json.dumps(query_params),
++                        headers=headers,
++                    ),
++                    forward,
++                    reverse,
++                )
++        except urllib3.exceptions.HTTPError as err:
++            raise SnubaError(err)
++
++    if len(snuba_param_list) > 1:
++        query_results = _query_thread_pool.map(snuba_query, query_param_list)
++    else:
++        # No need to submit to the thread pool if we're just performing a
++        # single query
++        query_results = [snuba_query(query_param_list[0])]
++
++    results = []
++    for response, _, reverse in query_results:
++        try:
++            body = json.loads(response.data)
++        except ValueError:
++            raise UnexpectedResponseError(
++                u"Could not decode JSON response: {}".format(response.data),
++            )
++
++        if response.status != 200:
++            if body.get('error'):
++                error = body['error']
++                if response.status == 429:
++                    raise RateLimitExceeded(error['message'])
++                elif error['type'] == 'schema':
++                    raise SchemaValidationError(error['message'])
++                elif error['type'] == 'clickhouse':
++                    raise clickhouse_error_codes_map.get(
++                        error['code'],
++                        QueryExecutionError,
++                    )(error['message'])
++                else:
++                    raise SnubaError(error['message'])
+             else:
+-                raise SnubaError(error['message'])
+-        else:
+-            raise SnubaError(u'HTTP {}'.format(response.status))
++                raise SnubaError(u'HTTP {}'.format(response.status))
++
++        # Forward and reverse translation maps from model ids to snuba keys, per column
++        body['data'] = [reverse(d) for d in body['data']]
++        results.append(body)
+ 
+-    # Forward and reverse translation maps from model ids to snuba keys, per column
+-    body['data'] = [reverse(d) for d in body['data']]
+-    return body
++    return results
+ 
+ 
+ def query(start, end, groupby, conditions=None, filter_keys=None, aggregations=None,
+diff --git a/tests/sentry/api/endpoints/test_organization_incident.py b/tests/sentry/api/endpoints/test_organization_incident_index.py
+similarity index 100%
+rename from tests/sentry/api/endpoints/test_organization_incident.py
+rename to tests/sentry/api/endpoints/test_organization_incident_index.py
+diff --git a/tests/sentry/incidents/test_logic.py b/tests/sentry/incidents/test_logic.py
+index a55d1acb68..ab531edb3a 100644
+--- a/tests/sentry/incidents/test_logic.py
++++ b/tests/sentry/incidents/test_logic.py
+@@ -1,7 +1,10 @@
+ from __future__ import absolute_import
+ 
+ from datetime import timedelta
+-from exam import patcher
++from exam import (
++    fixture,
++    patcher,
++)
+ from freezegun import freeze_time
+ 
+ from uuid import uuid4
+@@ -20,6 +23,9 @@ from sentry.incidents.logic import (
+     create_incident,
+     create_incident_activity,
+     create_initial_event_stats_snapshot,
++    bulk_build_incident_query_params,
++    bulk_get_incident_aggregates,
++    bulk_get_incident_event_stats,
+     get_incident_aggregates,
+     get_incident_event_stats,
+     get_incident_subscribers,
+@@ -190,7 +196,33 @@ class BaseIncidentsTest(SnubaTestCase):
+         return timezone.now()
+ 
+ 
+-class GetIncidentEventStatsTest(TestCase, BaseIncidentsTest):
++class BaseIncidentEventStatsTest(BaseIncidentsTest):
++    @fixture
++    def project_incident(self):
++        self.create_event(self.now - timedelta(minutes=2))
++        self.create_event(self.now - timedelta(minutes=2))
++        self.create_event(self.now - timedelta(minutes=1))
++        return self.create_incident(
++            date_started=self.now - timedelta(minutes=5),
++            query='',
++            projects=[self.project]
++        )
++
++    @fixture
++    def group_incident(self):
++        fingerprint = 'group-1'
++        event = self.create_event(self.now - timedelta(minutes=2), fingerprint=fingerprint)
++        self.create_event(self.now - timedelta(minutes=2), fingerprint='other-group')
++        self.create_event(self.now - timedelta(minutes=1), fingerprint=fingerprint)
++        return self.create_incident(
++            date_started=self.now - timedelta(minutes=5),
++            query='',
++            projects=[],
++            groups=[event.group],
++        )
++
++
++class GetIncidentEventStatsTest(TestCase, BaseIncidentEventStatsTest):
+ 
+     def run_test(self, incident, expected_results, start=None, end=None):
+         kwargs = {}
+@@ -207,36 +239,53 @@ class GetIncidentEventStatsTest(TestCase, BaseIncidentsTest):
+         assert [r['count'] for r in result.data['data']] == expected_results
+ 
+     def test_project(self):
+-        self.create_event(self.now - timedelta(minutes=2))
+-        self.create_event(self.now - timedelta(minutes=2))
+-        self.create_event(self.now - timedelta(minutes=1))
++        self.run_test(self.project_incident, [2, 1])
++        self.run_test(self.project_incident, [1], start=self.now - timedelta(minutes=1))
++        self.run_test(self.project_incident, [2], end=self.now - timedelta(minutes=1, seconds=59))
+ 
+-        incident = self.create_incident(
++    def test_groups(self):
++        self.run_test(self.group_incident, [1, 1])
++
++
++class BulkGetIncidentEventStatsTest(TestCase, BaseIncidentEventStatsTest):
++    def run_test(self, incidents, expected_results_list, start=None, end=None):
++        query_params_list = bulk_build_incident_query_params(incidents, start=start, end=end)
++        results = bulk_get_incident_event_stats(incidents, query_params_list, data_points=20)
++        for incident, result, expected_results in zip(incidents, results, expected_results_list):
++            # Duration of 300s / 20 data points
++            assert result.rollup == 15
++            assert result.start == start if start else incident.date_started
++            assert result.end == end if end else incident.current_end_date
++            assert [r['count'] for r in result.data['data']] == expected_results
++
++    def test_project(self):
++        other_project = self.create_project()
++        other_incident = self.create_incident(
+             date_started=self.now - timedelta(minutes=5),
+             query='',
+-            projects=[self.project]
++            projects=[other_project],
++            groups=[],
+         )
+-        self.run_test(incident, [2, 1])
+-        self.run_test(incident, [1], start=self.now - timedelta(minutes=1))
+-        self.run_test(incident, [2], end=self.now - timedelta(minutes=1, seconds=59))
++        incidents = [self.project_incident, other_incident]
++        self.run_test(incidents, [[2, 1], []])
++        self.run_test(incidents, [[1], []], start=self.now - timedelta(minutes=1))
++        self.run_test(incidents, [[2], []], end=self.now - timedelta(minutes=1, seconds=59))
+ 
+     def test_groups(self):
+-        fingerprint = 'group-1'
+-        event = self.create_event(self.now - timedelta(minutes=2), fingerprint=fingerprint)
+-        self.create_event(self.now - timedelta(minutes=2), fingerprint='other-group')
+-        self.create_event(self.now - timedelta(minutes=1), fingerprint=fingerprint)
+-
+-        incident = self.create_incident(
++        other_group = self.create_group()
++        other_incident = self.create_incident(
+             date_started=self.now - timedelta(minutes=5),
+             query='',
+             projects=[],
+-            groups=[event.group],
++            groups=[other_group],
+         )
+-        self.run_test(incident, [1, 1])
+ 
++        self.run_test([self.group_incident, other_incident], [[1, 1], []])
+ 
+-class GetIncidentAggregatesTest(TestCase, BaseIncidentsTest):
+-    def test_projects(self):
++
++class BaseIncidentAggregatesTest(BaseIncidentsTest):
++    @property
++    def project_incident(self):
+         incident = self.create_incident(
+             date_started=self.now - timedelta(minutes=5),
+             query='',
+@@ -246,9 +295,10 @@ class GetIncidentAggregatesTest(TestCase, BaseIncidentsTest):
+         self.create_event(self.now - timedelta(minutes=2), user={'id': 123})
+         self.create_event(self.now - timedelta(minutes=2), user={'id': 123})
+         self.create_event(self.now - timedelta(minutes=2), user={'id': 124})
+-        assert get_incident_aggregates(incident) == {'count': 4, 'unique_users': 2}
++        return incident
+ 
+-    def test_groups(self):
++    @property
++    def group_incident(self):
+         fp = 'group'
+         group = self.create_event(self.now - timedelta(minutes=1), fingerprint=fp).group
+         self.create_event(self.now - timedelta(minutes=2), user={'id': 123}, fingerprint=fp)
+@@ -256,14 +306,53 @@ class GetIncidentAggregatesTest(TestCase, BaseIncidentsTest):
+         self.create_event(self.now - timedelta(minutes=2), user={'id': 123}, fingerprint='other')
+         self.create_event(self.now - timedelta(minutes=2), user={'id': 124}, fingerprint=fp)
+         self.create_event(self.now - timedelta(minutes=2), user={'id': 124}, fingerprint='other')
+-
+-        incident = self.create_incident(
++        return self.create_incident(
+             date_started=self.now - timedelta(minutes=5),
+             query='',
+             projects=[],
+             groups=[group],
+         )
+-        assert get_incident_aggregates(incident) == {'count': 4, 'unique_users': 2}
++
++
++class GetIncidentAggregatesTest(TestCase, BaseIncidentAggregatesTest):
++
++    def test_projects(self):
++        assert get_incident_aggregates(self.project_incident) == {'count': 4, 'unique_users': 2}
++
++    def test_groups(self):
++        assert get_incident_aggregates(self.group_incident) == {'count': 4, 'unique_users': 2}
++
++
++class BulkGetIncidentAggregatesTest(TestCase, BaseIncidentAggregatesTest):
++    def test_projects(self):
++        other_project = self.create_project()
++        other_incident = self.create_incident(
++            date_started=self.now - timedelta(minutes=5),
++            query='',
++            projects=[other_project],
++            groups=[],
++        )
++        params = bulk_build_incident_query_params([self.project_incident, other_incident])
++
++        assert bulk_get_incident_aggregates(params) == [
++            {'count': 4, 'unique_users': 2},
++            {'count': 0, 'unique_users': 0},
++        ]
++
++    def test_groups(self):
++        other_group = self.create_group()
++        other_incident = self.create_incident(
++            date_started=self.now - timedelta(minutes=5),
++            query='',
++            projects=[],
++            groups=[other_group],
++        )
++
++        params = bulk_build_incident_query_params([self.group_incident, other_incident])
++        assert bulk_get_incident_aggregates(params) == [
++            {'count': 4, 'unique_users': 2},
++            {'count': 0, 'unique_users': 0},
++        ]
+ 
+ 
+ @freeze_time()
+diff --git a/tests/snuba/test_snuba.py b/tests/snuba/test_snuba.py
+index 106d862b7d..e51b642c55 100644
+--- a/tests/snuba/test_snuba.py
++++ b/tests/snuba/test_snuba.py
+@@ -1,9 +1,11 @@
+ from __future__ import absolute_import
+ 
+ from datetime import datetime, timedelta
++
+ import pytest
+ import time
+ import uuid
++from django.utils import timezone
+ 
+ from sentry.testutils import SnubaTestCase, TestCase
+ from sentry.utils import snuba
+@@ -125,3 +127,49 @@ class SnubaTest(TestCase, SnubaTestCase):
+                 'issue': group.id,
+                 'timestamp': base_time.strftime('%Y-%m-%dT%H:%M:%S+00:00'),
+             }]
++
++
++class BulkRawQueryTest(TestCase, SnubaTestCase):
++    def test_simple(self):
++        one_min_ago = (timezone.now() - timedelta(minutes=1)).isoformat()[:19]
++        event_1 = self.store_event(
++            data={
++                'fingerprint': ['group-1'],
++                'message': 'hello',
++                'timestamp': one_min_ago,
++            },
++            project_id=self.project.id,
++        )
++        event_2 = self.store_event(
++            data={
++                'fingerprint': ['group-2'],
++                'message': 'hello',
++                'timestamp': one_min_ago,
++            },
++            project_id=self.project.id,
++        )
++
++        results = snuba.bulk_raw_query([
++            snuba.SnubaQueryParams(
++                start=timezone.now() - timedelta(days=1),
++                end=timezone.now(),
++                selected_columns=['event_id', 'issue', 'timestamp'],
++                filter_keys={
++                    'project_id': [self.project.id],
++                    'issue': [event_1.group.id]
++                },
++            ),
++            snuba.SnubaQueryParams(
++                start=timezone.now() - timedelta(days=1),
++                end=timezone.now(),
++                selected_columns=['event_id', 'issue', 'timestamp'],
++                filter_keys={
++                    'project_id': [self.project.id],
++                    'issue': [event_2.group.id]
++                },
++            ),
++        ])
++        assert [{'issue': r['data'][0]['issue'], 'event_id': r['data'][0]['event_id']} for r in results] == [
++            {'issue': event_1.group.id, 'event_id': event_1.event_id},
++            {'issue': event_2.group.id, 'event_id': event_2.event_id},
++        ]

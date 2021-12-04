@@ -1,0 +1,398 @@
+commit 677f28d8620ea499114e6d337454d68c708646e0
+Author: Megan Heskett <meg.heskett@gmail.com>
+Date:   Tue Sep 18 15:07:04 2018 -0700
+
+    feat(require-2fa): handle saml and require 2fa (#9582)
+
+diff --git a/src/sentry/api/endpoints/organization_auth_providers.py b/src/sentry/api/endpoints/organization_auth_providers.py
+index 0e3dd383e9..c9e95f9583 100644
+--- a/src/sentry/api/endpoints/organization_auth_providers.py
++++ b/src/sentry/api/endpoints/organization_auth_providers.py
+@@ -22,13 +22,14 @@ class OrganizationAuthProvidersEndpoint(OrganizationEndpoint):
+         """
+         provider_list = []
+         for k, v in manager:
+-            if issubclass(v, SAML2Provider) and not HAS_SAML2:
++            is_saml = issubclass(v, SAML2Provider)
++            if is_saml and not HAS_SAML2:
+                 continue
+ 
+             feature = v.required_feature
+             if feature and not features.has(feature, organization, actor=request.user):
+                 continue
+ 
+-            provider_list.append((k, v.name))
++            provider_list.append((k, v.name, is_saml))
+ 
+         return Response(serialize(provider_list, request.user))
+diff --git a/src/sentry/api/endpoints/organization_details.py b/src/sentry/api/endpoints/organization_details.py
+index 429bc69274..5f229a8e0e 100644
+--- a/src/sentry/api/endpoints/organization_details.py
++++ b/src/sentry/api/endpoints/organization_details.py
+@@ -15,9 +15,11 @@ from sentry.api.serializers import serialize
+ from sentry.api.serializers.models.organization import (
+     DetailedOrganizationSerializer)
+ from sentry.api.serializers.rest_framework import ListField
++from sentry.auth.providers.saml2 import SAML2Provider
+ from sentry.constants import LEGACY_RATE_LIMIT_OPTIONS, RESERVED_ORGANIZATION_SLUGS
+ from sentry.models import (
+-    AuditLogEntryEvent, Authenticator, Organization, OrganizationAvatar, OrganizationOption, OrganizationStatus
++    AuditLogEntryEvent, Authenticator, AuthProvider, Organization, OrganizationAvatar,
++    OrganizationOption, OrganizationStatus,
+ )
+ from sentry.tasks.deletion import delete_organization
+ from sentry.utils.apidocs import scenario, attach_scenarios
+@@ -99,6 +101,14 @@ class OrganizationSerializer(serializers.Serializer):
+             key__in=LEGACY_RATE_LIMIT_OPTIONS,
+         ).exists()
+ 
++    def _has_saml_enabled(self):
++        org = self.context['organization']
++        try:
++            provider = AuthProvider.objects.get(organization=org).get_provider()
++        except AuthProvider.DoesNotExist:
++            return False
++        return isinstance(provider, SAML2Provider)
++
+     def validate_slug(self, attrs, source):
+         value = attrs[source]
+         # Historically, the only check just made sure there was more than 1
+@@ -139,6 +149,9 @@ class OrganizationSerializer(serializers.Serializer):
+         if value and not has_2fa:
+             raise serializers.ValidationError(
+                 'Cannot require two-factor authentication without personal two-factor enabled.')
++        if value and self._has_saml_enabled():
++            raise serializers.ValidationError(
++                'Cannot require two-factor authentication with SAML SSO enabled')
+         return attrs
+ 
+     def validate_accountRateLimit(self, attrs, source):
+diff --git a/src/sentry/auth/providers/saml2.py b/src/sentry/auth/providers/saml2.py
+index 9c5a54496e..30c2f67b94 100644
+--- a/src/sentry/auth/providers/saml2.py
++++ b/src/sentry/auth/providers/saml2.py
+@@ -1,8 +1,12 @@
+ from __future__ import absolute_import, print_function
+ 
++import logging
++
+ from django.contrib import messages
+ from django.contrib.auth import logout
+ from django.core.urlresolvers import reverse
++from django.db import models
++
+ from django.http import HttpResponse, HttpResponseServerError
+ from django.utils.decorators import method_decorator
+ from django.utils.translation import ugettext_lazy as _
+@@ -13,11 +17,17 @@ from six.moves.urllib.parse import urlparse
+ from sentry import options
+ from sentry.auth import Provider, AuthView
+ from sentry.auth.exceptions import IdentityNotValid
+-from sentry.models import (AuthProvider, Organization, OrganizationStatus)
++from sentry.models import (
++    AuditLogEntryEvent, AuthProvider, Organization, OrganizationStatus
++)
++from sentry.utils.audit import create_audit_entry
+ from sentry.utils.auth import get_login_url
+ from sentry.utils.http import absolute_uri
+ from sentry.web.frontend.base import BaseView
+ 
++logger = logging.getLogger('sentry.auth')
++
++
+ try:
+     from onelogin.saml2.auth import OneLogin_Saml2_Auth, OneLogin_Saml2_Settings
+     from onelogin.saml2.constants import OneLogin_Saml2_Constants
+@@ -63,10 +73,12 @@ class SAML2LoginView(AuthView):
+ 
+         provider = helper.provider
+ 
+-        # If we're authenticating during the setup piepline the provider will
+-        # not have been configured yet, build the config first from the state
++        # During the setup pipeline, the provider will not have been configured yet,
++        # so build the config first from the state. Then disable require 2FA for the
++        # orgnization, since only SAML or require 2FA can be enabled.
+         if not provider.config:
+             provider.config = provider.build_config(helper.fetch_state())
++            disable_2fa_required(request, helper.organization)
+ 
+         saml_config = build_saml_config(provider.config, helper.organization.slug)
+         auth = build_auth(request, saml_config)
+@@ -378,3 +390,27 @@ def build_auth(request, saml_config):
+     }
+ 
+     return OneLogin_Saml2_Auth(saml_request, saml_config)
++
++
++def disable_2fa_required(request, organization):
++    require_2fa = organization.flags.require_2fa
++    if require_2fa and require_2fa.is_set:
++        organization.update(
++            flags=models.F('flags').bitand(~Organization.flags.require_2fa)
++        )
++
++        logger.info(
++            'Require 2fa disabled during saml sso setup',
++            extra={
++                'organization_id': organization.id,
++            }
++        )
++        create_audit_entry(
++            request=request,
++            organization=organization,
++            target_object=organization.id,
++            event=AuditLogEntryEvent.ORG_EDIT,
++            data={
++                'require_2fa': u'to False when enabling SAML SSO'
++            },
++        )
+diff --git a/src/sentry/static/sentry/app/views/settings/organizationAuth/organizationAuthList.jsx b/src/sentry/static/sentry/app/views/settings/organizationAuth/organizationAuthList.jsx
+index 6f8e50e26c..780e6d9ac3 100644
+--- a/src/sentry/static/sentry/app/views/settings/organizationAuth/organizationAuthList.jsx
++++ b/src/sentry/static/sentry/app/views/settings/organizationAuth/organizationAuthList.jsx
+@@ -18,13 +18,18 @@ class OrganizationAuthList extends React.Component {
+   };
+ 
+   static propTypes = {
+-    providerList: PropTypes.arrayOf(PropTypes.arrayOf(PropTypes.string)),
++    providerList: PropTypes.array,
+   };
+ 
+   render() {
+     let {organization} = this.context;
+     let {providerList} = this.props;
+     let hasProviderList = providerList && !!providerList.length;
++    let samlAvailable =
++      hasProviderList &&
++      providerList.some(([providerKey, providerName, providerSaml]) => {
++        return providerSaml;
++      });
+ 
+     return (
+       <div className="sso">
+@@ -42,6 +47,15 @@ class OrganizationAuthList extends React.Component {
+               )}
+             </PanelAlert>
+ 
++            {organization.require2FA &&
++              samlAvailable && (
++                <PanelAlert m={0} mb={0} type="warning">
++                  {t(
++                    'Require 2FA will be disabled if you enable SAML-based SSO (Okta, OneLogin, Auth0, etc.)'
++                  )}
++                </PanelAlert>
++              )}
++
+             <form
+               action={`/organizations/${organization.slug}/auth/configure/`}
+               method="POST"
+diff --git a/src/sentry/static/sentry/app/views/settings/organizationGeneralSettings/organizationSettingsForm.jsx b/src/sentry/static/sentry/app/views/settings/organizationGeneralSettings/organizationSettingsForm.jsx
+index 847b2fcbf6..12cc5e1cdd 100644
+--- a/src/sentry/static/sentry/app/views/settings/organizationGeneralSettings/organizationSettingsForm.jsx
++++ b/src/sentry/static/sentry/app/views/settings/organizationGeneralSettings/organizationSettingsForm.jsx
+@@ -42,14 +42,7 @@ const OrganizationSettingsForm = createReactClass({
+             onSave(initialData, model.initialData);
+           }
+         }}
+-        onSubmitError={error => {
+-          if (error.responseJSON && 'require2FA' in error.responseJSON) {
+-            return addErrorMessage(
+-              'Unable to save change. Enable two-factor authentication on your account first.'
+-            );
+-          }
+-          return addErrorMessage('Unable to save change');
+-        }}
++        onSubmitError={addErrorMessage('Unable to save change')}
+       >
+         <Box>
+           <JsonForm
+diff --git a/tests/js/setup.js b/tests/js/setup.js
+index a750210f14..20e1fae7d7 100644
+--- a/tests/js/setup.js
++++ b/tests/js/setup.js
+@@ -313,7 +313,11 @@ window.TestStubs = {
+   ],
+ 
+   AuthProviders: () => {
+-    return [['dummy', 'Dummy']];
++    return [['dummy', 'Dummy', false]];
++  },
++
++  AuthProvidersSaml: () => {
++    return [['dummy', 'Dummy', true]];
+   },
+ 
+   AuthProvider: () => {
+diff --git a/tests/js/spec/views/settings/organizationAuthList.spec.jsx b/tests/js/spec/views/settings/organizationAuthList.spec.jsx
+index d37c6c3a88..ad5dadd917 100644
+--- a/tests/js/spec/views/settings/organizationAuthList.spec.jsx
++++ b/tests/js/spec/views/settings/organizationAuthList.spec.jsx
+@@ -27,4 +27,55 @@ describe('OrganizationAuthList', function() {
+ 
+     expect(wrapper).toMatchSnapshot();
+   });
++
++  it('renders require 2fa warning', function() {
++    let wrapper = shallow(
++      <OrganizationAuthList
++        orgId="org-slug"
++        onSendReminders={() => {}}
++        providerList={TestStubs.AuthProvidersSaml()}
++      />,
++      {
++        context: {
++          organization: TestStubs.Organization({require2FA: true}),
++        },
++      }
++    );
++
++    expect(wrapper.find('PanelAlert[type="warning"]')).toHaveLength(1);
++  });
++
++  it('does not render warning without saml available', function() {
++    let wrapper = shallow(
++      <OrganizationAuthList
++        orgId="org-slug"
++        onSendReminders={() => {}}
++        providerList={TestStubs.AuthProviders()}
++      />,
++      {
++        context: {
++          organization: TestStubs.Organization({require2FA: true}),
++        },
++      }
++    );
++
++    expect(wrapper.find('PanelAlert[type="warning"]')).toHaveLength(0);
++  });
++
++  it('does not render warning without require 2fa enabled', function() {
++    let wrapper = shallow(
++      <OrganizationAuthList
++        orgId="org-slug"
++        onSendReminders={() => {}}
++        providerList={TestStubs.AuthProvidersSaml()}
++      />,
++      {
++        context: {
++          organization: TestStubs.Organization({require2FA: false}),
++        },
++      }
++    );
++
++    expect(wrapper.find('PanelAlert[type="warning"]')).toHaveLength(0);
++  });
+ });
+diff --git a/tests/sentry/api/endpoints/test_organization_auth_providers.py b/tests/sentry/api/endpoints/test_organization_auth_providers.py
+index 8d372a0e6b..c0635d47a6 100644
+--- a/tests/sentry/api/endpoints/test_organization_auth_providers.py
++++ b/tests/sentry/api/endpoints/test_organization_auth_providers.py
+@@ -44,4 +44,4 @@ class OrganizationAuthProviders(APITestCase):
+ 
+         assert resp.status_code == 200
+ 
+-        assert 'dummy' in [k for k, v in resp.data]
++        assert 'dummy' in [k for k, v, s in resp.data]
+diff --git a/tests/sentry/api/endpoints/test_organization_details.py b/tests/sentry/api/endpoints/test_organization_details.py
+index f77e6de574..df42dcdafe 100644
+--- a/tests/sentry/api/endpoints/test_organization_details.py
++++ b/tests/sentry/api/endpoints/test_organization_details.py
+@@ -13,6 +13,7 @@ from sentry.constants import RESERVED_ORGANIZATION_SLUGS
+ from sentry.models import (
+     AuditLogEntry,
+     Authenticator,
++    AuthProvider,
+     DeletedOrganization,
+     Organization,
+     OrganizationAvatar,
+@@ -567,6 +568,22 @@ class OrganizationSettings2FATest(TwoFactorAPITestCase):
+         assert not Authenticator.objects.user_has_2fa(self.owner)
+         self.assert_cannot_enable_org_2fa(self.organization, self.owner, 400)
+ 
++    def test_cannot_enforce_2fa_with_saml_enabled(self):
++        self.auth_provider = AuthProvider.objects.create(
++            provider='saml2',
++            organization=self.org_2fa,
++        )
++        self.assert_cannot_enable_org_2fa(self.organization, self.owner, 400)
++
++    def test_can_enforce_2fa_with_non_saml_sso_enabled(self):
++        org = self.create_organization(owner=self.owner)
++        TotpInterface().enroll(self.owner)
++        self.auth_provider = AuthProvider.objects.create(
++            provider='github',
++            organization=org,
++        )
++        self.assert_can_enable_org_2fa(self.organization, self.owner)
++
+     def test_owner_can_set_2fa_single_member(self):
+         org = self.create_organization(owner=self.owner)
+         TotpInterface().enroll(self.owner)
+diff --git a/tests/sentry/web/frontend/test_auth_saml2.py b/tests/sentry/web/frontend/test_auth_saml2.py
+index dc06e7fcbd..480d54bc7d 100644
+--- a/tests/sentry/web/frontend/test_auth_saml2.py
++++ b/tests/sentry/web/frontend/test_auth_saml2.py
+@@ -9,9 +9,13 @@ from six.moves.urllib.parse import urlencode, urlparse, parse_qs
+ 
+ from django.conf import settings
+ from django.core.urlresolvers import reverse
++from django.db import models
+ 
+ from sentry.auth.providers.saml2 import SAML2Provider, Attributes, HAS_SAML2
+-from sentry.models import AuthProvider
++from sentry.models import (
++    AuditLogEntry, AuditLogEntryEvent, AuthProvider, Organization,
++    TotpInterface
++)
+ from sentry.testutils import AuthProviderTestCase
+ from sentry.testutils.helpers import Feature
+ 
+@@ -48,6 +52,14 @@ class AuthSAML2Test(AuthProviderTestCase):
+     def setUp(self):
+         self.user = self.create_user('rick@onehundredyears.com')
+         self.org = self.create_organization(owner=self.user, name='saml2-org')
++
++        # enable require 2FA and enroll user
++        TotpInterface().enroll(self.user)
++        self.org.update(
++            flags=models.F('flags').bitor(Organization.flags.require_2fa)
++        )
++        assert self.org.flags.require_2fa.is_set
++
+         self.auth_provider = AuthProvider.objects.create(
+             provider=self.provider_name,
+             config=dummy_provider_config,
+@@ -119,7 +131,8 @@ class AuthSAML2Test(AuthProviderTestCase):
+         assert auth.status_code == 200
+         assert auth.context['existing_user'] == self.user
+ 
+-    def test_auth_setup(self):
++    @mock.patch('sentry.auth.providers.saml2.logger')
++    def test_auth_setup(self, auth_log):
+         self.auth_provider.delete()
+         self.login_as(self.user)
+ 
+@@ -140,6 +153,23 @@ class AuthSAML2Test(AuthProviderTestCase):
+         assert messages[0] == 'You have successfully linked your account to your SSO provider.'
+         assert messages[1].startswith('SSO has been configured for your organization')
+ 
++        # require 2FA disabled when saml is enabled
++        org = Organization.objects.get(id=self.org.id)
++        assert not org.flags.require_2fa.is_set
++
++        event = AuditLogEntry.objects.get(
++            target_object=org.id,
++            event=AuditLogEntryEvent.ORG_EDIT,
++            actor=self.user
++        )
++        assert 'require_2fa to False when enabling SAML SSO' in event.get_note()
++        auth_log.info.assert_called_once_with(
++            'Require 2fa disabled during saml sso setup',
++            extra={
++                'organization_id': self.org.id
++            }
++        )
++
+     def test_auth_idp_initiated_no_provider(self):
+         self.auth_provider.delete()
+         auth = self.accept_auth(follow=True)

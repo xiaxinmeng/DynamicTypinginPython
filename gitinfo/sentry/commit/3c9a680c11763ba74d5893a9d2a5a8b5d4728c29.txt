@@ -1,0 +1,220 @@
+commit 3c9a680c11763ba74d5893a9d2a5a8b5d4728c29
+Author: Jess MacQueen <macqueen@users.noreply.github.com>
+Date:   Fri Sep 7 13:04:44 2018 -0700
+
+    feat(integrations): Move repo migration to async task for GH (#9639)
+
+diff --git a/src/sentry/integrations/github/integration.py b/src/sentry/integrations/github/integration.py
+index 9a2cdb7e50..530daf8d2e 100644
+--- a/src/sentry/integrations/github/integration.py
++++ b/src/sentry/integrations/github/integration.py
+@@ -9,9 +9,9 @@ from sentry.integrations import Integration, IntegrationFeatures, IntegrationPro
+ from sentry.integrations.exceptions import ApiError
+ from sentry.integrations.constants import ERR_INTERNAL, ERR_UNAUTHORIZED
+ from sentry.integrations.repositories import RepositoryMixin
+-from sentry.integrations.migrate import PluginMigrator
+ from sentry.models import Repository
+ from sentry.pipeline import NestedPipelineView, PipelineView
++from sentry.tasks.integrations import migrate_repo
+ from sentry.utils.http import absolute_uri
+ 
+ from .client import GitHubAppsClient
+@@ -124,6 +124,18 @@ class GitHubIntegration(Integration, GitHubIssueBasic, RepositoryMixin):
+         else:
+             return ERR_INTERNAL
+ 
++    def has_repo_access(self, repo):
++        client = self.get_client()
++        try:
++            # make sure installation has access to this specific repo
++            # use hooks endpoint since we explicity ask for those permissions
++            # when installing the app (commits can be accessed for public repos)
++            # https://developer.github.com/v3/repos/hooks/#list-hooks
++            client.repo_hooks(repo.config['name'])
++        except ApiError:
++            return False
++        return True
++
+ 
+ class GitHubIntegrationProvider(IntegrationProvider):
+     key = 'github'
+@@ -143,19 +155,17 @@ class GitHubIntegrationProvider(IntegrationProvider):
+     }
+ 
+     def post_install(self, integration, organization):
+-        repos = Repository.objects.filter(
++        repo_ids = Repository.objects.filter(
+             organization_id=organization.id,
+             provider='github',
+-        )
+-
+-        unmigratable_repos = self \
+-            .get_installation(integration, organization.id) \
+-            .get_unmigratable_repositories()
+-
+-        for repo in filter(lambda r: r not in unmigratable_repos, repos):
+-            repo.update(integration_id=integration.id)
+-
+-        PluginMigrator(integration, organization).call()
++        ).values_list('id', flat=True)
++
++        for repo_id in repo_ids:
++            migrate_repo.apply_async(kwargs={
++                'repo_id': repo_id,
++                'integration_id': integration.id,
++                'organization_id': organization.id,
++            })
+ 
+     def get_pipeline_views(self):
+         identity_pipeline_config = {
+diff --git a/src/sentry/integrations/repositories.py b/src/sentry/integrations/repositories.py
+index dd2692e904..21e01ae67c 100644
+--- a/src/sentry/integrations/repositories.py
++++ b/src/sentry/integrations/repositories.py
+@@ -36,3 +36,6 @@ class RepositoryMixin(object):
+             provider='integrations:%s' % self.model.provider,
+             integration_id=self.model.id,
+         ).update(status=ObjectStatus.VISIBLE)
++
++    def has_repo_access(self, repo):
++        raise NotImplementedError
+diff --git a/src/sentry/tasks/integrations.py b/src/sentry/tasks/integrations.py
+index e1836eeff2..8eac6fee4d 100644
+--- a/src/sentry/tasks/integrations.py
++++ b/src/sentry/tasks/integrations.py
+@@ -2,9 +2,10 @@ from __future__ import absolute_import
+ 
+ from sentry import analytics, features
+ from sentry.models import (
+-    ExternalIssue, Group, GroupLink, GroupStatus, Integration, Organization, User
++    ExternalIssue, Group, GroupLink, GroupStatus, Integration, Organization, Repository, User
+ )
+ from sentry.integrations.exceptions import IntegrationError
++from sentry.integrations.migrate import PluginMigrator
+ from sentry.tasks.base import instrumented_task, retry
+ 
+ 
+@@ -154,3 +155,26 @@ def kick_off_status_syncs(project_id, group_id, **kwargs):
+                 'external_issue_id': external_issue_id,
+             }
+         )
++
++
++@instrumented_task(
++    name='sentry.tasks.integrations.migrate_repo',
++    queue='integrations',
++    default_retry_delay=60 * 5,
++    max_retries=5
++)
++@retry(exclude=(Integration.DoesNotExist, Repository.DoesNotExist, Organization.DoesNotExist))
++def migrate_repo(repo_id, integration_id, organization_id):
++    integration = Integration.objects.get(id=integration_id)
++    installation = integration.get_installation(
++        organization_id=organization_id,
++    )
++    repo = Repository.objects.get(id=repo_id)
++    if installation.has_repo_access(repo):
++        repo.integration_id = integration_id
++        repo.save()
++
++        PluginMigrator(
++            integration,
++            Organization.objects.get(id=organization_id),
++        ).call()
+diff --git a/tests/sentry/integrations/github/test_integration.py b/tests/sentry/integrations/github/test_integration.py
+index de0adbd73b..aafe1ff1ce 100644
+--- a/tests/sentry/integrations/github/test_integration.py
++++ b/tests/sentry/integrations/github/test_integration.py
+@@ -109,6 +109,12 @@ class GitHubIntegrationTest(IntegrationTestCase):
+             }
+         )
+ 
++        responses.add(
++            responses.GET,
++            u'https://api.github.com/repos/Test-Organization/foo/hooks',
++            json=[],
++        )
++
+     def assert_setup_flow(self):
+         resp = self.client.get(self.init_path)
+         assert resp.status_code == 302
+@@ -173,6 +179,9 @@ class GitHubIntegrationTest(IntegrationTestCase):
+             url='https://github.com/Test-Organization/foo',
+             provider='github',
+             external_id=123,
++            config={
++                'name': 'Test-Organization/foo',
++            },
+         )
+ 
+         inaccessible_repo = Repository.objects.create(
+@@ -180,9 +189,13 @@ class GitHubIntegrationTest(IntegrationTestCase):
+             name='Not-My-Org/other',
+             provider='github',
+             external_id=321,
++            config={
++                'name': 'Not-My-Org/other',
++            },
+         )
+ 
+-        self.assert_setup_flow()
++        with self.tasks():
++            self.assert_setup_flow()
+ 
+         integration = Integration.objects.get(provider=self.provider.key)
+ 
+@@ -212,27 +225,32 @@ class GitHubIntegrationTest(IntegrationTestCase):
+             url='https://github.com/Test-Organization/foo',
+             provider='github',
+             external_id=123,
++            config={
++                'name': 'Test-Organization/foo',
++            },
+         )
+ 
+         assert 'github' in [p.slug for p in plugins.for_project(project)]
+ 
+-        self.assert_setup_flow()
++        with self.tasks():
++            self.assert_setup_flow()
+ 
+         assert 'github' not in [p.slug for p in plugins.for_project(project)]
+ 
+     @responses.activate
+     def test_basic_flow(self):
+-        self.assert_setup_flow()
++        with self.tasks():
++            self.assert_setup_flow()
+ 
+         integration = Integration.objects.get(provider=self.provider.key)
+ 
+         assert integration.external_id == self.installation_id
+         assert integration.name == 'Test Organization'
+         assert integration.metadata == {
+-            'access_token': self.access_token,
++            'access_token': None,
+             # The metadata doesn't get saved with the timezone "Z" character
+             # for some reason, so just compare everything but that.
+-            'expires_at': self.expires_at[:-1],
++            'expires_at': None,
+             'icon': 'http://example.com/avatar.png',
+             'domain_name': 'github.com/Test-Organization',
+             'account_type': 'Organization',
+@@ -366,12 +384,16 @@ class GitHubIntegrationTest(IntegrationTestCase):
+             url='https://github.com/Test-Organization/foo',
+             provider='github',
+             external_id='123',
++            config={
++                'name': 'Test-Organization/foo',
++            },
+         )
+ 
+         # Enabled before
+         assert 'github' in [p.slug for p in plugins.for_project(project)]
+ 
+-        self.assert_setup_flow()
++        with self.tasks():
++            self.assert_setup_flow()
+ 
+         # Disabled after Integration installed
+         assert 'github' not in [p.slug for p in plugins.for_project(project)]

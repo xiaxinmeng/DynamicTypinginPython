@@ -1,0 +1,986 @@
+commit 038384b645aa748dfd63ae61d9684bc788e560d3
+Author: ted kaemming <t.kaemming+github@gmail.com>
+Date:   Mon Oct 10 16:37:41 2016 -0700
+
+    Add calendar visualization to weekly organization report. (#4293)
+    
+    Adds a visualization showing the number of issues received by an organization over the past three full calendar months. The days are color coded by the number of events received during that day. The color is chosen by determining what percentile the day is in compared to all days displayed — this results in a uniform distribution of colors throughout the graph.
+
+diff --git a/src/sentry/api/base.py b/src/sentry/api/base.py
+index 5bda13eb58..9b64e15a52 100644
+--- a/src/sentry/api/base.py
++++ b/src/sentry/api/base.py
+@@ -1,12 +1,10 @@
+ from __future__ import absolute_import
+ 
+-__all__ = ['DocSection', 'Endpoint', 'StatsMixin']
+-
+ import logging
+-import six
+ import time
+-
+ from datetime import datetime, timedelta
++
++import six
+ from django.conf import settings
+ from django.utils.http import urlquote
+ from django.views.decorators.csrf import csrf_exempt
+@@ -28,6 +26,7 @@ from .authentication import ApiKeyAuthentication, TokenAuthentication
+ from .paginator import Paginator
+ from .permissions import NoPermission
+ 
++__all__ = ['DocSection', 'Endpoint', 'StatsMixin']
+ 
+ ONE_MINUTE = 60
+ ONE_HOUR = ONE_MINUTE * 60
+@@ -229,8 +228,7 @@ class StatsMixin(object):
+         resolution = request.GET.get('resolution')
+         if resolution:
+             resolution = self._parse_resolution(resolution)
+-
+-            assert any(r for r in tsdb.rollups if r[0] == resolution)
++            assert resolution in tsdb.rollups
+ 
+         end = request.GET.get('until')
+         if end:
+diff --git a/src/sentry/features/__init__.py b/src/sentry/features/__init__.py
+index ce61300fd0..f4dc9a3ebd 100644
+--- a/src/sentry/features/__init__.py
++++ b/src/sentry/features/__init__.py
+@@ -14,6 +14,7 @@ default_manager.add('organizations:onboarding', OrganizationFeature)  # NOQA
+ default_manager.add('organizations:callsigns', OrganizationFeature)  # NOQA
+ default_manager.add('organizations:reports:prepare', OrganizationFeature)  # NOQA
+ default_manager.add('organizations:reports:deliver', OrganizationFeature)  # NOQA
++default_manager.add('organizations:reports:calendar', OrganizationFeature)  # NOQA
+ default_manager.add('projects:global-events', ProjectFeature)  # NOQA
+ default_manager.add('projects:quotas', ProjectFeature)  # NOQA
+ default_manager.add('projects:plugins', ProjectPluginFeature)  # NOQA
+diff --git a/src/sentry/tasks/reports.py b/src/sentry/tasks/reports.py
+index ee97786533..374e076d33 100644
+--- a/src/sentry/tasks/reports.py
++++ b/src/sentry/tasks/reports.py
+@@ -1,20 +1,24 @@
+ from __future__ import absolute_import
+ 
++import bisect
+ import functools
+ import itertools
+ import logging
++import math
+ import operator
+ import zlib
+-from collections import namedtuple
+-from datetime import timedelta
++from calendar import Calendar
++from collections import OrderedDict, namedtuple
++from datetime import datetime, timedelta
+ 
++import pytz
+ from django.utils import dateformat, timezone
+ 
+ from sentry import features
+ from sentry.app import tsdb
+ from sentry.models import (
+-    Activity, GroupStatus, Organization, OrganizationStatus, Project,
+-    Release, TagValue, Team, User, UserOption
++    Activity, GroupStatus, Organization, OrganizationStatus, Project, Release,
++    TagValue, Team, User, UserOption
+ )
+ from sentry.tasks.base import instrumented_task
+ from sentry.utils import json, redis
+@@ -65,6 +69,45 @@ def change(value, reference):
+     return ((value or 0) - reference) / float(reference)
+ 
+ 
++def safe_add(x, y):
++    """
++    Adds two values which are either numeric types or None.
++
++    - If both values are numeric, the result is the sum of those values.
++    - If only one numeric value is provided, that value is returned.
++    - If both values are None, then None is returned.
++    """
++    if x is not None and y is not None:
++        return x + y
++    elif x is not None:
++        return x
++    elif y is not None:
++        return y
++    else:
++        return None
++
++
++def month_to_index(year, month):
++    """
++    Convert a year and month to a single value: the number of months between
++    this month and 1 AD.
++
++    This mainly exists to simplify doing month-based arithmetic (e.g. "three
++    months ago") without having to manually handle wrapping around years, since
++    timedelta doesn't accept a "months" parameter.
++    """
++    assert 12 >= month >= 1
++    return (year - 1) * 12 + month - 1
++
++
++def index_to_month(index):
++    """
++    The opposite companion to ``month_to_index``. Returns a (year, month)
++    tuple.
++    """
++    return (index // 12) + 1, index % 12 + 1
++
++
+ def clean_series(start, stop, rollup, series):
+     """
+     Validate a series, ensuring that it follows the specified rollup and
+@@ -247,9 +290,6 @@ def prepare_project_issue_summaries(interval, project):
+     ]
+ 
+ 
+-merge_issue_summaries = merge_sequences
+-
+-
+ def trim_release_list(value):
+     return sorted(
+         value,
+@@ -299,15 +339,140 @@ def prepare_project_usage_summary((start, stop), project):
+     )
+ 
+ 
+-def prepare_project_report(interval, project):
+-    return (
+-        prepare_project_series(interval, project),
+-        prepare_project_aggregates(interval, project),
+-        prepare_project_issue_summaries(interval, project),
+-        prepare_project_release_list(interval, project),
+-        prepare_project_usage_summary(interval, project),
++def get_calendar_range((_, stop_time), months):
++    assert (
++        stop_time.hour,
++        stop_time.minute,
++        stop_time.second,
++        stop_time.microsecond,
++        stop_time.tzinfo,
++    ) == (0, 0, 0, 0, pytz.utc)
++
++    last_day = stop_time - timedelta(days=1)
++
++    stop_month_index = month_to_index(
++        last_day.year,
++        last_day.month,
++    )
++
++    start_month_index = stop_month_index - months + 1
++    return start_month_index, stop_month_index
++
++
++def get_calendar_query_range(interval, months):
++    start_month_index, _ = get_calendar_range(interval, months)
++
++    start_time = datetime(
++        day=1,
++        tzinfo=pytz.utc,
++        *index_to_month(start_month_index)
+     )
+ 
++    return start_time, interval[1]
++
++
++def clean_calendar_data(project, series, start, stop, rollup, timestamp=None):
++    earliest = tsdb.get_earliest_timestamp(rollup, timestamp=timestamp)
++
++    def remove_invalid_values(item):
++        timestamp, value = item
++        if timestamp < earliest:
++            value = None
++        elif to_datetime(timestamp) < project.date_added:
++            value = None
++        return (timestamp, value)
++
++    return map(
++        remove_invalid_values,
++        clean_series(
++            start,
++            stop,
++            rollup,
++            series,
++        ),
++    )
++
++
++def prepare_project_calendar_series(interval, project):
++    start, stop = get_calendar_query_range(interval, 3)
++
++    rollup = 60 * 60 * 24
++    series = tsdb.get_range(
++        tsdb.models.project,
++        [project.id],
++        start,
++        stop,
++        rollup=rollup,
++    )[project.id]
++
++    return clean_calendar_data(
++        project,
++        series,
++        start,
++        stop,
++        rollup,
++    )
++
++
++def build(name, fields):
++    names, prepare_fields, merge_fields = zip(*fields)
++
++    cls = namedtuple(name, names)
++
++    def prepare(*args):
++        return cls(*[f(*args) for f in prepare_fields])
++
++    def merge(target, other):
++        return cls(*[f(target[i], other[i]) for i, f in enumerate(merge_fields)])
++
++    return cls, prepare, merge
++
++
++Report, prepare_project_report, merge_reports = build(
++    'Report',
++    [
++        (
++            'series',
++            prepare_project_series,
++            functools.partial(
++                merge_series,
++                function=merge_sequences,
++            ),
++        ),
++        (
++            'aggregates',
++            prepare_project_aggregates,
++            functools.partial(
++                merge_sequences,
++                function=safe_add,
++            ),
++        ),
++        (
++            'issue_summaries',
++            prepare_project_issue_summaries,
++            merge_sequences,
++        ),
++        (
++            'release_list',
++            prepare_project_release_list,
++            lambda target, other: trim_release_list(target + other),
++        ),
++        (
++            'usage_summary',
++            prepare_project_usage_summary,
++            merge_sequences,
++        ),
++        (
++            'calendar_series',
++            prepare_project_calendar_series,
++            functools.partial(
++                merge_series,
++                function=safe_add,
++            ),
++        ),
++    ],
++)
++
+ 
+ class ReportBackend(object):
+     def build(self, timestamp, duration, project):
+@@ -364,10 +529,10 @@ class RedisReportBackend(ReportBackend):
+         )
+ 
+     def __encode(self, report):
+-        return zlib.compress(json.dumps(report))
++        return zlib.compress(json.dumps(list(report)))
+ 
+     def __decode(self, value):
+-        return json.loads(zlib.decompress(value))
++        return Report(*json.loads(zlib.decompress(value)))
+ 
+     def prepare(self, timestamp, duration, organization):
+         reports = {}
+@@ -403,41 +568,6 @@ backend = RedisReportBackend(
+ )
+ 
+ 
+-def safe_add(x, y):
+-    if x is not None and y is not None:
+-        return x + y
+-    elif x is not None:
+-        return x
+-    elif y is not None:
+-        return y
+-    else:
+-        return None
+-
+-
+-def merge_reports(target, other):
+-    return (
+-        merge_series(
+-            target[0],
+-            other[0],
+-            merge_sequences,
+-        ),
+-        merge_sequences(
+-            target[1],
+-            other[1],
+-            safe_add,
+-        ),
+-        merge_issue_summaries(
+-            target[2],
+-            other[2],
+-        ),
+-        trim_release_list(target[3] + other[3]),
+-        merge_sequences(
+-            target[4],
+-            other[4],
+-        )
+-    )
+-
+-
+ @instrumented_task(
+     name='sentry.tasks.reports.prepare_reports',
+     queue='reports.prepare')
+@@ -542,7 +672,7 @@ def build_message(timestamp, duration, organization, user, reports):
+                 organization,
+                 user,
+             ),
+-            'report': to_context(reports),
++            'report': to_context(organization, interval, reports),
+             'user': user,
+         },
+     )
+@@ -571,8 +701,7 @@ class Skipped(object):
+ 
+ 
+ def has_valid_aggregates(interval, (project, report)):
+-    _, aggregates, _, _, _ = report
+-    return any(bool(value) for value in aggregates)
++    return any(bool(value) for value in report.aggregates)
+ 
+ 
+ @instrumented_task(
+@@ -664,9 +793,9 @@ def build_project_breakdown_series(reports):
+     Key = namedtuple('Key', 'label url color data')
+ 
+     def get_legend_data(report):
+-        series, _, _, _, (filtered, rate_limited) = report
++        filtered, rate_limited = report.usage_summary
+         return {
+-            'events': sum(sum(value) for timestamp, value in series),
++            'events': sum(sum(value) for timestamp, value in report.series),
+             'filtered': filtered,
+             'rate_limited': rate_limited,
+         }
+@@ -740,14 +869,11 @@ def build_project_breakdown_series(reports):
+     }
+ 
+ 
+-def to_context(reports):
+-    series, aggregates, issue_summaries, release_list, usage_summary = reduce(
+-        merge_reports,
+-        reports.values(),
+-    )
+-    series = [(to_datetime(timestamp), Point(*values)) for timestamp, values in series]
++def to_context(organization, interval, reports):
++    report = reduce(merge_reports, reports.values())
++    series = [(to_datetime(timestamp), Point(*values)) for timestamp, values in report.series]
+ 
+-    return {
++    context = {
+         'series': {
+             'points': series,
+             'maximum': max(sum(point) for timestamp, point in series),
+@@ -762,19 +888,122 @@ def to_context(reports):
+                         DistributionType('Reopened', '#6C5FC7'),
+                         DistributionType('Existing', '#534a92'),
+                     ),
+-                    issue_summaries,
++                    report.issue_summaries,
+                 ),
+             ),
+-            'total': sum(issue_summaries),
++            'total': sum(report.issue_summaries),
+         },
+         'comparisons': [
+-            ('last week', change(aggregates[-1], aggregates[-2])),
++            ('last week', change(report.aggregates[-1], report.aggregates[-2])),
+             ('four week average', change(
+-                aggregates[-1],
+-                mean(aggregates) if all(v is not None for v in aggregates) else None,
++                report.aggregates[-1],
++                mean(report.aggregates) if all(v is not None for v in report.aggregates) else None,
+             )),
+         ],
+         'projects': {
+             'series': build_project_breakdown_series(reports),
+         },
+     }
++
++    if features.has('organizations:reports:calendar', organization):
++        context['calendar'] = to_calendar(
++            interval,
++            report.calendar_series,
++        )
++
++    return context
++
++
++def get_percentile(values, percentile):
++    # XXX: ``values`` must be sorted.
++    assert 1 >= percentile > 0
++    if percentile == 1:
++        index = -1
++    else:
++        index = int(math.ceil(len(values) * percentile)) - 1
++    return values[index]
++
++
++def colorize(spectrum, values):
++    calculate_percentile = functools.partial(
++        get_percentile,
++        sorted(values),
++    )
++
++    legend = OrderedDict()
++    width = 1.0 / len(spectrum)
++    for i, color in enumerate(spectrum, 1):
++        legend[color] = calculate_percentile(i * width)
++
++    find_index = functools.partial(
++        bisect.bisect_left,
++        legend.values(),
++    )
++
++    results = []
++    for value in values:
++        results.append((
++            value,
++            spectrum[find_index(value)],
++        ))
++
++    return legend, results
++
++
++def to_calendar(interval, series):
++    start, stop = get_calendar_range(interval, 3)
++
++    legend, values = colorize(
++        [
++            '#fae5cf',
++            '#f9ddc2',
++            '#f9d6b6',
++            '#f9cfaa',
++            '#f8c79e',
++            '#f8bf92',
++            '#f8b786',
++            '#f9a66d',
++            '#f99d60',
++            '#fa9453',
++            '#fb8034',
++            '#fc7520',
++            '#f9600c',
++            '#f75500',
++        ],
++        [value for timestamp, value in series if value is not None],
++    )
++
++    value_color_map = dict(values)
++    value_color_map[None] = '#F2F2F2'
++
++    series_value_map = dict(series)
++
++    def get_data_for_date(date):
++        dt = datetime(date.year, date.month, date.day, tzinfo=pytz.utc)
++        ts = to_timestamp(dt)
++        value = series_value_map.get(ts, None)
++        return (
++            dt,
++            {
++                'value': value,
++                'color': value_color_map[value],
++            }
++        )
++
++    calendar = Calendar(6)
++    sheets = []
++    for year, month in map(index_to_month, range(start, stop + 1)):
++        weeks = []
++
++        for week in calendar.monthdatescalendar(year, month):
++            weeks.append(map(get_data_for_date, week))
++
++        sheets.append((
++            datetime(year, month, 1, tzinfo=pytz.utc),
++            weeks,
++        ))
++
++    return {
++        'legend': list(legend.keys()),
++        'sheets': sheets,
++    }
+diff --git a/src/sentry/templates/sentry/emails/reports/body.html b/src/sentry/templates/sentry/emails/reports/body.html
+index e042ae8802..296124126b 100644
+--- a/src/sentry/templates/sentry/emails/reports/body.html
++++ b/src/sentry/templates/sentry/emails/reports/body.html
+@@ -228,6 +228,93 @@
+ 
+   </div>
+ 
++  {% if report.calendar %}
++
++  <style type="text/css">
++    td.spectrum {  /* XXX: td qualifier is a hack */
++      margin: 0;
++      padding: 0;
++      font-size: 12px;
++      text-align: right;
++      color: #555;
++    }
++    .spectrum .range {
++      font-size: 0px;
++      display: inline-block;
++      vertical-align: middle;
++      margin: 0 6px;
++    }
++    .spectrum .range span {
++      display: inline-block;
++      height: 5px;
++      width: 5px;
++    }
++    .calendar {
++      width: 33.3%;
++      vertical-align: top;
++      padding-right: 10px;
++    }
++    .calendar:last-child {
++      padding-right: 0;
++    }
++    .calendar h5 {
++      font-size: 14px;
++      text-align: center;
++      margin-bottom: 10px;
++    }
++    .calendar .day {
++      width: 14.2%;
++      padding: 0 5px 5px 0;
++    }
++    .calendar .day span {
++      display: inline-block;
++      width: 100%;
++      height: 20px;
++    }
++  </style>
++
++  <table style="margin-bottom: 25px;">
++    <tr>
++      <th style="width: 300px; text-align: left; font-weight: 700; font-size: 18px;">
++        3 Month History
++      </th>
++      <td class="spectrum">
++        Less Events
++        <div class="range">{% for color in report.calendar.legend %}<span style="background-color: {{ color }}">&nbsp;</span>{% endfor %}</div>
++        More Events
++      </td>
++    </tr>
++  </table>
++
++  <div>
++    <table>
++      <tr>
++        {% for first_date, weeks in report.calendar.sheets %}
++          <td class="calendar" style="">
++            <h5>{{ first_date|date:"F Y" }}</h5>
++            <table>
++              {% for week in weeks %}
++                <tr>
++                  {% for day, data in week %}
++                  {% if day.month == first_date.month %}
++                    <td class="day" title="{{ day|date:"F jS, Y" }}: {{ data.value }}">
++                      <span style="background-color: {{ data.color }}">&nbsp;</span>
++                    </td>
++                  {% else %}
++                    <td class="day">&nbsp;</td>
++                  {% endif %}
++                  {% endfor %}
++                </tr>
++              {% endfor %}
++            </table>
++          </td>
++        {% endfor %}
++      </tr>
++    </table>
++  </div>
++
++  {% endif %}
++
+   {% if personal.resolved and personal.users %}
+     <h4>Your impact</h4>
+     <table class="user-impact">
+diff --git a/src/sentry/tsdb/base.py b/src/sentry/tsdb/base.py
+index 570b0f5e54..8bce96744f 100644
+--- a/src/sentry/tsdb/base.py
++++ b/src/sentry/tsdb/base.py
+@@ -7,9 +7,10 @@ sentry.tsdb.base
+ """
+ from __future__ import absolute_import
+ 
+-import six
++from collections import OrderedDict
+ from datetime import timedelta
+ 
++import six
+ from django.conf import settings
+ from django.utils import timezone
+ from enum import Enum
+@@ -77,7 +78,7 @@ class BaseTSDB(object):
+     models = TSDBModel
+ 
+     def __init__(self, rollups=settings.SENTRY_TSDB_ROLLUPS):
+-        self.rollups = rollups
++        self.rollups = OrderedDict(rollups)
+ 
+     def validate(self):
+         """
+@@ -133,13 +134,13 @@ class BaseTSDB(object):
+         # window, retrieved several days after it's occurrence), this can
+         # return a rollup that has already been evicted due to TTL, even if a
+         # lower resolution representation of the range exists.
+-        for rollup, samples in self.rollups:
++        for rollup, samples in six.iteritems(self.rollups):
+             if rollup * samples >= num_seconds:
+                 return rollup
+ 
+         # If nothing actually matches the requested range, just return the
+         # lowest resolution interval.
+-        return self.rollups[-1][0]
++        return list(self.rollups)[-1]
+ 
+     def get_optimal_rollup_series(self, start, end=None, rollup=None):
+         if end is None:
+@@ -171,6 +172,19 @@ class BaseTSDB(object):
+         epoch = self.normalize_to_epoch(timestamp, rollup)
+         return epoch + (rollup * samples)
+ 
++    def get_earliest_timestamp(self, rollup, timestamp=None):
++        """
++        Calculate the earliest available timestamp for a rollup.
++        """
++        if timestamp is None:
++            timestamp = timezone.now()
++
++        lifespan = timedelta(seconds=rollup * (self.rollups[rollup] - 1))
++        return self.normalize_to_epoch(
++            timestamp - lifespan,
++            rollup,
++        )
++
+     def incr(self, model, key, timestamp=None, count=1):
+         """
+         Increment project ID=1:
+diff --git a/src/sentry/tsdb/inmemory.py b/src/sentry/tsdb/inmemory.py
+index 820e660677..2e7514425f 100644
+--- a/src/sentry/tsdb/inmemory.py
++++ b/src/sentry/tsdb/inmemory.py
+@@ -7,14 +7,13 @@ sentry.tsdb.inmemory
+ """
+ from __future__ import absolute_import
+ 
+-import six
+-
+ from collections import Counter, defaultdict
+ 
++import six
+ from django.utils import timezone
+ 
+-from sentry.utils.dates import to_datetime, to_timestamp
+ from sentry.tsdb.base import BaseTSDB
++from sentry.utils.dates import to_datetime, to_timestamp
+ 
+ 
+ class InMemoryTSDB(BaseTSDB):
+@@ -31,7 +30,7 @@ class InMemoryTSDB(BaseTSDB):
+         if timestamp is None:
+             timestamp = timezone.now()
+ 
+-        for rollup, max_values in self.rollups:
++        for rollup, max_values in six.iteritems(self.rollups):
+             norm_epoch = self.normalize_to_rollup(timestamp, rollup)
+             self.data[model][key][norm_epoch] += count
+ 
+@@ -58,7 +57,7 @@ class InMemoryTSDB(BaseTSDB):
+         if timestamp is None:
+             timestamp = timezone.now()
+ 
+-        for rollup, max_values in self.rollups:
++        for rollup, max_values in six.iteritems(self.rollups):
+             r = self.normalize_to_rollup(timestamp, rollup)
+             self.sets[model][key][r].update(values)
+ 
+@@ -131,7 +130,7 @@ class InMemoryTSDB(BaseTSDB):
+             for key, items in request.items():
+                 items = {k: float(v) for k, v in items.items()}
+                 source = self.frequencies[model][key]
+-                for rollup, _ in self.rollups:
++                for rollup in self.rollups:
+                     source[self.normalize_to_rollup(timestamp, rollup)].update(items)
+ 
+     def get_most_frequent(self, model, keys, start, end=None, rollup=None, limit=None):
+diff --git a/src/sentry/tsdb/redis.py b/src/sentry/tsdb/redis.py
+index ba65094a3c..7547f71792 100644
+--- a/src/sentry/tsdb/redis.py
++++ b/src/sentry/tsdb/redis.py
+@@ -11,22 +11,21 @@ import itertools
+ import logging
+ import operator
+ import random
+-import six
+ import uuid
+-
+ from binascii import crc32
+ from collections import defaultdict, namedtuple
++from hashlib import md5
+ 
++import six
+ from django.utils import timezone
+-from hashlib import md5
+ from pkg_resources import resource_string
+ from redis.client import Script
+-from six.moves import reduce
+ 
+ from sentry.tsdb.base import BaseTSDB
+ from sentry.utils.dates import to_datetime, to_timestamp
+ from sentry.utils.redis import check_cluster_versions, get_cluster_from_options
+ from sentry.utils.versioning import Version
++from six.moves import reduce
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -164,7 +163,7 @@ class RedisTSDB(BaseTSDB):
+             timestamp = timezone.now()
+ 
+         with self.cluster.map() as client:
+-            for rollup, max_values in self.rollups:
++            for rollup, max_values in six.iteritems(self.rollups):
+                 norm_rollup = normalize_to_rollup(timestamp, rollup)
+                 for model, key in items:
+                     model_key = self.get_model_key(key)
+@@ -229,7 +228,7 @@ class RedisTSDB(BaseTSDB):
+         with self.cluster.fanout() as client:
+             for model, key, values in items:
+                 c = client.target_key(key)
+-                for rollup, max_values in self.rollups:
++                for rollup, max_values in six.iteritems(self.rollups):
+                     k = self.make_key(
+                         model,
+                         rollup,
+@@ -407,7 +406,7 @@ class RedisTSDB(BaseTSDB):
+ 
+                 # Figure out all of the keys we need to be incrementing, as
+                 # well as their expiration policies.
+-                for rollup, max_values in self.rollups:
++                for rollup, max_values in six.iteritems(self.rollups):
+                     chunk = self.make_frequency_table_keys(model, rollup, ts, key)
+                     keys.extend(chunk)
+ 
+diff --git a/src/sentry/web/frontend/debug/mail.py b/src/sentry/web/frontend/debug/mail.py
+index 9e5d986b7e..10b6b22998 100644
+--- a/src/sentry/web/frontend/debug/mail.py
++++ b/src/sentry/web/frontend/debug/mail.py
+@@ -16,6 +16,7 @@ from django.utils import timezone
+ from django.utils.safestring import mark_safe
+ from django.views.generic import View
+ 
++from sentry.app import tsdb
+ from sentry.constants import LOG_LEVELS
+ from sentry.digests import Record
+ from sentry.digests.notifications import Notification, build_digest
+@@ -366,11 +367,19 @@ def report(request):
+     random = get_random(request)
+ 
+     duration = 60 * 60 * 24 * 7
+-    timestamp = random.randint(
+-        to_timestamp(datetime(2016, 6, 1, 0, 0, 0, tzinfo=timezone.utc)),
+-        to_timestamp(datetime(2016, 7, 1, 0, 0, 0, tzinfo=timezone.utc)),
++    timestamp = to_timestamp(
++        reports.floor_to_utc_day(
++            to_datetime(
++                random.randint(
++                    to_timestamp(datetime(2015, 6, 1, 0, 0, 0, tzinfo=timezone.utc)),
++                    to_timestamp(datetime(2016, 7, 1, 0, 0, 0, tzinfo=timezone.utc)),
++                )
++            )
++        )
+     )
+ 
++    start, stop = interval = reports._to_interval(timestamp, duration)
++
+     organization = Organization(
+         id=1,
+         slug='example',
+@@ -399,11 +408,10 @@ def report(request):
+                 team=team,
+                 slug=slugify(name),
+                 name=name,
++                date_added=start - timedelta(days=random.randint(0, 120)),
+             )
+         )
+ 
+-    start, stop = reports._to_interval(timestamp, duration)
+-
+     def make_release_generator():
+         id_sequence = itertools.count(1)
+         while True:
+@@ -456,7 +464,29 @@ def report(request):
+             int(random.weibullvariate(5, 1) * random.paretovariate(0.2)),
+         )
+ 
+-    def build_report():
++    def build_calendar_data(project):
++        start, stop = reports.get_calendar_query_range(interval, 3)
++        rollup = 60 * 60 * 24
++        series = []
++
++        weekend = frozenset((5, 6))
++        value = int(random.weibullvariate(5000, 3))
++        for timestamp in tsdb.get_optimal_rollup_series(start, stop, rollup)[1]:
++            damping = random.uniform(0.2, 0.6) if to_datetime(timestamp).weekday in weekend else 1
++            jitter = random.paretovariate(1.2)
++            series.append((timestamp, int(value * damping * jitter)))
++            value = value * random.uniform(0.25, 2)
++
++        return reports.clean_calendar_data(
++            project,
++            series,
++            start,
++            stop,
++            rollup,
++            stop
++        )
++
++    def build_report(project):
+         daily_maximum = random.randint(1000, 10000)
+ 
+         rollup = 60 * 60 * 24
+@@ -469,7 +499,14 @@ def report(request):
+             random.randint(0, daily_maximum * 7) if random.random() < 0.9 else None for _ in xrange(0, 4)
+         ]
+ 
+-        return series, aggregates, build_issue_summaries(), build_release_list(), build_usage_summary()
++        return reports.Report(
++            series,
++            aggregates,
++            build_issue_summaries(),
++            build_release_list(),
++            build_usage_summary(),
++            build_calendar_data(project),
++        )
+ 
+     if random.random() < 0.85:
+         personal = {
+@@ -492,7 +529,9 @@ def report(request):
+                 'stop': reports.date_format(stop),
+             },
+             'report': reports.to_context(
+-                {project: build_report() for project in projects}
++                organization,
++                interval,
++                {project: build_report(project) for project in projects}
+             ),
+             'organization': organization,
+             'personal': personal,
+diff --git a/tests/sentry/tasks/test_reports.py b/tests/sentry/tasks/test_reports.py
+index 8325e11b53..056c5ea8c0 100644
+--- a/tests/sentry/tasks/test_reports.py
++++ b/tests/sentry/tasks/test_reports.py
+@@ -11,10 +11,11 @@ from django.core import mail
+ from sentry.app import tsdb
+ from sentry.models import Project, UserOption
+ from sentry.tasks.reports import (
+-    DISABLED_ORGANIZATIONS_USER_OPTION_KEY, Skipped, change,
+-    clean_series, deliver_organization_user_report, has_valid_aggregates,
+-    merge_mappings, merge_sequences, merge_series, prepare_reports, safe_add,
+-    user_subscribed_to_organization_reports
++    DISABLED_ORGANIZATIONS_USER_OPTION_KEY, Report, Skipped, change,
++    clean_series, colorize, deliver_organization_user_report,
++    get_calendar_range, get_percentile, has_valid_aggregates, index_to_month,
++    merge_mappings, merge_sequences, merge_series, month_to_index,
++    prepare_reports, safe_add, user_subscribed_to_organization_reports
+ )
+ from sentry.testutils.cases import TestCase
+ from sentry.utils.dates import to_datetime, to_timestamp
+@@ -169,7 +170,7 @@ def test_has_valid_aggregates(interval):
+     project = None  # parameter is unused
+ 
+     def make_report(aggregates):
+-        return None, aggregates, None, None, None
++        return Report(None, aggregates, None, None, None, None)
+ 
+     assert has_valid_aggregates(
+         interval,
+@@ -187,6 +188,45 @@ def test_has_valid_aggregates(interval):
+     ) is True
+ 
+ 
++def test_percentiles():
++    values = [3, 6, 7, 8, 8, 9, 10, 13, 15, 16, 20]
++
++    get_percentile(values, 0.25) == 7
++    get_percentile(values, 0.50) == 9
++    get_percentile(values, 0.75) == 15
++    get_percentile(values, 1.00) == 20
++
++
++def test_colorize():
++    colors = ['green', 'yellow', 'red']
++    values = [2, 5, 1, 3, 4, 0]
++
++    legend, results = colorize(colors, values)
++
++    assert results == [
++        (2, 'yellow'),
++        (5, 'red'),
++        (1, 'green'),
++        (3, 'yellow'),
++        (4, 'red'),
++        (0, 'green'),
++    ]
++
++
++def test_month_indexing():
++    assert index_to_month(month_to_index(1986, 10)) == (1986, 10)
++
++
++def test_calendar_range():
++    assert get_calendar_range(
++        (None, datetime(2016, 2, 1, tzinfo=pytz.utc)),
++        months=3,
++    ) == (
++        month_to_index(2015, 11),
++        month_to_index(2016, 1),
++    )
++
++
+ class ReportTestCase(TestCase):
+     @mock.patch('sentry.features.has')
+     def test_integration(self, has_feature):
+@@ -197,11 +237,13 @@ class ReportTestCase(TestCase):
+         has_feature.side_effect = lambda name, *a, **k: {
+             'organizations:reports:deliver': True,
+             'organizations:reports:prepare': True,
++            'organizations:reports:calendar': True,
+         }.get(name, False)
+ 
+         project = self.create_project(
+             organization=self.organization,
+             team=self.team,
++            date_added=now - timedelta(days=90),
+         )
+ 
+         tsdb.incr(

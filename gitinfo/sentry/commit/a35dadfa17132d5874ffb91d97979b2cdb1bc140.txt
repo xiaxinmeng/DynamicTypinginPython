@@ -1,0 +1,384 @@
+commit a35dadfa17132d5874ffb91d97979b2cdb1bc140
+Author: Markus Unterwaditzer <markus@unterwaditzer.net>
+Date:   Tue Oct 22 08:38:09 2019 +0200
+
+    ref: Move TSDB calls from outcomes producer into consumer (#15192)
+    
+    * ref: Move TSDB calls from outcomes producer into consumer
+    
+    * fix: Fix a few bugs in tsdb refactor
+    
+    * trigger bot
+
+diff --git a/src/sentry/ingest/outcomes_consumer.py b/src/sentry/ingest/outcomes_consumer.py
+index f32b706b08..ffc3a2ba10 100644
+--- a/src/sentry/ingest/outcomes_consumer.py
++++ b/src/sentry/ingest/outcomes_consumer.py
+@@ -19,7 +19,6 @@ from __future__ import absolute_import
+ 
+ import six
+ 
+-import datetime
+ import time
+ import atexit
+ import logging
+@@ -36,9 +35,15 @@ from sentry.db.models.manager import BaseManager
+ from sentry.signals import event_filtered, event_dropped
+ from sentry.utils.kafka import create_batching_kafka_consumer
+ from sentry.utils import json, metrics
+-from sentry.utils.outcomes import Outcome
+-from sentry.utils.dates import to_datetime
++from sentry.utils.outcomes import (
++    Outcome,
++    mark_tsdb_incremented,
++    is_tsdb_incremented,
++    tsdb_increments_from_outcome,
++)
++from sentry.utils.dates import to_datetime, parse_timestamp
+ from sentry.buffer.redis import batch_buffers_incr
++from sentry import tsdb
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -70,7 +75,7 @@ def is_signal_sent(project_id, event_id):
+     return cache.get(key, None) is not None
+ 
+ 
+-def _process_message(msg):
++def _process_signal(msg):
+     project_id = int(msg.get("project_id", 0))
+     if project_id == 0:
+         return  # no project. this is valid, so ignore silently.
+@@ -104,17 +109,53 @@ def _process_message(msg):
+ 
+     timestamp = msg.get("timestamp")
+     if timestamp is not None:
+-        delta = to_datetime(time.time()).replace(tzinfo=None) - datetime.datetime.strptime(
+-            timestamp, "%Y-%m-%dT%H:%M:%S.%fZ"
+-        )
++        delta = to_datetime(time.time()) - parse_timestamp(timestamp)
+         metrics.timing("outcomes_consumer.timestamp_lag", delta.total_seconds())
+ 
+     metrics.incr("outcomes_consumer.signal_sent", tags={"reason": reason, "outcome": outcome})
+ 
+ 
+-def _process_message_with_timer(message):
+-    with metrics.timer("outcomes_consumer.process_message"):
+-        return _process_message(message)
++def _process_signal_with_timer(message):
++    with metrics.timer("outcomes_consumer.process_signal"):
++        return _process_signal(message)
++
++
++def _process_tsdb_batch(batch):
++    tsdb_increments = []
++
++    for msg in batch:
++        project_id = int(msg.get("project_id") or 0) or None
++        event_id = msg.get("event_id")
++
++        if is_tsdb_incremented(project_id, event_id):
++            continue
++
++        for model, key in tsdb_increments_from_outcome(
++            org_id=int(msg.get("org_id") or 0) or None,
++            project_id=project_id,
++            key_id=int(msg.get("key_id") or 0) or None,
++            outcome=int(msg.get("outcome", -1)),
++            reason=msg.get("reason") or None,
++        ):
++            tsdb_increments.append(
++                (
++                    model,
++                    key,
++                    {
++                        "timestamp": parse_timestamp(msg["timestamp"])
++                        if msg.get("timestamp") is not None
++                        else to_datetime(time.time())
++                    },
++                )
++            )
++
++        mark_tsdb_incremented(project_id, event_id)
++        metrics.incr("outcomes_consumer.tsdb_incremented")
++
++    metrics.timing("outcomes_consumer.tsdb_incr_multi_size", len(tsdb_increments))
++
++    if tsdb_increments:
++        tsdb.incr_multi(tsdb_increments)
+ 
+ 
+ class OutcomesConsumerWorker(AbstractBatchWorker):
+@@ -128,12 +169,16 @@ class OutcomesConsumerWorker(AbstractBatchWorker):
+     def flush_batch(self, batch):
+         batch.sort(key=lambda msg: msg.get("project_id", 0) or 0)
+ 
+-        with batch_buffers_incr():
+-            with BaseManager.local_cache():
+-                for _ in self.pool.imap_unordered(
+-                    _process_message_with_timer, batch, chunksize=100
+-                ):
+-                    pass
++        with metrics.timer("outcomes_consumer.process_tsdb_batch"):
++            _process_tsdb_batch(batch)
++
++        with metrics.timer("outcomes_consumer.process_signal_batch"):
++            with batch_buffers_incr():
++                with BaseManager.local_cache():
++                    for _ in self.pool.imap_unordered(
++                        _process_signal_with_timer, batch, chunksize=100
++                    ):
++                        pass
+ 
+     def shutdown(self):
+         pass
+diff --git a/src/sentry/tsdb/base.py b/src/sentry/tsdb/base.py
+index d2536e8a93..c25e4235e0 100644
+--- a/src/sentry/tsdb/base.py
++++ b/src/sentry/tsdb/base.py
+@@ -315,9 +315,26 @@ class BaseTSDB(Service):
+         Increment project ID=1 and group ID=5:
+ 
+         >>> incr_multi([(TimeSeriesModel.project, 1), (TimeSeriesModel.group, 5)])
++
++        Increment individual timestamps:
++
++        >>> incr_multi([(TimeSeriesModel.project, 1, {"timestamp": ...}),
++        ...             (TimeSeriesModel.group, 5, {"timestamp": ...})])
+         """
+-        for model, key in items:
+-            self.incr(model, key, timestamp, count, environment_id=environment_id)
++        for item in items:
++            if len(item) == 2:
++                model, key = item
++                options = {}
++            else:
++                model, key, options = item
++
++            self.incr(
++                model,
++                key,
++                timestamp=options.get("timestamp", timestamp),
++                count=options.get("count", count),
++                environment_id=environment_id,
++            )
+ 
+     def merge(self, model, destination, sources, timestamp=None, environment_ids=None):
+         """
+diff --git a/src/sentry/tsdb/redis.py b/src/sentry/tsdb/redis.py
+index 730044979b..34ebd220ea 100644
+--- a/src/sentry/tsdb/redis.py
++++ b/src/sentry/tsdb/redis.py
+@@ -207,11 +207,20 @@ class RedisTSDB(BaseTSDB):
+         Increment project ID=1 and group ID=5:
+ 
+         >>> incr_multi([(TimeSeriesModel.project, 1), (TimeSeriesModel.group, 5)])
++
++        Increment individual timestamps:
++
++        >>> incr_multi([(TimeSeriesModel.project, 1, {"timestamp": ...}),
++        ...             (TimeSeriesModel.group, 5, {"timestamp": ...})])
+         """
+-        self.validate_arguments([model for model, _ in items], [environment_id])
+ 
+-        if timestamp is None:
+-            timestamp = timezone.now()
++        default_timestamp = timestamp
++        default_count = count
++
++        self.validate_arguments([item[0] for item in items], [environment_id])
++
++        if default_timestamp is None:
++            default_timestamp = timezone.now()
+ 
+         for (cluster, durable), environment_ids in self.get_cluster_groups(
+             set([None, environment_id])
+@@ -221,16 +230,38 @@ class RedisTSDB(BaseTSDB):
+                 manager = SuppressionWrapper(manager)
+ 
+             with manager as client:
++                # (hash_key, hash_field) -> count
++                key_operations = defaultdict(lambda: 0)
++                # (hash_key) -> "max expiration encountered"
++                key_expiries = defaultdict(lambda: 0.0)
++
+                 for rollup, max_values in six.iteritems(self.rollups):
+-                    for model, key in items:
++                    for item in items:
++                        if len(item) == 2:
++                            model, key = item
++                            options = {}
++                        else:
++                            model, key, options = item
++
++                        count = options.get("count", default_count)
++                        timestamp = options.get("timestamp", default_timestamp)
++
++                        expiry = self.calculate_expiry(rollup, max_values, timestamp)
++
+                         for environment_id in environment_ids:
+                             hash_key, hash_field = self.make_counter_key(
+                                 model, rollup, timestamp, key, environment_id
+                             )
+-                            client.hincrby(hash_key, hash_field, count)
+-                            client.expireat(
+-                                hash_key, self.calculate_expiry(rollup, max_values, timestamp)
+-                            )
++
++                            if key_expiries[hash_key] < expiry:
++                                key_expiries[hash_key] = expiry
++
++                            key_operations[(hash_key, hash_field)] += count
++
++                for (hash_key, hash_field), count in six.iteritems(key_operations):
++                    client.hincrby(hash_key, hash_field, count)
++                    if key_expiries.get(hash_key):
++                        client.expireat(hash_key, key_expiries.pop(hash_key))
+ 
+     def get_range(self, model, keys, start, end, rollup=None, environment_ids=None):
+         """
+diff --git a/src/sentry/tsdb/redissnuba.py b/src/sentry/tsdb/redissnuba.py
+index 9843ad7c90..df91e7b1c5 100644
+--- a/src/sentry/tsdb/redissnuba.py
++++ b/src/sentry/tsdb/redissnuba.py
+@@ -37,7 +37,7 @@ method_specifications = {
+     "get_frequency_series": (READ, single_model_argument),
+     "get_frequency_totals": (READ, single_model_argument),
+     "incr": (WRITE, single_model_argument),
+-    "incr_multi": (WRITE, lambda callargs: {model for model, key in callargs["items"]}),
++    "incr_multi": (WRITE, lambda callargs: {item[0] for item in callargs["items"]}),
+     "merge": (WRITE, single_model_argument),
+     "delete": (WRITE, multiple_model_argument),
+     "record": (WRITE, single_model_argument),
+diff --git a/src/sentry/utils/outcomes.py b/src/sentry/utils/outcomes.py
+index 38f54ea684..56b5b6ff50 100644
+--- a/src/sentry/utils/outcomes.py
++++ b/src/sentry/utils/outcomes.py
+@@ -4,6 +4,7 @@ import random
+ 
+ from datetime import datetime
+ from django.conf import settings
++from django.core.cache import cache
+ from enum import IntEnum
+ import six
+ import time
+@@ -34,6 +35,67 @@ def decide_signals_in_consumer():
+     return rate and rate > random.random()
+ 
+ 
++def decide_tsdb_in_consumer():
++    rate = options.get("outcomes.tsdb-in-consumer-sample-rate")
++    return rate and rate > random.random()
++
++
++def _get_tsdb_cache_key(project_id, event_id):
++    assert isinstance(project_id, six.integer_types)
++    return "is-tsdb-incremented:{}:{}".format(project_id, event_id)
++
++
++def mark_tsdb_incremented(project_id, event_id):
++    """
++    Remembers that TSDB was already called for an outcome.
++
++    Sets a boolean flag in memcached to remember that
++    tsdb_increments_from_outcome was already called for a particular
++    event/outcome.
++
++    This is used by the outcomes consumer to avoid double-emission.
++    """
++    key = _get_tsdb_cache_key(project_id, event_id)
++    cache.set(key, True, 3600)
++
++
++def is_tsdb_incremented(project_id, event_id):
++    key = _get_tsdb_cache_key(project_id, event_id)
++    return cache.get(key, None) is not None
++
++
++def tsdb_increments_from_outcome(org_id, project_id, key_id, outcome, reason):
++    if outcome != Outcome.INVALID:
++        # This simply preserves old behavior. We never counted invalid events
++        # (too large, duplicate, CORS) toward regular `received` counts.
++        if project_id is not None:
++            yield (tsdb.models.project_total_received, project_id)
++        if org_id is not None:
++            yield (tsdb.models.organization_total_received, org_id)
++        if key_id is not None:
++            yield (tsdb.models.key_total_received, key_id)
++
++    if outcome == Outcome.FILTERED:
++        if project_id is not None:
++            yield (tsdb.models.project_total_blacklisted, project_id)
++        if org_id is not None:
++            yield (tsdb.models.organization_total_blacklisted, org_id)
++        if key_id is not None:
++            yield (tsdb.models.key_total_blacklisted, key_id)
++
++    elif outcome == Outcome.RATE_LIMITED:
++        if project_id is not None:
++            yield (tsdb.models.project_total_rejected, project_id)
++        if org_id is not None:
++            yield (tsdb.models.organization_total_rejected, org_id)
++        if key_id is not None:
++            yield (tsdb.models.key_total_rejected, key_id)
++
++    if reason in FILTER_STAT_KEYS_TO_VALUES:
++        if project_id is not None:
++            yield (FILTER_STAT_KEYS_TO_VALUES[reason], project_id)
++
++
+ def track_outcome(org_id, project_id, key_id, outcome, reason=None, timestamp=None, event_id=None):
+     """
+     This is a central point to track org/project counters per incoming event.
+@@ -58,41 +120,20 @@ def track_outcome(org_id, project_id, key_id, outcome, reason=None, timestamp=No
+     assert isinstance(timestamp, (type(None), datetime))
+ 
+     timestamp = timestamp or to_datetime(time.time())
+-    increment_list = []
+-    if outcome != Outcome.INVALID:
+-        # This simply preserves old behavior. We never counted invalid events
+-        # (too large, duplicate, CORS) toward regular `received` counts.
+-        increment_list.extend(
+-            [
+-                (tsdb.models.project_total_received, project_id),
+-                (tsdb.models.organization_total_received, org_id),
+-                (tsdb.models.key_total_received, key_id),
+-            ]
+-        )
+ 
+-    if outcome == Outcome.FILTERED:
+-        increment_list.extend(
+-            [
+-                (tsdb.models.project_total_blacklisted, project_id),
+-                (tsdb.models.organization_total_blacklisted, org_id),
+-                (tsdb.models.key_total_blacklisted, key_id),
+-            ]
+-        )
+-    elif outcome == Outcome.RATE_LIMITED:
+-        increment_list.extend(
+-            [
+-                (tsdb.models.project_total_rejected, project_id),
+-                (tsdb.models.organization_total_rejected, org_id),
+-                (tsdb.models.key_total_rejected, key_id),
+-            ]
++    tsdb_in_consumer = decide_tsdb_in_consumer()
++
++    if not tsdb_in_consumer:
++        increment_list = list(
++            tsdb_increments_from_outcome(
++                org_id=org_id, project_id=project_id, key_id=key_id, outcome=outcome, reason=reason
++            )
+         )
+ 
+-    if reason in FILTER_STAT_KEYS_TO_VALUES:
+-        increment_list.append((FILTER_STAT_KEYS_TO_VALUES[reason], project_id))
++        if increment_list:
++            tsdb.incr_multi(increment_list, timestamp=timestamp)
+ 
+-    increment_list = [(model, key) for model, key in increment_list if key is not None]
+-    if increment_list:
+-        tsdb.incr_multi(increment_list, timestamp=timestamp)
++        mark_tsdb_incremented(project_id, event_id)
+ 
+     # Send a snuba metrics payload.
+     outcomes_publisher.publish(

@@ -1,0 +1,615 @@
+commit 5ef1d1b9dab142075e1e2c2709b1becf03a13c47
+Author: Lauryn Brown <lauryndbrown@gmail.com>
+Date:   Wed Oct 10 11:13:02 2018 -0700
+
+    feat(integrations): Gitlab Webhook first draft (#9733)
+    
+    * fleshed out webhooks.
+    * Adding client information needed to create webhooks.
+    * Added webhook creation to gitlab integration provider
+    * feat(integrations) fix gitlab integration setup tests
+    * feat(integrations) add test skeleton for webhooks
+
+diff --git a/src/sentry/integrations/gitlab/client.py b/src/sentry/integrations/gitlab/client.py
+index 970bcedf01..3194887908 100644
+--- a/src/sentry/integrations/gitlab/client.py
++++ b/src/sentry/integrations/gitlab/client.py
+@@ -5,12 +5,14 @@ from six.moves.urllib.parse import quote
+ from sentry.integrations.client import ApiClient, OAuth2RefreshMixin
+ from sentry.integrations.exceptions import ApiError
+ 
++
+ API_VERSION = u'/api/v4'
+ 
+ 
+ class GitLabApiClientPath(object):
+     group = u'/groups/{group}'
+     group_projects = u'/groups/{group}/projects'
++    hooks = u'/hooks'
+     issue = u'/projects/{project}/issues/{issue}'
+     issues = u'/projects/{project}/issues'
+     issues_search = u'/issues'
+diff --git a/src/sentry/integrations/gitlab/integration.py b/src/sentry/integrations/gitlab/integration.py
+index 142a2550c1..c7734f2076 100644
+--- a/src/sentry/integrations/gitlab/integration.py
++++ b/src/sentry/integrations/gitlab/integration.py
+@@ -8,6 +8,7 @@ from django import forms
+ 
+ from sentry import http
+ from sentry.web.helpers import render_to_response
++from sentry.models.apitoken import generate_token
+ from sentry.identity.pipeline import IdentityProviderPipeline
+ from sentry.identity.gitlab import get_user_info
+ from sentry.identity.gitlab.provider import GitlabIdentityProvider
+@@ -232,6 +233,12 @@ class GitlabIntegrationProvider(IntegrationProvider):
+         scopes = sorted(GitlabIdentityProvider.oauth_scopes)
+         base_url = state['installation_data']['url']
+         domain_name = '%s/%s' % (re.sub(r'https?://', '', base_url), group['path'])
++        verify_ssl = state['installation_data']['verify_ssl']
++
++        webhook_id, webhook_secret = self.create_webhook(
++            base_url,
++            data['access_token'],
++            verify_ssl)
+ 
+         integration = {
+             'name': group['name'],
+@@ -240,8 +247,12 @@ class GitlabIntegrationProvider(IntegrationProvider):
+                 'icon': group['avatar_url'],
+                 'domain_name': domain_name,
+                 'scopes': scopes,
+-                'verify_ssl': state['installation_data']['verify_ssl'],
++                'verify_ssl': verify_ssl,
+                 'base_url': base_url,
++                'webhook': {
++                    'secret': webhook_secret,
++                    'id': webhook_id,
++                }
+             },
+             'user_identity': {
+                 'type': 'gitlab',
+@@ -260,3 +271,29 @@ class GitlabIntegrationProvider(IntegrationProvider):
+             GitlabRepositoryProvider,
+             id='integrations:gitlab',
+         )
++
++    def create_webhook(self, base_url, access_token, verify_ssl):
++        webhook_secret = generate_token()
++        session = http.build_session()
++
++        uri = GitLabApiClientPath.build_api_url(
++            base_url=base_url,
++            path=GitLabApiClientPath.hooks
++        )
++        resp = session.post(
++            uri,
++            headers={
++                'Accept': 'application/json',
++                'Authorization': 'Bearer %s' % access_token,
++            },
++            verify=verify_ssl,
++            data={
++                'url': absolute_uri('/extensions/gitlab/webhooks/'),
++                'token': webhook_secret,
++                'merge_requests_events': True,
++                'push_events': True,
++            },
++        )
++
++        resp.raise_for_status()
++        return resp.json()['id'], webhook_secret
+diff --git a/src/sentry/integrations/gitlab/urls.py b/src/sentry/integrations/gitlab/urls.py
+index 6b401ac945..195b20c472 100644
+--- a/src/sentry/integrations/gitlab/urls.py
++++ b/src/sentry/integrations/gitlab/urls.py
+@@ -2,6 +2,7 @@ from __future__ import absolute_import, print_function
+ 
+ from django.conf.urls import patterns, url
+ 
++from .webhooks import GitlabWebhookEndpoint
+ from .search import GitlabIssueSearchEndpoint
+ 
+ urlpatterns = patterns(
+@@ -10,5 +11,10 @@ urlpatterns = patterns(
+         r'^search/(?P<organization_slug>[^\/]+)/(?P<integration_id>\d+)/$',
+         GitlabIssueSearchEndpoint.as_view(),
+         name='sentry-extensions-gitlab-search'
+-    )
++    ),
++    url(
++        r'^webhooks/$',
++        GitlabWebhookEndpoint.as_view(),
++        name='sentry-extensions-gitlab-webhook'
++    ),
+ )
+diff --git a/src/sentry/integrations/gitlab/webhooks.py b/src/sentry/integrations/gitlab/webhooks.py
+new file mode 100644
+index 0000000000..44577ac6ab
+--- /dev/null
++++ b/src/sentry/integrations/gitlab/webhooks.py
+@@ -0,0 +1,170 @@
++from __future__ import absolute_import
++
++import dateutil.parser
++import logging
++import six
++
++from django.db import IntegrityError, transaction
++from django.http import HttpResponse, Http404
++from django.utils.decorators import method_decorator
++from django.views.decorators.csrf import csrf_exempt
++from django.views.generic import View
++from django.utils import timezone
++from simplejson import JSONDecodeError
++
++from sentry.models import (Commit, CommitAuthor, Organization, Repository)
++from sentry.plugins.providers import IntegrationRepositoryProvider
++from sentry.utils import json
++
++logger = logging.getLogger('sentry.webhooks')
++
++PROVIDER_NAME = 'integrations:gitlab'
++
++
++class Webhook(object):
++    def __call__(self, organization, event):
++        raise NotImplementedError
++
++    def create_repo(self, event, organization):
++        repo_name = event['repository']['url']
++        try:
++            repo = Repository.objects.get(
++                organization_id=organization.id,
++                provider=PROVIDER_NAME,
++                external_id=six.text_type(repo_name),
++            )
++        except Repository.DoesNotExist:
++            raise Http404()
++
++        if repo.config.get('name') != repo_name:
++            repo.config['name'] = repo_name
++            repo.save()
++
++        return repo
++
++    def create_commits(self, event, organization, repo):
++        authors = {}
++
++        # TODO gitlab only sends a max of 20 commits. If a push contains
++        # more commits they provide a total count and require additional API
++        # requests to fetch the commit details
++        for commit in event.get('commits', []):
++            if IntegrationRepositoryProvider.should_ignore_commit(commit['message']):
++                continue
++
++            author_email = commit['author']['email']
++
++            # TODO(dcramer): we need to deal with bad values here, but since
++            # its optional, lets just throw it out for now
++            if author_email is None or len(author_email) > 75:
++                author = None
++            elif author_email not in authors:
++                authors[author_email] = author = CommitAuthor.objects.get_or_create(
++                    organization_id=organization.id,
++                    email=author_email,
++                    defaults={'name': commit['author']['name']}
++                )[0]
++            else:
++                author = authors[author_email]
++            try:
++                with transaction.atomic():
++
++                    Commit.objects.create(
++                        repository_id=repo.id,
++                        organization_id=organization.id,
++                        key=commit['id'],
++                        message=commit['message'],
++                        author=author,
++                        date_added=dateutil.parser.parse(
++                            commit['timestamp'],
++                        ).astimezone(timezone.utc),
++                    )
++
++            except IntegrityError:
++                pass
++
++
++class MergeEventWebhook(Webhook):
++    def __call__(self, organization, event):
++        repo = self.create_repo(event, organization)
++        self.create_commits(event, organization, repo)
++
++
++class PushEventWebhook(Webhook):
++    def __call__(self, organization, event):
++        repo = self.create_repo(event, organization)
++        self.create_commits(event, organization, repo)
++
++
++class GitlabWebhookEndpoint(View):
++    _handlers = {
++        'repository_update': PushEventWebhook,
++        'merge_request': MergeEventWebhook,
++    }
++
++    def get_handler(self, event_type):
++        return self._handlers.get(event_type)
++
++    @method_decorator(csrf_exempt)
++    def dispatch(self, request, *args, **kwargs):
++        if request.method != 'POST':
++            return HttpResponse(status=405)
++
++        # if not self.check_secret(request):
++        #     raise Exception???
++
++        return super(GitlabWebhookEndpoint, self).dispatch(request, *args, **kwargs)
++
++    def post(self, request, organization_id):
++        try:
++            organization = Organization.objects.get_from_cache(
++                id=organization_id,
++            )
++        except Organization.DoesNotExist:
++            logger.error(
++                PROVIDER_NAME + '.webhook.invalid-organization',
++                extra={
++                    'organization_id': organization_id,
++                }
++            )
++            return HttpResponse(status=400)
++
++        body = six.binary_type(request.body)
++        if not body:
++            logger.error(
++                PROVIDER_NAME + '.webhook.missing-body', extra={
++                    'organization_id': organization.id,
++                }
++            )
++            return HttpResponse(status=400)
++
++        try:
++            handler = self.get_handler(request.META['HTTP_X_EVENT_KEY'])
++        except KeyError:
++            logger.error(
++                PROVIDER_NAME + '.webhook.missing-event', extra={
++                    'organization_id': organization.id,
++                }
++            )
++            return HttpResponse(status=400)
++
++        if not handler:
++            return HttpResponse(status=204)
++
++        try:
++            event = json.loads(body.decode('utf-8'))
++        except JSONDecodeError:
++            logger.error(
++                PROVIDER_NAME + '.webhook.invalid-json',
++                extra={
++                    'organization_id': organization.id,
++                },
++                exc_info=True
++            )
++            return HttpResponse(status=400)
++
++        handler()(organization, event)
++        return HttpResponse(status=204)
++
++    def check_secret(self, request):
++        pass
+diff --git a/tests/sentry/integrations/gitlab/test_integration.py b/tests/sentry/integrations/gitlab/test_integration.py
+index d76b8b4e3f..899d17fd6c 100644
+--- a/tests/sentry/integrations/gitlab/test_integration.py
++++ b/tests/sentry/integrations/gitlab/test_integration.py
+@@ -4,10 +4,12 @@ import responses
+ import six
+ 
+ from six.moves.urllib.parse import parse_qs, urlencode, urlparse
++from mock import patch
+ 
+ from sentry.integrations.gitlab import GitlabIntegrationProvider
+ from sentry.models import (
+-    Identity, IdentityProvider, IdentityStatus, Integration, OrganizationIntegration,
++    Identity, IdentityProvider, IdentityStatus, Integration,
++    OrganizationIntegration
+ )
+ from sentry.testutils import IntegrationTestCase
+ 
+@@ -24,7 +26,6 @@ class GitlabIntegrationTest(IntegrationTestCase):
+     }
+ 
+     def assert_setup_flow(self, user_id='user_id_1', group_id=4):
+-        responses.reset()
+         resp = self.client.get(self.init_path)
+         assert resp.status_code == 200
+         resp = self.client.post(self.init_path, data=self.config)
+@@ -46,17 +47,18 @@ class GitlabIntegrationTest(IntegrationTestCase):
+         access_token = 'xxxxx-xxxxxxxxx-xxxxxxxxxx-xxxxxxxxxxxx'
+ 
+         responses.add(
+-            responses.POST, 'https://gitlab.example.com/oauth/token',
++            responses.POST,
++            'https://gitlab.example.com/oauth/token',
+             json={'access_token': access_token}
+         )
+-
+         responses.add(
+-            responses.GET, 'https://gitlab.example.com/api/v4/user',
++            responses.GET,
++            'https://gitlab.example.com/api/v4/user',
+             json={'id': user_id}
+         )
+-
+         responses.add(
+-            responses.GET, u'https://gitlab.example.com/api/v4/groups/cool-group',
++            responses.GET,
++            'https://gitlab.example.com/api/v4/groups/cool-group',
+             json={
+                 'id': group_id,
+                 'name': 'Cool',
+@@ -65,6 +67,13 @@ class GitlabIntegrationTest(IntegrationTestCase):
+                 'avatar_url': 'https://gitlab.example.com/uploads/group/avatar/4/foo.jpg',
+             }
+         )
++        responses.add(
++            responses.POST,
++            'https://gitlab.example.com/api/v4/hooks',
++            json={
++                'id': 'webhook-id-1'
++            }
++        )
+ 
+         resp = self.client.get(u'{}?{}'.format(
+             self.setup_path,
+@@ -88,7 +97,9 @@ class GitlabIntegrationTest(IntegrationTestCase):
+         self.assertDialogSuccess(resp)
+ 
+     @responses.activate
+-    def test_basic_flow(self):
++    @patch('sentry.integrations.gitlab.integration.generate_token')
++    def test_basic_flow(self, mock_generate_token):
++        mock_generate_token.return_value = 'secret-token'
+         self.assert_setup_flow()
+ 
+         integration = Integration.objects.get(provider=self.provider.key)
+@@ -100,7 +111,11 @@ class GitlabIntegrationTest(IntegrationTestCase):
+             u'icon': u'https://gitlab.example.com/uploads/group/avatar/4/foo.jpg',
+             u'domain_name': u'gitlab.example.com/cool-group',
+             u'verify_ssl': True,
+-            u'base_url': 'https://gitlab.example.com'
++            u'base_url': 'https://gitlab.example.com',
++            'webhook': {
++                'id': 'webhook-id-1',
++                'secret': 'secret-token'
++            }
+         }
+         oi = OrganizationIntegration.objects.get(
+             integration=integration,
+diff --git a/tests/sentry/integrations/gitlab/test_webhook.py b/tests/sentry/integrations/gitlab/test_webhook.py
+new file mode 100644
+index 0000000000..f73bae1b31
+--- /dev/null
++++ b/tests/sentry/integrations/gitlab/test_webhook.py
+@@ -0,0 +1,61 @@
++from __future__ import absolute_import
++
++from sentry.testutils import APITestCase
++
++import pytest
++
++
++class WebhookTest(APITestCase):
++    url = '/extensions/gitlab/webhook'
++
++    @pytest.mark.incomplete
++    def test_get(self):
++        pass
++
++    @pytest.mark.incomplete
++    def test_invalid_secret(self):
++        pass
++
++    @pytest.mark.incomplete
++    def test_push_event_create_repo(self):
++        pass
++
++    @pytest.mark.incomplete
++    def test_push_event_create_commits(self):
++        pass
++
++    @pytest.mark.incomplete
++    def test_push_event_ignore_commit(self):
++        pass
++
++    @pytest.mark.incomplete
++    def test_push_event_create_commits_more_than_20(self):
++        pass
++
++    @pytest.mark.incomplete
++    def test_push_event_known_author(self):
++        pass
++
++    @pytest.mark.incomplete
++    def test_push_event_unknown_author(self):
++        pass
++
++    @pytest.mark.incomplete
++    def test_push_event_suspect_commit(self):
++        pass
++
++    @pytest.mark.incomplete
++    def test_merge_event_create_repo(self):
++        pass
++
++    @pytest.mark.incomplete
++    def test_merge_event_create_commits(self):
++        pass
++
++    @pytest.mark.incomplete
++    def test_merge_event_create_commits_more_than_20(self):
++        pass
++
++    @pytest.mark.incomplete
++    def test_merge_event_link_author(self):
++        pass
+diff --git a/tests/sentry/integrations/gitlab/testutils.py b/tests/sentry/integrations/gitlab/testutils.py
+index 5f891e4f92..8fdbd721d2 100644
+--- a/tests/sentry/integrations/gitlab/testutils.py
++++ b/tests/sentry/integrations/gitlab/testutils.py
+@@ -33,3 +33,155 @@ class GitLabTestCase(APITestCase):
+         )
+         integration.add_organization(self.organization, self.user, identity.id)
+         self.installation = integration.get_installation(self.organization.id)
++
++
++MERGE_REQUEST_EVENT = b"""{
++  "object_kind": "merge_request",
++  "user": {
++    "name": "Administrator",
++    "username": "root",
++    "avatar_url": "http://www.gravatar.com/avatar/e64c7d89f26bd1972efa854d13d7dd61?s=80&d=identicon"
++  },
++  "project": {
++    "name": "Example",
++    "description": "",
++    "web_url": "http://example.com/jsmith/example",
++    "avatar_url": null,
++    "git_ssh_url": "git@example.com:jsmith/example.git",
++    "git_http_url": "http://example.com/jsmith/example.git",
++    "namespace": "Jsmith",
++    "visibility_level": 0,
++    "path_with_namespace": "jsmith/example",
++    "default_branch": "master",
++    "ci_config_path": "",
++    "homepage": "http://example.com/jsmith/example",
++    "url": "git@example.com:jsmith/example.git",
++    "ssh_url": "git@example.com:jsmith/example.git",
++    "http_url": "http://example.com/jsmith/example.git"
++  },
++  "object_attributes": {
++    "id": 90,
++    "target_branch": "master",
++    "source_branch": "ms-viewport",
++    "source_project_id": 14,
++    "author_id": 51,
++    "assignee_id": 6,
++    "title": "MS-Viewport",
++    "created_at": "2017-09-20T08:31:45.944Z",
++    "updated_at": "2017-09-28T12:23:42.365Z",
++    "milestone_id": null,
++    "state": "opened",
++    "merge_status": "unchecked",
++    "target_project_id": 14,
++    "iid": 1,
++    "description": "",
++    "updated_by_id": 1,
++    "merge_error": null,
++    "merge_params": {
++      "force_remove_source_branch": "0"
++    },
++    "merge_when_pipeline_succeeds": false,
++    "merge_user_id": null,
++    "merge_commit_sha": null,
++    "deleted_at": null,
++    "in_progress_merge_commit_sha": null,
++    "lock_version": 5,
++    "time_estimate": 0,
++    "last_edited_at": "2017-09-27T12:43:37.558Z",
++    "last_edited_by_id": 1,
++    "head_pipeline_id": 61,
++    "ref_fetched": true,
++    "merge_jid": null,
++    "source": {
++      "name": "Awesome Project",
++      "description": "",
++      "web_url": "http://example.com/awesome_space/awesome_project",
++      "avatar_url": null,
++      "git_ssh_url": "git@example.com:awesome_space/awesome_project.git",
++      "git_http_url": "http://example.com/awesome_space/awesome_project.git",
++      "namespace": "root",
++      "visibility_level": 0,
++      "path_with_namespace": "awesome_space/awesome_project",
++      "default_branch": "master",
++      "ci_config_path": "",
++      "homepage": "http://example.com/awesome_space/awesome_project",
++      "url": "http://example.com/awesome_space/awesome_project.git",
++      "ssh_url": "git@example.com:awesome_space/awesome_project.git",
++      "http_url": "http://example.com/awesome_space/awesome_project.git"
++    },
++    "target": {
++      "name": "Awesome Project",
++      "description": "Aut reprehenderit ut est.",
++      "web_url": "http://example.com/awesome_space/awesome_project",
++      "avatar_url": null,
++      "git_ssh_url": "git@example.com:awesome_space/awesome_project.git",
++      "git_http_url": "http://example.com/awesome_space/awesome_project.git",
++      "namespace": "Awesome Space",
++      "visibility_level": 0,
++      "path_with_namespace": "awesome_space/awesome_project",
++      "default_branch": "master",
++      "ci_config_path": "",
++      "homepage": "http://example.com/awesome_space/awesome_project",
++      "url": "http://example.com/awesome_space/awesome_project.git",
++      "ssh_url": "git@example.com:awesome_space/awesome_project.git",
++      "http_url": "http://example.com/awesome_space/awesome_project.git"
++    },
++    "last_commit": {
++      "id": "ba3e0d8ff79c80d5b0bbb4f3e2e343e0aaa662b7",
++      "message": "fixed readme",
++      "timestamp": "2017-09-26T16:12:57Z",
++      "url": "http://example.com/awesome_space/awesome_project/commits/da1560886d4f094c3e6c9ef40349f7d38b5d27d7",
++      "author": {
++        "name": "GitLab dev user",
++        "email": "gitlabdev@dv6700.(none)"
++      }
++    },
++    "work_in_progress": false,
++    "total_time_spent": 0,
++    "human_total_time_spent": null,
++    "human_time_estimate": null
++  },
++  "labels": null,
++  "repository": {
++    "name": "git-gpg-test",
++    "url": "git@example.com:awesome_space/awesome_project.git",
++    "description": "",
++    "homepage": "http://example.com/awesome_space/awesome_project"
++  }
++}"""
++
++
++COMMIT_REQUEST_EVENT = b"""
++{
++  "event_name": "repository_update",
++  "user_id": 1,
++  "user_name": "John Smith",
++  "user_email": "admin@example.com",
++  "user_avatar": "https://s.gravatar.com/avatar/d4c74594d841139328695756648b6bd6?s=8://s.gravatar.com/avatar/d4c74594d841139328695756648b6bd6?s=80",
++  "project_id": 1,
++  "project": {
++    "name":"Example",
++    "description":"",
++    "web_url":"http://example.com/jsmith/example",
++    "avatar_url":null,
++    "git_ssh_url":"git@example.com:jsmith/example.git",
++    "git_http_url":"http://example.com/jsmith/example.git",
++    "namespace":"Jsmith",
++    "visibility_level":0,
++    "path_with_namespace":"jsmith/example",
++    "default_branch":"master",
++    "homepage":"http://example.com/jsmith/example",
++    "url":"git@example.com:jsmith/example.git",
++    "ssh_url":"git@example.com:jsmith/example.git",
++    "http_url":"http://example.com/jsmith/example.git",
++  },
++  "changes": [
++    {
++      "before":"8205ea8d81ce0c6b90fbe8280d118cc9fdad6130",
++      "after":"4045ea7a3df38697b3730a20fb73c8bed8a3e69e",
++      "ref":"refs/heads/master"
++    }
++  ],
++  "refs":["refs/heads/master"]
++}
++"""

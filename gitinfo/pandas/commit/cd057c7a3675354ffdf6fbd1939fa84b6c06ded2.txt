@@ -1,0 +1,687 @@
+commit cd057c7a3675354ffdf6fbd1939fa84b6c06ded2
+Author: Vasily Litvinov <45396231+vnlitvin@users.noreply.github.com>
+Date:   Fri Mar 22 19:19:37 2019 +0300
+
+    PERF: Improve performance of hash sets in read_csv (#25804)
+
+diff --git a/doc/source/whatsnew/v0.25.0.rst b/doc/source/whatsnew/v0.25.0.rst
+index 91b1c30f9..b56c03cc8 100644
+--- a/doc/source/whatsnew/v0.25.0.rst
++++ b/doc/source/whatsnew/v0.25.0.rst
+@@ -176,6 +176,7 @@ Performance Improvements
+   int8/int16/int32 and the searched key is within the integer bounds for the dtype (:issue:`22034`)
+ - Improved performance of :meth:`pandas.core.groupby.GroupBy.quantile` (:issue:`20405`)
+ - Improved performance of :meth:`read_csv` by faster tokenizing and faster parsing of small float numbers (:issue:`25784`)
++- Improved performance of :meth:`read_csv` by faster parsing of N/A and boolean values (:issue:`25804`)
+ 
+ .. _whatsnew_0250.bug_fixes:
+ 
+diff --git a/pandas/_libs/khash.pxd b/pandas/_libs/khash.pxd
+index 971a45e36..c52dacd37 100644
+--- a/pandas/_libs/khash.pxd
++++ b/pandas/_libs/khash.pxd
+@@ -56,6 +56,17 @@ cdef extern from "khash_python.h":
+ 
+     bint kh_exist_str(kh_str_t*, khiter_t) nogil
+ 
++    ctypedef struct kh_str_starts_t:
++        kh_str_t *table
++        int starts[256]
++
++    kh_str_starts_t* kh_init_str_starts() nogil
++    khint_t kh_put_str_starts_item(kh_str_starts_t* table, char* key,
++                                   int* ret) nogil
++    khint_t kh_get_str_starts_item(kh_str_starts_t* table, char* key) nogil
++    void kh_destroy_str_starts(kh_str_starts_t*) nogil
++    void kh_resize_str_starts(kh_str_starts_t*, khint_t) nogil
++
+     ctypedef struct kh_int64_t:
+         khint_t n_buckets, size, n_occupied, upper_bound
+         uint32_t *flags
+diff --git a/pandas/_libs/parsers.pyx b/pandas/_libs/parsers.pyx
+index 18959b2d3..88bb00cb5 100644
+--- a/pandas/_libs/parsers.pyx
++++ b/pandas/_libs/parsers.pyx
+@@ -39,11 +39,13 @@ import pandas._libs.lib as lib
+ from pandas._libs.khash cimport (
+     khiter_t,
+     kh_str_t, kh_init_str, kh_put_str, kh_exist_str,
+-    kh_get_str, kh_destroy_str,
++    kh_get_str, kh_destroy_str, kh_resize_str,
+     kh_float64_t, kh_get_float64, kh_destroy_float64,
+-    kh_put_float64, kh_init_float64,
++    kh_put_float64, kh_init_float64, kh_resize_float64,
+     kh_strbox_t, kh_put_strbox, kh_get_strbox, kh_init_strbox,
+-    kh_destroy_strbox)
++    kh_destroy_strbox,
++    kh_str_starts_t, kh_put_str_starts_item, kh_init_str_starts,
++    kh_get_str_starts_item, kh_destroy_str_starts, kh_resize_str_starts)
+ 
+ import pandas.compat as compat
+ from pandas.core.dtypes.common import (
+@@ -71,9 +73,6 @@ cdef:
+     float64_t NEGINF = -INF
+ 
+ 
+-cdef extern from "errno.h":
+-    int errno
+-
+ cdef extern from "headers/portable.h":
+     # I *think* this is here so that strcasecmp is defined on Windows
+     # so we don't get
+@@ -186,7 +185,7 @@ cdef extern from "parser/tokenizer.h":
+         int64_t skipfooter
+         # pick one, depending on whether the converter requires GIL
+         float64_t (*double_converter_nogil)(const char *, char **,
+-                                            char, char, char, int) nogil
++                                            char, char, char, int, int *) nogil
+         float64_t (*double_converter_withgil)(const char *, char **,
+                                               char, char, char, int)
+ 
+@@ -237,9 +236,9 @@ cdef extern from "parser/tokenizer.h":
+                            uint64_t uint_max, int *error, char tsep) nogil
+ 
+     float64_t xstrtod(const char *p, char **q, char decimal, char sci,
+-                      char tsep, int skip_trailing) nogil
++                      char tsep, int skip_trailing, int *error) nogil
+     float64_t precise_xstrtod(const char *p, char **q, char decimal, char sci,
+-                              char tsep, int skip_trailing) nogil
++                              char tsep, int skip_trailing, int *error) nogil
+     float64_t round_trip(const char *p, char **q, char decimal, char sci,
+                          char tsep, int skip_trailing) nogil
+ 
+@@ -285,8 +284,8 @@ cdef class TextReader:
+         int64_t parser_start
+         list clocks
+         char *c_encoding
+-        kh_str_t *false_set
+-        kh_str_t *true_set
++        kh_str_starts_t *false_set
++        kh_str_starts_t *true_set
+ 
+     cdef public:
+         int64_t leading_cols, table_width, skipfooter, buffer_lines
+@@ -557,10 +556,10 @@ cdef class TextReader:
+     def __dealloc__(self):
+         parser_free(self.parser)
+         if self.true_set:
+-            kh_destroy_str(self.true_set)
++            kh_destroy_str_starts(self.true_set)
+             self.true_set = NULL
+         if self.false_set:
+-            kh_destroy_str(self.false_set)
++            kh_destroy_str_starts(self.false_set)
+             self.false_set = NULL
+         parser_del(self.parser)
+ 
+@@ -575,10 +574,10 @@ cdef class TextReader:
+         # also preemptively free all allocated memory
+         parser_free(self.parser)
+         if self.true_set:
+-            kh_destroy_str(self.true_set)
++            kh_destroy_str_starts(self.true_set)
+             self.true_set = NULL
+         if self.false_set:
+-            kh_destroy_str(self.false_set)
++            kh_destroy_str_starts(self.false_set)
+             self.false_set = NULL
+ 
+     def set_error_bad_lines(self, int status):
+@@ -1020,7 +1019,7 @@ cdef class TextReader:
+         cdef:
+             int64_t i
+             int nused
+-            kh_str_t *na_hashset = NULL
++            kh_str_starts_t *na_hashset = NULL
+             int64_t start, end
+             object name, na_flist, col_dtype = None
+             bint na_filter = 0
+@@ -1144,7 +1143,7 @@ cdef class TextReader:
+ 
+     cdef inline _convert_tokens(self, Py_ssize_t i, int start, int end,
+                                 object name, bint na_filter,
+-                                kh_str_t *na_hashset,
++                                kh_str_starts_t *na_hashset,
+                                 object na_flist, object col_dtype):
+ 
+         if col_dtype is not None:
+@@ -1207,7 +1206,7 @@ cdef class TextReader:
+                              int64_t start, int64_t end,
+                              bint na_filter,
+                              bint user_dtype,
+-                             kh_str_t *na_hashset,
++                             kh_str_starts_t *na_hashset,
+                              object na_flist):
+         if is_categorical_dtype(dtype):
+             # TODO: I suspect that _categorical_convert could be
+@@ -1304,7 +1303,7 @@ cdef class TextReader:
+                             "supported for parsing".format(dtype=dtype))
+ 
+     cdef _string_convert(self, Py_ssize_t i, int64_t start, int64_t end,
+-                         bint na_filter, kh_str_t *na_hashset):
++                         bint na_filter, kh_str_starts_t *na_hashset):
+ 
+         cdef StringPath path = _string_path(self.c_encoding)
+ 
+@@ -1363,8 +1362,8 @@ cdef class TextReader:
+ 
+             return _ensure_encoded(self.na_values), self.na_fvalues
+ 
+-    cdef _free_na_set(self, kh_str_t *table):
+-        kh_destroy_str(table)
++    cdef _free_na_set(self, kh_str_starts_t *table):
++        kh_destroy_str_starts(table)
+ 
+     cdef _get_column_name(self, Py_ssize_t i, Py_ssize_t nused):
+         cdef int64_t j
+@@ -1454,7 +1453,7 @@ cdef inline StringPath _string_path(char *encoding):
+ 
+ cdef _string_box_factorize(parser_t *parser, int64_t col,
+                            int64_t line_start, int64_t line_end,
+-                           bint na_filter, kh_str_t *na_hashset):
++                           bint na_filter, kh_str_starts_t *na_hashset):
+     cdef:
+         int error, na_count = 0
+         Py_ssize_t i, lines
+@@ -1479,9 +1478,8 @@ cdef _string_box_factorize(parser_t *parser, int64_t col,
+         COLITER_NEXT(it, word)
+ 
+         if na_filter:
+-            k = kh_get_str(na_hashset, word)
+-            # in the hash table
+-            if k != na_hashset.n_buckets:
++            if kh_get_str_starts_item(na_hashset, word):
++                # in the hash table
+                 na_count += 1
+                 result[i] = NA
+                 continue
+@@ -1508,7 +1506,7 @@ cdef _string_box_factorize(parser_t *parser, int64_t col,
+ 
+ cdef _string_box_utf8(parser_t *parser, int64_t col,
+                       int64_t line_start, int64_t line_end,
+-                      bint na_filter, kh_str_t *na_hashset):
++                      bint na_filter, kh_str_starts_t *na_hashset):
+     cdef:
+         int error, na_count = 0
+         Py_ssize_t i, lines
+@@ -1533,9 +1531,8 @@ cdef _string_box_utf8(parser_t *parser, int64_t col,
+         COLITER_NEXT(it, word)
+ 
+         if na_filter:
+-            k = kh_get_str(na_hashset, word)
+-            # in the hash table
+-            if k != na_hashset.n_buckets:
++            if kh_get_str_starts_item(na_hashset, word):
++                # in the hash table
+                 na_count += 1
+                 result[i] = NA
+                 continue
+@@ -1562,7 +1559,7 @@ cdef _string_box_utf8(parser_t *parser, int64_t col,
+ 
+ cdef _string_box_decode(parser_t *parser, int64_t col,
+                         int64_t line_start, int64_t line_end,
+-                        bint na_filter, kh_str_t *na_hashset,
++                        bint na_filter, kh_str_starts_t *na_hashset,
+                         char *encoding):
+     cdef:
+         int error, na_count = 0
+@@ -1590,9 +1587,8 @@ cdef _string_box_decode(parser_t *parser, int64_t col,
+         COLITER_NEXT(it, word)
+ 
+         if na_filter:
+-            k = kh_get_str(na_hashset, word)
++            if kh_get_str_starts_item(na_hashset, word):
+             # in the hash table
+-            if k != na_hashset.n_buckets:
+                 na_count += 1
+                 result[i] = NA
+                 continue
+@@ -1621,7 +1617,7 @@ cdef _string_box_decode(parser_t *parser, int64_t col,
+ @cython.boundscheck(False)
+ cdef _categorical_convert(parser_t *parser, int64_t col,
+                           int64_t line_start, int64_t line_end,
+-                          bint na_filter, kh_str_t *na_hashset,
++                          bint na_filter, kh_str_starts_t *na_hashset,
+                           char *encoding):
+     "Convert column data into codes, categories"
+     cdef:
+@@ -1654,9 +1650,8 @@ cdef _categorical_convert(parser_t *parser, int64_t col,
+             COLITER_NEXT(it, word)
+ 
+             if na_filter:
+-                k = kh_get_str(na_hashset, word)
++                if kh_get_str_starts_item(na_hashset, word):
+                 # is in NA values
+-                if k != na_hashset.n_buckets:
+                     na_count += 1
+                     codes[i] = NA
+                     continue
+@@ -1733,7 +1728,7 @@ cdef:
+ 
+ cdef _try_double(parser_t *parser, int64_t col,
+                  int64_t line_start, int64_t line_end,
+-                 bint na_filter, kh_str_t *na_hashset, object na_flist):
++                 bint na_filter, kh_str_starts_t *na_hashset, object na_flist):
+     cdef:
+         int error, na_count = 0
+         Py_ssize_t i, lines
+@@ -1761,7 +1756,7 @@ cdef _try_double(parser_t *parser, int64_t col,
+         assert parser.double_converter_withgil != NULL
+         error = _try_double_nogil(parser,
+                                   <float64_t (*)(const char *, char **,
+-                                                 char, char, char, int)
++                                                 char, char, char, int, int *)
+                                   nogil>parser.double_converter_withgil,
+                                   col, line_start, line_end,
+                                   na_filter, na_hashset, use_na_flist,
+@@ -1775,23 +1770,21 @@ cdef _try_double(parser_t *parser, int64_t col,
+ cdef inline int _try_double_nogil(parser_t *parser,
+                                   float64_t (*double_converter)(
+                                       const char *, char **, char,
+-                                      char, char, int) nogil,
++                                      char, char, int, int *) nogil,
+                                   int col, int line_start, int line_end,
+-                                  bint na_filter, kh_str_t *na_hashset,
++                                  bint na_filter, kh_str_starts_t *na_hashset,
+                                   bint use_na_flist,
+                                   const kh_float64_t *na_flist,
+                                   float64_t NA, float64_t *data,
+                                   int *na_count) nogil:
+     cdef:
+-        int error,
++        int error = 0,
+         Py_ssize_t i, lines = line_end - line_start
+         coliter_t it
+         const char *word = NULL
+         char *p_end
+         khiter_t k, k64
+ 
+-    global errno
+-
+     na_count[0] = 0
+     coliter_setup(&it, parser, col, line_start)
+ 
+@@ -1799,23 +1792,22 @@ cdef inline int _try_double_nogil(parser_t *parser,
+         for i in range(lines):
+             COLITER_NEXT(it, word)
+ 
+-            k = kh_get_str(na_hashset, word)
+-            # in the hash table
+-            if k != na_hashset.n_buckets:
++            if kh_get_str_starts_item(na_hashset, word):
++                # in the hash table
+                 na_count[0] += 1
+                 data[0] = NA
+             else:
+                 data[0] = double_converter(word, &p_end, parser.decimal,
+-                                           parser.sci, parser.thousands, 1)
+-                if errno != 0 or p_end[0] or p_end == word:
++                                           parser.sci, parser.thousands,
++                                           1, &error)
++                if error != 0 or p_end == word or p_end[0]:
++                    error = 0
+                     if (strcasecmp(word, cinf) == 0 or
+                             strcasecmp(word, cposinf) == 0):
+                         data[0] = INF
+                     elif strcasecmp(word, cneginf) == 0:
+                         data[0] = NEGINF
+                     else:
+-                        # Just return a non-zero value since
+-                        # the errno is never consumed.
+                         return 1
+                 if use_na_flist:
+                     k64 = kh_get_float64(na_flist, data[0])
+@@ -1827,16 +1819,15 @@ cdef inline int _try_double_nogil(parser_t *parser,
+         for i in range(lines):
+             COLITER_NEXT(it, word)
+             data[0] = double_converter(word, &p_end, parser.decimal,
+-                                       parser.sci, parser.thousands, 1)
+-            if errno != 0 or p_end[0] or p_end == word:
++                                       parser.sci, parser.thousands, 1, &error)
++            if error != 0 or p_end == word or p_end[0]:
++                error = 0
+                 if (strcasecmp(word, cinf) == 0 or
+                         strcasecmp(word, cposinf) == 0):
+                     data[0] = INF
+                 elif strcasecmp(word, cneginf) == 0:
+                     data[0] = NEGINF
+                 else:
+-                    # Just return a non-zero value since
+-                    # the errno is never consumed.
+                     return 1
+             data += 1
+ 
+@@ -1845,7 +1836,7 @@ cdef inline int _try_double_nogil(parser_t *parser,
+ 
+ cdef _try_uint64(parser_t *parser, int64_t col,
+                  int64_t line_start, int64_t line_end,
+-                 bint na_filter, kh_str_t *na_hashset):
++                 bint na_filter, kh_str_starts_t *na_hashset):
+     cdef:
+         int error
+         Py_ssize_t i, lines
+@@ -1882,7 +1873,7 @@ cdef _try_uint64(parser_t *parser, int64_t col,
+ cdef inline int _try_uint64_nogil(parser_t *parser, int64_t col,
+                                   int64_t line_start,
+                                   int64_t line_end, bint na_filter,
+-                                  const kh_str_t *na_hashset,
++                                  const kh_str_starts_t *na_hashset,
+                                   uint64_t *data, uint_state *state) nogil:
+     cdef:
+         int error
+@@ -1896,9 +1887,8 @@ cdef inline int _try_uint64_nogil(parser_t *parser, int64_t col,
+     if na_filter:
+         for i in range(lines):
+             COLITER_NEXT(it, word)
+-            k = kh_get_str(na_hashset, word)
+-            # in the hash table
+-            if k != na_hashset.n_buckets:
++            if kh_get_str_starts_item(na_hashset, word):
++                # in the hash table
+                 state.seen_null = 1
+                 data[i] = 0
+                 continue
+@@ -1920,7 +1910,7 @@ cdef inline int _try_uint64_nogil(parser_t *parser, int64_t col,
+ 
+ cdef _try_int64(parser_t *parser, int64_t col,
+                 int64_t line_start, int64_t line_end,
+-                bint na_filter, kh_str_t *na_hashset):
++                bint na_filter, kh_str_starts_t *na_hashset):
+     cdef:
+         int error, na_count = 0
+         Py_ssize_t i, lines
+@@ -1950,7 +1940,7 @@ cdef _try_int64(parser_t *parser, int64_t col,
+ cdef inline int _try_int64_nogil(parser_t *parser, int64_t col,
+                                  int64_t line_start,
+                                  int64_t line_end, bint na_filter,
+-                                 const kh_str_t *na_hashset, int64_t NA,
++                                 const kh_str_starts_t *na_hashset, int64_t NA,
+                                  int64_t *data, int *na_count) nogil:
+     cdef:
+         int error
+@@ -1965,9 +1955,8 @@ cdef inline int _try_int64_nogil(parser_t *parser, int64_t col,
+     if na_filter:
+         for i in range(lines):
+             COLITER_NEXT(it, word)
+-            k = kh_get_str(na_hashset, word)
+-            # in the hash table
+-            if k != na_hashset.n_buckets:
++            if kh_get_str_starts_item(na_hashset, word):
++                # in the hash table
+                 na_count[0] += 1
+                 data[i] = NA
+                 continue
+@@ -1989,9 +1978,9 @@ cdef inline int _try_int64_nogil(parser_t *parser, int64_t col,
+ 
+ cdef _try_bool_flex(parser_t *parser, int64_t col,
+                     int64_t line_start, int64_t line_end,
+-                    bint na_filter, const kh_str_t *na_hashset,
+-                    const kh_str_t *true_hashset,
+-                    const kh_str_t *false_hashset):
++                    bint na_filter, const kh_str_starts_t *na_hashset,
++                    const kh_str_starts_t *true_hashset,
++                    const kh_str_starts_t *false_hashset):
+     cdef:
+         int error, na_count = 0
+         Py_ssize_t i, lines
+@@ -2018,9 +2007,9 @@ cdef _try_bool_flex(parser_t *parser, int64_t col,
+ cdef inline int _try_bool_flex_nogil(parser_t *parser, int64_t col,
+                                      int64_t line_start,
+                                      int64_t line_end, bint na_filter,
+-                                     const kh_str_t *na_hashset,
+-                                     const kh_str_t *true_hashset,
+-                                     const kh_str_t *false_hashset,
++                                     const kh_str_starts_t *na_hashset,
++                                     const kh_str_starts_t *true_hashset,
++                                     const kh_str_starts_t *false_hashset,
+                                      uint8_t NA, uint8_t *data,
+                                      int *na_count) nogil:
+     cdef:
+@@ -2037,21 +2026,18 @@ cdef inline int _try_bool_flex_nogil(parser_t *parser, int64_t col,
+         for i in range(lines):
+             COLITER_NEXT(it, word)
+ 
+-            k = kh_get_str(na_hashset, word)
+-            # in the hash table
+-            if k != na_hashset.n_buckets:
++            if kh_get_str_starts_item(na_hashset, word):
++                # in the hash table
+                 na_count[0] += 1
+                 data[0] = NA
+                 data += 1
+                 continue
+ 
+-            k = kh_get_str(true_hashset, word)
+-            if k != true_hashset.n_buckets:
++            if kh_get_str_starts_item(true_hashset, word):
+                 data[0] = 1
+                 data += 1
+                 continue
+-            k = kh_get_str(false_hashset, word)
+-            if k != false_hashset.n_buckets:
++            if kh_get_str_starts_item(false_hashset, word):
+                 data[0] = 0
+                 data += 1
+                 continue
+@@ -2064,14 +2050,12 @@ cdef inline int _try_bool_flex_nogil(parser_t *parser, int64_t col,
+         for i in range(lines):
+             COLITER_NEXT(it, word)
+ 
+-            k = kh_get_str(true_hashset, word)
+-            if k != true_hashset.n_buckets:
++            if kh_get_str_starts_item(true_hashset, word):
+                 data[0] = 1
+                 data += 1
+                 continue
+ 
+-            k = kh_get_str(false_hashset, word)
+-            if k != false_hashset.n_buckets:
++            if kh_get_str_starts_item(false_hashset, word):
+                 data[0] = 0
+                 data += 1
+                 continue
+@@ -2084,27 +2068,34 @@ cdef inline int _try_bool_flex_nogil(parser_t *parser, int64_t col,
+     return 0
+ 
+ 
+-cdef kh_str_t* kset_from_list(list values) except NULL:
++cdef kh_str_starts_t* kset_from_list(list values) except NULL:
+     # caller takes responsibility for freeing the hash table
+     cdef:
+         Py_ssize_t i
+         khiter_t k
+-        kh_str_t *table
++        kh_str_starts_t *table
+         int ret = 0
+ 
+         object val
+ 
+-    table = kh_init_str()
++    table = kh_init_str_starts()
+ 
+     for i in range(len(values)):
+         val = values[i]
+ 
+         # None creeps in sometimes, which isn't possible here
+         if not isinstance(val, bytes):
+-            kh_destroy_str(table)
++            kh_destroy_str_starts(table)
+             raise ValueError('Must be all encoded bytes')
+ 
+-        k = kh_put_str(table, PyBytes_AsString(val), &ret)
++        kh_put_str_starts_item(table, PyBytes_AsString(val), &ret)
++
++    if table.table.n_buckets <= 128:
++        # Resize the hash table to make it almost empty, this
++        # reduces amount of hash collisions on lookup thus
++        # "key not in table" case is faster.
++        # Note that this trades table memory footprint for lookup speed.
++        kh_resize_str_starts(table, table.table.n_buckets * 8)
+ 
+     return table
+ 
+@@ -2126,6 +2117,9 @@ cdef kh_float64_t* kset_float64_from_list(values) except NULL:
+ 
+         k = kh_put_float64(table, val, &ret)
+ 
++    if table.n_buckets <= 128:
++        # See reasoning in kset_from_list
++        kh_resize_float64(table, table.n_buckets * 8)
+     return table
+ 
+ 
+diff --git a/pandas/_libs/src/klib/khash_python.h b/pandas/_libs/src/klib/khash_python.h
+index 45a93051f..a81f9785e 100644
+--- a/pandas/_libs/src/klib/khash_python.h
++++ b/pandas/_libs/src/klib/khash_python.h
+@@ -84,3 +84,41 @@ KHASH_SET_INIT_PYOBJECT(pyset)
+ #define kh_exist_pyset(h, k) (kh_exist(h, k))
+ 
+ KHASH_MAP_INIT_STR(strbox, kh_pyobject_t)
++
++typedef struct {
++	kh_str_t *table;
++	int starts[256];
++} kh_str_starts_t;
++
++typedef kh_str_starts_t* p_kh_str_starts_t;
++
++p_kh_str_starts_t PANDAS_INLINE kh_init_str_starts(void) {
++	kh_str_starts_t *result = (kh_str_starts_t*)calloc(1, sizeof(kh_str_starts_t));
++	result->table = kh_init_str();
++	return result;
++}
++
++khint_t PANDAS_INLINE kh_put_str_starts_item(kh_str_starts_t* table, char* key, int* ret) {
++    khint_t result = kh_put_str(table->table, key, ret);
++	if (*ret != 0) {
++		table->starts[(unsigned char)key[0]] = 1;
++	}
++    return result;
++}
++
++khint_t PANDAS_INLINE kh_get_str_starts_item(kh_str_starts_t* table, char* key) {
++    unsigned char ch = *key;
++	if (table->starts[ch]) {
++		if (ch == '\0' || kh_get_str(table->table, key) != table->table->n_buckets) return 1;
++	}
++    return 0;
++}
++
++void PANDAS_INLINE kh_destroy_str_starts(kh_str_starts_t* table) {
++	kh_destroy_str(table->table);
++	free(table);
++}
++
++void PANDAS_INLINE kh_resize_str_starts(kh_str_starts_t* table, khint_t val) {
++	kh_resize_str(table->table, val);
++}
+\ No newline at end of file
+diff --git a/pandas/_libs/src/parser/tokenizer.c b/pandas/_libs/src/parser/tokenizer.c
+index 1117e75aa..712e12829 100644
+--- a/pandas/_libs/src/parser/tokenizer.c
++++ b/pandas/_libs/src/parser/tokenizer.c
+@@ -1544,7 +1544,7 @@ int main(int argc, char *argv[]) {
+ const int max_int_decimal_digits = (sizeof(unsigned int) * 8) / 4;
+ 
+ double xstrtod(const char *str, char **endptr, char decimal, char sci,
+-               char tsep, int skip_trailing) {
++               char tsep, int skip_trailing, int *error) {
+     double number;
+     unsigned int i_number = 0;
+     int exponent;
+@@ -1555,7 +1555,6 @@ double xstrtod(const char *str, char **endptr, char decimal, char sci,
+     int num_digits;
+     int num_decimals;
+ 
+-    errno = 0;
+ 
+     // Skip leading whitespace.
+     while (isspace_ascii(*p)) p++;
+@@ -1609,7 +1608,7 @@ double xstrtod(const char *str, char **endptr, char decimal, char sci,
+     }
+ 
+     if (num_digits == 0) {
+-        errno = ERANGE;
++        *error = ERANGE;
+         return 0.0;
+     }
+ 
+@@ -1646,7 +1645,7 @@ double xstrtod(const char *str, char **endptr, char decimal, char sci,
+     }
+ 
+     if (exponent < DBL_MIN_EXP || exponent > DBL_MAX_EXP) {
+-        errno = ERANGE;
++        *error = ERANGE;
+         return HUGE_VAL;
+     }
+ 
+@@ -1666,7 +1665,7 @@ double xstrtod(const char *str, char **endptr, char decimal, char sci,
+     }
+ 
+     if (number == HUGE_VAL) {
+-        errno = ERANGE;
++        *error = ERANGE;
+     }
+ 
+     if (skip_trailing) {
+@@ -1680,7 +1679,7 @@ double xstrtod(const char *str, char **endptr, char decimal, char sci,
+ }
+ 
+ double precise_xstrtod(const char *str, char **endptr, char decimal, char sci,
+-                       char tsep, int skip_trailing) {
++                       char tsep, int skip_trailing, int *error) {
+     double number;
+     int exponent;
+     int negative;
+@@ -1722,7 +1721,6 @@ double precise_xstrtod(const char *str, char **endptr, char decimal, char sci,
+         1e280, 1e281, 1e282, 1e283, 1e284, 1e285, 1e286, 1e287, 1e288, 1e289,
+         1e290, 1e291, 1e292, 1e293, 1e294, 1e295, 1e296, 1e297, 1e298, 1e299,
+         1e300, 1e301, 1e302, 1e303, 1e304, 1e305, 1e306, 1e307, 1e308};
+-    errno = 0;
+ 
+     // Skip leading whitespace.
+     while (isspace_ascii(*p)) p++;
+@@ -1772,7 +1770,7 @@ double precise_xstrtod(const char *str, char **endptr, char decimal, char sci,
+     }
+ 
+     if (num_digits == 0) {
+-        errno = ERANGE;
++        *error = ERANGE;
+         return 0.0;
+     }
+ 
+@@ -1809,7 +1807,7 @@ double precise_xstrtod(const char *str, char **endptr, char decimal, char sci,
+     }
+ 
+     if (exponent > 308) {
+-        errno = ERANGE;
++        *error = ERANGE;
+         return HUGE_VAL;
+     } else if (exponent > 0) {
+         number *= e[exponent];
+@@ -1822,7 +1820,7 @@ double precise_xstrtod(const char *str, char **endptr, char decimal, char sci,
+         number /= e[-exponent];
+     }
+ 
+-    if (number == HUGE_VAL || number == -HUGE_VAL) errno = ERANGE;
++    if (number == HUGE_VAL || number == -HUGE_VAL) *error = ERANGE;
+ 
+     if (skip_trailing) {
+         // Skip trailing whitespace.
+diff --git a/pandas/_libs/src/parser/tokenizer.h b/pandas/_libs/src/parser/tokenizer.h
+index 7a0c8b536..70d7e4a3a 100644
+--- a/pandas/_libs/src/parser/tokenizer.h
++++ b/pandas/_libs/src/parser/tokenizer.h
+@@ -260,9 +260,9 @@ uint64_t str_to_uint64(uint_state *state, const char *p_item, int64_t int_max,
+ int64_t str_to_int64(const char *p_item, int64_t int_min, int64_t int_max,
+                      int *error, char tsep);
+ double xstrtod(const char *p, char **q, char decimal, char sci, char tsep,
+-               int skip_trailing);
++               int skip_trailing, int *error);
+ double precise_xstrtod(const char *p, char **q, char decimal, char sci,
+-                       char tsep, int skip_trailing);
++                       char tsep, int skip_trailing, int *error);
+ double round_trip(const char *p, char **q, char decimal, char sci, char tsep,
+                   int skip_trailing);
+ int to_boolean(const char *item, uint8_t *val);

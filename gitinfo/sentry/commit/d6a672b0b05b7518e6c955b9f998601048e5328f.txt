@@ -1,0 +1,231 @@
+commit d6a672b0b05b7518e6c955b9f998601048e5328f
+Author: David Cramer <dcramer@gmail.com>
+Date:   Thu Jul 14 14:38:55 2016 -0700
+
+    Store issue freqs for [release+env]
+    
+    This adjusts the tsdb storage for release frequencies to use the new GroupRelease which is bound to an environment.
+    
+    /cc @getsentry/infrastructure
+
+diff --git a/src/sentry/event_manager.py b/src/sentry/event_manager.py
+index 8a3fb778c3..04795eb3e2 100644
+--- a/src/sentry/event_manager.py
++++ b/src/sentry/event_manager.py
+@@ -558,17 +558,41 @@ class EventManager(object):
+             return event
+ 
+         if release:
+-            # TODO(dcramer): would be a bit more ideal to buffer this
+-            GroupRelease.objects.create_or_update(
+-                project_id=project.id,
+-                release_id=release.id,
+-                group_id=group.id,
+-                environment=environment or '',
+-                values={
+-                    'last_seen': date,
+-                }
++            grouprelease = GroupRelease.get_or_create(
++                group=group,
++                release=release,
++                environment=environment,
++                datetime=date,
++            )
++
++        tsdb.incr_multi([
++            (tsdb.models.group, group.id),
++            (tsdb.models.project, project.id),
++        ], timestamp=event.datetime)
++
++        frequencies = [
++            (tsdb.models.frequent_projects_by_organization, {
++                project.organization_id: {
++                    project.id: 1,
++                },
++            }),
++            (tsdb.models.frequent_issues_by_project, {
++                project.id: {
++                    group.id: 1,
++                },
++            })
++        ]
++        if release:
++            frequencies.append(
++                (tsdb.models.frequent_releases_by_groups, {
++                    group.id: {
++                        grouprelease.id: 1,
++                    },
++                })
+             )
+ 
++        tsdb.record_frequency_multi(frequencies, timestamp=event.datetime)
++
+         UserReport.objects.filter(
+             project=project, event_id=event_id,
+         ).update(group=group)
+@@ -761,34 +785,6 @@ class EventManager(object):
+         else:
+             is_sample = can_sample
+ 
+-        tsdb.incr_multi([
+-            (tsdb.models.group, group.id),
+-            (tsdb.models.project, project.id),
+-        ], timestamp=event.datetime)
+-
+-        frequencies = [
+-            (tsdb.models.frequent_projects_by_organization, {
+-                project.organization_id: {
+-                    project.id: 1,
+-                },
+-            }),
+-            (tsdb.models.frequent_issues_by_project, {
+-                project.id: {
+-                    group.id: 1,
+-                },
+-            })
+-        ]
+-        if release:
+-            frequencies.append(
+-                (tsdb.models.frequent_releases_by_groups, {
+-                    group.id: {
+-                        release.id: 1,
+-                    },
+-                })
+-            )
+-
+-        tsdb.record_frequency_multi(frequencies, timestamp=event.datetime)
+-
+         return group, is_new, is_regression, is_sample
+ 
+     def _handle_regression(self, group, event, release):
+diff --git a/src/sentry/models/grouprelease.py b/src/sentry/models/grouprelease.py
+index 53c46b374f..36546a97de 100644
+--- a/src/sentry/models/grouprelease.py
++++ b/src/sentry/models/grouprelease.py
+@@ -2,7 +2,9 @@ from __future__ import absolute_import
+ 
+ from django.db import models
+ from django.utils import timezone
++from hashlib import md5
+ 
++from sentry.utils.cache import cache
+ from sentry.db.models import (
+     BoundedPositiveIntegerField, Model, sane_repr
+ )
+@@ -24,3 +26,37 @@ class GroupRelease(Model):
+         unique_together = (('group_id', 'release_id', 'environment'),)
+ 
+     __repr__ = sane_repr('group_id', 'release_id')
++
++    @classmethod
++    def get_cache_key(cls, group_id, release_id, environment):
++        return 'grouprelease:1:{}:{}'.format(
++            group_id,
++            md5('{}:{}'.format(release_id, environment)).hexdigest(),
++        )
++
++    @classmethod
++    def get_or_create(cls, group, release, environment, datetime, **kwargs):
++        if not environment:
++            environment = ''
++        cache_key = cls.get_cache_key(group.id, release.id, environment)
++
++        instance = cache.get(cache_key)
++        if instance is None:
++            instance, created = cls.objects.get_or_create(
++                release_id=release.id,
++                group_id=group.id,
++                environment=environment,
++                defaults={
++                    'project_id': group.project_id,
++                    'first_seen': datetime,
++                    'last_seen': datetime,
++                },
++            )
++            cache.set(cache_key, instance, 3600)
++        else:
++            created = False
++
++        # TODO(dcramer): this would be good to buffer
++        if not created:
++            instance.update(last_seen=datetime)
++        return instance
+diff --git a/src/sentry/tsdb/base.py b/src/sentry/tsdb/base.py
+index 4effeef21a..fa5b8376e2 100644
+--- a/src/sentry/tsdb/base.py
++++ b/src/sentry/tsdb/base.py
+@@ -62,7 +62,9 @@ class TSDBModel(Enum):
+     # number of issues seen for a project, by project
+     frequent_issues_by_project = 404
+     # number of events seen for a release, by issue
+-    frequent_releases_by_groups = 406
++    # frequent_releases_by_groups = 406  # DEPRECATED
++    # number of events seen for a release, by issue
++    frequent_releases_by_groups = 407
+ 
+ 
+ class BaseTSDB(object):
+diff --git a/tests/sentry/models/test_grouprelease.py b/tests/sentry/models/test_grouprelease.py
+new file mode 100644
+index 0000000000..7eaba8b6cc
+--- /dev/null
++++ b/tests/sentry/models/test_grouprelease.py
+@@ -0,0 +1,58 @@
++from __future__ import absolute_import
++
++from datetime import timedelta
++from django.utils import timezone
++
++from sentry.models import GroupRelease, Release
++from sentry.testutils import TestCase
++
++
++class GetOrCreateTest(TestCase):
++    def test_simple(self):
++        project = self.create_project()
++        group = self.create_group(project=project)
++        release = Release.objects.create(version='abc', project=project)
++
++        datetime = timezone.now()
++
++        grouprelease = GroupRelease.get_or_create(
++            group=group,
++            release=release,
++            environment='prod',
++            datetime=datetime,
++        )
++
++        assert grouprelease.project_id == project.id
++        assert grouprelease.group_id == group.id
++        assert grouprelease.release_id == release.id
++        assert grouprelease.environment == 'prod'
++        assert grouprelease.first_seen == datetime
++        assert grouprelease.last_seen == datetime
++
++        datetime_new = timezone.now() + timedelta(days=1)
++
++        grouprelease = GroupRelease.get_or_create(
++            group=group,
++            release=release,
++            environment='prod',
++            datetime=datetime_new,
++        )
++
++        assert grouprelease.first_seen == datetime
++        assert grouprelease.last_seen == datetime_new
++
++    def test_empty_env(self):
++        project = self.create_project()
++        group = self.create_group(project=project)
++        release = Release.objects.create(version='abc', project=project)
++
++        datetime = timezone.now()
++
++        grouprelease = GroupRelease.get_or_create(
++            group=group,
++            release=release,
++            environment=None,
++            datetime=datetime,
++        )
++
++        assert grouprelease.environment == ''

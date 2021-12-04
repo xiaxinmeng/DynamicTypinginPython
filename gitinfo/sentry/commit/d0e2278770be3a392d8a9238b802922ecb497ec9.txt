@@ -1,0 +1,1963 @@
+commit d0e2278770be3a392d8a9238b802922ecb497ec9
+Author: David Cramer <dcramer@gmail.com>
+Date:   Tue Aug 5 17:43:04 2014 -0700
+
+    Add multi hash to interface API
+    
+    - Add in_app hash to stacktraces and exceptions
+    - Remove get_composite_hash API
+
+diff --git a/src/sentry/conf/server.py b/src/sentry/conf/server.py
+index 1cc2640613..71c7e31653 100644
+--- a/src/sentry/conf/server.py
++++ b/src/sentry/conf/server.py
+@@ -287,6 +287,7 @@ CELERY_IMPORTS = (
+     'sentry.tasks.email',
+     'sentry.tasks.fetch_source',
+     'sentry.tasks.index',
++    'sentry.tasks.merge',
+     'sentry.tasks.store',
+     'sentry.tasks.post_process',
+     'sentry.tasks.process_buffer',
+diff --git a/src/sentry/event_manager.py b/src/sentry/event_manager.py
+new file mode 100644
+index 0000000000..c81ce88985
+--- /dev/null
++++ b/src/sentry/event_manager.py
+@@ -0,0 +1,493 @@
++"""
++sentry.event_manager
++~~~~~~~~~~~~~~~~~~~~
++
++:copyright: (c) 2010-2014 by the Sentry Team, see AUTHORS for more details.
++:license: BSD, see LICENSE for more details.
++"""
++
++import logging
++import six
++
++from datetime import datetime
++from django.conf import settings
++from django.db import IntegrityError, transaction
++from django.utils import timezone
++from hashlib import md5
++from raven.utils.encoding import to_string
++from uuid import uuid4
++
++from sentry.app import buffer, tsdb
++from sentry.constants import (
++    STATUS_RESOLVED, STATUS_UNRESOLVED, LOG_LEVELS,
++    DEFAULT_LOGGER_NAME, MAX_CULPRIT_LENGTH
++)
++from sentry.models import Event, EventMapping, Group, GroupHash, Project
++from sentry.plugins import plugins
++from sentry.signals import regression_signal
++from sentry.tasks.index import index_event
++from sentry.tasks.merge import merge_group
++from sentry.tasks.post_process import post_process_group
++from sentry.utils.db import get_db_engine
++from sentry.utils.safe import safe_execute, trim, trim_dict
++
++
++def count_limit(count):
++    # TODO: could we do something like num_to_store = max(math.sqrt(100*count)+59, 200) ?
++    # ~ 150 * ((log(n) - 1.5) ^ 2 - 0.25)
++    for amount, sample_rate in settings.SENTRY_SAMPLE_RATES:
++        if count <= amount:
++            return sample_rate
++    return settings.SENTRY_MAX_SAMPLE_RATE
++
++
++def time_limit(silence):  # ~ 3600 per hour
++    for amount, sample_rate in settings.SENTRY_SAMPLE_TIMES:
++        if silence >= amount:
++            return sample_rate
++    return settings.SENTRY_MAX_SAMPLE_TIME
++
++
++def md5_from_hash(hash_bits):
++    result = md5()
++    for bit in hash_bits:
++        result.update(to_string(bit))
++    return result.hexdigest()
++
++
++def get_hashes_for_event(event):
++    interfaces = event.interfaces
++    for interface in interfaces.itervalues():
++        result = interface.compute_hashes()
++        if not result:
++            continue
++        return map(md5_from_hash, result)
++    return [md5_from_hash([event.message])]
++
++
++if not settings.SENTRY_SAMPLE_DATA:
++    def should_sample(group, event):
++        return False
++else:
++    def should_sample(group, event):
++        silence_timedelta = event.datetime - group.last_seen
++        silence = silence_timedelta.days * 86400 + silence_timedelta.seconds
++
++        if group.times_seen % count_limit(group.times_seen):
++            return False
++
++        if group.times_seen % time_limit(silence):
++            return False
++
++        return True
++
++
++class ScoreClause(object):
++    def __init__(self, group):
++        self.group = group
++
++    def __int__(self):
++        # Calculate the score manually when coercing to an int.
++        # This is used within create_or_update and friends
++        return self.group.get_score()
++
++    def prepare_database_save(self, unused):
++        return self
++
++    def prepare(self, evaluator, query, allow_joins):
++        return
++
++    def evaluate(self, node, qn, connection):
++        engine = get_db_engine(getattr(connection, 'alias', 'default'))
++        if engine.startswith('postgresql'):
++            sql = 'log(times_seen) * 600 + last_seen::abstime::int'
++        elif engine.startswith('mysql'):
++            sql = 'log(times_seen) * 600 + unix_timestamp(last_seen)'
++        else:
++            # XXX: if we cant do it atomically let's do it the best we can
++            sql = int(self)
++
++        return (sql, [])
++
++
++class EventManager(object):
++    def __init__(self, data):
++        self.data = data
++
++    def normalize(self):
++        # TODO(dcramer): store http.env.REMOTE_ADDR as user.ip
++        # First we pull out our top-level (non-data attr) kwargs
++        data = self.data
++
++        if not isinstance(data.get('level'), (six.string_types, int)):
++            data['level'] = logging.ERROR
++        elif data['level'] not in LOG_LEVELS:
++            data['level'] = logging.ERROR
++
++        if not data.get('logger'):
++            data['logger'] = DEFAULT_LOGGER_NAME
++        else:
++            data['logger'] = trim(data['logger'], 64)
++
++        if data.get('platform'):
++            data['platform'] = trim(data['platform'], 64)
++
++        timestamp = data.get('timestamp')
++        if not timestamp:
++            timestamp = timezone.now()
++
++        if isinstance(timestamp, datetime):
++            # We must convert date to local time so Django doesn't mess it up
++            # based on TIME_ZONE
++            if settings.TIME_ZONE:
++                if not timezone.is_aware(timestamp):
++                    timestamp = timestamp.replace(tzinfo=timezone.utc)
++            elif timezone.is_aware(timestamp):
++                timestamp = timestamp.replace(tzinfo=None)
++            timestamp = float(timestamp.strftime('%s'))
++
++        data['timestamp'] = timestamp
++
++        if not data.get('event_id'):
++            data['event_id'] = uuid4().hex
++
++        data.setdefault('message', None)
++        data.setdefault('culprit', None)
++        data.setdefault('time_spent', None)
++        data.setdefault('server_name', None)
++        data.setdefault('site', None)
++        data.setdefault('checksum', None)
++        data.setdefault('platform', None)
++        data.setdefault('extra', {})
++
++        tags = data.get('tags')
++        if not tags:
++            tags = []
++        # full support for dict syntax
++        elif isinstance(tags, dict):
++            tags = tags.items()
++        # prevent [tag, tag, tag] (invalid) syntax
++        elif not all(len(t) == 2 for t in tags):
++            tags = []
++        else:
++            tags = list(tags)
++
++        data['tags'] = tags
++
++        if not isinstance(data['extra'], dict):
++            # throw it away
++            data['extra'] = {}
++
++        trim_dict(
++            data['extra'], max_size=settings.SENTRY_MAX_EXTRA_VARIABLE_SIZE)
++
++        # TODO(dcramer): find a better place for this logic
++        exception = data.get('sentry.interfaces.Exception')
++        stacktrace = data.get('sentry.interfaces.Stacktrace')
++        if exception and len(exception['values']) == 1 and stacktrace:
++            exception['values'][0]['stacktrace'] = stacktrace
++            del data['sentry.interfaces.Stacktrace']
++
++        if 'sentry.interfaces.Http' in data:
++            # default the culprit to the url
++            if not data['culprit']:
++                data['culprit'] = data['sentry.interfaces.Http']['url']
++
++        if data['culprit']:
++            data['culprit'] = trim(data['culprit'], MAX_CULPRIT_LENGTH)
++
++        if data['message']:
++            data['message'] = trim(data['message'], 2048)
++
++        return data
++
++    @transaction.commit_on_success
++    def save(self, project, raw=False):
++        # TODO: culprit should default to "most recent" frame in stacktraces when
++        # it's not provided.
++        project = Project.objects.get_from_cache(id=project)
++
++        data = self.data.copy()
++
++        # First we pull out our top-level (non-data attr) kwargs
++        event_id = data.pop('event_id')
++        message = data.pop('message')
++        level = data.pop('level')
++
++        culprit = data.pop('culprit', None) or ''
++        time_spent = data.pop('time_spent', None)
++        logger_name = data.pop('logger', None)
++        server_name = data.pop('server_name', None)
++        site = data.pop('site', None)
++        checksum = data.pop('checksum', None)
++        platform = data.pop('platform', None)
++
++        date = datetime.fromtimestamp(data.pop('timestamp'))
++        date = date.replace(tzinfo=timezone.utc)
++
++        kwargs = {
++            'message': message,
++            'platform': platform,
++        }
++
++        event = Event(
++            project=project,
++            event_id=event_id,
++            data=data,
++            time_spent=time_spent,
++            datetime=date,
++            **kwargs
++        )
++
++        # Calculate the checksum from the first highest scoring interface
++        if checksum:
++            hashes = [checksum]
++        else:
++            hashes = get_hashes_for_event(event)
++
++        # TODO(dcramer): remove checksum usage
++        event.checksum = hashes[0]
++
++        group_kwargs = kwargs.copy()
++        group_kwargs.update({
++            'culprit': culprit,
++            'logger': logger_name,
++            'level': level,
++            'last_seen': date,
++            'first_seen': date,
++            'time_spent_total': time_spent or 0,
++            'time_spent_count': time_spent and 1 or 0,
++        })
++
++        tags = data['tags']
++        tags.append(('level', LOG_LEVELS[level]))
++        if logger_name:
++            tags.append(('logger', logger_name))
++        if server_name:
++            tags.append(('server_name', server_name))
++        if site:
++            tags.append(('site', site))
++
++        for plugin in plugins.for_project(project):
++            added_tags = safe_execute(plugin.get_tags, event)
++            if added_tags:
++                tags.extend(added_tags)
++
++        result = safe_execute(
++            self._save_aggregate,
++            event=event,
++            tags=tags,
++            hashes=hashes,
++            **group_kwargs
++        )
++        if result is None:
++            return
++
++        group, is_new, is_regression, is_sample = result
++
++        using = group._state.db
++
++        event.group = group
++
++        # save the event unless its been sampled
++        if not is_sample:
++            sid = transaction.savepoint(using=using)
++            try:
++                event.save()
++            except IntegrityError:
++                transaction.savepoint_rollback(sid, using=using)
++                return event
++            transaction.savepoint_commit(sid, using=using)
++
++        sid = transaction.savepoint(using=using)
++        try:
++            EventMapping.objects.create(
++                project=project, group=group, event_id=event_id)
++        except IntegrityError:
++            transaction.savepoint_rollback(sid, using=using)
++            return event
++        transaction.savepoint_commit(sid, using=using)
++        transaction.commit_unless_managed(using=using)
++
++        if not raw:
++            post_process_group.delay(
++                group=group,
++                event=event,
++                is_new=is_new or is_regression,  # backwards compat
++                is_sample=is_sample,
++                is_regression=is_regression,
++            )
++
++        index_event.delay(event)
++
++        # TODO: move this to the queue
++        if is_new and not raw:
++            regression_signal.send_robust(sender=Group, instance=group)
++
++        return event
++
++    def _find_hashes(self, project, hash_list):
++        from sentry.models import GroupHash
++
++        matches = []
++        for hash in hash_list:
++            try:
++                ghash, _ = GroupHash.objects.get_or_create(
++                    project=project,
++                    hash=hash,
++                )
++            except GroupHash.DoesNotExist:
++                continue
++            matches.append((ghash.group_id, ghash.hash))
++        return matches
++
++    def _ensure_hashes_merged(self, group, hash_list):
++        bad_hashes = GroupHash.objects.filter(
++            project=group.project,
++            hash__in=hash_list,
++        ).exclude(
++            group=group,
++        )
++        if not bad_hashes:
++            return
++
++        for hash in bad_hashes:
++            merge_group.delay(
++                from_group_id=hash.group_id,
++                to_group_id=group.id,
++            )
++
++        GroupHash.objects.filter(
++            project=group.project,
++            hash__in=bad_hashes,
++        ).update(
++            group=group,
++        )
++
++    def _save_aggregate(self, event, tags, hashes, **kwargs):
++        date = event.datetime
++        time_spent = event.time_spent
++        project = event.project
++
++        # attempt to find a matching hash
++        existing_hashes = self._find_hashes(project, hashes)
++
++        try:
++            existing_group_id = (h[0] for h in existing_hashes if h[0]).next()
++        except StopIteration:
++            existing_group_id = None
++
++        # XXX(dcramer): this has the opportunity to create duplicate groups
++        # it should be resolved by the hash merging function later but this
++        # should be better tested/reviewed
++        if existing_group_id is None:
++            group, _ = Group.objects.get_or_create(
++                project=project,
++                # TODO(dcramer): remove checksum from Group/Event
++                checksum=hashes[0],
++                defaults=kwargs,
++            )
++
++            is_new = True
++        else:
++            group = Group.objects.get(id=existing_group_id)
++
++            is_new = False
++
++        new_hashes = [h[1] for h in existing_hashes if h[0] is None]
++        if new_hashes:
++            affected = GroupHash.objects.filter(
++                project=project,
++                hash__in=new_hashes,
++                group__isnull=True,
++            ).update(
++                group=group,
++            )
++            if affected != len(new_hashes):
++                self._ensure_hashes_merged(group, new_hashes)
++
++        update_kwargs = {
++            'times_seen': 1,
++        }
++        if time_spent:
++            update_kwargs.update({
++                'time_spent_total': time_spent,
++                'time_spent_count': 1,
++            })
++
++        if not is_new:
++            is_regression = self._process_existing_aggregate(group, event, kwargs)
++        else:
++            is_regression = False
++
++            # TODO: this update should actually happen as part of create
++            group.update(score=ScoreClause(group))
++
++            # We need to commit because the queue can run too fast and hit
++            # an issue with the group not existing before the buffers run
++            transaction.commit_unless_managed(using=group._state.db)
++
++        # Determine if we've sampled enough data to store this event
++        if is_new:
++            is_sample = False
++        elif not should_sample(group, event):
++            is_sample = False
++        else:
++            is_sample = True
++
++        # Rounded down to the nearest interval
++        safe_execute(Group.objects.add_tags, group, tags)
++
++        tsdb.incr_multi([
++            (tsdb.models.group, group.id),
++            (tsdb.models.project, project.id),
++        ])
++
++        return group, is_new, is_regression, is_sample
++
++    def _process_existing_aggregate(self, group, event, data):
++        date = max(event.datetime, group.last_seen)
++
++        extra = {
++            'last_seen': date,
++            'score': ScoreClause(group),
++        }
++        if event.message and event.message != group.message:
++            extra['message'] = event.message
++        if group.level != data['level']:
++            extra['level'] = data['level']
++        if group.culprit != data['culprit']:
++            extra['culprit'] = data['culprit']
++
++        if group.status == STATUS_RESOLVED or group.is_over_resolve_age():
++            # Making things atomic
++            is_regression = bool(Group.objects.filter(
++                id=group.id,
++                status=STATUS_RESOLVED,
++            ).exclude(
++                active_at__gte=date,
++            ).update(active_at=date, status=STATUS_UNRESOLVED))
++
++            transaction.commit_unless_managed(using=group._state.db)
++
++            group.active_at = date
++            group.status = STATUS_UNRESOLVED
++        else:
++            is_regression = False
++
++        group.last_seen = extra['last_seen']
++
++        update_kwargs = {
++            'times_seen': 1,
++        }
++        if event.time_spent:
++            update_kwargs.update({
++                'time_spent_total': event.time_spent,
++                'time_spent_count': 1,
++            })
++
++        buffer.incr(Group, update_kwargs, {
++            'id': group.id,
++        }, extra)
++
++        return is_regression
+diff --git a/src/sentry/interfaces/base.py b/src/sentry/interfaces/base.py
+index c2c9156fee..e332447796 100644
+--- a/src/sentry/interfaces/base.py
++++ b/src/sentry/interfaces/base.py
+@@ -68,12 +68,15 @@ class Interface(object):
+     def get_alias(self):
+         return self.get_slug()
+ 
+-    def get_composite_hash(self, interfaces):
+-        return self.get_hash()
+-
+     def get_hash(self):
+         return []
+ 
++    def compute_hashes(self):
++        result = self.get_hash()
++        if not result:
++            return []
++        return [result]
++
+     def get_slug(self):
+         return type(self).__name__.lower()
+ 
+diff --git a/src/sentry/interfaces/exception.py b/src/sentry/interfaces/exception.py
+index 7a795008cf..695429e050 100644
+--- a/src/sentry/interfaces/exception.py
++++ b/src/sentry/interfaces/exception.py
+@@ -179,27 +179,34 @@ class Exception(Interface):
+     def get_path(self):
+         return 'sentry.interfaces.Exception'
+ 
+-    def get_hash(self):
+-        output = []
+-        for value in self.values:
+-            output.extend(value.get_hash())
+-        return output
++    def compute_hashes(self):
++        system_hash = self.get_hash(system_frames=True)
++        if not system_hash:
++            return []
++
++        app_hash = self.get_hash(system_frames=False)
++        if system_hash == app_hash or not app_hash:
++            return [system_hash]
++
++        return [system_hash, app_hash]
+ 
+-    def get_composite_hash(self, interfaces):
++    def get_hash(self, system_frames=True):
+         # optimize around the fact that some exceptions might have stacktraces
+         # while others may not and we ALWAYS want stacktraces over values
+         output = []
+         for value in self.values:
+             if not value.stacktrace:
+                 continue
+-            stack_hash = value.stacktrace.get_hash()
++            stack_hash = value.stacktrace.get_hash(
++                system_frames=system_frames,
++            )
+             if stack_hash:
+                 output.extend(stack_hash)
+                 output.append(value.type)
+ 
+         if not output:
+             for value in self.values:
+-                output.extend(value.get_composite_hash(interfaces))
++                output.extend(value.get_hash())
+ 
+         return output
+ 
+diff --git a/src/sentry/interfaces/stacktrace.py b/src/sentry/interfaces/stacktrace.py
+index 7b447312c9..2a60e894f0 100644
+--- a/src/sentry/interfaces/stacktrace.py
++++ b/src/sentry/interfaces/stacktrace.py
+@@ -423,23 +423,27 @@ class Stacktrace(Interface):
+         data['frames_omitted'] = data.pop('frames_omitted', None)
+         return data
+ 
+-    def get_composite_hash(self, interfaces):
+-        output = self.get_hash()
+-        if 'sentry.interfaces.Exception' in interfaces:
+-            exc = interfaces['sentry.interfaces.Exception'][0]
+-            if exc.type:
+-                output.append(exc.type)
+-            elif not output:
+-                output = exc.get_hash()
+-        return output
++    def compute_hashes(self):
++        system_hash = self.get_hash(system_frames=True)
++        if not system_hash:
++            return []
+ 
+-    def get_hash(self):
++        app_hash = self.get_hash(system_frames=False)
++        if system_hash == app_hash or not app_hash:
++            return [system_hash]
++
++        return [system_hash, app_hash]
++
++    def get_hash(self, system_frames=True):
+         frames = self.frames
+ 
+         # TODO(dcramer): this should apply only to JS
+         if len(frames) == 1 and frames[0].lineno == 1 and frames[0].function in ('?', None):
+             return []
+ 
++        if not system_frames:
++            frames = [f for f in frames if f.in_app] or frames
++
+         output = []
+         for frame in frames:
+             output.extend(frame.get_hash())
+diff --git a/src/sentry/manager.py b/src/sentry/manager.py
+index 63f78ed2fe..af1275e8bf 100644
+--- a/src/sentry/manager.py
++++ b/src/sentry/manager.py
+@@ -8,93 +8,16 @@ sentry.manager
+ 
+ from __future__ import absolute_import
+ 
+-import hashlib
+-import logging
+ import six
+-import warnings
+-import uuid
+ 
+-from datetime import datetime
+ from django.conf import settings
+ from django.contrib.auth.models import UserManager
+-from django.db import transaction, IntegrityError
+-from django.utils import timezone
+ from django.utils.datastructures import SortedDict
+-from raven.utils.encoding import to_string
+ 
+-from sentry import app
+-from sentry.constants import (
+-    STATUS_RESOLVED, STATUS_UNRESOLVED, MEMBER_USER, LOG_LEVELS,
+-    DEFAULT_LOGGER_NAME, MAX_CULPRIT_LENGTH, MAX_TAG_VALUE_LENGTH
+-)
++from sentry.app import buffer, tsdb
++from sentry.constants import MAX_TAG_VALUE_LENGTH, MEMBER_USER
+ from sentry.db.models import BaseManager
+-from sentry.signals import regression_signal
+-from sentry.tasks.index import index_event
+-from sentry.tasks.post_process import post_process_group
+-from sentry.tsdb.base import TSDBModel
+-from sentry.utils.cache import memoize
+-from sentry.utils.db import get_db_engine, attach_foreignkey
+-from sentry.utils.safe import safe_execute, trim, trim_dict
+-
+-logger = logging.getLogger('sentry.errors')
+-
+-UNSAVED = dict()
+-
+-
+-def get_checksum_from_event(event):
+-    interfaces = event.interfaces
+-    for interface in interfaces.itervalues():
+-        result = interface.get_composite_hash(interfaces=event.interfaces)
+-        if result:
+-            hash = hashlib.md5()
+-            for r in result:
+-                hash.update(to_string(r))
+-            return hash.hexdigest()
+-    return hashlib.md5(to_string(event.message)).hexdigest()
+-
+-
+-class ScoreClause(object):
+-    def __init__(self, group):
+-        self.group = group
+-
+-    def __int__(self):
+-        # Calculate the score manually when coercing to an int.
+-        # This is used within create_or_update and friends
+-        return self.group.get_score()
+-
+-    def prepare_database_save(self, unused):
+-        return self
+-
+-    def prepare(self, evaluator, query, allow_joins):
+-        return
+-
+-    def evaluate(self, node, qn, connection):
+-        engine = get_db_engine(getattr(connection, 'alias', 'default'))
+-        if engine.startswith('postgresql'):
+-            sql = 'log(times_seen) * 600 + last_seen::abstime::int'
+-        elif engine.startswith('mysql'):
+-            sql = 'log(times_seen) * 600 + unix_timestamp(last_seen)'
+-        else:
+-            # XXX: if we cant do it atomically let's do it the best we can
+-            sql = int(self)
+-
+-        return (sql, [])
+-
+-
+-def count_limit(count):
+-    # TODO: could we do something like num_to_store = max(math.sqrt(100*count)+59, 200) ?
+-    # ~ 150 * ((log(n) - 1.5) ^ 2 - 0.25)
+-    for amount, sample_rate in settings.SENTRY_SAMPLE_RATES:
+-        if count <= amount:
+-            return sample_rate
+-    return settings.SENTRY_MAX_SAMPLE_RATE
+-
+-
+-def time_limit(silence):  # ~ 3600 per hour
+-    for amount, sample_rate in settings.SENTRY_SAMPLE_TIMES:
+-        if silence >= amount:
+-            return sample_rate
+-    return settings.SENTRY_MAX_SAMPLE_TIME
++from sentry.utils.db import attach_foreignkey
+ 
+ 
+ class UserManager(BaseManager, UserManager):
+@@ -104,324 +27,15 @@ class UserManager(BaseManager, UserManager):
+ class GroupManager(BaseManager):
+     use_for_related_fields = True
+ 
+-    def normalize_event_data(self, data):
+-        # TODO(dcramer): store http.env.REMOTE_ADDR as user.ip
+-        # First we pull out our top-level (non-data attr) kwargs
+-        if not isinstance(data.get('level'), (six.string_types, int)):
+-            data['level'] = logging.ERROR
+-        elif data['level'] not in LOG_LEVELS:
+-            data['level'] = logging.ERROR
+-
+-        if not data.get('logger'):
+-            data['logger'] = DEFAULT_LOGGER_NAME
+-        else:
+-            data['logger'] = trim(data['logger'], 64)
+-
+-        if data.get('platform'):
+-            data['platform'] = trim(data['platform'], 64)
+-
+-        timestamp = data.get('timestamp')
+-        if not timestamp:
+-            timestamp = timezone.now()
+-
+-        if isinstance(timestamp, datetime):
+-            # We must convert date to local time so Django doesn't mess it up
+-            # based on TIME_ZONE
+-            if settings.TIME_ZONE:
+-                if not timezone.is_aware(timestamp):
+-                    timestamp = timestamp.replace(tzinfo=timezone.utc)
+-            elif timezone.is_aware(timestamp):
+-                timestamp = timestamp.replace(tzinfo=None)
+-            timestamp = float(timestamp.strftime('%s'))
+-
+-        data['timestamp'] = timestamp
+-
+-        if not data.get('event_id'):
+-            data['event_id'] = uuid.uuid4().hex
+-
+-        data.setdefault('message', None)
+-        data.setdefault('culprit', None)
+-        data.setdefault('time_spent', None)
+-        data.setdefault('server_name', None)
+-        data.setdefault('site', None)
+-        data.setdefault('checksum', None)
+-        data.setdefault('platform', None)
+-        data.setdefault('extra', {})
+-
+-        tags = data.get('tags')
+-        if not tags:
+-            tags = []
+-        # full support for dict syntax
+-        elif isinstance(tags, dict):
+-            tags = tags.items()
+-        # prevent [tag, tag, tag] (invalid) syntax
+-        elif not all(len(t) == 2 for t in tags):
+-            tags = []
+-        else:
+-            tags = list(tags)
+-
+-        data['tags'] = tags
+-
+-        if not isinstance(data['extra'], dict):
+-            # throw it away
+-            data['extra'] = {}
+-
+-        trim_dict(
+-            data['extra'], max_size=settings.SENTRY_MAX_EXTRA_VARIABLE_SIZE)
+-
+-        # TODO(dcramer): find a better place for this logic
+-        exception = data.get('sentry.interfaces.Exception')
+-        stacktrace = data.get('sentry.interfaces.Stacktrace')
+-        if exception and len(exception['values']) == 1 and stacktrace:
+-            exception['values'][0]['stacktrace'] = stacktrace
+-            del data['sentry.interfaces.Stacktrace']
+-
+-        if 'sentry.interfaces.Http' in data:
+-            # default the culprit to the url
+-            if not data['culprit']:
+-                data['culprit'] = data['sentry.interfaces.Http']['url']
+-
+-        if data['culprit']:
+-            data['culprit'] = trim(data['culprit'], MAX_CULPRIT_LENGTH)
+-
+-        if data['message']:
+-            data['message'] = trim(data['message'], 2048)
+-
+-        return data
++    def get_by_natural_key(self, project, checksum):
++        return self.get(project=project, checksum=checksum)
+ 
+     def from_kwargs(self, project, **kwargs):
+-        data = self.normalize_event_data(kwargs)
+-
+-        return self.save_data(project, data)
+-
+-    @transaction.commit_on_success
+-    def save_data(self, project, data, raw=False):
+-        # TODO: this function is way too damn long and needs refactored
+-        # the inner imports also suck so let's try to move it away from
+-        # the objects manager
+-
+-        # TODO: culprit should default to "most recent" frame in stacktraces when
+-        # it's not provided.
+-        from sentry.plugins import plugins
+-        from sentry.models import Event, Project, EventMapping
+-
+-        project = Project.objects.get_from_cache(id=project)
+-
+-        # First we pull out our top-level (non-data attr) kwargs
+-        event_id = data.pop('event_id')
+-        message = data.pop('message')
+-        culprit = data.pop('culprit') or ''
+-        level = data.pop('level')
+-        time_spent = data.pop('time_spent')
+-        logger_name = data.pop('logger')
+-        server_name = data.pop('server_name')
+-        site = data.pop('site')
+-        checksum = data.pop('checksum')
+-        platform = data.pop('platform')
+-
+-        date = datetime.fromtimestamp(data.pop('timestamp'))
+-        date = date.replace(tzinfo=timezone.utc)
+-
+-        kwargs = {
+-            'message': message,
+-            'platform': platform,
+-        }
+-
+-        event = Event(
+-            project=project,
+-            event_id=event_id,
+-            data=data,
+-            time_spent=time_spent,
+-            datetime=date,
+-            **kwargs
+-        )
+-
+-        # Calculate the checksum from the first highest scoring interface
+-        if not checksum:
+-            checksum = get_checksum_from_event(event)
+-
+-        event.checksum = checksum
+-
+-        group_kwargs = kwargs.copy()
+-        group_kwargs.update({
+-            'culprit': culprit,
+-            'logger': logger_name,
+-            'level': level,
+-            'last_seen': date,
+-            'first_seen': date,
+-            'time_spent_total': time_spent or 0,
+-            'time_spent_count': time_spent and 1 or 0,
+-        })
+-
+-        tags = data['tags']
+-        tags.append(('level', LOG_LEVELS[level]))
+-        if logger:
+-            tags.append(('logger', logger_name))
+-        if server_name:
+-            tags.append(('server_name', server_name))
+-        if site:
+-            tags.append(('site', site))
+-
+-        for plugin in plugins.for_project(project):
+-            added_tags = safe_execute(plugin.get_tags, event)
+-            if added_tags:
+-                tags.extend(added_tags)
+-
+-        try:
+-            group, is_new, is_regression, is_sample = self._create_group(
+-                event=event,
+-                tags=data['tags'],
+-                **group_kwargs
+-            )
+-        except Exception as exc:
+-            # TODO: should we mail admins when there are failures?
+-            try:
+-                logger.exception(u'Unable to process log entry: %s', exc)
+-            except Exception as exc:
+-                warnings.warn(u'Unable to process log entry: %s', exc)
+-            return
+-
+-        using = group._state.db
+-
+-        event.group = group
+-
+-        # save the event unless its been sampled
+-        if not is_sample:
+-            sid = transaction.savepoint(using=using)
+-            try:
+-                event.save()
+-            except IntegrityError:
+-                transaction.savepoint_rollback(sid, using=using)
+-                return event
+-            transaction.savepoint_commit(sid, using=using)
+-
+-        sid = transaction.savepoint(using=using)
+-        try:
+-            EventMapping.objects.create(
+-                project=project, group=group, event_id=event_id)
+-        except IntegrityError:
+-            transaction.savepoint_rollback(sid, using=using)
+-            return event
+-        transaction.savepoint_commit(sid, using=using)
+-        transaction.commit_unless_managed(using=using)
+-
+-        if not raw:
+-            post_process_group.delay(
+-                group=group,
+-                event=event,
+-                is_new=is_new or is_regression,  # backwards compat
+-                is_sample=is_sample,
+-                is_regression=is_regression,
+-            )
+-
+-        index_event.delay(event)
+-
+-        # TODO: move this to the queue
+-        if is_new and not raw:
+-            regression_signal.send_robust(sender=self.model, instance=group)
+-
+-        return event
+-
+-    def should_sample(self, group, event):
+-        if not settings.SENTRY_SAMPLE_DATA:
+-            return False
+-
+-        silence_timedelta = event.datetime - group.last_seen
+-        silence = silence_timedelta.days * 86400 + silence_timedelta.seconds
+-
+-        if group.times_seen % count_limit(group.times_seen):
+-            return False
+-
+-        if group.times_seen % time_limit(silence):
+-            return False
+-
+-        return True
+-
+-    def _create_group(self, event, tags=None, **kwargs):
+-        date = event.datetime
+-        time_spent = event.time_spent
+-        project = event.project
+-
+-        group, is_new = self.get_or_create(
+-            project=project,
+-            checksum=event.checksum,
+-            defaults=kwargs
+-        )
+-        if is_new:
+-            transaction.commit_unless_managed(using=group._state.db)
+-
+-        update_kwargs = {
+-            'times_seen': 1,
+-        }
+-        if time_spent:
+-            update_kwargs.update({
+-                'time_spent_total': time_spent,
+-                'time_spent_count': 1,
+-            })
+-
+-        if not is_new:
+-            extra = {
+-                'last_seen': max(event.datetime, group.last_seen),
+-                'score': ScoreClause(group),
+-            }
+-            if event.message and event.message != group.message:
+-                extra['message'] = event.message
+-            if group.level != kwargs['level']:
+-                extra['level'] = kwargs['level']
+-            if group.culprit != kwargs['culprit']:
+-                extra['culprit'] = kwargs['culprit']
+-
+-            if group.status == STATUS_RESOLVED or group.is_over_resolve_age():
+-                # Making things atomic
+-                is_regression = bool(self.filter(
+-                    id=group.id,
+-                    status=STATUS_RESOLVED,
+-                ).exclude(
+-                    active_at__gte=date,
+-                ).update(active_at=date, status=STATUS_UNRESOLVED))
+-
+-                transaction.commit_unless_managed(using=group._state.db)
+-
+-                group.active_at = date
+-                group.status = STATUS_UNRESOLVED
+-            else:
+-                is_regression = False
+-
+-            group.last_seen = extra['last_seen']
+-
+-            app.buffer.incr(self.model, update_kwargs, {
+-                'id': group.id,
+-            }, extra)
+-        else:
+-            is_regression = False
+-
+-            # TODO: this update should actually happen as part of create
+-            group.update(score=ScoreClause(group))
++        from sentry.event_manager import EventManager
+ 
+-            # We need to commit because the queue can run too fast and hit
+-            # an issue with the group not existing before the buffers run
+-            transaction.commit_unless_managed(using=group._state.db)
+-
+-        # Determine if we've sampled enough data to store this event
+-        if is_new:
+-            is_sample = False
+-        elif not self.should_sample(group, event):
+-            is_sample = False
+-        else:
+-            is_sample = True
+-
+-        # Rounded down to the nearest interval
+-        try:
+-            self.add_tags(group, tags)
+-        except Exception as e:
+-            logger.exception('Unable to record tags: %s' % (e,))
+-
+-        app.tsdb.incr_multi([
+-            (TSDBModel.group, group.id),
+-            (TSDBModel.project, project.id),
+-        ])
+-
+-        return group, is_new, is_regression, is_sample
++        manager = EventManager(kwargs)
++        manager.normalize()
++        return manager.save(project)
+ 
+     def add_tags(self, group, tags):
+         from sentry.models import TagValue, GroupTagValue
+@@ -447,10 +61,10 @@ class GroupManager(BaseManager):
+             tsdb_id = u'%s=%s' % (key, value)
+ 
+             tsdb_keys.extend([
+-                (TSDBModel.project_tag_value, tsdb_id),
++                (tsdb.models.project_tag_value, tsdb_id),
+             ])
+ 
+-            app.buffer.incr(TagValue, {
++            buffer.incr(TagValue, {
+                 'times_seen': 1,
+             }, {
+                 'project': project,
+@@ -461,7 +75,7 @@ class GroupManager(BaseManager):
+                 'data': data,
+             })
+ 
+-            app.buffer.incr(GroupTagValue, {
++            buffer.incr(GroupTagValue, {
+                 'times_seen': 1,
+             }, {
+                 'group': group,
+@@ -473,14 +87,7 @@ class GroupManager(BaseManager):
+             })
+ 
+         if tsdb_keys:
+-            app.tsdb.incr_multi(tsdb_keys)
+-
+-    def get_by_natural_key(self, project, logger, culprit, checksum):
+-        return self.get(project=project, logger=logger, view=culprit, checksum=checksum)
+-
+-    @memoize
+-    def model_fields_clause(self):
+-        return ', '.join('sentry_groupedmessage."%s"' % (f.column,) for f in self.model._meta.fields)
++            tsdb.incr_multi(tsdb_keys)
+ 
+ 
+ class ProjectManager(BaseManager):
+diff --git a/src/sentry/migrations/0124_auto__add_grouphash__add_unique_grouphash_project_hash.py b/src/sentry/migrations/0124_auto__add_grouphash__add_unique_grouphash_project_hash.py
+new file mode 100644
+index 0000000000..5f0a44e515
+--- /dev/null
++++ b/src/sentry/migrations/0124_auto__add_grouphash__add_unique_grouphash_project_hash.py
+@@ -0,0 +1,306 @@
++# -*- coding: utf-8 -*-
++import datetime
++from south.db import db
++from south.v2 import SchemaMigration
++from django.db import models
++
++
++class Migration(SchemaMigration):
++
++    def forwards(self, orm):
++        # Adding model 'GroupHash'
++        db.create_table('sentry_grouphash', (
++            ('id', self.gf('django.db.models.fields.AutoField')(primary_key=True)),
++            ('project', self.gf('django.db.models.fields.related.ForeignKey')(to=orm['sentry.Project'], null=True)),
++            ('hash', self.gf('django.db.models.fields.CharField')(max_length=32, db_index=True)),
++            ('group', self.gf('django.db.models.fields.related.ForeignKey')(to=orm['sentry.Group'], null=True)),
++        ))
++        db.send_create_signal('sentry', ['GroupHash'])
++
++        # Adding unique constraint on 'GroupHash', fields ['project', 'hash']
++        db.create_unique('sentry_grouphash', ['project_id', 'hash'])
++
++
++    def backwards(self, orm):
++        # Removing unique constraint on 'GroupHash', fields ['project', 'hash']
++        db.delete_unique('sentry_grouphash', ['project_id', 'hash'])
++
++        # Deleting model 'GroupHash'
++        db.delete_table('sentry_grouphash')
++
++
++    models = {
++        'sentry.accessgroup': {
++            'Meta': {'unique_together': "(('team', 'name'),)", 'object_name': 'AccessGroup'},
++            'data': ('django.db.models.fields.TextField', [], {'null': 'True', 'blank': 'True'}),
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'id': ('django.db.models.fields.AutoField', [], {'primary_key': 'True'}),
++            'managed': ('django.db.models.fields.BooleanField', [], {'default': 'False'}),
++            'members': ('django.db.models.fields.related.ManyToManyField', [], {'to': "orm['sentry.User']", 'symmetrical': 'False'}),
++            'name': ('django.db.models.fields.CharField', [], {'max_length': '64'}),
++            'projects': ('django.db.models.fields.related.ManyToManyField', [], {'to': "orm['sentry.Project']", 'symmetrical': 'False'}),
++            'team': ('django.db.models.fields.related.ForeignKey', [], {'to': "orm['sentry.Team']"}),
++            'type': ('django.db.models.fields.IntegerField', [], {'default': '50'})
++        },
++        'sentry.activity': {
++            'Meta': {'object_name': 'Activity'},
++            'data': ('django.db.models.fields.TextField', [], {'null': 'True'}),
++            'datetime': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'event': ('django.db.models.fields.related.ForeignKey', [], {'to': "orm['sentry.Event']", 'null': 'True'}),
++            'group': ('django.db.models.fields.related.ForeignKey', [], {'to': "orm['sentry.Group']", 'null': 'True'}),
++            'id': ('django.db.models.fields.AutoField', [], {'primary_key': 'True'}),
++            'ident': ('django.db.models.fields.CharField', [], {'max_length': '64', 'null': 'True'}),
++            'project': ('django.db.models.fields.related.ForeignKey', [], {'to': "orm['sentry.Project']"}),
++            'type': ('django.db.models.fields.PositiveIntegerField', [], {}),
++            'user': ('django.db.models.fields.related.ForeignKey', [], {'to': "orm['sentry.User']", 'null': 'True'})
++        },
++        'sentry.alert': {
++            'Meta': {'object_name': 'Alert'},
++            'data': ('django.db.models.fields.TextField', [], {'null': 'True'}),
++            'datetime': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'group': ('django.db.models.fields.related.ForeignKey', [], {'to': "orm['sentry.Group']", 'null': 'True'}),
++            'id': ('django.db.models.fields.AutoField', [], {'primary_key': 'True'}),
++            'message': ('django.db.models.fields.TextField', [], {}),
++            'project': ('django.db.models.fields.related.ForeignKey', [], {'to': "orm['sentry.Project']"}),
++            'related_groups': ('django.db.models.fields.related.ManyToManyField', [], {'related_name': "'related_alerts'", 'symmetrical': 'False', 'through': "orm['sentry.AlertRelatedGroup']", 'to': "orm['sentry.Group']"}),
++            'status': ('django.db.models.fields.PositiveIntegerField', [], {'default': '0', 'db_index': 'True'})
++        },
++        'sentry.alertrelatedgroup': {
++            'Meta': {'unique_together': "(('group', 'alert'),)", 'object_name': 'AlertRelatedGroup'},
++            'alert': ('django.db.models.fields.related.ForeignKey', [], {'to': "orm['sentry.Alert']"}),
++            'data': ('django.db.models.fields.TextField', [], {'null': 'True'}),
++            'group': ('django.db.models.fields.related.ForeignKey', [], {'to': "orm['sentry.Group']"}),
++            'id': ('django.db.models.fields.AutoField', [], {'primary_key': 'True'})
++        },
++        'sentry.event': {
++            'Meta': {'unique_together': "(('project', 'event_id'),)", 'object_name': 'Event', 'db_table': "'sentry_message'", 'index_together': "(('group', 'datetime'),)"},
++            'checksum': ('django.db.models.fields.CharField', [], {'max_length': '32', 'db_index': 'True'}),
++            'data': ('django.db.models.fields.TextField', [], {'null': 'True', 'blank': 'True'}),
++            'datetime': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now', 'db_index': 'True'}),
++            'event_id': ('django.db.models.fields.CharField', [], {'max_length': '32', 'null': 'True', 'db_column': "'message_id'"}),
++            'group': ('django.db.models.fields.related.ForeignKey', [], {'blank': 'True', 'related_name': "'event_set'", 'null': 'True', 'to': "orm['sentry.Group']"}),
++            'id': ('django.db.models.fields.AutoField', [], {'primary_key': 'True'}),
++            'message': ('django.db.models.fields.TextField', [], {}),
++            'num_comments': ('django.db.models.fields.PositiveIntegerField', [], {'default': '0', 'null': 'True'}),
++            'platform': ('django.db.models.fields.CharField', [], {'max_length': '64', 'null': 'True'}),
++            'project': ('django.db.models.fields.related.ForeignKey', [], {'to': "orm['sentry.Project']", 'null': 'True'}),
++            'time_spent': ('django.db.models.fields.IntegerField', [], {'null': 'True'})
++        },
++        'sentry.eventmapping': {
++            'Meta': {'unique_together': "(('project', 'event_id'),)", 'object_name': 'EventMapping'},
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'event_id': ('django.db.models.fields.CharField', [], {'max_length': '32'}),
++            'group': ('django.db.models.fields.related.ForeignKey', [], {'to': "orm['sentry.Group']"}),
++            'id': ('django.db.models.fields.AutoField', [], {'primary_key': 'True'}),
++            'project': ('django.db.models.fields.related.ForeignKey', [], {'to': "orm['sentry.Project']"})
++        },
++        'sentry.group': {
++            'Meta': {'unique_together': "(('project', 'checksum'),)", 'object_name': 'Group', 'db_table': "'sentry_groupedmessage'"},
++            'active_at': ('django.db.models.fields.DateTimeField', [], {'null': 'True', 'db_index': 'True'}),
++            'checksum': ('django.db.models.fields.CharField', [], {'max_length': '32', 'db_index': 'True'}),
++            'culprit': ('django.db.models.fields.CharField', [], {'max_length': '200', 'null': 'True', 'db_column': "'view'", 'blank': 'True'}),
++            'data': ('django.db.models.fields.TextField', [], {'null': 'True', 'blank': 'True'}),
++            'first_seen': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now', 'db_index': 'True'}),
++            'id': ('django.db.models.fields.AutoField', [], {'primary_key': 'True'}),
++            'is_public': ('django.db.models.fields.NullBooleanField', [], {'default': 'False', 'null': 'True', 'blank': 'True'}),
++            'last_seen': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now', 'db_index': 'True'}),
++            'level': ('django.db.models.fields.PositiveIntegerField', [], {'default': '40', 'db_index': 'True', 'blank': 'True'}),
++            'logger': ('django.db.models.fields.CharField', [], {'default': "'root'", 'max_length': '64', 'db_index': 'True', 'blank': 'True'}),
++            'message': ('django.db.models.fields.TextField', [], {}),
++            'num_comments': ('django.db.models.fields.PositiveIntegerField', [], {'default': '0', 'null': 'True'}),
++            'platform': ('django.db.models.fields.CharField', [], {'max_length': '64', 'null': 'True'}),
++            'project': ('django.db.models.fields.related.ForeignKey', [], {'to': "orm['sentry.Project']", 'null': 'True'}),
++            'resolved_at': ('django.db.models.fields.DateTimeField', [], {'null': 'True', 'db_index': 'True'}),
++            'score': ('django.db.models.fields.IntegerField', [], {'default': '0'}),
++            'status': ('django.db.models.fields.PositiveIntegerField', [], {'default': '0', 'db_index': 'True'}),
++            'time_spent_count': ('django.db.models.fields.IntegerField', [], {'default': '0'}),
++            'time_spent_total': ('django.db.models.fields.IntegerField', [], {'default': '0'}),
++            'times_seen': ('django.db.models.fields.PositiveIntegerField', [], {'default': '1', 'db_index': 'True'})
++        },
++        'sentry.groupassignee': {
++            'Meta': {'object_name': 'GroupAssignee', 'db_table': "'sentry_groupasignee'"},
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'group': ('django.db.models.fields.related.ForeignKey', [], {'related_name': "'assignee_set'", 'unique': 'True', 'to': "orm['sentry.Group']"}),
++            'id': ('django.db.models.fields.AutoField', [], {'primary_key': 'True'}),
++            'project': ('django.db.models.fields.related.ForeignKey', [], {'related_name': "'assignee_set'", 'to': "orm['sentry.Project']"}),
++            'user': ('django.db.models.fields.related.ForeignKey', [], {'related_name': "'sentry_assignee_set'", 'to': "orm['sentry.User']"})
++        },
++        'sentry.groupbookmark': {
++            'Meta': {'unique_together': "(('project', 'user', 'group'),)", 'object_name': 'GroupBookmark'},
++            'group': ('django.db.models.fields.related.ForeignKey', [], {'related_name': "'bookmark_set'", 'to': "orm['sentry.Group']"}),
++            'id': ('django.db.models.fields.AutoField', [], {'primary_key': 'True'}),
++            'project': ('django.db.models.fields.related.ForeignKey', [], {'related_name': "'bookmark_set'", 'to': "orm['sentry.Project']"}),
++            'user': ('django.db.models.fields.related.ForeignKey', [], {'related_name': "'sentry_bookmark_set'", 'to': "orm['sentry.User']"})
++        },
++        'sentry.grouphash': {
++            'Meta': {'unique_together': "(('project', 'hash'),)", 'object_name': 'GroupHash'},
++            'group': ('django.db.models.fields.related.ForeignKey', [], {'to': "orm['sentry.Group']", 'null': 'True'}),
++            'hash': ('django.db.models.fields.CharField', [], {'max_length': '32', 'db_index': 'True'}),
++            'id': ('django.db.models.fields.AutoField', [], {'primary_key': 'True'}),
++            'project': ('django.db.models.fields.related.ForeignKey', [], {'to': "orm['sentry.Project']", 'null': 'True'})
++        },
++        'sentry.groupmeta': {
++            'Meta': {'unique_together': "(('group', 'key'),)", 'object_name': 'GroupMeta'},
++            'group': ('django.db.models.fields.related.ForeignKey', [], {'to': "orm['sentry.Group']"}),
++            'id': ('django.db.models.fields.AutoField', [], {'primary_key': 'True'}),
++            'key': ('django.db.models.fields.CharField', [], {'max_length': '64'}),
++            'value': ('django.db.models.fields.TextField', [], {})
++        },
++        'sentry.grouprulestatus': {
++            'Meta': {'unique_together': "(('rule', 'group'),)", 'object_name': 'GroupRuleStatus'},
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'group': ('django.db.models.fields.related.ForeignKey', [], {'to': "orm['sentry.Group']"}),
++            'id': ('django.db.models.fields.AutoField', [], {'primary_key': 'True'}),
++            'project': ('django.db.models.fields.related.ForeignKey', [], {'to': "orm['sentry.Project']"}),
++            'rule': ('django.db.models.fields.related.ForeignKey', [], {'to': "orm['sentry.Rule']"}),
++            'status': ('django.db.models.fields.PositiveSmallIntegerField', [], {'default': '0'})
++        },
++        'sentry.groupseen': {
++            'Meta': {'unique_together': "(('user', 'group'),)", 'object_name': 'GroupSeen'},
++            'group': ('django.db.models.fields.related.ForeignKey', [], {'to': "orm['sentry.Group']"}),
++            'id': ('django.db.models.fields.AutoField', [], {'primary_key': 'True'}),
++            'last_seen': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'project': ('django.db.models.fields.related.ForeignKey', [], {'to': "orm['sentry.Project']"}),
++            'user': ('django.db.models.fields.related.ForeignKey', [], {'to': "orm['sentry.User']", 'db_index': 'False'})
++        },
++        'sentry.grouptagkey': {
++            'Meta': {'unique_together': "(('project', 'group', 'key'),)", 'object_name': 'GroupTagKey'},
++            'group': ('django.db.models.fields.related.ForeignKey', [], {'to': "orm['sentry.Group']"}),
++            'id': ('django.db.models.fields.AutoField', [], {'primary_key': 'True'}),
++            'key': ('django.db.models.fields.CharField', [], {'max_length': '32'}),
++            'project': ('django.db.models.fields.related.ForeignKey', [], {'to': "orm['sentry.Project']", 'null': 'True'}),
++            'values_seen': ('django.db.models.fields.PositiveIntegerField', [], {'default': '0'})
++        },
++        'sentry.grouptagvalue': {
++            'Meta': {'unique_together': "(('project', 'key', 'value', 'group'),)", 'object_name': 'GroupTagValue', 'db_table': "'sentry_messagefiltervalue'"},
++            'first_seen': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now', 'null': 'True', 'db_index': 'True'}),
++            'group': ('django.db.models.fields.related.ForeignKey', [], {'related_name': "'grouptag'", 'to': "orm['sentry.Group']"}),
++            'id': ('django.db.models.fields.AutoField', [], {'primary_key': 'True'}),
++            'key': ('django.db.models.fields.CharField', [], {'max_length': '32'}),
++            'last_seen': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now', 'null': 'True', 'db_index': 'True'}),
++            'project': ('django.db.models.fields.related.ForeignKey', [], {'related_name': "'grouptag'", 'null': 'True', 'to': "orm['sentry.Project']"}),
++            'times_seen': ('django.db.models.fields.PositiveIntegerField', [], {'default': '0'}),
++            'value': ('django.db.models.fields.CharField', [], {'max_length': '200'})
++        },
++        'sentry.lostpasswordhash': {
++            'Meta': {'object_name': 'LostPasswordHash'},
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'hash': ('django.db.models.fields.CharField', [], {'max_length': '32'}),
++            'id': ('django.db.models.fields.AutoField', [], {'primary_key': 'True'}),
++            'user': ('django.db.models.fields.related.ForeignKey', [], {'to': "orm['sentry.User']", 'unique': 'True'})
++        },
++        'sentry.option': {
++            'Meta': {'object_name': 'Option'},
++            'id': ('django.db.models.fields.AutoField', [], {'primary_key': 'True'}),
++            'key': ('django.db.models.fields.CharField', [], {'unique': 'True', 'max_length': '64'}),
++            'value': ('sentry.db.models.fields.pickle.UnicodePickledObjectField', [], {})
++        },
++        'sentry.pendingteammember': {
++            'Meta': {'unique_together': "(('team', 'email'),)", 'object_name': 'PendingTeamMember'},
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'email': ('django.db.models.fields.EmailField', [], {'max_length': '75'}),
++            'id': ('django.db.models.fields.AutoField', [], {'primary_key': 'True'}),
++            'team': ('django.db.models.fields.related.ForeignKey', [], {'related_name': "'pending_member_set'", 'to': "orm['sentry.Team']"}),
++            'type': ('django.db.models.fields.IntegerField', [], {'default': '50'})
++        },
++        'sentry.project': {
++            'Meta': {'unique_together': "(('team', 'slug'),)", 'object_name': 'Project'},
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'id': ('django.db.models.fields.AutoField', [], {'primary_key': 'True'}),
++            'name': ('django.db.models.fields.CharField', [], {'max_length': '200'}),
++            'owner': ('django.db.models.fields.related.ForeignKey', [], {'related_name': "'sentry_owned_project_set'", 'null': 'True', 'to': "orm['sentry.User']"}),
++            'platform': ('django.db.models.fields.CharField', [], {'max_length': '32', 'null': 'True'}),
++            'public': ('django.db.models.fields.BooleanField', [], {'default': 'False'}),
++            'slug': ('django.db.models.fields.SlugField', [], {'max_length': '50', 'null': 'True'}),
++            'status': ('django.db.models.fields.PositiveIntegerField', [], {'default': '0', 'db_index': 'True'}),
++            'team': ('django.db.models.fields.related.ForeignKey', [], {'to': "orm['sentry.Team']", 'null': 'True'})
++        },
++        'sentry.projectkey': {
++            'Meta': {'object_name': 'ProjectKey'},
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now', 'null': 'True'}),
++            'id': ('django.db.models.fields.AutoField', [], {'primary_key': 'True'}),
++            'label': ('django.db.models.fields.CharField', [], {'max_length': '64', 'null': 'True', 'blank': 'True'}),
++            'project': ('django.db.models.fields.related.ForeignKey', [], {'related_name': "'key_set'", 'to': "orm['sentry.Project']"}),
++            'public_key': ('django.db.models.fields.CharField', [], {'max_length': '32', 'unique': 'True', 'null': 'True'}),
++            'roles': ('django.db.models.fields.BigIntegerField', [], {'default': '1'}),
++            'secret_key': ('django.db.models.fields.CharField', [], {'max_length': '32', 'unique': 'True', 'null': 'True'}),
++            'user': ('django.db.models.fields.related.ForeignKey', [], {'to': "orm['sentry.User']", 'null': 'True'}),
++            'user_added': ('django.db.models.fields.related.ForeignKey', [], {'related_name': "'keys_added_set'", 'null': 'True', 'to': "orm['sentry.User']"})
++        },
++        'sentry.projectoption': {
++            'Meta': {'unique_together': "(('project', 'key'),)", 'object_name': 'ProjectOption', 'db_table': "'sentry_projectoptions'"},
++            'id': ('django.db.models.fields.AutoField', [], {'primary_key': 'True'}),
++            'key': ('django.db.models.fields.CharField', [], {'max_length': '64'}),
++            'project': ('django.db.models.fields.related.ForeignKey', [], {'to': "orm['sentry.Project']"}),
++            'value': ('sentry.db.models.fields.pickle.UnicodePickledObjectField', [], {})
++        },
++        'sentry.rule': {
++            'Meta': {'object_name': 'Rule'},
++            'data': ('django.db.models.fields.TextField', [], {}),
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'id': ('django.db.models.fields.AutoField', [], {'primary_key': 'True'}),
++            'label': ('django.db.models.fields.CharField', [], {'max_length': '64'}),
++            'project': ('django.db.models.fields.related.ForeignKey', [], {'to': "orm['sentry.Project']"})
++        },
++        'sentry.tagkey': {
++            'Meta': {'unique_together': "(('project', 'key'),)", 'object_name': 'TagKey', 'db_table': "'sentry_filterkey'"},
++            'id': ('django.db.models.fields.AutoField', [], {'primary_key': 'True'}),
++            'key': ('django.db.models.fields.CharField', [], {'max_length': '32'}),
++            'label': ('django.db.models.fields.CharField', [], {'max_length': '64', 'null': 'True'}),
++            'project': ('django.db.models.fields.related.ForeignKey', [], {'to': "orm['sentry.Project']"}),
++            'values_seen': ('django.db.models.fields.PositiveIntegerField', [], {'default': '0'})
++        },
++        'sentry.tagvalue': {
++            'Meta': {'unique_together': "(('project', 'key', 'value'),)", 'object_name': 'TagValue', 'db_table': "'sentry_filtervalue'"},
++            'data': ('django.db.models.fields.TextField', [], {'null': 'True', 'blank': 'True'}),
++            'first_seen': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now', 'null': 'True', 'db_index': 'True'}),
++            'id': ('django.db.models.fields.AutoField', [], {'primary_key': 'True'}),
++            'key': ('django.db.models.fields.CharField', [], {'max_length': '32'}),
++            'last_seen': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now', 'null': 'True', 'db_index': 'True'}),
++            'project': ('django.db.models.fields.related.ForeignKey', [], {'to': "orm['sentry.Project']", 'null': 'True'}),
++            'times_seen': ('django.db.models.fields.PositiveIntegerField', [], {'default': '0'}),
++            'value': ('django.db.models.fields.CharField', [], {'max_length': '200'})
++        },
++        'sentry.team': {
++            'Meta': {'object_name': 'Team'},
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now', 'null': 'True'}),
++            'id': ('django.db.models.fields.AutoField', [], {'primary_key': 'True'}),
++            'members': ('django.db.models.fields.related.ManyToManyField', [], {'related_name': "'team_memberships'", 'symmetrical': 'False', 'through': "orm['sentry.TeamMember']", 'to': "orm['sentry.User']"}),
++            'name': ('django.db.models.fields.CharField', [], {'max_length': '64'}),
++            'owner': ('django.db.models.fields.related.ForeignKey', [], {'to': "orm['sentry.User']"}),
++            'slug': ('django.db.models.fields.SlugField', [], {'unique': 'True', 'max_length': '50'}),
++            'status': ('django.db.models.fields.PositiveIntegerField', [], {'default': '0'})
++        },
++        'sentry.teammember': {
++            'Meta': {'unique_together': "(('team', 'user'),)", 'object_name': 'TeamMember'},
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'id': ('django.db.models.fields.AutoField', [], {'primary_key': 'True'}),
++            'team': ('django.db.models.fields.related.ForeignKey', [], {'related_name': "'member_set'", 'to': "orm['sentry.Team']"}),
++            'type': ('django.db.models.fields.IntegerField', [], {'default': '50'}),
++            'user': ('django.db.models.fields.related.ForeignKey', [], {'related_name': "'sentry_teammember_set'", 'to': "orm['sentry.User']"})
++        },
++        'sentry.user': {
++            'Meta': {'object_name': 'User', 'db_table': "'auth_user'"},
++            'date_joined': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'email': ('django.db.models.fields.EmailField', [], {'max_length': '75', 'blank': 'True'}),
++            'first_name': ('django.db.models.fields.CharField', [], {'max_length': '30', 'blank': 'True'}),
++            'id': ('django.db.models.fields.AutoField', [], {'primary_key': 'True'}),
++            'is_active': ('django.db.models.fields.BooleanField', [], {'default': 'True'}),
++            'is_staff': ('django.db.models.fields.BooleanField', [], {'default': 'False'}),
++            'is_superuser': ('django.db.models.fields.BooleanField', [], {'default': 'False'}),
++            'last_login': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'last_name': ('django.db.models.fields.CharField', [], {'max_length': '30', 'blank': 'True'}),
++            'password': ('django.db.models.fields.CharField', [], {'max_length': '128'}),
++            'username': ('django.db.models.fields.CharField', [], {'unique': 'True', 'max_length': '128'})
++        },
++        'sentry.useroption': {
++            'Meta': {'unique_together': "(('user', 'project', 'key'),)", 'object_name': 'UserOption'},
++            'id': ('django.db.models.fields.AutoField', [], {'primary_key': 'True'}),
++            'key': ('django.db.models.fields.CharField', [], {'max_length': '64'}),
++            'project': ('django.db.models.fields.related.ForeignKey', [], {'to': "orm['sentry.Project']", 'null': 'True'}),
++            'user': ('django.db.models.fields.related.ForeignKey', [], {'to': "orm['sentry.User']"}),
++            'value': ('sentry.db.models.fields.pickle.UnicodePickledObjectField', [], {})
++        }
++    }
++
++    complete_apps = ['sentry']
+\ No newline at end of file
+diff --git a/src/sentry/models/grouphash.py b/src/sentry/models/grouphash.py
+new file mode 100644
+index 0000000000..2d93ae43cc
+--- /dev/null
++++ b/src/sentry/models/grouphash.py
+@@ -0,0 +1,23 @@
++"""
++sentry.models.grouphash
++~~~~~~~~~~~~~~~~~~~~~~~
++
++:copyright: (c) 2010-2014 by the Sentry Team, see AUTHORS for more details.
++:license: BSD, see LICENSE for more details.
++"""
++from __future__ import absolute_import
++
++from django.db import models
++
++from sentry.db.models import Model
++
++
++class GroupHash(Model):
++    project = models.ForeignKey('sentry.Project', null=True)
++    hash = models.CharField(max_length=32, db_index=True)
++    group = models.ForeignKey('sentry.Group', null=True)
++
++    class Meta:
++        app_label = 'sentry'
++        db_table = 'sentry_grouphash'
++        unique_together = (('project', 'hash'),)
+diff --git a/src/sentry/tasks/base.py b/src/sentry/tasks/base.py
+index 894de2089f..11f770e66b 100644
+--- a/src/sentry/tasks/base.py
++++ b/src/sentry/tasks/base.py
+@@ -6,7 +6,7 @@ sentry.tasks.base
+ :license: BSD, see LICENSE for more details.
+ """
+ 
+-from celery.task import task
++from celery.task import current, task
+ from django_statsd.clients import statsd
+ from functools import wraps
+ 
+@@ -23,3 +23,13 @@ def instrumented_task(name, stat_suffix=None, **kwargs):
+             return result
+         return task(name=name, **kwargs)(_wrapped)
+     return wrapped
++
++
++def retry(func):
++    @wraps(func)
++    def wrapped(*args, **kwargs):
++        try:
++            return func(*args, **kwargs)
++        except Exception as exc:
++            current.retry(exc=exc)
++    return wrapped
+diff --git a/src/sentry/tasks/deletion.py b/src/sentry/tasks/deletion.py
+index 942c705756..f96cfbd0ca 100644
+--- a/src/sentry/tasks/deletion.py
++++ b/src/sentry/tasks/deletion.py
+@@ -8,20 +8,7 @@ sentry.tasks.deletion
+ 
+ from __future__ import absolute_import
+ 
+-from celery.task import current
+-from functools import wraps
+-
+-from sentry.tasks.base import instrumented_task
+-
+-
+-def retry(func):
+-    @wraps(func)
+-    def wrapped(*args, **kwargs):
+-        try:
+-            return func(*args, **kwargs)
+-        except Exception as exc:
+-            current.retry(exc=exc)
+-    return wrapped
++from sentry.tasks.base import instrumented_task, retry
+ 
+ 
+ @instrumented_task(name='sentry.tasks.deletion.delete_team', queue='cleanup',
+diff --git a/src/sentry/tasks/merge.py b/src/sentry/tasks/merge.py
+new file mode 100644
+index 0000000000..41ab58a6d0
+--- /dev/null
++++ b/src/sentry/tasks/merge.py
+@@ -0,0 +1,75 @@
++"""
++sentry.tasks.merge
++~~~~~~~~~~~~~~~~~~
++
++:copyright: (c) 2010-2014 by the Sentry Team, see AUTHORS for more details.
++:license: BSD, see LICENSE for more details.
++"""
++
++from __future__ import absolute_import
++
++from django.db import IntegrityError, transaction
++
++from sentry.tasks.base import instrumented_task, retry
++
++
++@instrumented_task(name='sentry.tasks.merge.merge_group', queue='cleanup',
++                   default_retry_delay=60 * 5, max_retries=None)
++@retry
++def merge_group(from_object_id, to_object_id, **kwargs):
++    from sentry.models import (
++        Group, GroupRuleStatus, GroupTagKey, GroupTagValue, EventMapping, Event
++    )
++
++    try:
++        group = Group.objects.get(id=from_object_id)
++    except Group.DoesNotExist:
++        return
++
++    try:
++        new_group = Group.objects.get(id=to_object_id)
++    except Group.DoesNotExist:
++        return
++
++    logger = merge_group.get_logger()
++
++    model_list = (
++        GroupRuleStatus, GroupTagValue, GroupTagKey, EventMapping, Event
++    )
++
++    has_more = merge_objects(model_list, group, new_group, logger=logger)
++
++    if has_more:
++        merge_group.delay(
++            from_object_id=from_object_id,
++            to_object_id=to_object_id,
++        )
++        return
++
++    group.delete()
++
++
++def merge_objects(models, group, new_group, limit=1000,
++                  logger=None):
++
++    has_more = False
++    for model in models:
++        if logger is not None:
++            logger.info('Merging %r objects where %r into %r', model, group,
++                        new_group)
++        for obj in model.objects.filter(group=group)[:limit]:
++            obj.group = new_group
++
++            sid = transaction.savepoint()
++            try:
++                obj.save()
++            except IntegrityError:
++                transaction.savepoint_rollback(sid)
++                obj.delete()
++            else:
++                transaction.savepoint_commit(sid)
++            has_more = True
++
++        if has_more:
++            return True
++    return has_more
+diff --git a/src/sentry/tasks/store.py b/src/sentry/tasks/store.py
+index a32ceb30f6..e9e4612eb0 100644
+--- a/src/sentry/tasks/store.py
++++ b/src/sentry/tasks/store.py
+@@ -49,7 +49,7 @@ def save_event(cache_key=None, data=None, **kwargs):
+     Saves an event to the database.
+     """
+     from sentry.app import cache
+-    from sentry.models import Group
++    from sentry.event_manager import EventManager
+ 
+     if cache_key:
+         data = cache.get(cache_key)
+@@ -57,8 +57,11 @@ def save_event(cache_key=None, data=None, **kwargs):
+     if data is None:
+         return
+ 
++    project = data.pop('project')
++
+     try:
+-        Group.objects.save_data(data.pop('project'), data)
++        manager = EventManager(data)
++        manager.save(project)
+     finally:
+         if cache_key:
+             cache.delete(cache_key)
+diff --git a/src/sentry/web/api.py b/src/sentry/web/api.py
+index 81eccf4819..ccc9ef8ad5 100644
+--- a/src/sentry/web/api.py
++++ b/src/sentry/web/api.py
+@@ -38,6 +38,7 @@ from sentry.coreapi import (
+     APIForbidden, APIRateLimited, extract_auth_vars, ensure_has_ip,
+     decompress_deflate, decompress_gzip)
+ from sentry.exceptions import InvalidData, InvalidOrigin, InvalidRequest
++from sentry.event_manager import EventManager
+ from sentry.models import (
+     Group, GroupBookmark, Project, TagValue, Activity, User)
+ from sentry.signals import event_received
+@@ -337,7 +338,8 @@ class StoreView(APIView):
+             raise APIError(u'Invalid data: %s (%s)' % (six.text_type(e), type(e)))
+ 
+         # mutates data
+-        Group.objects.normalize_event_data(data)
++        manager = EventManager(data)
++        data = manager.normalize()
+ 
+         # insert IP address if not available
+         if auth.is_public:
+diff --git a/tests/sentry/interfaces/test_stacktrace.py b/tests/sentry/interfaces/test_stacktrace.py
+index 5caf8a0e06..d39af3e3bf 100644
+--- a/tests/sentry/interfaces/test_stacktrace.py
++++ b/tests/sentry/interfaces/test_stacktrace.py
+@@ -6,7 +6,6 @@ import mock
+ 
+ from exam import fixture
+ 
+-from sentry.interfaces.exception import Exception
+ from sentry.interfaces.stacktrace import (
+     Frame, Stacktrace, get_context, trim_frames
+ )
+@@ -99,6 +98,35 @@ class StacktraceTest(TestCase):
+         result = interface.to_json()
+         assert 'frames' in result
+ 
++    def test_hash_without_system_frames(self):
++        interface = Stacktrace.to_python(dict(frames=[{
++            'lineno': 1,
++            'filename': 'foo.py',
++            'in_app': True,
++        }, {
++            'lineno': 1,
++            'filename': 'bar.py',
++            'in_app': None,
++        }]))
++        result = interface.get_hash(system_frames=False)
++        assert result == ['foo.py', 1]
++
++        result = interface.get_hash(system_frames=True)
++        assert result == ['foo.py', 1, 'bar.py', 1]
++
++    def test_compute_hashes(self):
++        interface = Stacktrace.to_python(dict(frames=[{
++            'lineno': 1,
++            'filename': 'foo.py',
++            'in_app': True,
++        }, {
++            'lineno': 1,
++            'filename': 'bar.py',
++            'in_app': None,
++        }]))
++        result = interface.compute_hashes()
++        assert result == [['foo.py', 1, 'bar.py', 1], ['foo.py', 1]]
++
+     def test_get_hash_with_only_required_vars(self):
+         interface = Frame.to_python({
+             'lineno': 1,
+@@ -202,27 +230,6 @@ class StacktraceTest(TestCase):
+         result = interface.get_hash()
+         self.assertEquals(result, ['foo.py', 'foo bar'])
+ 
+-    def test_get_composite_hash_uses_exception_if_present(self):
+-        interface = Stacktrace.to_python(dict(frames=[{
+-            'context_line': 'foo bar',
+-            'lineno': 1,
+-            'filename': 'foo.py',
+-            'function': 'bar'
+-        }]))
+-        interface_exc = Exception.to_python(dict(type='exception', value='bar'))
+-        result = interface.get_composite_hash({
+-            'sentry.interfaces.Exception': interface_exc,
+-        })
+-        self.assertEquals(result[-1], 'exception')
+-
+-    def test_get_composite_hash_uses_exception_value_if_no_type_or_stack(self):
+-        interface = Stacktrace(frames=[])
+-        interface_exc = Exception.to_python(dict(type='bar'))
+-        result = interface.get_composite_hash({
+-            'sentry.interfaces.Exception': interface_exc,
+-        })
+-        self.assertEquals(result[-1], 'bar')
+-
+     @mock.patch('sentry.interfaces.stacktrace.Stacktrace.get_stacktrace')
+     def test_to_string_returns_stacktrace(self, get_stacktrace):
+         event = mock.Mock(spec=Event())
+diff --git a/tests/sentry/manager/tests.py b/tests/sentry/manager/tests.py
+index 53ae01ddbb..9e73e4096c 100644
+--- a/tests/sentry/manager/tests.py
++++ b/tests/sentry/manager/tests.py
+@@ -5,80 +5,19 @@ from __future__ import absolute_import
+ import mock
+ 
+ from sentry.constants import MEMBER_OWNER, MEMBER_USER
+-from sentry.manager import get_checksum_from_event
+ from sentry.models import (
+-    Event, Group, Project, Team, EventMapping, User, AccessGroup, GroupTagValue
++    Group, Project, Team, User, AccessGroup, GroupTagValue
+ )
+ from sentry.testutils import TestCase
+ 
+ 
+ class SentryManagerTest(TestCase):
+-    @mock.patch('sentry.signals.regression_signal.send')
+-    def test_broken_regression_signal(self, send):
+-        send.side_effect = Exception()
+-
+-        event = Group.objects.from_kwargs(1, message='foo')
+-        self.assertEquals(event.message, 'foo')
+-        self.assertEquals(event.project_id, 1)
+-
+-    @mock.patch.object(Group.objects, 'should_sample')
+-    def test_saves_event_mapping_when_sampled(self, should_sample):
+-        should_sample.return_value = True
+-        event_id = 'a' * 32
+-
+-        event = Group.objects.from_kwargs(1, message='foo', event_id=event_id)
+-        group = event.group
+-
+-        assert EventMapping.objects.filter(
+-            group=group, event_id=event_id).exists()
+-
+-    def test_invalid_project(self):
+-        self.assertRaises(Project.DoesNotExist, Group.objects.from_kwargs, 2, message='foo')
+-
+     def test_valid_only_message(self):
+         event = Group.objects.from_kwargs(1, message='foo')
+         self.assertEquals(event.group.last_seen, event.datetime)
+         self.assertEquals(event.message, 'foo')
+         self.assertEquals(event.project_id, 1)
+ 
+-    @mock.patch('sentry.manager.GroupManager.add_tags')
+-    def test_tags_as_list(self, add_tags):
+-        event = Group.objects.from_kwargs(1, message='foo', tags=[('foo', 'bar')])
+-        group = event.group
+-        add_tags.assert_called_once_with(group, [('foo', 'bar'), ('level', 'error'), ('logger', 'root')])
+-
+-    @mock.patch('sentry.manager.GroupManager.add_tags')
+-    def test_tags_as_dict(self, add_tags):
+-        event = Group.objects.from_kwargs(1, message='foo', tags={'foo': 'bar'})
+-        group = event.group
+-        add_tags.assert_called_once_with(group, [('foo', 'bar'), ('level', 'error'), ('logger', 'root')])
+-
+-    def test_platform_is_saved(self):
+-        event = Group.objects.from_kwargs(1, message='foo', platform='python')
+-        group = event.group
+-        self.assertEquals(group.platform, 'python')
+-        self.assertEquals(event.platform, 'python')
+-
+-    def test_dupe_message_id(self):
+-        event = Group.objects.from_kwargs(1, event_id=1, message='foo')
+-        self.assertEquals(event.message, 'foo')
+-        self.assertEquals(event.project_id, 1)
+-        self.assertEquals(Event.objects.count(), 1)
+-
+-        # ensure that calling it again doesn't raise a db error
+-        Group.objects.from_kwargs(1, event_id=1, message='foo')
+-        self.assertEquals(Event.objects.count(), 1)
+-
+-    def test_updates_group(self):
+-        Group.objects.from_kwargs(1, message='foo', checksum='a' * 32)
+-        event = Group.objects.from_kwargs(1, message='foo bar', checksum='a' * 32)
+-
+-        group = Group.objects.get(pk=event.group_id)
+-
+-        self.assertEquals(group.times_seen, 2)
+-        self.assertEquals(group.last_seen.replace(microsecond=0), event.datetime.replace(microsecond=0))
+-        self.assertEquals(group.message, 'foo bar')
+-
+     def test_add_tags(self):
+         event = Group.objects.from_kwargs(1, message='rrr')
+         group = event.group
+@@ -102,33 +41,6 @@ class SentryManagerTest(TestCase):
+         self.assertEquals(res.times_seen, 1)
+ 
+ 
+-class GetChecksumFromEventTest(TestCase):
+-    @mock.patch('sentry.interfaces.stacktrace.Stacktrace.get_composite_hash')
+-    @mock.patch('sentry.interfaces.http.Http.get_composite_hash')
+-    def test_stacktrace_wins_over_http(self, http_comp_hash, stack_comp_hash):
+-        # this was a regression, and a very important one
+-        http_comp_hash.return_value = ['baz']
+-        stack_comp_hash.return_value = ['foo', 'bar']
+-        event = Event(
+-            data={
+-                'sentry.interfaces.Stacktrace': {
+-                    'frames': [{
+-                        'lineno': 1,
+-                        'filename': 'foo.py',
+-                    }],
+-                },
+-                'sentry.interfaces.Http': {
+-                    'url': 'http://example.com'
+-                },
+-            },
+-            message='Foo bar',
+-        )
+-        checksum = get_checksum_from_event(event)
+-        stack_comp_hash.assert_called_once_with(interfaces=event.interfaces)
+-        assert not http_comp_hash.called
+-        assert checksum == '3858f62230ac3c915f300c664312c63f'
+-
+-
+ class ProjectManagerTest(TestCase):
+     def setUp(self):
+         self.project = Project.objects.get()
+diff --git a/tests/sentry/test_event_manager.py b/tests/sentry/test_event_manager.py
+new file mode 100644
+index 0000000000..1849b900d9
+--- /dev/null
++++ b/tests/sentry/test_event_manager.py
+@@ -0,0 +1,135 @@
++# -*- coding: utf-8 -*-
++
++from __future__ import absolute_import
++
++import logging
++
++from mock import patch
++
++from sentry.event_manager import EventManager, get_hashes_for_event
++from sentry.models import Event, Group, Project, EventMapping
++from sentry.testutils import TestCase
++
++
++class EventManagerTest(TestCase):
++    def make_event(self, **kwargs):
++        result = {
++            'event_id': 'a' * 32,
++            'message': 'foo',
++            'timestamp': 1403007314.570599,
++            'level': logging.ERROR,
++            'logger': 'default',
++            'tags': [],
++        }
++        result.update(kwargs)
++        return result
++
++    @patch('sentry.signals.regression_signal.send')
++    def test_broken_regression_signal(self, send):
++        send.side_effect = Exception()
++
++        manager = EventManager(self.make_event())
++        event = manager.save(1)
++
++        assert event.message == 'foo'
++        assert event.project_id == 1
++
++    @patch('sentry.event_manager.should_sample')
++    def test_saves_event_mapping_when_sampled(self, should_sample):
++        should_sample.return_value = True
++        event_id = 'a' * 32
++
++        manager = EventManager(self.make_event())
++        event = manager.save(1)
++
++        assert EventMapping.objects.filter(
++            group=event.group, event_id=event_id).exists()
++
++    def test_invalid_project(self):
++        manager = EventManager(self.make_event())
++        with self.assertRaises(Project.DoesNotExist):
++            event = manager.save(2)
++
++    @patch('sentry.manager.GroupManager.add_tags')
++    def test_tags_as_list(self, add_tags):
++        manager = EventManager(self.make_event(tags=[('foo', 'bar')]))
++        data = manager.normalize()
++
++        assert data['tags'] == [('foo', 'bar')]
++
++    @patch('sentry.manager.GroupManager.add_tags')
++    def test_tags_as_dict(self, add_tags):
++        manager = EventManager(self.make_event(tags={'foo': 'bar'}))
++        data = manager.normalize()
++
++        assert data['tags'] == [('foo', 'bar')]
++
++    def test_platform_is_saved(self):
++        manager = EventManager(self.make_event(platform='python'))
++        event = manager.save(1)
++
++        group = event.group
++        assert group.platform == 'python'
++        assert event.platform == 'python'
++
++    def test_dupe_message_id(self):
++        event_id = 'a' * 32
++
++        manager = EventManager(self.make_event(event_id='a' * 32))
++        manager.save(1)
++
++        assert Event.objects.count() == 1
++
++        # ensure that calling it again doesn't raise a db error
++        manager = EventManager(self.make_event(event_id='a' * 32))
++        manager.save(1)
++
++        assert Event.objects.count() == 1
++
++    def test_updates_group(self):
++        manager = EventManager(self.make_event(
++            message='foo', event_id='a' * 32,
++            checksum='a' * 32,
++        ))
++        event = manager.save(1)
++
++        manager = EventManager(self.make_event(
++            message='foo bar', event_id='b' * 32,
++            checksum='a' * 32,
++        ))
++        event2 = manager.save(1)
++
++        group = Group.objects.get(id=event.group_id)
++
++        assert group.times_seen == 2
++        assert group.last_seen.replace(microsecond=0) == event.datetime.replace(microsecond=0)
++        assert group.message == event2.message
++
++
++class GetHashesFromEventTest(TestCase):
++    @patch('sentry.interfaces.stacktrace.Stacktrace.compute_hashes')
++    @patch('sentry.interfaces.http.Http.compute_hashes')
++    def test_stacktrace_wins_over_http(self, http_comp_hash, stack_comp_hash):
++        # this was a regression, and a very important one
++        http_comp_hash.return_value = [['baz']]
++        stack_comp_hash.return_value = [['foo', 'bar']]
++        event = Event(
++            data={
++                'sentry.interfaces.Stacktrace': {
++                    'frames': [{
++                        'lineno': 1,
++                        'filename': 'foo.py',
++                    }],
++                },
++                'sentry.interfaces.Http': {
++                    'url': 'http://example.com'
++                },
++            },
++            message='Foo bar',
++        )
++        checksums = get_hashes_for_event(event)
++        assert len(checksums) == 1
++        checksum = checksums[0]
++        stack_comp_hash.assert_called_once_with()
++        assert not http_comp_hash.called
++        assert checksum == '3858f62230ac3c915f300c664312c63f'

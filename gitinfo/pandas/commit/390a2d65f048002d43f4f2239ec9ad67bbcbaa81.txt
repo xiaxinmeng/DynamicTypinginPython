@@ -1,0 +1,943 @@
+commit 390a2d65f048002d43f4f2239ec9ad67bbcbaa81
+Author: Jacob Schaer <jacob.schaer@pearson.com>
+Date:   Tue Oct 8 16:12:10 2013 -0700
+
+    Added pandas.io.gbq module To Connect To Google BigQuery
+
+diff --git a/pandas/io/gbq.py b/pandas/io/gbq.py
+new file mode 100644
+index 000000000..f226af662
+--- /dev/null
++++ b/pandas/io/gbq.py
+@@ -0,0 +1,467 @@
++"""
++Pandas module to interface with Google BigQuery.
++"""
++import os
++import sys
++import tempfile
++import csv
++import logging
++from datetime import datetime
++
++import pandas as pd
++import numpy as np
++
++from pandas import DataFrame, concat
++from pandas.core.common import PandasError
++
++try:
++    import bq
++    import bigquery_client
++    import gflags as flags
++    _BQ_INSTALLED = True
++except ImportError:
++    _BQ_INSTALLED = False
++
++
++# Setup the logger
++logger = logging.getLogger('pandas.io.gbq')
++
++# These are some custom exceptions that the
++# to_gbq() method can throw
++
++class SchemaMissing(PandasError,IOError):
++    """
++    Raised when attempting to write a DataFrame to
++    a new table in Google BigQuery without specifying
++    a schema describing the DataFrame.
++    """
++    pass
++
++class InvalidSchema(PandasError,IOError):
++    """
++    Raised when attempting to write a DataFrame to
++    Google BigQuery with an invalid table schema.
++    """
++    pass
++
++class TableExistsFail(PandasError,IOError):
++    """
++    Raised when attempting to write a DataFrame to
++    an existing Google BigQuery table without specifying
++    that a replace/update action be taken.
++    """
++    pass
++
++class InvalidColumnOrder(PandasError,IOError):
++    """
++    Raised when the provided column order for output
++    results DataFrame does not match the schema
++    returned by BigQuery.
++    """
++    pass
++
++
++def _authenticate():
++    """
++    For testing, we abstract the authentication to BigQuery API.
++    Presently this is implemented using the bq.py Client.Get()
++    method. Any exceptions raised are considered fatal, so we
++    do not process them.
++
++    Returns
++    -------
++    BigqueryClient : Configured connection to Google BigQuery
++    """
++    return bq.Client.Get()
++
++def _parse_entry(field_value, field_type):
++    """
++    Given a value and the corresponding BigQuery data type,
++    perform any operations needed and return in a format
++    appropriate for a numpy record dictionary
++
++    Parameters
++    ----------
++    field_value : Source object to be transformed
++    field_type : String representation of Google BigQuery
++                 data type (per schema)
++
++    Returns
++    -------
++    field_value : object or primitive of type corresponding
++                  to field_type
++    """
++
++    # Avoid any casting problems
++    if field_value is None or field_value == 'null':
++        return None
++    if field_type == 'INTEGER' or field_type == 'FLOAT':
++        field_value = float(field_value)
++    elif field_type == 'TIMESTAMP':
++        timestamp = datetime.utcfromtimestamp(float(field_value))
++        field_value = np.datetime64(timestamp)
++    elif field_type == 'BOOLEAN':
++        field_value = field_value == 'true'
++    else:
++        field_value = str(field_value)
++    return field_value
++
++
++def _parse_page(raw_page, col_names, col_types, col_dtypes):
++    """
++    Given a list of rows produced by the client.apiclient.tabledata().list(),
++    build a numpy array with proper dtypes and column names as specified
++    by the arguments.
++
++    Parameters
++    ----------
++    raw_page : Resulting list of rows from a page retrieved via
++        bigquery API
++        client.apiclient.tabledata().list().execute()['rows']
++    col_names: An ordered list of names for the columns
++    col_types: String representation of the BigQuery DataType for that
++        column
++    col_dtypes: Target numpy.dtype for the column
++
++    Returns
++    -------
++    page_array : numpy record array corresponding
++        to the page data
++    """
++
++    # Should be at most 100,000 per the API, but this could
++    # be increased in the future. Should only be less than
++    # this for the last page to reduce API calls
++    page_row_count = len(raw_page)
++
++    # Place to hold the results for a page of data
++    page_array = np.zeros(
++                    (page_row_count,),
++                    dtype=zip(col_names,col_dtypes)
++                 )
++    for row_num, raw_row in enumerate(raw_page):
++        entries = raw_row.get('f', [])
++         # Iterate over each entry - setting proper field types
++        for col_num, field_type in enumerate(col_types):
++            # Process the field's types using schema
++            field_value = _parse_entry(entries[col_num].get('v', ''),
++                                       field_type)
++            # Fill the value into the final array
++            page_array[row_num][col_num] = field_value
++
++    return page_array
++
++def _parse_data(client, job, index_col=None, col_order=None):
++    """
++    Iterate through the query results and piece together the
++    final DataFrame. Builds a DataFrame for each page of
++    results, then concatenates them together when finished.
++    To save memory, we use numpy record arrays to build these
++    DataFrames.
++
++    Parameters
++    ----------
++    client: An instance of bq.Client
++    job: An array containing the job info for a completed query
++    index_col: str (optional)
++        Name of result column to use for index in results DataFrame
++    col_order: list() (optional)
++        List of BigQuery column names in the desired order for results
++        DataFrame
++
++    Returns
++    -------
++    df: pandas DataFrame
++        DataFrame representing results of query
++
++    Raises:
++    ------
++    InvalidColumnOrder:
++        Raised if 'col_order' parameter doesn't match returned DataFrame
++    BigqueryError:
++        Raised by bigquery_client if a Google API error is encountered
++
++
++    Notes:
++    -----
++    This script relies on Google being consistent with their 
++    pagination API. We are using the most flexible iteration method
++    that we could find in the bq.py/bigquery_client.py API's, but 
++    these have undergone large amounts of change recently.
++
++    We have encountered bugs with this functionality, see:
++    http://stackoverflow.com/questions/19145587/bq-py-not-paging-results
++    """
++
++    # dtype Map -
++    # see: http://pandas.pydata.org/pandas-docs/dev/missing_data.html#missing-data-casting-rules-and-indexing
++    dtype_map = {'INTEGER': np.dtype(float),
++                 'FLOAT': np.dtype(float),
++                 'TIMESTAMP': 'M8[ns]'}     # This seems to be buggy without nanosecond indicator
++
++    # We first need the schema to get information about the columns of
++    # our dataframe. 
++
++    table_dict = job['configuration']['query']['destinationTable']
++    fields = client.GetTableSchema(table_dict)['fields']
++
++    # Get the schema into a format useable to create our
++    # dataframe
++    col_dtypes = []
++    col_types = []
++    col_names = []
++
++    # TODO: Do this in one clean step
++    for field in fields:
++        col_types.append(field['type'])
++        # Note the encoding... numpy doesn't like titles that are UTF8, which is the return
++        # type from the API
++        col_names.append(field['name'].encode('ascii', 'ignore'))
++        # Note, it would be nice to use 'str' types, but BigQuery doesn't have a fixed length
++        # in mind - just maxes out at 64k
++        col_dtypes.append(dtype_map.get(field['type'],object))
++
++  
++    # How many columns are there
++    num_columns = len(col_names)
++    
++    # Iterate over the result rows.
++    # Since Google's API now requires pagination of results,
++    # we do that here. The following is repurposed from 
++    # bigquery_client.py  :: Client.ReadTableRows()
++
++    # Initially, no page token is set
++    page_token = None
++
++    # Most of Google's client API's allow one to set total_rows in case
++    # the user only wants the first 'n' results from a query. Typically
++    # they set this to sys.maxint by default, but this caused problems
++    # during testing - specifically on OS X. It appears that at some
++    # point in bigquery_client.py, there is an attempt to cast this value
++    # to an unsigned integer. Depending on the python install,
++    # sys.maxint may exceed the limitations of unsigned integers.
++    #
++    # See:
++    # https://code.google.com/p/google-bigquery-tools/issues/detail?id=14
++
++    # This is hardcoded value for 32bit sys.maxint per
++    # the above note. Theoretically, we could simply use
++    # 100,000 (or whatever the current max page size is),
++    # but this is more flexible in the event of an API change
++    total_rows = 2147483647
++
++    # Keep track of rows read
++    row_count = 0
++
++    # Keep our page DataFrames until the end when we 
++    # concatentate them
++    dataframe_list = list()
++
++    # Iterate over all rows
++    while row_count < total_rows:
++        data = client.apiclient.tabledata().list(maxResults=total_rows - row_count,
++                                                 pageToken=page_token,
++                                                 **table_dict).execute()
++
++        # If there are more results than will fit on a page, 
++        # you will recieve a token for the next page.
++        page_token = data.get('pageToken', None)
++
++        # How many rows are there across all pages?
++        total_rows = min(total_rows, int(data['totalRows'])) # Changed to use get(data[rows],0)
++        raw_page = data.get('rows', [])
++        page_array = _parse_page(raw_page, col_names, col_types, col_dtypes)
++
++        row_count += len(page_array)
++        if total_rows > 0:
++            completed = (100 * row_count) / total_rows
++            logger.info('Remaining Rows: ' + str(total_rows - row_count) + '(' + str(completed) + '% Complete)') 
++        else:
++            logger.info('No Rows')
++
++        dataframe_list.append(DataFrame(page_array))
++
++        # Handle any exceptions that might have occured
++        if not page_token and row_count != total_rows:
++            raise bigquery_client.BigqueryInterfaceError(
++                'PageToken missing for %r' % (
++                    bigquery_client.ApiClientHelper.TableReference.Create(**table_dict),))
++        if not raw_page and row_count != total_rows:
++            raise bigquery_client.BigqueryInterfaceError(
++                'Not enough rows returned by server for %r' % (
++                    bigquery_client.ApiClientHelper.TableReference.Create(**table_dict),))
++
++    # Build final dataframe
++    final_df = concat(dataframe_list, ignore_index=True)
++
++    # Reindex the DataFrame on the provided column
++    if index_col is not None:
++        if index_col in col_names:
++            final_df.set_index(index_col, inplace=True)
++            col_names.remove(index_col)
++        else:
++            raise InvalidColumnOrder('Index column "{0}" does not exist in DataFrame.'.format(index_col))
++
++    # Change the order of columns in the DataFrame based on provided list
++    if col_order is not None:
++        if sorted(col_order) == sorted(col_names):
++            final_df = final_df[col_order]
++        else:
++            raise InvalidColumnOrder('Column order does not match this DataFrame.')
++
++    # Downcast floats to integers and objects to booleans
++    # if there are no NaN's. This is presently due to a
++    # limitation of numpy in handling missing data.
++    final_df._data = final_df._data.downcast(dtypes='infer')
++    return final_df
++
++def to_gbq(dataframe, destination_table, schema=None, col_order=None, if_exists='fail', **kwargs):
++    """
++    Write a DataFrame to a Google BigQuery table. If the table exists,
++    the DataFrame will be appended. If not, a new table will be created,
++    in which case the schema will have to be specified. By default,
++    rows will be written in the order they appear in the DataFrame, though
++    the user may specify an alternative order.
++
++    Parameters
++    ---------------
++    dataframe: DataFrame
++        DataFrame to be written
++    destination_table: string
++         name of table to be written, in the form 'dataset.tablename'
++    schema : sequence (optional)
++         list of column types in order for data to be inserted, e.g. ['INTEGER', 'TIMESTAMP', 'BOOLEAN']
++    col_order: sequence (optional)
++         order which columns are to be inserted, e.g. ['primary_key', 'birthday', 'username']
++    if_exists: {'fail', 'replace', 'append'} (optional)
++            fail: If table exists, do nothing.
++            replace: If table exists, drop it, recreate it, and insert data.
++            append: If table exists, insert data. Create if does not exist.
++    kwargs are passed to the Client constructor
++
++    Raises:
++    ------
++    SchemaMissing:
++        Raised if the 'if_exists' parameter is set to 'replace', but no schema is specified
++    TableExists:
++        Raised if the specified 'destination_table' exists but the 'if_exists' parameter is set to 'fail' (the default)
++    InvalidSchema:
++        Raised if the 'schema' parameter does not match the provided DataFrame
++    """
++
++    if not _BQ_INSTALLED:
++        if sys.version_info >= (3, 0):
++            raise NotImplementedError('gbq module does not support Python 3 yet')
++        else:
++            raise ImportError('Could not import Google BigQuery Client.')
++
++    ALLOWED_TYPES = ['STRING', 'INTEGER', 'FLOAT', 'BOOLEAN', 'TIMESTAMP', 'RECORD']
++
++    if if_exists == 'replace' and schema is None:
++        raise SchemaMissing('Cannot replace a table without specifying the data schema')
++    else:
++        client = _authenticate()
++        table_reference = client.GetTableReference(destination_table)
++        if client.TableExists(table_reference):
++            if if_exists == 'fail':
++                raise TableExistsFail('Cannot overwrite existing tables if \'if_exists="fail"\'')
++            else:
++                # Build up a string representation of the 
++                # table's schema. Since the table already
++                # exists, we ask ask the API for it, which
++                # is returned in a list of dictionaries
++                # describing column data. Iterate over these
++                # and build up a string of form:
++                # "col_name1 : col_type1, col_name2 : col_type2..."
++                schema_full = client.GetTableSchema(dict(table_reference))['fields']
++                schema = ''
++                for count, row in enumerate(schema_full):
++                    if count > 0:
++                        schema += ', '
++                    schema += row['name'] + ':' + row['type']
++        else:
++            logger.info('Creating New Table')
++            if schema is None:
++                raise SchemaMissing('Cannot create a new table without specifying the data schema')
++            else:
++                columns = dataframe.columns
++                if len(schema) != len(columns):
++                    raise InvalidSchema('Incorrect number of columns in schema')
++                else:
++                    schema_string = ''
++                    for count, name in enumerate(columns):
++                        if count > 0:
++                            schema_string += ', '
++                        column_type = schema[count].upper()
++                        if column_type in ALLOWED_TYPES:
++                            schema_string += name + ':' + schema[count].lower()
++                        else:
++                            raise InvalidSchema('Invalid Type: ' + column_type + ". Must be one of: " + str(ALLOWED_TYPES))
++                    schema = schema_string
++
++    opts = kwargs
++    opts['sync'] = True
++    opts['skip_leading_rows'] = 1
++    opts['encoding'] = 'UTF-8'
++    opts['max_bad_records'] = 0
++
++    # See: https://developers.google.com/bigquery/docs/reference/v2/jobs
++    if if_exists == 'replace':
++        opts['write_disposition'] = 'WRITE_TRUNCATE'
++    elif if_exists == 'append':
++        opts['write_disposition'] = 'WRITE_APPEND'
++
++    with tempfile.NamedTemporaryFile() as csv_file:
++        dataframe.to_csv(csv_file.name, index=False, encoding='utf-8')
++        job = client.Load(table_reference, csv_file.name, schema=schema, **opts)
++
++def read_gbq(query, project_id = None, destination_table = None, index_col=None, col_order=None, **kwargs):
++    """
++    The main method a user calls to load data from Google BigQuery into a pandas DataFrame. 
++    This is a simple wrapper for Google's bq.py and bigquery_client.py, which we use
++    to get the source data. Because of this, this script respects the user's bq settings 
++    file, '~/.bigqueryrc', if it exists. Such a file can be generated using 'bq init'. Further,
++    additional parameters for the query can be specified as either **kwds in the command,
++    or using FLAGS provided in the 'gflags' module. Particular options can be found in
++    bigquery_client.py.
++
++    Parameters
++    ----------
++    query: str
++        SQL-Like Query to return data values
++    project_id: str (optional)
++        Google BigQuery Account project ID. Optional, since it may be
++        located in ~/.bigqueryrc
++    index_col: str (optional)
++        Name of result column to use for index in results DataFrame
++    col_order: list(str) (optional)
++        List of BigQuery column names in the desired order for results
++        DataFrame
++    destination_table: string (optional)
++        If provided, send the results to the given table.
++    **kwargs: to be passed to bq.Client.Create(). Particularly: 'trace', 'sync',
++        'api', 'api_version'
++
++    Returns
++    -------
++    df: pandas DataFrame
++        DataFrame representing results of query
++
++    """
++    if not _BQ_INSTALLED:
++        if sys.version_info >= (3, 0):
++            raise NotImplementedError('gbq module does not support Python 3 yet')
++        else:
++            raise ImportError('Could not import Google BigQuery Client.')
++
++    query_args = kwargs
++    query_args['project_id'] = project_id
++    query_args['query'] = query
++    query_args['destination_table'] = destination_table
++    query_args['sync'] = True
++
++    client = _authenticate()
++
++    job = client.Query(**query_args)
++    
++    return _parse_data(client, job, index_col=index_col, col_order=col_order)
+diff --git a/pandas/io/tests/data/gbq_fake_job.txt b/pandas/io/tests/data/gbq_fake_job.txt
+new file mode 100644
+index 000000000..2a0f09bc6
+--- /dev/null
++++ b/pandas/io/tests/data/gbq_fake_job.txt
+@@ -0,0 +1 @@
++{u'status': {u'state': u'DONE'}, u'kind': u'bigquery#job', u'statistics': {u'query': {u'cacheHit': True, u'totalBytesProcessed': u'0'}, u'endTime': u'1377668744674', u'totalBytesProcessed': u'0', u'startTime': u'1377668744466'}, u'jobReference': {u'projectId': u'57288129629', u'jobId': u'bqjob_r5f956972f0190bdf_00000140c374bf42_2'}, u'etag': u'"4PTsVxg68bQkQs1RJ1Ndewqkgg4/oO4VmgFrAku4N6FWci9s7iFIftc"', u'configuration': {u'query': {u'createDisposition': u'CREATE_IF_NEEDED', u'query': u'SELECT * FROM [publicdata:samples.shakespeare]', u'writeDisposition': u'WRITE_TRUNCATE', u'destinationTable': {u'projectId': u'57288129629', u'tableId': u'anonb5ec450da88eeeb78a27784ea482ee75a146d442', u'datasetId': u'_d0b4f5f0d50dc68a3eb0fa6cba66a9a8687d9253'}}}, u'id': u'57288129629:bqjob_r5f956972f0190bdf_00000140c374bf42_2', u'selfLink': u'https://www.googleapis.com/bigquery/v2/projects/57288129629/jobs/bqjob_r5f956972f0190bdf_00000140c374bf42_2'}
+\ No newline at end of file
+diff --git a/pandas/io/tests/test_gbq.py b/pandas/io/tests/test_gbq.py
+new file mode 100644
+index 000000000..89b048d47
+--- /dev/null
++++ b/pandas/io/tests/test_gbq.py
+@@ -0,0 +1,450 @@
++import ast
++import nose
++import os
++import shutil
++import subprocess
++import unittest
++
++import numpy as np
++
++import pandas.io.gbq as gbq
++import pandas.util.testing as tm
++
++from pandas.core.frame import DataFrame
++from pandas.util.testing import with_connectivity_check
++from pandas import NaT
++
++
++try:
++    import bq
++    import bigquery_client
++    import gflags as flags
++except ImportError:
++    raise nose.SkipTest
++
++####################################################################################
++# Fake Google BigQuery Client
++
++class FakeClient:
++    def __init__(self):
++        self.apiclient = FakeApiClient()
++    def GetTableSchema(self,table_dict):
++        retval =  {'fields': [
++                    {'type': 'STRING', 'name': 'corpus', 'mode': 'NULLABLE'},
++                    {'type': 'INTEGER', 'name': 'corpus_date', 'mode': 'NULLABLE'},
++                    {'type': 'STRING', 'name': 'word', 'mode': 'NULLABLE'},
++                    {'type': 'INTEGER', 'name': 'word_count', 'mode': 'NULLABLE'}
++                  ]}
++        return retval
++
++# Fake Google BigQuery API Client
++class FakeApiClient:
++    def __init__(self):
++        self._tabledata = FakeTableData()
++        
++
++    def tabledata(self):
++        return self._tabledata
++
++class FakeTableData:
++    def __init__(self): 
++        self._list = FakeList()
++
++    def list(self,maxResults = None, pageToken = None, **table_dict):
++        return self._list   
++
++class FakeList:
++    def execute(self):
++        return {'rows': [  {'f': [{'v': 'othello'}, {'v': '1603'}, {'v': 'brave'}, {'v': '3'}]},
++                            {'f': [{'v': 'othello'}, {'v': '1603'}, {'v': 'attended'}, {'v': '1'}]},
++                            {'f': [{'v': 'othello'}, {'v': '1603'}, {'v': 'treason'}, {'v': '1'}]},
++                            {'f': [{'v': 'othello'}, {'v': '1603'}, {'v': 'islanders'}, {'v': '1'}]},
++                            {'f': [{'v': 'othello'}, {'v': '1603'}, {'v': 'heed'}, {'v': '3'}]},
++                            {'f': [{'v': 'othello'}, {'v': '1603'}, {'v': 'alehouse'}, {'v': '1'}]},
++                            {'f': [{'v': 'othello'}, {'v': '1603'}, {'v': 'corrigible'}, {'v': '1'}]},
++                            {'f': [{'v': 'othello'}, {'v': '1603'}, {'v': 'brawl'}, {'v': '2'}]},
++                            {'f': [{'v': 'othello'}, {'v': '1603'}, {'v': "'"}, {'v': '17'}]},
++                            {'f': [{'v': 'othello'}, {'v': '1603'}, {'v': 'troubled'}, {'v': '1'}]}
++                        ],
++                'kind': 'bigquery#tableDataList',
++                'etag': '"4PTsVxg68bQkQs1RJ1Ndewqkgg4/hoRHzb4qfhJAIa2mEewC-jhs9Bg"',
++                'totalRows': '10'}
++
++####################################################################################
++
++class test_gbq(unittest.TestCase):
++    def setUp(self):
++        with open(self.fake_job_path, 'r') as fin:
++            self.fake_job = ast.literal_eval(fin.read())
++
++        self.test_data_small = [{'f': [{'v': 'othello'}, {'v': '1603'}, {'v': 'brave'}, {'v': '3'}]},
++                {'f': [{'v': 'othello'}, {'v': '1603'}, {'v': 'attended'}, {'v': '1'}]},
++                {'f': [{'v': 'othello'}, {'v': '1603'}, {'v': 'treason'}, {'v': '1'}]},
++                {'f': [{'v': 'othello'}, {'v': '1603'}, {'v': 'islanders'}, {'v': '1'}]},
++                {'f': [{'v': 'othello'}, {'v': '1603'}, {'v': 'heed'}, {'v': '3'}]},
++                {'f': [{'v': 'othello'}, {'v': '1603'}, {'v': 'alehouse'}, {'v': '1'}]},
++                {'f': [{'v': 'othello'}, {'v': '1603'}, {'v': 'corrigible'}, {'v': '1'}]},
++                {'f': [{'v': 'othello'}, {'v': '1603'}, {'v': 'brawl'}, {'v': '2'}]},
++                {'f': [{'v': 'othello'}, {'v': '1603'}, {'v': "'"}, {'v': '17'}]},
++                {'f': [{'v': 'othello'}, {'v': '1603'}, {'v': 'troubled'},
++                {'v': '1'}]}]
++
++        self.correct_data_small = np.array(
++            [('othello', 1603, 'brave', 3),
++             ('othello', 1603, 'attended', 1),
++             ('othello', 1603, 'treason', 1),
++             ('othello', 1603, 'islanders', 1),
++             ('othello', 1603, 'heed', 3),
++             ('othello', 1603, 'alehouse', 1),
++             ('othello', 1603, 'corrigible', 1),
++             ('othello', 1603, 'brawl', 2),
++             ('othello', 1603, "'", 17),
++             ('othello', 1603, 'troubled', 1)
++            ], 
++            dtype=[('corpus', 'S16'),
++                   ('corpus_date', '<i8'),
++                   ('word', 'S16'),
++                   ('word_count', '<i8')]
++        )
++
++        self.correct_test_datatype = DataFrame(
++            {'VALID_STRING' : ['PI'],
++             'EMPTY_STRING' :  [""],
++             'NULL_STRING' : [None],
++             'VALID_INTEGER' : [3],
++             'NULL_INTEGER' : [np.nan],
++             'VALID_FLOAT' : [3.141592653589793],
++             'NULL_FLOAT' : [np.nan],
++             'UNIX_EPOCH' : [np.datetime64('1970-01-01T00:00:00.000000Z')],
++             'VALID_TIMESTAMP' : [np.datetime64('2004-09-15T05:00:00.000000Z')],
++             'NULL_TIMESTAMP' :[NaT],
++             'TRUE_BOOLEAN' : [True],
++             'FALSE_BOOLEAN' : [False],
++             'NULL_BOOLEAN' : [None]
++            }
++        )[['VALID_STRING',
++          'EMPTY_STRING',
++          'NULL_STRING',
++          'VALID_INTEGER',
++          'NULL_INTEGER',
++          'VALID_FLOAT',
++          'NULL_FLOAT',
++          'UNIX_EPOCH',
++          'VALID_TIMESTAMP',
++          'NULL_TIMESTAMP',
++          'TRUE_BOOLEAN',
++          'FALSE_BOOLEAN',
++          'NULL_BOOLEAN']]
++    
++    @classmethod
++    def setUpClass(self):
++        # Integration tests require a valid bigquery token
++        # be present in the user's home directory. This
++        # can be generated with 'bq init' in the command line
++        self.dirpath = tm.get_data_path()
++        home = os.path.expanduser("~")
++        self.bq_token = os.path.join(home, '.bigquery.v2.token')
++        self.fake_job_path = os.path.join(self.dirpath, 'gbq_fake_job.txt')
++        
++        # If we're using a valid token, make a test dataset
++        # Note, dataset functionality is beyond the scope
++        # of the module under test, so we rely on the command
++        # line utility for this.
++        if os.path.exists(self.bq_token):
++            subprocess.call(['bq','mk', '-d', 'pandas_testing_dataset'])
++
++    @classmethod
++    def tearDownClass(self):
++        # If we're using a valid token, remove the test dataset
++        # created.
++        if os.path.exists(self.bq_token):
++            subprocess.call(['bq', 'rm', '-r', '-f', '-d', 'pandas_testing_dataset'])
++
++    @with_connectivity_check
++    def test_valid_authentication(self):
++        # If the user has a token file, they should recieve a client from gbq._authenticate
++        if not os.path.exists(self.bq_token):
++            raise nose.SkipTest('Skipped because authentication information is not available.')
++        
++        self.assertTrue(gbq._authenticate is not None, 'Authentication To GBQ Failed')
++
++    @with_connectivity_check
++    def test_malformed_query(self):
++        # If the user has a connection file, performing an invalid query should raise an error
++        if not os.path.exists(self.bq_token):
++            raise nose.SkipTest('Skipped because authentication information is not available.')
++        else:
++            self.assertRaises(bigquery_client.BigqueryInvalidQueryError,
++                              gbq.read_gbq, "SELCET * FORM [publicdata:samples.shakespeare]")
++
++    def test_type_conversion(self):
++        # All BigQuery Types should be cast into appropriate numpy types
++        sample_input = [('1.095292800E9', 'TIMESTAMP'),
++                 ('false', 'BOOLEAN'),
++                 ('2', 'INTEGER'),
++                 ('3.14159', 'FLOAT'),
++                 ('Hello World', 'STRING')]
++        actual_output = [gbq._parse_entry(result[0],result[1]) for result in sample_input]
++        sample_output = [np.datetime64('2004-09-16T00:00:00.000000Z'),
++                  np.bool(False),
++                  np.int('2'),
++                  np.float('3.14159'),
++                  'Hello World']
++        self.assertEqual(actual_output, sample_output, 'A format conversion failed')
++
++    def test_data_small(self):
++        # Parsing a fixed page of data should return the proper fixed np.array()
++        result_frame = gbq._parse_page(self.test_data_small,
++                                        ['corpus','corpus_date','word','word_count'],
++                                        ['STRING','INTEGER','STRING','INTEGER'],
++                                        [object,np.dtype(int),object,np.dtype(int)]
++                                      )
++        tm.assert_frame_equal(DataFrame(result_frame), DataFrame(self.correct_data_small),
++                        'An element in the result DataFrame didn\'t match the sample set')
++
++    def test_index_column(self):
++        # A user should be able to specify an index column for return     
++        result_frame = gbq._parse_data(FakeClient(), self.fake_job, index_col='word')
++        correct_frame = DataFrame(self.correct_data_small)
++        correct_frame.set_index('word', inplace=True)
++        self.assertTrue(result_frame.index.name == correct_frame.index.name)
++
++    def test_column_order(self):
++        # A User should be able to specify the order in which columns are returned in the dataframe    
++        col_order = ['corpus_date', 'word_count', 'corpus', 'word']
++        result_frame = gbq._parse_data(FakeClient(), self.fake_job, col_order=col_order)
++        tm.assert_index_equal(result_frame.columns, DataFrame(self.correct_data_small)[col_order].columns)
++
++    def test_column_order_plus_index(self):
++        # A User should be able to specify an index and the order of THE REMAINING columns.. they should be notified
++        # if they screw up
++        col_order = ['corpus_date', 'word', 'corpus']
++        result_frame = gbq._parse_data(FakeClient(), self.fake_job, index_col='word_count', col_order=col_order)
++        correct_frame_small = DataFrame(self.correct_data_small)
++        correct_frame_small.set_index('word_count',inplace=True)
++        correct_frame_small = DataFrame(correct_frame_small)[col_order]
++        tm.assert_index_equal(result_frame.columns, correct_frame_small.columns)
++
++    # @with_connectivity_check
++    # def test_download_dataset_larger_than_100k_rows(self):
++    #     # Test for known BigQuery bug in datasets larger than 100k rows
++    #     # http://stackoverflow.com/questions/19145587/bq-py-not-paging-results
++    #     if not os.path.exists(self.bq_token):
++    #         raise nose.SkipTest('Skipped because authentication information is not available.')
++
++    #     client = gbq._authenticate()
++    #     a = gbq.read_gbq("SELECT id, FROM [publicdata:samples.wikipedia] LIMIT 100005")
++    #     self.assertTrue(len(a) == 100005)
++
++    @with_connectivity_check
++    def test_download_all_data_types(self):
++        # Test that all available data types from BigQuery (as of now)
++        # are handled properly
++        if not os.path.exists(self.bq_token):
++            raise nose.SkipTest('Skipped because authentication information is not available.')
++
++        query = """SELECT "PI" as VALID_STRING,
++                   "" as EMPTY_STRING,
++                   STRING(NULL) as NULL_STRING,
++                   INTEGER(3) as VALID_INTEGER,
++                   INTEGER(NULL) as NULL_INTEGER,
++                   PI() as VALID_FLOAT,
++                   FLOAT(NULL) as NULL_FLOAT,
++                   TIMESTAMP("1970-01-01 00:00:00") as UNIX_EPOCH,
++                   TIMESTAMP("2004-09-15 05:00:00") as VALID_TIMESTAMP,
++                   TIMESTAMP(NULL) as NULL_TIMESTAMP,
++                   BOOLEAN(TRUE) as TRUE_BOOLEAN,
++                   BOOLEAN(FALSE) as FALSE_BOOLEAN,
++                   BOOLEAN(NULL) as NULL_BOOLEAN"""
++
++        client = gbq._authenticate()
++        a = gbq.read_gbq(query, col_order = ['VALID_STRING',
++                                             'EMPTY_STRING',
++                                             'NULL_STRING',
++                                             'VALID_INTEGER',
++                                             'NULL_INTEGER',
++                                             'VALID_FLOAT',
++                                             'NULL_FLOAT',
++                                             'UNIX_EPOCH',
++                                             'VALID_TIMESTAMP',
++                                             'NULL_TIMESTAMP',
++                                             'TRUE_BOOLEAN',
++                                             'FALSE_BOOLEAN',
++                                             'NULL_BOOLEAN'])
++
++        tm.assert_frame_equal(a, self.correct_test_datatype)
++
++    @with_connectivity_check
++    def test_table_exists(self):
++        # Given a table name in the format {dataset}.{tablename}, if a table exists,
++        # the GetTableReference should accurately indicate this. 
++        # This could possibly change in future implementations of bq, 
++        # but it is the simplest way to provide users with appropriate
++        # error messages regarding schemas.
++        if not os.path.exists(self.bq_token):
++            raise nose.SkipTest('Skipped because authentication information is not available.')
++
++        client = gbq._authenticate()
++        table_reference = client.GetTableReference("publicdata:samples.shakespeare")
++        self.assertTrue(client.TableExists(table_reference))
++
++    @with_connectivity_check
++    def test_table__not_exists(self):
++        # Test the inverse of `test_table_exists`
++        if not os.path.exists(self.bq_token):
++            raise nose.SkipTest('Skipped because authentication information is not available.')
++
++        client = gbq._authenticate()
++        table_reference = client.GetTableReference("publicdata:samples.does_not_exist")
++        self.assertFalse(client.TableExists(table_reference))
++
++    @with_connectivity_check
++    def test_upload_new_table_schema_error(self):
++        # Attempting to upload to a non-existent table without a schema should fail
++        if not os.path.exists(self.bq_token):
++            raise nose.SkipTest('Skipped because authentication information is not available.')
++
++        df = DataFrame(self.correct_data_small)
++        with self.assertRaises(gbq.SchemaMissing):
++            gbq.to_gbq(df, 'pandas_testing_dataset.test_database', schema=None, col_order=None, if_exists='fail')
++ 
++    @with_connectivity_check
++    def test_upload_replace_schema_error(self):
++        # Attempting to replace an existing table without specifying a schema should fail
++        if not os.path.exists(self.bq_token):
++            raise nose.SkipTest('Skipped because authentication information is not available.')
++
++        df = DataFrame(self.correct_data_small)
++        with self.assertRaises(gbq.SchemaMissing):
++            gbq.to_gbq(df, 'pandas_testing_dataset.test_database', schema=None, col_order=None, if_exists='replace')
++    
++    @with_connectivity_check
++    def test_upload_public_data_error(self):
++        # Attempting to upload to a public, read-only, dataset should fail
++        if not os.path.exists(self.bq_token):
++            raise nose.SkipTest('Skipped because authentication information is not available.')
++
++        array = [['TESTING_GBQ', 999999999, 'hi', 0, True, 9999999999, '00.000.00.000', 1, 'hola',
++                 99999999, False, False, 1, 'Jedi', 11210]]
++        df = DataFrame(array)
++        with self.assertRaises(bigquery_client.BigqueryServiceError):
++            gbq.to_gbq(df, 'publicdata:samples.wikipedia', schema=None, col_order=None, if_exists='append')
++
++    @with_connectivity_check
++    def test_upload_new_table(self):
++        # Attempting to upload to a new table with valid data and a valid schema should succeed
++        if not os.path.exists(self.bq_token):
++            raise nose.SkipTest('Skipped because authentication information is not available.')
++
++        schema = ['STRING', 'INTEGER', 'STRING', 'INTEGER', 'BOOLEAN',
++                  'INTEGER', 'STRING', 'INTEGER',
++                  'STRING', 'INTEGER', 'BOOLEAN', 'BOOLEAN',
++                  'INTEGER', 'STRING', 'INTEGER']
++
++        array = [['TESTING_GBQ', 999999999, 'hi', 0, True, 9999999999, '00.000.00.000', 1, 'hola',
++                 99999999, False, False, 1, 'Jedi', 11210]]
++        df = DataFrame(array, columns=['title','id','language','wp_namespace','is_redirect','revision_id',
++                                       'contributor_ip','contributor_id','contributor_username','timestamp',
++                                       'is_minor','is_bot','reversion_id','comment','num_characters'])
++        gbq.to_gbq(df, 'pandas_testing_dataset.test_data2', schema=schema, col_order=None, if_exists='append')
++        a = gbq.read_gbq("SELECT * FROM pandas_testing_dataset.test_data2")
++        self.assertTrue((a == df).all().all())
++
++    @with_connectivity_check
++    def test_upload_bad_data_table(self):
++        # Attempting to upload data that does not match schema should fail
++        if not os.path.exists(self.bq_token):
++            raise nose.SkipTest('Skipped because authentication information is not available.')
++
++        schema = ['STRING', 'INTEGER', 'STRING', 'INTEGER', 'BOOLEAN',
++                  'INTEGER', 'STRING', 'INTEGER',
++                  'STRING', 'INTEGER', 'BOOLEAN', 'BOOLEAN',
++                  'INTEGER', 'STRING', 'INTEGER']
++
++        array = [['TESTING_GBQ\',', False, 'hi', 0, True, 'STRING IN INTEGER', '00.000.00.000', 1, 'hola',
++                 99999999, -100, 1000, 1, 'Jedi', 11210]]
++        df = DataFrame(array, columns=['title','id','language','wp_namespace','is_redirect','revision_id',
++                                       'contributor_ip','contributor_id','contributor_username','timestamp',
++                                       'is_minor','is_bot','reversion_id','comment','num_characters'])
++        with self.assertRaises(bigquery_client.BigqueryServiceError):
++            gbq.to_gbq(df, 'pandas_testing_dataset.test_data1', schema=schema, col_order=None, if_exists='append')
++
++    @with_connectivity_check
++    def test_invalid_column_name_schema(self):
++        # Specifying a schema that contains an invalid column name should fail
++        if not os.path.exists(self.bq_token):
++            raise nose.SkipTest('Skipped because authentication information is not available.')
++
++        schema = ['INCORRECT']
++        df = DataFrame([[1]],columns=['fake'])
++        with self.assertRaises(gbq.InvalidSchema):
++            gbq.to_gbq(df, 'pandas_testing_dataset.test_data', schema=schema, col_order=None, if_exists='append')
++
++    @with_connectivity_check
++    def test_invalid_number_of_columns_schema(self):
++        # Specifying a schema that does not have same shape as dataframe should fail
++        if not os.path.exists(self.bq_token):
++            raise nose.SkipTest('Skipped because authentication information is not available.')
++
++        schema = ['INTEGER']
++        df = DataFrame([[1, 'STRING']],columns=['fake','fake'])
++        with self.assertRaises(gbq.InvalidSchema):
++            gbq.to_gbq(df, 'pandas_testing_dataset.test_data4', schema=schema, col_order=None, if_exists='append')
++
++    @with_connectivity_check
++    def test_upload_fail_if_exists(self):
++        # Attempting to upload to a new table with valid data and a valid schema should succeed
++        if not os.path.exists(self.bq_token):
++            raise nose.SkipTest('Skipped because authentication information is not available.')
++
++        schema = ['STRING', 'INTEGER', 'STRING', 'INTEGER', 'BOOLEAN',
++                  'INTEGER', 'STRING', 'INTEGER',
++                  'STRING', 'INTEGER', 'BOOLEAN', 'BOOLEAN',
++                  'INTEGER', 'STRING', 'INTEGER']
++
++        array = [['TESTING_GBQ', 999999999, 'hi', 0, True, 9999999999, '00.000.00.000', 1, 'hola',
++                 99999999, False, False, 1, 'Jedi', 11210]]
++        df = DataFrame(array, columns=['title','id','language','wp_namespace','is_redirect','revision_id',
++                                       'contributor_ip','contributor_id','contributor_username','timestamp',
++                                       'is_minor','is_bot','reversion_id','comment','num_characters'])
++        gbq.to_gbq(df, 'pandas_testing_dataset.test_data3', schema=schema, col_order=None, if_exists='fail')
++
++        with self.assertRaises(gbq.TableExistsFail):
++            gbq.to_gbq(df, 'pandas_testing_dataset.test_data3', schema=schema, col_order=None, if_exists='fail')
++
++    @with_connectivity_check
++    def test_upload_replace(self):
++        # Attempting to overwrite an existing table with valid data and a valid schema should succeed
++        if not os.path.exists(self.bq_token):
++            raise nose.SkipTest('Skipped because authentication information is not available.')
++
++        schema = ['STRING', 'INTEGER', 'STRING', 'INTEGER', 'BOOLEAN',
++                  'INTEGER', 'STRING', 'INTEGER',
++                  'STRING', 'INTEGER', 'BOOLEAN', 'BOOLEAN',
++                  'INTEGER', 'STRING', 'INTEGER']
++
++        # Setup an existing table
++        array1 = [['', 1, '', 1, False, 1, '00.111.00.111', 1, 'hola',
++                 1, True, True, 1, 'Sith', 1]]
++        df1 = DataFrame(array1, columns=['title','id','language','wp_namespace','is_redirect','revision_id',
++                                       'contributor_ip','contributor_id','contributor_username','timestamp',
++                                       'is_minor','is_bot','reversion_id','comment','num_characters'])
++        gbq.to_gbq(df1, 'pandas_testing_dataset.test_data5', schema=schema, col_order=None, if_exists='fail')
++        
++        array2 = [['TESTING_GBQ', 999999999, 'hi', 0, True, 9999999999, '00.000.00.000', 1, 'hola',
++                 99999999, False, False, 1, 'Jedi', 11210]]
++
++        # Overwrite the existing table with different data
++        df2 = DataFrame(array2, columns=['title','id','language','wp_namespace','is_redirect','revision_id',
++                                       'contributor_ip','contributor_id','contributor_username','timestamp',
++                                       'is_minor','is_bot','reversion_id','comment','num_characters'])
++        gbq.to_gbq(df2, 'pandas_testing_dataset.test_data5', schema=schema, col_order=None, if_exists='replace')
++        
++        # Read the table and confirm the new data is all that is there
++        a = gbq.read_gbq("SELECT * FROM pandas_testing_dataset.test_data5")
++        self.assertTrue((a == df2).all().all())
++
++
++if __name__ == '__main__':
++    nose.runmodule(argv=[__file__, '-vvs', '-x', '--pdb', '--pdb-failure'],
++                   exit=False)

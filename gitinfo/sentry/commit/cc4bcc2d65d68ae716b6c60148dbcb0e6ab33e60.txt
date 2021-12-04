@@ -1,0 +1,526 @@
+commit cc4bcc2d65d68ae716b6c60148dbcb0e6ab33e60
+Author: Jess MacQueen <macqueen@users.noreply.github.com>
+Date:   Tue Apr 25 11:01:43 2017 -0700
+
+    move commit fetching to celery task (#5275)
+    
+    * move commit fetching to celery task
+    
+    * fix tests
+
+diff --git a/src/sentry/api/endpoints/organization_release_details.py b/src/sentry/api/endpoints/organization_release_details.py
+index 969826dd81..3ffe43ba3e 100644
+--- a/src/sentry/api/endpoints/organization_release_details.py
++++ b/src/sentry/api/endpoints/organization_release_details.py
+@@ -167,7 +167,7 @@ class OrganizationReleaseDetailsEndpoint(OrganizationReleasesBaseEndpoint):
+                     'refs': ['You must use an authenticated API token to fetch refs']
+                 }, status=400)
+             fetch_commits = not commit_list
+-            release.set_refs(refs, request.user, fetch_commits=fetch_commits)
++            release.set_refs(refs, request.user, fetch=fetch_commits)
+ 
+         if (not was_released and release.date_released):
+             for project in release.projects.all():
+diff --git a/src/sentry/api/endpoints/organization_releases.py b/src/sentry/api/endpoints/organization_releases.py
+index 42cf3690e6..e0c0c614ae 100644
+--- a/src/sentry/api/endpoints/organization_releases.py
++++ b/src/sentry/api/endpoints/organization_releases.py
+@@ -189,7 +189,7 @@ class OrganizationReleasesEndpoint(OrganizationReleasesBaseEndpoint):
+                         'refs': ['You must use an authenticated API token to fetch refs']
+                     }, status=400)
+                 fetch_commits = not commit_list
+-                release.set_refs(refs, request.user, fetch_commits=fetch_commits)
++                release.set_refs(refs, request.user, fetch=fetch_commits)
+ 
+             if not created and not new_projects:
+                 # This is the closest status code that makes sense, and we want
+diff --git a/src/sentry/conf/server.py b/src/sentry/conf/server.py
+index 52b1b1b78d..d2254863cd 100644
+--- a/src/sentry/conf/server.py
++++ b/src/sentry/conf/server.py
+@@ -445,6 +445,7 @@ CELERY_IMPORTS = (
+     'sentry.tasks.auth',
+     'sentry.tasks.auto_resolve_issues',
+     'sentry.tasks.beacon',
++    'sentry.tasks.commits',
+     'sentry.tasks.check_auth',
+     'sentry.tasks.clear_expired_snoozes',
+     'sentry.tasks.collect_project_platforms',
+@@ -464,6 +465,7 @@ CELERY_IMPORTS = (
+ CELERY_QUEUES = [
+     Queue('alerts', routing_key='alerts'),
+     Queue('auth', routing_key='auth'),
++    Queue('commits', routing_key='commits'),
+     Queue('cleanup', routing_key='cleanup'),
+     Queue('default', routing_key='default'),
+     Queue('digests.delivery', routing_key='digests.delivery'),
+diff --git a/src/sentry/models/release.py b/src/sentry/models/release.py
+index d2f6d83407..7005938e15 100644
+--- a/src/sentry/models/release.py
++++ b/src/sentry/models/release.py
+@@ -9,7 +9,6 @@ from __future__ import absolute_import, print_function
+ 
+ import logging
+ import re
+-import six
+ 
+ from django.db import models, IntegrityError, transaction
+ from django.db.models import F
+@@ -19,7 +18,6 @@ from jsonfield import JSONField
+ from sentry.db.models import (
+     BoundedPositiveIntegerField, FlexibleForeignKey, Model, sane_repr
+ )
+-from sentry.exceptions import InvalidIdentity, PluginError
+ from sentry.utils.cache import cache
+ from sentry.utils.hashlib import md5_text
+ 
+@@ -247,9 +245,9 @@ class Release(Model):
+         else:
+             return True
+ 
+-    def set_refs(self, refs, user, fetch_commits=False):
++    def set_refs(self, refs, user, fetch=False):
+         from sentry.models import Commit, ReleaseHeadCommit, Repository
+-        from sentry.plugins import bindings
++        from sentry.tasks.commits import fetch_commits
+ 
+         # TODO: this does the wrong thing unless you are on the most
+         # recent release.  Add a timestamp compare?
+@@ -258,8 +256,6 @@ class Release(Model):
+             projects__in=self.projects.all(),
+         ).exclude(version=self.version).order_by('-date_added').first()
+ 
+-        commit_list = []
+-
+         for ref in refs:
+             try:
+                 repo = Repository.objects.get(
+@@ -283,43 +279,15 @@ class Release(Model):
+                     'commit': commit,
+                 }
+             )
+-            if fetch_commits:
+-                try:
+-                    provider_cls = bindings.get('repository.provider').get(repo.provider)
+-                except KeyError:
+-                    continue
+-
+-                # if previous commit isn't provided, try to get from
+-                # previous release otherwise, give up
+-                if ref.get('previousCommit'):
+-                    start_sha = ref['previousCommit']
+-                elif prev_release:
+-                    try:
+-                        start_sha = Commit.objects.filter(
+-                            organization_id=self.organization_id,
+-                            releaseheadcommit__release=prev_release,
+-                            repository_id=repo.id,
+-                        ).values_list('key', flat=True)[0]
+-                    except IndexError:
+-                        continue
+-                else:
+-                    continue
+-
+-                end_sha = commit.key
+-                provider = provider_cls(id=repo.provider)
+-                try:
+-                    repo_commits = provider.compare_commits(
+-                        repo, start_sha, end_sha, actor=user
+-                    )
+-                except NotImplementedError:
+-                    pass
+-                except (PluginError, InvalidIdentity) as e:
+-                    logger.exception(six.text_type(e))
+-                else:
+-                    commit_list.extend(repo_commits)
+-
+-            if commit_list:
+-                self.set_commits(commit_list)
++        if fetch:
++            fetch_commits.apply_async(
++                kwargs={
++                    'release_id': self.id,
++                    'user_id': user.id,
++                    'refs': refs,
++                    'prev_release_id': prev_release and prev_release.id,
++                }
++            )
+ 
+     def set_commits(self, commit_list):
+         from sentry.models import (
+diff --git a/src/sentry/tasks/commits.py b/src/sentry/tasks/commits.py
+new file mode 100644
+index 0000000000..7a8859952d
+--- /dev/null
++++ b/src/sentry/tasks/commits.py
+@@ -0,0 +1,83 @@
++from __future__ import absolute_import
++
++import logging
++import six
++
++from sentry.exceptions import InvalidIdentity, PluginError
++from sentry.models import Commit, Release, Repository, User
++from sentry.plugins import bindings
++from sentry.tasks.base import instrumented_task, retry
++
++logger = logging.getLogger(__name__)
++
++
++@instrumented_task(name='sentry.tasks.commit.fetch_commits', queue='commits',
++                   default_retry_delay=60 * 5, max_retries=5)
++@retry(exclude=(Release.DoesNotExist, User.DoesNotExist,))
++def fetch_commits(release_id, user_id, refs, prev_release_id=None, **kwargs):
++    commit_list = []
++
++    release = Release.objects.get(id=release_id)
++    user = User.objects.get(id=user_id)
++
++    prev_release = None
++    if prev_release_id is not None:
++        try:
++            prev_release = Release.objects.get(id=prev_release_id)
++        except Release.DoesNotExist:
++            pass
++
++    for ref in refs:
++        try:
++            repo = Repository.objects.get(
++                organization_id=release.organization_id,
++                name=ref['repository'],
++            )
++        except Repository.DoesNotExist:
++            continue
++
++        try:
++            commit = Commit.objects.get(
++                organization_id=release.organization_id,
++                repository_id=repo.id,
++                key=ref['commit'],
++            )
++        except Commit.DoesNotExist:
++            continue
++
++        try:
++            provider_cls = bindings.get('repository.provider').get(repo.provider)
++        except KeyError:
++            continue
++
++        # if previous commit isn't provided, try to get from
++        # previous release otherwise, give up
++        if ref.get('previousCommit'):
++            start_sha = ref['previousCommit']
++        elif prev_release:
++            try:
++                start_sha = Commit.objects.filter(
++                    organization_id=release.organization_id,
++                    releaseheadcommit__release=prev_release,
++                    repository_id=repo.id,
++                ).values_list('key', flat=True)[0]
++            except IndexError:
++                continue
++        else:
++            continue
++
++        end_sha = commit.key
++        provider = provider_cls(id=repo.provider)
++        try:
++            repo_commits = provider.compare_commits(
++                repo, start_sha, end_sha, actor=user
++            )
++        except NotImplementedError:
++            pass
++        except (PluginError, InvalidIdentity) as e:
++            logger.exception(six.text_type(e))
++        else:
++            commit_list.extend(repo_commits)
++
++    if commit_list:
++        release.set_commits(commit_list)
+diff --git a/tests/sentry/api/endpoints/test_organization_release_details.py b/tests/sentry/api/endpoints/test_organization_release_details.py
+index e1d776ac0c..6302d23987 100644
+--- a/tests/sentry/api/endpoints/test_organization_release_details.py
++++ b/tests/sentry/api/endpoints/test_organization_release_details.py
+@@ -1,5 +1,6 @@
+ from __future__ import absolute_import
+ 
++from mock import patch
+ from datetime import datetime
+ from django.core.urlresolvers import reverse
+ 
+@@ -94,7 +95,8 @@ class ReleaseDetailsTest(APITestCase):
+ 
+ 
+ class UpdateReleaseDetailsTest(APITestCase):
+-    def test_simple(self):
++    @patch('sentry.tasks.commits.fetch_commits')
++    def test_simple(self, mock_fetch_commits):
+         user = self.create_user(is_staff=False, is_superuser=False)
+         org = self.organization
+         org.flags.allow_joinleave = False
+@@ -161,28 +163,20 @@ class UpdateReleaseDetailsTest(APITestCase):
+             ],
+         })
+ 
++        mock_fetch_commits.apply_async.assert_called_with(
++            kwargs={
++                'release_id': release.id,
++                'user_id': user.id,
++                'refs': [
++                    {'commit': 'a' * 40, 'repository': repo.name},
++                    {'commit': 'b' * 40, 'repository': repo2.name},
++                ],
++                'prev_release_id': base_release.id,
++            }
++        )
++
+         assert response.status_code == 200, response.content
+         assert response.data['version'] == release.version
+-        assert ReleaseCommit.objects.filter(
+-            commit__repository_id=repo.id,
+-            commit__key='62de626b7c7cfb8e77efb4273b1a3df4123e6216',
+-            release__version=response.data['version'],
+-        ).exists()
+-        assert ReleaseCommit.objects.filter(
+-            commit__repository_id=repo.id,
+-            commit__key='58de626b7c7cfb8e77efb4273b1a3df4123e6345',
+-            release__version=response.data['version'],
+-        ).exists()
+-        assert ReleaseCommit.objects.filter(
+-            commit__repository_id=repo2.id,
+-            commit__key='62de626b7c7cfb8e77efb4273b1a3df4123e6216',
+-            release__version=response.data['version'],
+-        ).exists()
+-        assert ReleaseCommit.objects.filter(
+-            commit__repository_id=repo2.id,
+-            commit__key='58de626b7c7cfb8e77efb4273b1a3df4123e6345',
+-            release__version=response.data['version'],
+-        ).exists()
+ 
+         release = Release.objects.get(id=release.id)
+         assert release.ref == 'master'
+@@ -195,7 +189,8 @@ class UpdateReleaseDetailsTest(APITestCase):
+         response = self.client.put(url, {'ref': 'master'})
+         assert response.status_code == 403
+ 
+-    def test_deprecated_head_commits(self):
++    @patch('sentry.tasks.commits.fetch_commits')
++    def test_deprecated_head_commits(self, mock_fetch_commits):
+         user = self.create_user(is_staff=False, is_superuser=False)
+         org = self.organization
+         org.flags.allow_joinleave = False
+@@ -263,28 +258,20 @@ class UpdateReleaseDetailsTest(APITestCase):
+             ],
+         })
+ 
++        mock_fetch_commits.apply_async.assert_called_with(
++            kwargs={
++                'release_id': release.id,
++                'user_id': user.id,
++                'refs': [
++                    {'commit': 'a' * 40, 'previousCommit': None, 'repository': repo.name},
++                    {'commit': 'b' * 40, 'previousCommit': None, 'repository': repo2.name},
++                ],
++                'prev_release_id': base_release.id,
++            }
++        )
++
+         assert response.status_code == 200, response.content
+         assert response.data['version'] == release.version
+-        assert ReleaseCommit.objects.filter(
+-            commit__repository_id=repo.id,
+-            commit__key='62de626b7c7cfb8e77efb4273b1a3df4123e6216',
+-            release__version=response.data['version'],
+-        ).exists()
+-        assert ReleaseCommit.objects.filter(
+-            commit__repository_id=repo.id,
+-            commit__key='58de626b7c7cfb8e77efb4273b1a3df4123e6345',
+-            release__version=response.data['version'],
+-        ).exists()
+-        assert ReleaseCommit.objects.filter(
+-            commit__repository_id=repo2.id,
+-            commit__key='62de626b7c7cfb8e77efb4273b1a3df4123e6216',
+-            release__version=response.data['version'],
+-        ).exists()
+-        assert ReleaseCommit.objects.filter(
+-            commit__repository_id=repo2.id,
+-            commit__key='58de626b7c7cfb8e77efb4273b1a3df4123e6345',
+-            release__version=response.data['version'],
+-        ).exists()
+ 
+         release = Release.objects.get(id=release.id)
+         assert release.ref == 'master'
+diff --git a/tests/sentry/api/endpoints/test_organization_releases.py b/tests/sentry/api/endpoints/test_organization_releases.py
+index 526196db78..005bcb7140 100644
+--- a/tests/sentry/api/endpoints/test_organization_releases.py
++++ b/tests/sentry/api/endpoints/test_organization_releases.py
+@@ -1,5 +1,7 @@
+ from __future__ import absolute_import
+ 
++from mock import patch
++
+ from base64 import b64encode
+ from datetime import datetime
+ from django.core.urlresolvers import reverse
+@@ -437,7 +439,8 @@ class OrganizationReleaseCreateTest(APITestCase):
+         for rc in rc_list:
+             assert rc.organization_id
+ 
+-    def test_commits_from_provider(self):
++    @patch('sentry.tasks.commits.fetch_commits')
++    def test_commits_from_provider(self, mock_fetch_commits):
+         user = self.create_user(is_staff=False, is_superuser=False)
+         org = self.create_organization()
+         org.flags.allow_joinleave = False
+@@ -484,29 +487,21 @@ class OrganizationReleaseCreateTest(APITestCase):
+             'projects': [project.slug]
+         })
+         assert response.status_code == 201
+-        # check fake commits from dummy repo provider were created
+-        assert ReleaseCommit.objects.filter(
+-            commit__repository_id=repo.id,
+-            commit__key='62de626b7c7cfb8e77efb4273b1a3df4123e6216',
+-            release__version=response.data['version'],
+-        ).exists()
+-        assert ReleaseCommit.objects.filter(
+-            commit__repository_id=repo.id,
+-            commit__key='58de626b7c7cfb8e77efb4273b1a3df4123e6345',
+-            release__version=response.data['version'],
+-        ).exists()
+-        assert ReleaseCommit.objects.filter(
+-            commit__repository_id=repo2.id,
+-            commit__key='62de626b7c7cfb8e77efb4273b1a3df4123e6216',
+-            release__version=response.data['version'],
+-        ).exists()
+-        assert ReleaseCommit.objects.filter(
+-            commit__repository_id=repo2.id,
+-            commit__key='58de626b7c7cfb8e77efb4273b1a3df4123e6345',
+-            release__version=response.data['version'],
+-        ).exists()
+ 
+-    def test_commits_from_provider_deprecated_head_commits(self):
++        mock_fetch_commits.apply_async.assert_called_with(
++            kwargs={
++                'release_id': Release.objects.get(version='1.2.1', organization=org).id,
++                'user_id': user.id,
++                'refs': [
++                    {'commit': 'a' * 40, 'repository': repo.name},
++                    {'commit': 'b' * 40, 'repository': repo2.name},
++                ],
++                'prev_release_id': Release.objects.get(version='1', organization=org).id,
++            }
++        )
++
++    @patch('sentry.tasks.commits.fetch_commits')
++    def test_commits_from_provider_deprecated_head_commits(self, mock_fetch_commits):
+         user = self.create_user(is_staff=False, is_superuser=False)
+         org = self.create_organization()
+         org.flags.allow_joinleave = False
+@@ -552,28 +547,19 @@ class OrganizationReleaseCreateTest(APITestCase):
+             ],
+             'projects': [project.slug]
+         })
++
++        mock_fetch_commits.apply_async.assert_called_with(
++            kwargs={
++                'release_id': Release.objects.get(version='1.2.1', organization=org).id,
++                'user_id': user.id,
++                'refs': [
++                    {'commit': 'a' * 40, 'repository': repo.name, 'previousCommit': None},
++                    {'commit': 'b' * 40, 'repository': repo2.name, 'previousCommit': None},
++                ],
++                'prev_release_id': Release.objects.get(version='1', organization=org).id,
++            }
++        )
+         assert response.status_code == 201
+-        # check fake commits from dummy repo provider were created
+-        assert ReleaseCommit.objects.filter(
+-            commit__repository_id=repo.id,
+-            commit__key='62de626b7c7cfb8e77efb4273b1a3df4123e6216',
+-            release__version=response.data['version'],
+-        ).exists()
+-        assert ReleaseCommit.objects.filter(
+-            commit__repository_id=repo.id,
+-            commit__key='58de626b7c7cfb8e77efb4273b1a3df4123e6345',
+-            release__version=response.data['version'],
+-        ).exists()
+-        assert ReleaseCommit.objects.filter(
+-            commit__repository_id=repo2.id,
+-            commit__key='62de626b7c7cfb8e77efb4273b1a3df4123e6216',
+-            release__version=response.data['version'],
+-        ).exists()
+-        assert ReleaseCommit.objects.filter(
+-            commit__repository_id=repo2.id,
+-            commit__key='58de626b7c7cfb8e77efb4273b1a3df4123e6345',
+-            release__version=response.data['version'],
+-        ).exists()
+ 
+     def test_bad_project_slug(self):
+         user = self.create_user(is_staff=False, is_superuser=False)
+@@ -712,7 +698,8 @@ class OrganizationReleaseCreateTest(APITestCase):
+             }, HTTP_AUTHORIZATION='Basic ' + b64encode('{}:'.format(good_api_key.key)))
+         assert response.status_code == 201, response.content
+ 
+-    def test_api_token(self):
++    @patch('sentry.tasks.commits.fetch_commits')
++    def test_api_token(self, mock_fetch_commits):
+         user = self.create_user(is_staff=False, is_superuser=False)
+         org = self.create_organization()
+         org.flags.allow_joinleave = False
+@@ -748,41 +735,25 @@ class OrganizationReleaseCreateTest(APITestCase):
+             'organization_slug': org.slug
+         })
+ 
+-        response = self.client.post(url, data={
+-            'version': '1',
+-            'headCommits': [
+-                {'currentId': 'b' * 40, 'repository': repo2.name},
+-            ],
+-            'projects': [project1.slug]
+-        }, HTTP_AUTHORIZATION='Bearer {}'.format(api_token.token))
+         response = self.client.post(url, data={
+             'version': '1.2.1',
+-            'headCommits': [
+-                {'currentId': 'a' * 40, 'repository': repo.name, 'previousId': 'c' * 40},
+-                {'currentId': 'b' * 40, 'repository': repo2.name},
++            'refs': [
++                {'commit': 'a' * 40, 'repository': repo.name, 'previousCommit': 'c' * 40},
++                {'commit': 'b' * 40, 'repository': repo2.name},
+             ],
+             'projects': [project1.slug]
+         }, HTTP_AUTHORIZATION='Bearer {}'.format(api_token.token))
+ 
++        mock_fetch_commits.apply_async.assert_called_with(
++            kwargs={
++                'release_id': Release.objects.get(version='1.2.1', organization=org).id,
++                'user_id': user.id,
++                'refs': [
++                    {'commit': 'a' * 40, 'repository': repo.name, 'previousCommit': 'c' * 40},
++                    {'commit': 'b' * 40, 'repository': repo2.name},
++                ],
++                'prev_release_id': release1.id,
++            }
++        )
++
+         assert response.status_code == 201
+-        # check fake commits from dummy repo provider were created
+-        assert ReleaseCommit.objects.filter(
+-            commit__repository_id=repo.id,
+-            commit__key='62de626b7c7cfb8e77efb4273b1a3df4123e6216',
+-            release__version=response.data['version'],
+-        ).exists()
+-        assert ReleaseCommit.objects.filter(
+-            commit__repository_id=repo.id,
+-            commit__key='58de626b7c7cfb8e77efb4273b1a3df4123e6345',
+-            release__version=response.data['version'],
+-        ).exists()
+-        assert ReleaseCommit.objects.filter(
+-            commit__repository_id=repo2.id,
+-            commit__key='62de626b7c7cfb8e77efb4273b1a3df4123e6216',
+-            release__version=response.data['version'],
+-        ).exists()
+-        assert ReleaseCommit.objects.filter(
+-            commit__repository_id=repo2.id,
+-            commit__key='58de626b7c7cfb8e77efb4273b1a3df4123e6345',
+-            release__version=response.data['version'],
+-        ).exists()

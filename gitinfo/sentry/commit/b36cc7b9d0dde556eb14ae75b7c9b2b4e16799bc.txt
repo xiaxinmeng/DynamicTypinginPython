@@ -1,0 +1,321 @@
+commit b36cc7b9d0dde556eb14ae75b7c9b2b4e16799bc
+Author: Armin Ronacher <armin.ronacher@active-4.com>
+Date:   Tue Feb 20 13:55:27 2018 +0100
+
+    fix: Improvements for symcache creation (#7318)
+
+diff --git a/src/sentry/api/endpoints/chunk.py b/src/sentry/api/endpoints/chunk.py
+index 14e614b2cc..3218702d95 100644
+--- a/src/sentry/api/endpoints/chunk.py
++++ b/src/sentry/api/endpoints/chunk.py
+@@ -5,6 +5,7 @@ from rest_framework import status
+ from six.moves.urllib.parse import urljoin
+ from rest_framework.response import Response
+ from django.core.urlresolvers import reverse
++from django.conf import settings
+ from django.db import IntegrityError, transaction
+ 
+ from sentry import options
+@@ -16,7 +17,7 @@ from sentry.api.bases.organization import (OrganizationEndpoint,
+ 
+ MAX_CHUNKS_PER_REQUEST = 64
+ MAX_REQUEST_SIZE = 32 * 1024 * 1024
+-MAX_CONCURRENCY = 4
++MAX_CONCURRENCY = settings.DEBUG and 1 or 4
+ HASH_ALGORITHM = 'sha1'
+ 
+ 
+diff --git a/src/sentry/api/endpoints/dif_files.py b/src/sentry/api/endpoints/dif_files.py
+index 940198f848..e27e4ab27e 100644
+--- a/src/sentry/api/endpoints/dif_files.py
++++ b/src/sentry/api/endpoints/dif_files.py
+@@ -67,13 +67,14 @@ class DifAssembleEndpoint(ProjectEndpoint):
+             name = file_to_assemble.get('name', None)
+             chunks = file_to_assemble.get('chunks', [])
+ 
+-            # First, check if this project already owns the DSymFile
+-            try:
+-                dif = ProjectDSymFile.objects.filter(
+-                    project=project,
+-                    file__checksum=checksum
+-                ).get()
+-            except ProjectDSymFile.DoesNotExist:
++            # First, check if this project already owns the DSymFile.
++            # This can under rare circumstances yield more than one file
++            # which is why we use first() here instead of get().
++            dif = ProjectDSymFile.objects.filter(
++                project=project,
++                file__checksum=checksum
++            ).first()
++            if dif is None:
+                 # It does not exist yet.  Check the state we have in cache
+                 # in case this is a retry poll.
+                 state, detail = get_assemble_status(project, checksum)
+diff --git a/src/sentry/models/dsymfile.py b/src/sentry/models/dsymfile.py
+index 18a2c4f45c..6e545b50d5 100644
+--- a/src/sentry/models/dsymfile.py
++++ b/src/sentry/models/dsymfile.py
+@@ -32,7 +32,7 @@ from sentry import options
+ from sentry.cache import default_cache
+ from sentry.db.models import FlexibleForeignKey, Model, \
+     sane_repr, BaseManager, BoundedPositiveIntegerField
+-from sentry.models.file import File
++from sentry.models.file import File, ChunkFileState
+ from sentry.utils.zip import safe_extract_zip
+ from sentry.constants import KNOWN_DSYM_TYPES
+ from sentry.reprocessing import resolve_processing_issue, \
+@@ -78,7 +78,13 @@ def get_assemble_status(project, checksum):
+ def set_assemble_status(project, checksum, state, detail=None):
+     cache_key = 'assemble-status:%s' % _get_idempotency_id(
+         project, checksum)
+-    default_cache.set(cache_key, (state, detail), 300)
++
++    # If the state is okay we actually clear it from the cache because in
++    # that case a project dsym file was created.
++    if state == ChunkFileState.OK:
++        default_cache.delete(cache_key)
++    else:
++        default_cache.set(cache_key, (state, detail), 300)
+ 
+ 
+ class BadDif(Exception):
+@@ -485,13 +491,23 @@ class DSymCache(object):
+                                    for k, v in conversion_errors.items())
+         return symcaches
+ 
+-    def get_symcache(self, project, uuid, with_conversion_errors=False):
+-        """Return a single symcache."""
+-        symcaches, errors = self.get_symcaches(
+-            project, [uuid], with_conversion_errors=True)
+-        if with_conversion_errors:
+-            return symcaches.get(uuid), errors.get(uuid)
+-        return symcaches.get(uuid)
++    def generate_symcache(self, project, dsym_file, tf=None):
++        """Generate a single symcache for a uuid based on the passed file
++        contents.  If the tempfile is not passed then its opened again.
++        """
++        if not dsym_file.supports_symcache:
++            raise RuntimeError('This file type does not support symcaches')
++        close_tf = False
++        if tf is None:
++            tf = dsym_file.file.getfile(as_tempfile=True)
++            close_tf = True
++        else:
++            tf.seek(0)
++        try:
++            return self._update_cachefile(dsym_file, tf)
++        finally:
++            if close_tf:
++                tf.close()
+ 
+     def fetch_dsyms(self, project, uuids):
+         """Given some uuids returns a uuid to path mapping for where the
+@@ -584,22 +600,36 @@ class DSymCache(object):
+             if dsym_uuid in conversion_errors:
+                 continue
+ 
+-            try:
+-                with dsym_file.file.getfile(as_tempfile=True) as tf:
+-                    fo = FatObject.from_path(tf.name)
+-                    o = fo.get_object(uuid=dsym_file.uuid)
+-                    if o is None:
+-                        continue
+-                    symcache = o.make_symcache()
+-            except SymbolicError as e:
+-                default_cache.set('scbe:%s:%s' % (
+-                    dsym_uuid, dsym_file.file.checksum), e.message,
+-                    CONVERSION_ERROR_TTL)
+-                conversion_errors[dsym_uuid] = e.message
+-                logger.error('dsymfile.symcache-build-error',
+-                             exc_info=True, extra=dict(dsym_uuid=dsym_uuid))
+-                continue
++            with dsym_file.file.getfile(as_tempfile=True) as tf:
++                symcache_file, conversion_error = self._update_cachefile(
++                    dsym_file, tf)
++            if symcache_file is not None:
++                rv.append((dsym_uuid, symcache_file))
++            elif conversion_error is not None:
++                conversion_errors[dsym_uuid] = conversion_error
+ 
++        return rv, conversion_errors
++
++    def _update_cachefile(self, dsym_file, tf):
++        try:
++            fo = FatObject.from_path(tf.name)
++            o = fo.get_object(uuid=dsym_file.uuid)
++            if o is None:
++                return None, None
++            symcache = o.make_symcache()
++        except SymbolicError as e:
++            default_cache.set('scbe:%s:%s' % (
++                dsym_file.uuid, dsym_file.file.checksum), e.message,
++                CONVERSION_ERROR_TTL)
++            logger.error('dsymfile.symcache-build-error',
++                         exc_info=True, extra=dict(dsym_uuid=dsym_file.uuid))
++            return None, e.message
++
++        # We seem to have this task running onconcurrently or some
++        # other task might delete symcaches while this is running
++        # which is why this requires a loop instead of just a retry
++        # on get.
++        for iteration in range(5):
+             file = File.objects.create(
+                 name=dsym_file.uuid,
+                 type='project.symcache',
+@@ -607,23 +637,26 @@ class DSymCache(object):
+             file.putfile(symcache.open_stream())
+             try:
+                 with transaction.atomic():
+-                    rv.append((dsym_uuid, ProjectSymCacheFile.objects.get_or_create(
+-                        project=project,
++                    return ProjectSymCacheFile.objects.get_or_create(
++                        project=dsym_file.project,
+                         cache_file=file,
+                         dsym_file=dsym_file,
+                         defaults=dict(
+                             checksum=dsym_file.file.checksum,
+                             version=symcache.file_format_version,
+                         )
+-                    )[0]))
++                    )[0], None
+             except IntegrityError:
+                 file.delete()
+-                rv.append((dsym_uuid, ProjectSymCacheFile.objects.get(
+-                    project=project,
+-                    dsym_file=dsym_file,
+-                )))
++                try:
++                    return ProjectSymCacheFile.objects.get(
++                        project=dsym_file.project,
++                        dsym_file=dsym_file,
++                    ), None
++                except ProjectSymCacheFile.DoesNotExist:
++                    continue
+ 
+-        return rv, conversion_errors
++        raise RuntimeError('Concurrency error on symcache update')
+ 
+     def _load_cachefiles_via_fs(self, project, cachefiles):
+         rv = {}
+diff --git a/src/sentry/models/file.py b/src/sentry/models/file.py
+index e235039b9a..62721e38c3 100644
+--- a/src/sentry/models/file.py
++++ b/src/sentry/models/file.py
+@@ -274,8 +274,10 @@ class File(Model):
+ 
+     def assemble_from_file_blob_ids(self, file_blob_ids, checksum, commit=True):
+         """
+-        This creates a file, from file blobs
++        This creates a file, from file blobs and returns a temp file with the
++        contents.
+         """
++        tf = tempfile.NamedTemporaryFile()
+         with transaction.atomic():
+             file_blobs = FileBlob.objects.filter(id__in=file_blob_ids).all()
+             # Make sure the blobs are sorted with the order provided
+@@ -291,6 +293,7 @@ class File(Model):
+                 )
+                 for chunk in blob.getfile().chunks():
+                     new_checksum.update(chunk)
++                    tf.write(chunk)
+                 offset += blob.size
+ 
+             self.size = offset
+@@ -302,6 +305,9 @@ class File(Model):
+         metrics.timing('filestore.file-size', offset)
+         if commit:
+             self.save()
++        tf.flush()
++        tf.seek(0)
++        return tf
+ 
+ 
+ class FileBlobIndex(Model):
+diff --git a/src/sentry/tasks/assemble.py b/src/sentry/tasks/assemble.py
+index 45e5789c13..95c83363dc 100644
+--- a/src/sentry/tasks/assemble.py
++++ b/src/sentry/tasks/assemble.py
+@@ -20,21 +20,22 @@ def assemble_dif(project_id, name, checksum, chunks, **kwargs):
+         set_assemble_status(project, checksum, ChunkFileState.ASSEMBLING)
+ 
+         # Assemble the chunks into files
+-        file = assemble_file(project, name, checksum, chunks,
+-                             file_type='project.dsym')
++        rv = assemble_file(project, name, checksum, chunks,
++                           file_type='project.dsym')
+ 
+         # If not file has been created this means that the file failed to
+         # assemble because of bad input data.  Return.
+-        if file is None:
++        if rv is None:
+             return
+ 
++        file, temp_file = rv
+         delete_file = True
+         try:
+-            with file.getfile(as_tempfile=True) as tf:
++            with temp_file:
+                 # We only permit split difs to hit this endpoint.  The
+                 # client is required to split them up first or we error.
+                 try:
+-                    result = dsymfile.detect_dif_from_path(tf.name)
++                    result = dsymfile.detect_dif_from_path(temp_file.name)
+                 except BadDif as e:
+                     set_assemble_status(project, checksum, ChunkFileState.ERROR,
+                                         detail=e.args[0])
+@@ -55,13 +56,21 @@ def assemble_dif(project_id, name, checksum, chunks, **kwargs):
+                 delete_file = False
+                 bump_reprocessing_revision(project)
+ 
+-                # XXX: this should only be done for files that
+-                symcache, error = ProjectDSymFile.dsymcache.get_symcache(
+-                    project, file_uuid, with_conversion_errors=True)
+-                if error is not None:
+-                    set_assemble_status(project, checksum, ChunkFileState.ERROR,
+-                                        detail=error)
+-                else:
++                indicate_success = True
++
++                # If we need to write a symcache we can use the
++                # `generate_symcache` method to attempt to write one.
++                # This way we can also capture down the error if we need
++                # to.
++                if dsym.supports_symcache:
++                    symcache, error = ProjectDSymFile.dsymcache.generate_symcache(
++                        project, dsym, temp_file)
++                    if error is not None:
++                        set_assemble_status(project, checksum, ChunkFileState.ERROR,
++                                            detail=error)
++                        indicate_success = False
++
++                if indicate_success:
+                     set_assemble_status(project, checksum, ChunkFileState.OK)
+         finally:
+             if delete_file:
+@@ -100,11 +109,11 @@ def assemble_file(project, name, checksum, chunks, file_type):
+         type=file_type,
+     )
+     try:
+-        file.assemble_from_file_blob_ids(file_blob_ids, checksum)
++        temp_file = file.assemble_from_file_blob_ids(file_blob_ids, checksum)
+     except AssembleChecksumMismatch:
+         file.delete()
+         set_assemble_status(project, checksum, ChunkFileState.ERROR,
+                             detail='Reported checksum mismatch')
+     else:
+         file.save()
+-        return file
++        return file, temp_file
+diff --git a/tests/sentry/api/endpoints/test_dif_assemble.py b/tests/sentry/api/endpoints/test_dif_assemble.py
+index 969908602f..fb14e5d454 100644
+--- a/tests/sentry/api/endpoints/test_dif_assemble.py
++++ b/tests/sentry/api/endpoints/test_dif_assemble.py
+@@ -253,7 +253,7 @@ class DifAssembleEndpoint(APITestCase):
+             }
+         )
+ 
+-        file = assemble_file(self.project, 'test', total_checksum, chunks, 'project.dsym')
++        file = assemble_file(self.project, 'test', total_checksum, chunks, 'project.dsym')[0]
+         assert get_assemble_status(self.project, total_checksum)[0] != ChunkFileState.ERROR
+         assert file.checksum == total_checksum
+ 

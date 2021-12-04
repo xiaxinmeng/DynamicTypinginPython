@@ -1,0 +1,315 @@
+commit 3b5d06eb1e28767a17cedab21c52a59ef99e2c0c
+Author: jreback <jeff@reback.net>
+Date:   Tue Aug 20 18:03:10 2013 -0400
+
+    BUG: Fix assignment with iloc/loc involving a dtype change in an existing column (GH4312)
+
+diff --git a/doc/source/release.rst b/doc/source/release.rst
+index 9be9a03b0..b69c6aefd 100644
+--- a/doc/source/release.rst
++++ b/doc/source/release.rst
+@@ -265,6 +265,8 @@ See :ref:`Internal Refactoring<whatsnew_0130.refactoring>`
+   - Fixed issue where ``DataFrame.apply`` was reraising exceptions incorrectly
+     (causing the original stack trace to be truncated).
+   - Fix selection with ``ix/loc`` and non_unique selectors (:issue:`4619`)
++  - Fix assignment with iloc/loc involving a dtype change in an existing column (:issue:`4312`)
++    have internal setitem_with_indexer in core/indexing to use Block.setitem
+ 
+ pandas 0.12
+ ===========
+diff --git a/pandas/core/common.py b/pandas/core/common.py
+index e46abb4aa..0d3bd1a0c 100644
+--- a/pandas/core/common.py
++++ b/pandas/core/common.py
+@@ -891,42 +891,6 @@ def _maybe_upcast_putmask(result, mask, other, dtype=None, change=None):
+ 
+     return result, False
+ 
+-
+-def _maybe_upcast_indexer(result, indexer, other, dtype=None):
+-    """ a safe version of setitem that (potentially upcasts the result
+-        return the result and a changed flag
+-        """
+-
+-    other = _maybe_cast_scalar(result.dtype, other)
+-    original_dtype = result.dtype
+-
+-    def changeit():
+-        # our type is wrong here, need to upcast
+-        r, fill_value = _maybe_upcast(
+-            result, fill_value=other, dtype=dtype, copy=True)
+-        try:
+-            r[indexer] = other
+-        except:
+-
+-            # if we hit this then we still have an incompatible type
+-            r[indexer] = fill_value
+-
+-        # if we have changed to floats, might want to cast back if we can
+-        r = _possibly_downcast_to_dtype(r, original_dtype)
+-        return r, True
+-
+-    new_dtype, fill_value = _maybe_promote(original_dtype, other)
+-    if new_dtype != result.dtype:
+-        return changeit()
+-
+-    try:
+-        result[indexer] = other
+-    except:
+-        return changeit()
+-
+-    return result, False
+-
+-
+ def _maybe_upcast(values, fill_value=np.nan, dtype=None, copy=False):
+     """ provide explicty type promotion and coercion
+ 
+@@ -987,6 +951,12 @@ def _possibly_downcast_to_dtype(result, dtype):
+         dtype = np.dtype(dtype)
+ 
+     try:
++
++        # don't allow upcasts here
++        if dtype.kind == result.dtype.kind:
++            if result.dtype.itemsize <= dtype.itemsize:
++                return result
++
+         if issubclass(dtype.type, np.floating):
+             return result.astype(dtype)
+         elif dtype == np.bool_ or issubclass(dtype.type, np.integer):
+diff --git a/pandas/core/groupby.py b/pandas/core/groupby.py
+index d85ef1abd..1f15f1a8a 100644
+--- a/pandas/core/groupby.py
++++ b/pandas/core/groupby.py
+@@ -1557,7 +1557,9 @@ class SeriesGroupBy(GroupBy):
+ 
+             # need to do a safe put here, as the dtype may be different
+             # this needs to be an ndarray
+-            result,_ = com._maybe_upcast_indexer(result, indexer, res)
++            result = Series(result)
++            result.loc[indexer] = res
++            result = result.values
+ 
+         # downcast if we can (and need)
+         result = _possibly_downcast_to_dtype(result, dtype)
+diff --git a/pandas/core/indexing.py b/pandas/core/indexing.py
+index 3a0123b40..64760cdba 100644
+--- a/pandas/core/indexing.py
++++ b/pandas/core/indexing.py
+@@ -124,11 +124,13 @@ class _NDFrameIndexer(object):
+             item_labels = self.obj._get_axis(info_axis)
+ 
+             def setter(item, v):
+-                data = self.obj[item]
+-                values = data.values
+-                if np.prod(values.shape):
+-                    result, changed = com._maybe_upcast_indexer(values,plane_indexer,v,dtype=getattr(data,'dtype',None))
+-                    self.obj[item] = result
++                s = self.obj[item]
++                pi = plane_indexer[0] if len(plane_indexer) == 1 else plane_indexer
++
++                # set the item, possibly having a dtype change
++                s = s.copy()
++                s._data = s._data.setitem(pi,v)
++                self.obj[item] = s
+ 
+             labels = item_labels[info_idx]
+ 
+diff --git a/pandas/core/internals.py b/pandas/core/internals.py
+index ecce50828..9ca4dcda3 100644
+--- a/pandas/core/internals.py
++++ b/pandas/core/internals.py
+@@ -39,6 +39,7 @@ class Block(PandasObject):
+     is_float = False
+     is_integer = False
+     is_complex = False
++    is_datetime = False
+     is_bool = False
+     is_object = False
+     is_sparse = False
+@@ -453,10 +454,19 @@ class Block(PandasObject):
+     def _try_cast(self, value):
+         raise NotImplementedError()
+ 
+-    def _try_cast_result(self, result):
++    def _try_cast_result(self, result, dtype=None):
+         """ try to cast the result to our original type,
+         we may have roundtripped thru object in the mean-time """
+-        return result
++        if dtype is None:
++            dtype = self.dtype
++
++        if self.is_integer or self.is_bool or self.is_datetime:
++            pass
++        elif self.is_float and result.dtype == self.dtype:
++            return result
++
++        # may need to change the dtype here
++        return _possibly_downcast_to_dtype(result, dtype)
+ 
+     def _try_coerce_args(self, values, other):
+         """ provide coercion to our input arguments """
+@@ -513,27 +523,29 @@ class Block(PandasObject):
+         """ set the value inplace; return a new block (of a possibly different dtype)
+             indexer is a direct slice/positional indexer; value must be a compaitable shape """
+ 
+-        values = self.values
+-        if self.ndim == 2:
+-            values = values.T
++        # coerce args
++        values, value = self._try_coerce_args(self.values, value)
++        arr_value = np.array(value)
+ 
+-        # 2-d (DataFrame) are represented as a transposed array
+-        if self._can_hold_element(value):
+-            try:
+-                values[indexer] = value
+-                return [ self ]
+-            except (IndexError):
+-                return [ self ]
+-            except:
+-                pass
++        # cast the values to a type that can hold nan (if necessary)
++        if not self._can_hold_element(value):
++            dtype, _ = com._maybe_promote(arr_value.dtype)
++            values = values.astype(dtype)
+ 
+-        # create an indexing mask, the putmask which potentially changes the dtype
+-        indices = np.arange(np.prod(values.shape)).reshape(values.shape)
+-        mask = indices[indexer] == indices
+-        if self.ndim == 2:
+-            mask = mask.T
++        try:
++            # set and return a block
++            transf = (lambda x: x.T) if self.ndim == 2 else (lambda x: x)
++            values = transf(values)
++            values[indexer] = value
++
++            # coerce and try to infer the dtypes of the result
++            values = self._try_coerce_result(values)
++            values = self._try_cast_result(values, 'infer')
++            return [make_block(transf(values), self.items, self.ref_items, ndim=self.ndim, fastpath=True)]
++        except:
++            pass
+ 
+-        return self.putmask(mask, value, inplace=True)
++        return [ self ]
+ 
+     def putmask(self, mask, new, inplace=False):
+         """ putmask the data to the block; it is possible that we may create a new dtype of block
+@@ -585,7 +597,10 @@ class Block(PandasObject):
+                 if nv is None:
+                     dtype, _ = com._maybe_promote(n.dtype)
+                     nv = v.astype(dtype)
+-                    np.putmask(nv, m, n)
++                    try:
++                        nv[m] = n
++                    except:
++                        np.putmask(nv, m, n)
+ 
+                 if reshape:
+                     nv = _block_shape(nv)
+@@ -842,10 +857,6 @@ class NumericBlock(Block):
+     is_numeric = True
+     _can_hold_na = True
+ 
+-    def _try_cast_result(self, result):
+-        return _possibly_downcast_to_dtype(result, self.dtype)
+-
+-
+ class FloatBlock(NumericBlock):
+     is_float = True
+     _downcast_dtype = 'int64'
+@@ -1104,6 +1115,7 @@ class ObjectBlock(Block):
+ 
+ 
+ class DatetimeBlock(Block):
++    is_datetime = True
+     _can_hold_na = True
+ 
+     def __init__(self, values, items, ref_items, fastpath=False, placement=None, **kwargs):
+@@ -1119,8 +1131,8 @@ class DatetimeBlock(Block):
+     def _can_hold_element(self, element):
+         if is_list_like(element):
+             element = np.array(element)
+-            return element.dtype == _NS_DTYPE
+-        return com.is_integer(element) or isinstance(element, datetime)
++            return element.dtype == _NS_DTYPE or element.dtype == np.int64
++        return com.is_integer(element) or isinstance(element, datetime) or isnull(element)
+ 
+     def _try_cast(self, element):
+         try:
+@@ -1133,10 +1145,10 @@ class DatetimeBlock(Block):
+             we are going to compare vs i8, so coerce to integer
+             values is always ndarra like, other may not be """
+         values = values.view('i8')
+-        if isinstance(other, datetime):
+-            other = lib.Timestamp(other).asm8.view('i8')
+-        elif isnull(other):
++        if isnull(other) or (np.isscalar(other) and other == tslib.iNaT):
+             other = tslib.iNaT
++        elif isinstance(other, datetime):
++            other = lib.Timestamp(other).asm8.view('i8')
+         else:
+             other = other.view('i8')
+ 
+@@ -1438,6 +1450,8 @@ class SparseBlock(Block):
+             return []
+         return super(SparseBlock, self).split_block_at(self, item)
+ 
++    def _try_cast_result(self, result, dtype=None):
++        return result
+ 
+ def make_block(values, items, ref_items, klass=None, ndim=None, dtype=None, fastpath=False, placement=None):
+ 
+diff --git a/pandas/tests/test_common.py b/pandas/tests/test_common.py
+index 946e640d3..799cdd31c 100644
+--- a/pandas/tests/test_common.py
++++ b/pandas/tests/test_common.py
+@@ -127,14 +127,14 @@ def test_nan_to_nat_conversions():
+     result = df.loc[4,'B'].value
+     assert(result == iNaT)
+ 
+-    values = df['B'].values
+-    result, changed = com._maybe_upcast_indexer(values,tuple([slice(8,9)]),np.nan)
+-    assert(isnull(result[8]))
++    s = df['B'].copy()
++    s._data = s._data.setitem(tuple([slice(8,9)]),np.nan)
++    assert(isnull(s[8]))
+ 
+     # numpy < 1.7.0 is wrong
+     from distutils.version import LooseVersion
+     if LooseVersion(np.__version__) >= '1.7.0':
+-        assert(result[8] == np.datetime64('NaT'))
++        assert(s[8].value == np.datetime64('NaT').astype(np.int64))
+ 
+ def test_any_none():
+     assert(com._any_none(1, 2, 3, None))
+diff --git a/pandas/tests/test_frame.py b/pandas/tests/test_frame.py
+index 1a65eec85..c8f87a19a 100644
+--- a/pandas/tests/test_frame.py
++++ b/pandas/tests/test_frame.py
+@@ -7669,10 +7669,9 @@ class TestDataFrame(unittest.TestCase, CheckIndexing,
+         # upcasting case (GH # 2794)
+         df = DataFrame(dict([ (c,Series([1]*3,dtype=c)) for c in ['int64','int32','float32','float64'] ]))
+         df.ix[1,:] = 0
+-
+         result = df.where(df>=0).get_dtype_counts()
+ 
+-        #### when we don't preserver boolean casts ####
++        #### when we don't preserve boolean casts ####
+         #expected = Series({ 'float32' : 1, 'float64' : 3 })
+ 
+         expected = Series({ 'float32' : 1, 'float64' : 1, 'int32' : 1, 'int64' : 1 })
+diff --git a/pandas/tests/test_indexing.py b/pandas/tests/test_indexing.py
+index 12b7a239b..76003de65 100644
+--- a/pandas/tests/test_indexing.py
++++ b/pandas/tests/test_indexing.py
+@@ -942,6 +942,7 @@ class TestIndexing(unittest.TestCase):
+         # frame on rhs
+         df2.ix[mask, cols]= dft.ix[mask, cols]
+         assert_frame_equal(df2,expected)
++
+         df2.ix[mask, cols]= dft.ix[mask, cols]
+         assert_frame_equal(df2,expected)
+ 

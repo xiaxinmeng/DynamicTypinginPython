@@ -1,0 +1,346 @@
+commit 3807827a09270db3c57a6d70970c29f553f74068
+Author: Matt Robenolt <matt@ydekproductions.com>
+Date:   Fri Jan 25 22:28:19 2019 -0800
+
+    feat(nodestore): Add Bigtable backend
+
+diff --git a/requirements-optional.txt b/requirements-optional.txt
+index 194728c7b6..04ecd66102 100644
+--- a/requirements-optional.txt
++++ b/requirements-optional.txt
+@@ -1,6 +1,7 @@
+ batching-kafka-consumer==0.0.3
+ confluent-kafka==0.11.5
+ GeoIP==1.3.2
++google-cloud-bigtable>=0.32.1,<0.33.0
+ google-cloud-pubsub>=0.35.4,<0.36.0
+-google-cloud-storage>=1.10.0,<1.11.0
++google-cloud-storage>=1.13.2,<1.14
+ python3-saml>=1.4.0,<1.5
+diff --git a/src/sentry/conf/server.py b/src/sentry/conf/server.py
+index 87216a9288..d7e9eda481 100644
+--- a/src/sentry/conf/server.py
++++ b/src/sentry/conf/server.py
+@@ -1402,6 +1402,10 @@ SENTRY_DEVSERVICES = {
+             'REDIS_DB': '1',
+         },
+     },
++    'bigtable': {
++        'image': 'mattrobenolt/cbtemulator:0.36.0',
++        'ports': {'8086/tcp': 8086},
++    },
+ }
+ 
+ # Max file size for avatar photo uploads
+diff --git a/src/sentry/nodestore/base.py b/src/sentry/nodestore/base.py
+index b8a6c1e5b8..abcc10544b 100644
+--- a/src/sentry/nodestore/base.py
++++ b/src/sentry/nodestore/base.py
+@@ -64,7 +64,7 @@ class NodeStorage(local, Service):
+         """
+         return dict((id, self.get(id)) for id in id_list)
+ 
+-    def set(self, id, data):
++    def set(self, id, data, ttl=None):
+         """
+         >>> nodestore.set('key1', {'foo': 'bar'})
+         """
+diff --git a/src/sentry/nodestore/bigtable/__init__.py b/src/sentry/nodestore/bigtable/__init__.py
+new file mode 100644
+index 0000000000..1bd374084e
+--- /dev/null
++++ b/src/sentry/nodestore/bigtable/__init__.py
+@@ -0,0 +1,3 @@
++from __future__ import absolute_import, print_function
++
++from .backend import *  # NOQA
+diff --git a/src/sentry/nodestore/bigtable/backend.py b/src/sentry/nodestore/bigtable/backend.py
+new file mode 100644
+index 0000000000..168b642cdb
+--- /dev/null
++++ b/src/sentry/nodestore/bigtable/backend.py
+@@ -0,0 +1,201 @@
++from __future__ import absolute_import, print_function
++
++import struct
++from zlib import compress as zlib_compress, decompress as zlib_decompress
++
++from google.cloud import bigtable
++from simplejson import JSONEncoder, _default_decoder
++from django.utils import timezone
++
++from sentry.nodestore.base import NodeStorage
++from sentry.utils.cache import memoize
++
++# Cache an instance of the encoder we want to use
++json_dumps = JSONEncoder(
++    separators=(',', ':'),
++    skipkeys=False,
++    ensure_ascii=True,
++    check_circular=True,
++    allow_nan=True,
++    indent=None,
++    encoding='utf-8',
++    default=None,
++).encode
++
++json_loads = _default_decoder.decode
++
++
++class BigtableNodeStorage(NodeStorage):
++    """
++    A Bigtable-based backend for storing node data.
++
++    >>> BigtableNodeStorage(
++    ...     project='some-project',
++    ...     instance='sentry',
++    ...     table='nodestore',
++    ...     default_ttl=timedelta(days=30),
++    ...     compression=True,
++    ... )
++    """
++
++    max_size = 1024 * 1024 * 10
++    column_family = b'x'
++    ttl_column = b't'
++    flags_column = b'f'
++    data_column = b'0'
++
++    _FLAG_COMPRESSED = 1 << 0
++
++    def __init__(self, project=None, instance='sentry', table='nodestore',
++                 automatic_expiry=False, default_ttl=None, compression=False, **kwargs):
++        self.project = project
++        self.instance = instance
++        self.table = table
++        self.options = kwargs
++        self.automatic_expiry = automatic_expiry
++        self.default_ttl = default_ttl
++        self.compression = compression
++        super(BigtableNodeStorage, self).__init__()
++
++    @memoize
++    def connection(self):
++        return (
++            bigtable.Client(project=self.project, **self.options)
++            .instance(self.instance)
++            .table(self.table)
++        )
++
++    def delete(self, id):
++        row = self.connection.row(id)
++        row.delete()
++        self.connection.mutate_rows([row])
++
++    def get(self, id):
++        row = self.connection.read_row(id)
++        if row is None:
++            return None
++
++        columns = row.cells[self.column_family]
++
++        try:
++            cell = columns[self.data_column][0]
++        except KeyError:
++            return None
++
++        # Check if a TTL column exists
++        # for this row. If there is,
++        # we can use the `timestamp` property of the
++        # cells to see if we should return the
++        # row or not.
++        if self.ttl_column in columns:
++            # If we needed the actual value, we could unpack it.
++            # ttl = struct.unpack('<I', columns[self.ttl_column][0].value)[0]
++            if cell.timestamp < timezone.now():
++                return None
++
++        data = cell.value
++
++        # Read our flags
++        flags = 0
++        if self.flags_column in columns:
++            flags = struct.unpack('B', columns[self.flags_column][0].value)[0]
++
++        # Check for a compression flag on, if so
++        # decompress the data.
++        if flags & self._FLAG_COMPRESSED:
++            data = zlib_decompress(data)
++
++        return json_loads(data)
++
++    def set(self, id, data, ttl=None):
++        data = json_dumps(data)
++
++        row = self.connection.row(id)
++        # Call to delete is just a state mutation,
++        # and in this case is just used to clear all columns
++        # so the entire row will be replaced. Otherwise,
++        # if an existing row were mutated, and it took up more
++        # than one column, it'd be possible to overwrite
++        # beginning columns and still retain the end ones.
++        row.delete()
++
++        # If we are setting a TTL on this row,
++        # we want to set the timestamp of the cells
++        # into the future. This allows our GC policy
++        # to delete them when the time comes. It also
++        # allows us to filter the rows on read if
++        # we are past the timestamp to not return.
++        # We want to set a ttl column to the ttl
++        # value in the future if we wanted to bump the timestamp
++        # and rewrite a row with a new ttl.
++        ttl = ttl or self.default_ttl
++        if ttl is None:
++            ts = None
++        else:
++            ts = timezone.now() + ttl
++            row.set_cell(
++                self.column_family,
++                self.ttl_column,
++                struct.pack('<I', int(ttl.total_seconds())),
++                timestamp=ts,
++            )
++
++        # Track flags for metadata about this row.
++        # This only flag we're tracking now is whether compression
++        # is on or not for the data column.
++        flags = 0
++        if self.compression:
++            flags |= self._FLAG_COMPRESSED
++            data = zlib_compress(data)
++
++        # Only need to write the column at all if any flags
++        # are enabled. And if so, pack it into a single byte.
++        if flags:
++            row.set_cell(
++                self.column_family,
++                self.flags_column,
++                struct.pack('B', flags),
++                timestamp=ts,
++            )
++
++        assert len(data) <= self.max_size
++
++        row.set_cell(
++            self.column_family,
++            self.data_column,
++            data,
++            timestamp=ts,
++        )
++        self.connection.mutate_rows([row])
++
++    def cleanup(self, cutoff_timestamp):
++        raise NotImplementedError
++
++    def bootstrap(self):
++        table = (
++            bigtable.Client(project=self.project, admin=True, **self.options)
++            .instance(self.instance)
++            .table(self.table)
++        )
++        if table.exists():
++            return
++
++        # With automatic expiry, we set a GC rule to automatically
++        # delete rows with an age of 0. This sounds odd, but when
++        # we write rows, we write them with a future timestamp as long
++        # as a TTL is set during write. By doing this, we are effectively
++        # writing rows into the future, and they will be deleted due to TTL
++        # when their timestamp is passed.
++        if self.automatic_expiry:
++            from datetime import timedelta
++            # NOTE: Bigtable can't actually use 0 TTL, and
++            # requires a minimum value of 1ms.
++            # > InvalidArgument desc = Error in field 'Modifications list' : Error in element #0 : max_age must be at least one millisecond
++            delta = timedelta(milliseconds=1)
++            gc_rule = bigtable.column_family.MaxAgeGCRule(delta)
++        else:
++            gc_rule = None
++
++        table.create(column_families={
++            self.column_family: gc_rule,
++        })
+diff --git a/src/sentry/nodestore/cassandra/backend.py b/src/sentry/nodestore/cassandra/backend.py
+index 7a389db8f8..12b4c1e98c 100644
+--- a/src/sentry/nodestore/cassandra/backend.py
++++ b/src/sentry/nodestore/cassandra/backend.py
+@@ -50,5 +50,5 @@ class CassandraNodeStorage(NodeStorage):
+     def get_multi(self, id_list):
+         return self.connection.get_multi(id_list)
+ 
+-    def set(self, id, data):
++    def set(self, id, data, ttl=None):
+         self.connection.set(id, data)
+diff --git a/src/sentry/nodestore/django/backend.py b/src/sentry/nodestore/django/backend.py
+index 2592f1bf2f..eec46c8a2b 100644
+--- a/src/sentry/nodestore/django/backend.py
++++ b/src/sentry/nodestore/django/backend.py
+@@ -34,7 +34,7 @@ class DjangoNodeStorage(NodeStorage):
+     def delete_multi(self, id_list):
+         Node.objects.filter(id__in=id_list).delete()
+ 
+-    def set(self, id, data):
++    def set(self, id, data, ttl=None):
+         create_or_update(
+             Node,
+             id=id,
+diff --git a/src/sentry/nodestore/multi/backend.py b/src/sentry/nodestore/multi/backend.py
+index d15e992f05..6089b0e5e4 100644
+--- a/src/sentry/nodestore/multi/backend.py
++++ b/src/sentry/nodestore/multi/backend.py
+@@ -50,11 +50,11 @@ class MultiNodeStorage(NodeStorage):
+         backend = self.read_selector(self.backends)
+         return backend.get_multi(id_list=id_list)
+ 
+-    def set(self, id, data):
++    def set(self, id, data, ttl=None):
+         should_raise = False
+         for backend in self.backends:
+             try:
+-                backend.set(id, data)
++                backend.set(id, data, ttl=ttl)
+             except Exception:
+                 should_raise = True
+ 
+diff --git a/src/sentry/nodestore/riak/backend.py b/src/sentry/nodestore/riak/backend.py
+index 331eec859c..396b8b9427 100644
+--- a/src/sentry/nodestore/riak/backend.py
++++ b/src/sentry/nodestore/riak/backend.py
+@@ -68,7 +68,7 @@ class RiakNodeStorage(NodeStorage):
+         self.automatic_expiry = automatic_expiry
+         self.skip_deletes = automatic_expiry and '_SENTRY_CLEANUP' in os.environ
+ 
+-    def set(self, id, data):
++    def set(self, id, data, ttl=None):
+         self.conn.put(self.bucket, id, json_dumps(data), returnbody='false')
+ 
+     def delete(self, id):
+diff --git a/src/sentry/runner/commands/devservices.py b/src/sentry/runner/commands/devservices.py
+index 1c77644419..d0355ec81c 100644
+--- a/src/sentry/runner/commands/devservices.py
++++ b/src/sentry/runner/commands/devservices.py
+@@ -63,6 +63,10 @@ def up(project, exclude):
+     # services are run if they're not needed.
+     if not exclude:
+         exclude = set()
++
++    if 'bigtable' not in settings.SENTRY_NODESTORE:
++        exclude |= {'bigtable'}
++
+     if 'kafka' in settings.SENTRY_EVENTSTREAM:
+         pass
+     elif 'snuba' in settings.SENTRY_EVENTSTREAM:
+diff --git a/tests/sentry/nodestore/multi/backend/tests.py b/tests/sentry/nodestore/multi/backend/tests.py
+index 1a282ff22a..d6a2984e2c 100644
+--- a/tests/sentry/nodestore/multi/backend/tests.py
++++ b/tests/sentry/nodestore/multi/backend/tests.py
+@@ -11,7 +11,7 @@ class InMemoryBackend(NodeStorage):
+     def __init__(self):
+         self._data = {}
+ 
+-    def set(self, id, data):
++    def set(self, id, data, ttl=None):
+         self._data[id] = data
+ 
+     def get(self, id):

@@ -1,0 +1,1067 @@
+commit e87cf4a3cc2d74695b226e6ff073da342f72abf2
+Author: Chris Church <chris@ninemoreminutes.com>
+Date:   Fri Jul 24 12:39:54 2015 -0400
+
+    Fixes for WinRM/PowerShell support in v2.
+    
+    - Add support for inserting module args into PowerShell modules.  Fixes #11661.
+    - Support Windows paths containing spaces.  Applies changes from #10727 to v2.  Fixes #9999.  Should also fix ansible/ansible-modules-core#944 and ansible/ansible-modules-core#1007.
+    - Change how execution policy is set for running remote scripts.  Applies changes from #11092 to v2.  Also fixes ansible/ansible-modules-core#1776.
+    - Use codepage 65001 (UTF-8) for WinRM connection instead of default (CP437), convert command to UTF-8 and results from UTF-8.  Replaces changes from #10024.  Fixes #11198.
+    - Close WinRM connection when task completes.
+    - Use win_stat, win_file and win_copy modules instead of stat, file and copy when called from within other action plugins (only when using WinRM+PowerShell).
+    - Unquote Windows path arguments before passing to win_stat, win_file, win_copy and slurp modules (only when using WinRM/PowerShell).
+    - Check for win_ping module to determine if core modules are missing (only when using WinRM/PowerShell).
+    - Add stdout_lines to result from running low level commands (so stdout_lines is available when using raw/script).
+    - Update copy action plugin to use shell functions for joining paths and checking for trailing slash.
+    - Update fetch action plugin to unquote source path when using Windows paths.
+    - Add win_copy and win_template action plugins that inherit from copy and template.
+    - Support running .bat and .cmd scripts using default system encoding instead of UTF-8.
+    - Always send PowerShell commands as base64-encoded blobs to allow for running simple PowerShell commands via raw.
+    - Support running modules on Windows with interpreters other than PowerShell.
+    - Update integration tests to support above changes and test unicode fixes.
+    - Add test for win_user error from ansible/ansible-modules-core#1241 (fixed by ansible/ansible-modules-core#1774).
+    - Add test for additional win_stat output values (implemented by ansible/ansible-modules-core#1473).
+    - Add test for OS architecture and name from setup.ps1 (implemented by ansible/ansible-modules-core#1100).
+    
+    All WinRM integration tests pass for me with these changes.
+
+diff --git a/lib/ansible/executor/module_common.py b/lib/ansible/executor/module_common.py
+index 85dcafb961..09fdaa46d8 100644
+--- a/lib/ansible/executor/module_common.py
++++ b/lib/ansible/executor/module_common.py
+@@ -37,6 +37,7 @@ REPLACER         = "#<<INCLUDE_ANSIBLE_MODULE_COMMON>>"
+ REPLACER_ARGS    = "\"<<INCLUDE_ANSIBLE_MODULE_ARGS>>\""
+ REPLACER_COMPLEX = "\"<<INCLUDE_ANSIBLE_MODULE_COMPLEX_ARGS>>\""
+ REPLACER_WINDOWS = "# POWERSHELL_COMMON"
++REPLACER_WINARGS = "<<INCLUDE_ANSIBLE_MODULE_WINDOWS_ARGS>>"
+ REPLACER_VERSION = "\"<<ANSIBLE_VERSION>>\""
+ 
+ # We could end up writing out parameters with unicode characters so we need to
+@@ -65,6 +66,8 @@ def _find_snippet_imports(module_data, module_path, strip_comments):
+     module_style = 'old'
+     if REPLACER in module_data:
+         module_style = 'new'
++    elif REPLACER_WINDOWS in module_data:
++        module_style = 'new'
+     elif 'from ansible.module_utils.' in module_data:
+         module_style = 'new'
+     elif 'WANT_JSON' in module_data:
+@@ -165,6 +168,7 @@ def modify_module(module_path, module_args, task_vars=dict(), strip_comments=Fal
+         # these strings should be part of the 'basic' snippet which is required to be included
+         module_data = module_data.replace(REPLACER_VERSION, repr(__version__))
+         module_data = module_data.replace(REPLACER_COMPLEX, encoded_args)
++        module_data = module_data.replace(REPLACER_WINARGS, module_args_json.encode('utf-8'))
+ 
+         if module_style == 'new':
+             facility = C.DEFAULT_SYSLOG_FACILITY
+diff --git a/lib/ansible/executor/task_executor.py b/lib/ansible/executor/task_executor.py
+index 831680d30e..f417a02264 100644
+--- a/lib/ansible/executor/task_executor.py
++++ b/lib/ansible/executor/task_executor.py
+@@ -127,6 +127,13 @@ class TaskExecutor:
+             return result
+         except AnsibleError, e:
+             return dict(failed=True, msg=to_unicode(e, nonstring='simplerepr'))
++        finally:
++            try:
++                self._connection.close()
++            except AttributeError:
++                pass
++            except Exception, e:
++                debug("error closing connection: %s" % to_unicode(e))
+ 
+     def _get_loop_items(self):
+         '''
+diff --git a/lib/ansible/module_utils/powershell.ps1 b/lib/ansible/module_utils/powershell.ps1
+index a11e316989..41e3876d7a 100644
+--- a/lib/ansible/module_utils/powershell.ps1
++++ b/lib/ansible/module_utils/powershell.ps1
+@@ -26,8 +26,17 @@
+ # USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ #
+ 
+-# Helper function to parse Ansible JSON arguments from a file passed as
+-# the single argument to the module
++# Ansible v2 will insert the module arguments below as a string containing
++# JSON; assign them to an environment variable and redefine $args so existing
++# modules will continue to work.
++$complex_args = @'
++<<INCLUDE_ANSIBLE_MODULE_WINDOWS_ARGS>>
++'@
++Set-Content env:MODULE_COMPLEX_ARGS -Value $complex_args
++$args = @('env:MODULE_COMPLEX_ARGS')
++
++# Helper function to parse Ansible JSON arguments from a "file" passed as
++# the single argument to the module.
+ # Example: $params = Parse-Args $args
+ Function Parse-Args($arguments)
+ {
+diff --git a/lib/ansible/plugins/action/__init__.py b/lib/ansible/plugins/action/__init__.py
+index 1a723b99e5..b648f0edae 100644
+--- a/lib/ansible/plugins/action/__init__.py
++++ b/lib/ansible/plugins/action/__init__.py
+@@ -69,9 +69,29 @@ class ActionBase:
+ 
+         # Search module path(s) for named module.
+         module_suffixes = getattr(self._connection, 'default_suffixes', None)
++
++        # Check to determine if PowerShell modules are supported, and apply
++        # some fixes (hacks) to module name + args.
++        if module_suffixes and '.ps1' in module_suffixes:
++            # Use Windows versions of stat/file/copy modules when called from
++            # within other action plugins.
++            if module_name in ('stat', 'file', 'copy') and self._task.action != module_name:
++                module_name = 'win_%s' % module_name
++            # Remove extra quotes surrounding path parameters before sending to module.
++            if module_name in ('win_stat', 'win_file', 'win_copy', 'slurp') and module_args and hasattr(self._connection._shell, '_unquote'):
++                for key in ('src', 'dest', 'path'):
++                    if key in module_args:
++                        module_args[key] = self._connection._shell._unquote(module_args[key])
++
+         module_path = self._shared_loader_obj.module_loader.find_plugin(module_name, module_suffixes)
+         if module_path is None:
+-            module_path2 = self._shared_loader_obj.module_loader.find_plugin('ping', module_suffixes)
++            # Use Windows version of ping module to check module paths when
++            # using a connection that supports .ps1 suffixes.
++            if module_suffixes and '.ps1' in module_suffixes:
++                ping_module = 'win_ping'
++            else:
++                ping_module = 'ping'
++            module_path2 = self._shared_loader_obj.module_loader.find_plugin(ping_module, module_suffixes)
+             if module_path2 is not None:
+                 raise AnsibleError("The module %s was not found in configured module paths" % (module_name))
+             else:
+@@ -265,9 +285,10 @@ class ActionBase:
+ 
+     def _remote_expand_user(self, path, tmp):
+         ''' takes a remote path and performs tilde expansion on the remote host '''
+-        if not path.startswith('~'):
++        if not path.startswith('~'): # FIXME: Windows paths may start with "~ instead of just ~
+             return path
+ 
++        # FIXME: Can't use os.path.sep for Windows paths.
+         split_path = path.split(os.path.sep, 1)
+         expand_path = split_path[0]
+         if expand_path == '~':
+@@ -340,6 +361,8 @@ class ActionBase:
+         remote_module_path = None
+         if not tmp and self._late_needs_tmp_path(tmp, module_style):
+             tmp = self._make_tmp_path()
++
++        if tmp:
+             remote_module_path = self._connection._shell.join_path(tmp, module_name)
+ 
+         # FIXME: async stuff here?
+@@ -457,7 +480,7 @@ class ActionBase:
+         if rc is None:
+             rc = 0
+ 
+-        return dict(rc=rc, stdout=out, stderr=err)
++        return dict(rc=rc, stdout=out, stdout_lines=out.splitlines(), stderr=err)
+ 
+     def _get_first_available_file(self, faf, of=None, searchdir='files'):
+ 
+diff --git a/lib/ansible/plugins/action/copy.py b/lib/ansible/plugins/action/copy.py
+index 1474e476ca..34a426f5e2 100644
+--- a/lib/ansible/plugins/action/copy.py
++++ b/lib/ansible/plugins/action/copy.py
+@@ -53,7 +53,7 @@ class ActionModule(ActionBase):
+         # Check if the source ends with a "/"
+         source_trailing_slash = False
+         if source:
+-            source_trailing_slash = source.endswith(os.sep)
++            source_trailing_slash = self._connection._shell.path_has_trailing_slash(source)
+ 
+         # Define content_tempfile in case we set it after finding content populated.
+         content_tempfile = None
+@@ -182,7 +182,7 @@ class ActionModule(ActionBase):
+                     continue
+ 
+                 # Define a remote directory that we will copy the file to.
+-                tmp_src = tmp + 'source'
++                tmp_src = self._connection._shell.join_path(tmp, 'source')
+ 
+                 if not raw:
+                     self._connection.put_file(source_full, tmp_src)
+diff --git a/lib/ansible/plugins/action/fetch.py b/lib/ansible/plugins/action/fetch.py
+index 9d62a7b978..81edf65ef1 100644
+--- a/lib/ansible/plugins/action/fetch.py
++++ b/lib/ansible/plugins/action/fetch.py
+@@ -78,6 +78,7 @@ class ActionModule(ActionBase):
+ 
+         # calculate the destination name
+         if os.path.sep not in self._connection._shell.join_path('a', ''):
++            source = self._connection._shell._unquote(source)
+             source_local = source.replace('\\', '/')
+         else:
+             source_local = source
+diff --git a/lib/ansible/plugins/action/win_copy.py b/lib/ansible/plugins/action/win_copy.py
+new file mode 100644
+index 0000000000..54d94e12e6
+--- /dev/null
++++ b/lib/ansible/plugins/action/win_copy.py
+@@ -0,0 +1,28 @@
++# (c) 2012-2014, Michael DeHaan <michael.dehaan@gmail.com>
++#
++# This file is part of Ansible
++#
++# Ansible is free software: you can redistribute it and/or modify
++# it under the terms of the GNU General Public License as published by
++# the Free Software Foundation, either version 3 of the License, or
++# (at your option) any later version.
++#
++# Ansible is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU General Public License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
++
++# Make coding more python3-ish
++from __future__ import (absolute_import, division, print_function)
++__metaclass__ = type
++
++from ansible.plugins.action import ActionBase
++from ansible.plugins.action.copy import ActionModule as CopyActionModule
++
++# Even though CopyActionModule inherits from ActionBase, we still need to
++# directly inherit from ActionBase to appease the plugin loader.
++class ActionModule(CopyActionModule, ActionBase):
++    pass
+diff --git a/lib/ansible/plugins/action/win_template.py b/lib/ansible/plugins/action/win_template.py
+new file mode 100644
+index 0000000000..03091d494f
+--- /dev/null
++++ b/lib/ansible/plugins/action/win_template.py
+@@ -0,0 +1,28 @@
++# (c) 2012-2014, Michael DeHaan <michael.dehaan@gmail.com>
++#
++# This file is part of Ansible
++#
++# Ansible is free software: you can redistribute it and/or modify
++# it under the terms of the GNU General Public License as published by
++# the Free Software Foundation, either version 3 of the License, or
++# (at your option) any later version.
++#
++# Ansible is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU General Public License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
++
++# Make coding more python3-ish
++from __future__ import (absolute_import, division, print_function)
++__metaclass__ = type
++
++from ansible.plugins.action import ActionBase
++from ansible.plugins.action.template import ActionModule as TemplateActionModule
++
++# Even though TemplateActionModule inherits from ActionBase, we still need to
++# directly inherit from ActionBase to appease the plugin loader.
++class ActionModule(TemplateActionModule, ActionBase):
++    pass
+diff --git a/lib/ansible/plugins/connections/winrm.py b/lib/ansible/plugins/connections/winrm.py
+index d97db39662..0e19b93ac2 100644
+--- a/lib/ansible/plugins/connections/winrm.py
++++ b/lib/ansible/plugins/connections/winrm.py
+@@ -45,7 +45,7 @@ from ansible.errors import AnsibleError, AnsibleConnectionFailure, AnsibleFileNo
+ from ansible.plugins.connections import ConnectionBase
+ from ansible.plugins import shell_loader
+ from ansible.utils.path import makedirs_safe
+-from ansible.utils.unicode import to_bytes
++from ansible.utils.unicode import to_bytes, to_unicode
+ 
+ class Connection(ConnectionBase):
+     '''WinRM connections over HTTP/HTTPS.'''
+@@ -94,7 +94,7 @@ class Connection(ConnectionBase):
+ 
+             endpoint = parse.urlunsplit((scheme, netloc, '/wsman', '', ''))
+ 
+-            self._display.debug('WINRM CONNECT: transport=%s endpoint=%s' % (transport, endpoint), host=self._play_context.remote_addr)
++            self._display.vvvvv('WINRM CONNECT: transport=%s endpoint=%s' % (transport, endpoint), host=self._play_context.remote_addr)
+             protocol = Protocol(
+                 endpoint,
+                 transport=transport,
+@@ -117,30 +117,30 @@ class Connection(ConnectionBase):
+                         raise AnsibleError("the username/password specified for this server was incorrect")
+                     elif code == 411:
+                         return protocol
+-                self._display.debug('WINRM CONNECTION ERROR: %s' % err_msg, host=self._play_context.remote_addr)
++                self._display.vvvvv('WINRM CONNECTION ERROR: %s' % err_msg, host=self._play_context.remote_addr)
+                 continue
+         if exc:
+             raise AnsibleError(str(exc))
+ 
+     def _winrm_exec(self, command, args=(), from_exec=False):
+         if from_exec:
+-            self._display.debug("WINRM EXEC %r %r" % (command, args), host=self._play_context.remote_addr)
++            self._display.vvvvv("WINRM EXEC %r %r" % (command, args), host=self._play_context.remote_addr)
+         else:
+-            self._display.debugv("WINRM EXEC %r %r" % (command, args), host=self._play_context.remote_addr)
++            self._display.vvvvvv("WINRM EXEC %r %r" % (command, args), host=self._play_context.remote_addr)
+         if not self.protocol:
+             self.protocol = self._winrm_connect()
+         if not self.shell_id:
+-            self.shell_id = self.protocol.open_shell()
++            self.shell_id = self.protocol.open_shell(codepage=65001) # UTF-8
+         command_id = None
+         try:
+-            command_id = self.protocol.run_command(self.shell_id, command, args)
++            command_id = self.protocol.run_command(self.shell_id, to_bytes(command), map(to_bytes, args))
+             response = Response(self.protocol.get_command_output(self.shell_id, command_id))
+             if from_exec:
+-                self._display.debug('WINRM RESULT %r' % response, host=self._play_context.remote_addr)
++                self._display.vvvvv('WINRM RESULT %r' % to_unicode(response), host=self._play_context.remote_addr)
+             else:
+-                self._display.debugv('WINRM RESULT %r' % response, host=self._play_context.remote_addr)
+-            self._display.debugv('WINRM STDOUT %s' % response.std_out, host=self._play_context.remote_addr)
+-            self._display.debugv('WINRM STDERR %s' % response.std_err, host=self._play_context.remote_addr)
++                self._display.vvvvv('WINRM RESULT %r' % to_unicode(response), host=self._play_context.remote_addr)
++            self._display.vvvvvv('WINRM STDOUT %s' % to_unicode(response.std_out), host=self._play_context.remote_addr)
++            self._display.vvvvvv('WINRM STDERR %s' % to_unicode(response.std_err), host=self._play_context.remote_addr)
+             return response
+         finally:
+             if command_id:
+@@ -153,34 +153,42 @@ class Connection(ConnectionBase):
+ 
+     def exec_command(self, cmd, tmp_path, in_data=None, sudoable=True):
+         super(Connection, self).exec_command(cmd, tmp_path, in_data=in_data, sudoable=sudoable)
+-
+-        cmd = to_bytes(cmd)
+-        cmd_parts = shlex.split(cmd, posix=False)
++        cmd_parts = shlex.split(to_bytes(cmd), posix=False)
++        cmd_parts = map(to_unicode, cmd_parts)
++        script = None
++        cmd_ext = cmd_parts and self._shell._unquote(cmd_parts[0]).lower()[-4:] or ''
++        # Support running .ps1 files (via script/raw).
++        if cmd_ext == '.ps1':
++            script = ' '.join(['&'] + cmd_parts)
++        # Support running .bat/.cmd files; change back to the default system encoding instead of UTF-8.
++        elif cmd_ext in ('.bat', '.cmd'):
++            script = ' '.join(['[System.Console]::OutputEncoding = [System.Text.Encoding]::Default;', '&'] + cmd_parts)
++        # Encode the command if not already encoded; supports running simple PowerShell commands via raw.
++        elif '-EncodedCommand' not in cmd_parts:
++            script = ' '.join(cmd_parts)
++        if script:
++            cmd_parts = self._shell._encode_script(script, as_list=True)
+         if '-EncodedCommand' in cmd_parts:
+             encoded_cmd = cmd_parts[cmd_parts.index('-EncodedCommand') + 1]
+-            decoded_cmd = base64.b64decode(encoded_cmd)
++            decoded_cmd = to_unicode(base64.b64decode(encoded_cmd))
+             self._display.vvv("EXEC %s" % decoded_cmd, host=self._play_context.remote_addr)
+         else:
+             self._display.vvv("EXEC %s" % cmd, host=self._play_context.remote_addr)
+-        # For script/raw support.
+-        if cmd_parts and cmd_parts[0].lower().endswith('.ps1'):
+-            script = self._shell._build_file_cmd(cmd_parts, quote_args=False)
+-            cmd_parts = self._shell._encode_script(script, as_list=True)
+         try:
+             result = self._winrm_exec(cmd_parts[0], cmd_parts[1:], from_exec=True)
+         except Exception as e:
+             traceback.print_exc()
+             raise AnsibleError("failed to exec cmd %s" % cmd)
+-        result.std_out = to_bytes(result.std_out)
+-        result.std_err = to_bytes(result.std_err)
++        result.std_out = to_unicode(result.std_out)
++        result.std_err = to_unicode(result.std_err)
+         return (result.status_code, '', result.std_out, result.std_err)
+ 
+     def put_file(self, in_path, out_path):
+         super(Connection, self).put_file(in_path, out_path)
+-
+-        self._display.vvv("PUT %s TO %s" % (in_path, out_path), host=self._play_context.remote_addr)
++        out_path = self._shell._unquote(out_path)
++        self._display.vvv('PUT "%s" TO "%s"' % (in_path, out_path), host=self._play_context.remote_addr)
+         if not os.path.exists(in_path):
+-            raise AnsibleFileNotFound("file or module does not exist: %s" % in_path)
++            raise AnsibleFileNotFound('file or module does not exist: "%s"' % in_path)
+         with open(in_path) as in_file:
+             in_size = os.path.getsize(in_path)
+             script_template = '''
+@@ -206,20 +214,20 @@ class Connection(ConnectionBase):
+                             out_path = out_path + '.ps1'
+                     b64_data = base64.b64encode(out_data)
+                     script = script_template % (self._shell._escape(out_path), offset, b64_data, in_size)
+-                    self._display.debug("WINRM PUT %s to %s (offset=%d size=%d)" % (in_path, out_path, offset, len(out_data)), host=self._play_context.remote_addr)
++                    self._display.vvvvv('WINRM PUT "%s" to "%s" (offset=%d size=%d)' % (in_path, out_path, offset, len(out_data)), host=self._play_context.remote_addr)
+                     cmd_parts = self._shell._encode_script(script, as_list=True)
+                     result = self._winrm_exec(cmd_parts[0], cmd_parts[1:])
+                     if result.status_code != 0:
+-                        raise IOError(result.std_err.encode('utf-8'))
++                        raise IOError(to_unicode(result.std_err))
+                 except Exception:
+                     traceback.print_exc()
+-                    raise AnsibleError("failed to transfer file to %s" % out_path)
++                    raise AnsibleError('failed to transfer file to "%s"' % out_path)
+ 
+     def fetch_file(self, in_path, out_path):
+         super(Connection, self).fetch_file(in_path, out_path)
+-
++        in_path = self._shell._unquote(in_path)
+         out_path = out_path.replace('\\', '/')
+-        self._display.vvv("FETCH %s TO %s" % (in_path, out_path), host=self._play_context.remote_addr)
++        self._display.vvv('FETCH "%s" TO "%s"' % (in_path, out_path), host=self._play_context.remote_addr)
+         buffer_size = 2**19 # 0.5MB chunks
+         makedirs_safe(os.path.dirname(out_path))
+         out_file = None
+@@ -248,11 +256,11 @@ class Connection(ConnectionBase):
+                             Exit 1;
+                         }
+                     ''' % dict(buffer_size=buffer_size, path=self._shell._escape(in_path), offset=offset)
+-                    self._display.debug("WINRM FETCH %s to %s (offset=%d)" % (in_path, out_path, offset), host=self._play_context.remote_addr)
++                    self._display.vvvvv('WINRM FETCH "%s" to "%s" (offset=%d)' % (in_path, out_path, offset), host=self._play_context.remote_addr)
+                     cmd_parts = self._shell._encode_script(script, as_list=True)
+                     result = self._winrm_exec(cmd_parts[0], cmd_parts[1:])
+                     if result.status_code != 0:
+-                        raise IOError(result.std_err.encode('utf-8'))
++                        raise IOError(to_unicode(result.std_err))
+                     if result.std_out.strip() == '[DIR]':
+                         data = None
+                     else:
+@@ -272,7 +280,7 @@ class Connection(ConnectionBase):
+                         offset += len(data)
+                 except Exception:
+                     traceback.print_exc()
+-                    raise AnsibleError("failed to transfer file to %s" % out_path)
++                    raise AnsibleError('failed to transfer file to "%s"' % out_path)
+         finally:
+             if out_file:
+                 out_file.close()
+diff --git a/lib/ansible/plugins/shell/powershell.py b/lib/ansible/plugins/shell/powershell.py
+index 3377d5786f..33906b84eb 100644
+--- a/lib/ansible/plugins/shell/powershell.py
++++ b/lib/ansible/plugins/shell/powershell.py
+@@ -24,7 +24,9 @@ import random
+ import shlex
+ import time
+ 
+-_common_args = ['PowerShell', '-NoProfile', '-NonInteractive']
++from ansible.utils.unicode import to_bytes, to_unicode
++
++_common_args = ['PowerShell', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Unrestricted']
+ 
+ # Primarily for testing, allow explicitly specifying PowerShell version via
+ # an environment variable.
+@@ -38,24 +40,32 @@ class ShellModule(object):
+         return ''
+ 
+     def join_path(self, *args):
+-        return os.path.join(*args).replace('/', '\\')
++        parts = []
++        for arg in args:
++            arg = self._unquote(arg).replace('/', '\\')
++            parts.extend([a for a in arg.split('\\') if a])
++        path = '\\'.join(parts)
++        if path.startswith('~'):
++            return path
++        return '"%s"' % path
+ 
+     def path_has_trailing_slash(self, path):
+         # Allow Windows paths to be specified using either slash.
++        path = self._unquote(path)
+         return path.endswith('/') or path.endswith('\\')
+ 
+     def chmod(self, mode, path):
+         return ''
+ 
+     def remove(self, path, recurse=False):
+-        path = self._escape(path)
++        path = self._escape(self._unquote(path))
+         if recurse:
+             return self._encode_script('''Remove-Item "%s" -Force -Recurse;''' % path)
+         else:
+             return self._encode_script('''Remove-Item "%s" -Force;''' % path)
+ 
+     def mkdtemp(self, basefile, system=False, mode=None):
+-        basefile = self._escape(basefile)
++        basefile = self._escape(self._unquote(basefile))
+         # FIXME: Support system temp path!
+         return self._encode_script('''(New-Item -Type Directory -Path $env:temp -Name "%s").FullName | Write-Host -Separator '';''' % basefile)
+ 
+@@ -63,16 +73,17 @@ class ShellModule(object):
+         # PowerShell only supports "~" (not "~username").  Resolve-Path ~ does
+         # not seem to work remotely, though by default we are always starting
+         # in the user's home directory.
++        user_home_path = self._unquote(user_home_path)
+         if user_home_path == '~':
+             script = 'Write-Host (Get-Location).Path'
+         elif user_home_path.startswith('~\\'):
+-            script = 'Write-Host ((Get-Location).Path + "%s")' % _escape(user_home_path[1:])
++            script = 'Write-Host ((Get-Location).Path + "%s")' % self._escape(user_home_path[1:])
+         else:
+-            script = 'Write-Host "%s"' % _escape(user_home_path)
++            script = 'Write-Host "%s"' % self._escape(user_home_path)
+         return self._encode_script(script)
+ 
+     def checksum(self, path, *args, **kwargs):
+-        path = self._escape(path)
++        path = self._escape(self._unquote(path))
+         script = '''
+             If (Test-Path -PathType Leaf "%(path)s")
+             {
+@@ -93,16 +104,36 @@ class ShellModule(object):
+         return self._encode_script(script)
+ 
+     def build_module_command(self, env_string, shebang, cmd, rm_tmp=None):
+-        cmd = cmd.encode('utf-8')
+-        cmd_parts = shlex.split(cmd, posix=False)
+-        if not cmd_parts[0].lower().endswith('.ps1'):
+-            cmd_parts[0] = '%s.ps1' % cmd_parts[0]
+-        script = self._build_file_cmd(cmd_parts)
++        cmd_parts = shlex.split(to_bytes(cmd), posix=False)
++        cmd_parts = map(to_unicode, cmd_parts)
++        if shebang and shebang.lower() == '#!powershell':
++            if not self._unquote(cmd_parts[0]).lower().endswith('.ps1'):
++                cmd_parts[0] = '"%s.ps1"' % self._unquote(cmd_parts[0])
++            cmd_parts.insert(0, '&')
++        elif shebang and shebang.startswith('#!'):
++            cmd_parts.insert(0, shebang[2:])
++        catch = '''
++            $_obj = @{ failed = $true; $msg = $_ }
++            echo $_obj | ConvertTo-Json -Compress -Depth 99
++            Exit 1
++        '''
++        script = 'Try { %s }\nCatch { %s }' % (' '.join(cmd_parts), 'throw')
+         if rm_tmp:
+-            rm_tmp = self._escape(rm_tmp)
+-            script = '%s; Remove-Item "%s" -Force -Recurse;' % (script, rm_tmp)
++            rm_tmp = self._escape(self._unquote(rm_tmp))
++            rm_cmd = 'Remove-Item "%s" -Force -Recurse -ErrorAction SilentlyContinue' % rm_tmp
++            script = '%s\nFinally { %s }' % (script, rm_cmd)
+         return self._encode_script(script)
+ 
++    def _unquote(self, value):
++        '''Remove any matching quotes that wrap the given value.'''
++        m = re.match(r'^\s*?\'(.*?)\'\s*?$', value)
++        if m:
++            return m.group(1)
++        m = re.match(r'^\s*?"(.*?)"\s*?$', value)
++        if m:
++            return m.group(1)
++        return value
++
+     def _escape(self, value, include_vars=False):
+         '''Return value escaped for use in PowerShell command.'''
+         # http://www.techotopia.com/index.php/Windows_PowerShell_1.0_String_Quoting_and_Escape_Sequences
+@@ -119,14 +150,10 @@ class ShellModule(object):
+ 
+     def _encode_script(self, script, as_list=False):
+         '''Convert a PowerShell script to a single base64-encoded command.'''
++        script = to_unicode(script)
+         script = '\n'.join([x.strip() for x in script.splitlines() if x.strip()])
+         encoded_script = base64.b64encode(script.encode('utf-16-le'))
+         cmd_parts = _common_args + ['-EncodedCommand', encoded_script]
+         if as_list:
+             return cmd_parts
+         return ' '.join(cmd_parts)
+-
+-    def _build_file_cmd(self, cmd_parts):
+-        '''Build command line to run a file, given list of file name plus args.'''
+-        return ' '.join(_common_args + ['-ExecutionPolicy', 'Unrestricted', '-File'] + ['"%s"' % x for x in cmd_parts])
+-
+diff --git a/test/integration/integration_config.yml b/test/integration/integration_config.yml
+index bf5d6db3de..34a7cbf73d 100644
+--- a/test/integration/integration_config.yml
++++ b/test/integration/integration_config.yml
+@@ -1,5 +1,5 @@
+ ---
+-win_output_dir: 'C:/temp/'
++win_output_dir: 'C:\ansible_testing'
+ output_dir: ~/ansible_testing
+ non_root_test_user: ansible
+ pip_test_package: epdb
+diff --git a/test/integration/roles/test_win_fetch/tasks/main.yml b/test/integration/roles/test_win_fetch/tasks/main.yml
+index 8c0f5aa21f..f8b1865744 100644
+--- a/test/integration/roles/test_win_fetch/tasks/main.yml
++++ b/test/integration/roles/test_win_fetch/tasks/main.yml
+@@ -73,16 +73,14 @@
+       - "fetch_flat_stat.stat.isreg"
+       - "fetch_flat_stat.stat.md5 == fetch_flat.md5sum"
+ 
+-- name: fetch a small file to flat directory (without trailing slash)
+-  fetch: src="C:/Windows/win.ini" dest="{{ output_dir }}" flat=yes
+-  register: fetch_flat_dir
+-  ignore_errors: true
++#- name: fetch a small file to flat directory (without trailing slash)
++#  fetch: src="C:/Windows/win.ini" dest="{{ output_dir }}" flat=yes
++#  register: fetch_flat_dir
+ 
+-- name: check fetch flat to directory result
+-  assert:
+-    that:
+-      - "fetch_flat_dir|failed"
+-      - "fetch_flat_dir.msg"
++#- name: check fetch flat to directory result
++#  assert:
++#    that:
++#      - "not fetch_flat_dir|changed"
+ 
+ - name: fetch a large binary file
+   fetch: src="C:/Windows/explorer.exe" dest={{ output_dir }}
+@@ -114,7 +112,7 @@
+       - "not fetch_large_again.changed"
+ 
+ - name: fetch a small file using backslashes in src path
+-  fetch: src="C:\Windows\system.ini" dest={{ output_dir }}
++  fetch: src="C:\\Windows\\system.ini" dest={{ output_dir }}
+   register: fetch_small_bs
+ 
+ - name: check fetch small result with backslashes
+@@ -157,7 +155,7 @@
+       - "not fetch_missing|changed"
+ 
+ - name: attempt to fetch a directory
+-  fetch: src="C:\Windows" dest={{ output_dir }}
++  fetch: src="C:\\Windows" dest={{ output_dir }}
+   register: fetch_dir
+   ignore_errors: true
+ 
+diff --git a/test/integration/roles/test_win_file/tasks/main.yml b/test/integration/roles/test_win_file/tasks/main.yml
+index 35ecfb6387..f823a16ff8 100644
+--- a/test/integration/roles/test_win_file/tasks/main.yml
++++ b/test/integration/roles/test_win_file/tasks/main.yml
+@@ -32,7 +32,7 @@
+ #      - "file_result.state == 'file'"
+ 
+ - name: verify that we are checking an absent file
+-  win_file: path={{win_output_dir}}\bar.txt state=absent
++  win_file: path={{win_output_dir}}/bar.txt state=absent
+   register: file2_result
+ 
+ - name: verify that the file was marked as changed
+@@ -42,7 +42,7 @@
+ #      - "file2_result.state == 'absent'"
+ 
+ - name: verify we can touch a file
+-  win_file: path={{win_output_dir}}\baz.txt state=touch
++  win_file: path={{win_output_dir}}/baz.txt state=touch
+   register: file3_result
+ 
+ - name: verify that the file was marked as changed
+@@ -85,8 +85,8 @@
+ #      - "chown_result.failed == True"
+ #      - "file_exists_result.stat.exists == False"
+ #
+-- name: clean up
+-  win_file: path=/tmp/worldwritable state=absent
++#- name: clean up
++#  win_file: path=/tmp/worldwritable state=absent
+ 
+ #- name: create soft link to file
+ #  win_file: src={{output_file}} dest={{win_output_dir}}/soft.txt state=link
+@@ -107,7 +107,7 @@
+ #      - "file6_result.changed == true"
+ #
+ - name: create a directory
+-  win_file: path={{win_output_dir}}\foobar state=directory
++  win_file: path={{win_output_dir}}/foobar state=directory
+   register: file7_result
+ 
+ - debug: var=file7_result
+@@ -134,22 +134,22 @@
+ #  when: selinux_installed.stdout != "" and selinux_enabled.stdout != "Disabled"
+ 
+ - name: remote directory foobar
+-  win_file: path={{win_output_dir}}\foobar state=absent
++  win_file: path={{win_output_dir}}/foobar state=absent
+ 
+ - name: remove file foo.txt
+-  win_file: path={{win_output_dir}}\foo.txt state=absent
++  win_file: path={{win_output_dir}}/foo.txt state=absent
+ 
+ - name: remove file bar.txt
+-  win_file: path={{win_output_dir}}\foo.txt state=absent
++  win_file: path={{win_output_dir}}/foo.txt state=absent
+ 
+ - name: remove file baz.txt
+-  win_file: path={{win_output_dir}}\foo.txt state=absent
++  win_file: path={{win_output_dir}}/foo.txt state=absent
+ 
+ - name: win copy directory structure over
+   win_copy: src=foobar dest={{win_output_dir}}
+ 
+ - name: remove directory foobar
+-  win_file: path={{win_output_dir}}\foobar state=absent
++  win_file: path={{win_output_dir}}/foobar state=absent
+   register: file14_result
+ 
+ - debug: var=file14_result
+diff --git a/test/integration/roles/test_win_msi/tasks/main.yml b/test/integration/roles/test_win_msi/tasks/main.yml
+index d0d7034d78..85c9957a1d 100644
+--- a/test/integration/roles/test_win_msi/tasks/main.yml
++++ b/test/integration/roles/test_win_msi/tasks/main.yml
+@@ -17,7 +17,7 @@
+ # along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
+ 
+ - name: use win_get_url module to download msi
+-  win_get_url: url=http://downloads.sourceforge.net/project/sevenzip/7-Zip/9.22/7z922-x64.msi dest='C:\7z922-x64.msi'
++  win_get_url: url=http://downloads.sourceforge.net/project/sevenzip/7-Zip/9.22/7z922-x64.msi dest='C:\\7z922-x64.msi'
+   register: win_get_url_result
+ 
+ - name: install 7zip msi
+diff --git a/test/integration/roles/test_win_ping/tasks/main.yml b/test/integration/roles/test_win_ping/tasks/main.yml
+index 8bcbe910c4..f17a4a9227 100644
+--- a/test/integration/roles/test_win_ping/tasks/main.yml
++++ b/test/integration/roles/test_win_ping/tasks/main.yml
+@@ -28,7 +28,7 @@
+       - "win_ping_result.ping == 'pong'"
+ 
+ - name: test win_ping with data
+-  win_ping: data=blah
++  win_ping: data=☠
+   register: win_ping_with_data_result
+ 
+ - name: check win_ping result with data
+@@ -36,21 +36,11 @@
+     that:
+       - "not win_ping_with_data_result|failed"
+       - "not win_ping_with_data_result|changed"
+-      - "win_ping_with_data_result.ping == 'blah'"
++      - "win_ping_with_data_result.ping == '☠'"
+ 
+-#- name: test local ping (should use default ping)
+-#  local_action: ping
+-#  register: local_ping_result
+-
+-#- name: check local ping result
+-#  assert:
+-#    that: 
+-#      - "not local_ping_result|failed"
+-#      - "not local_ping_result|changed"
+-#      - "local_ping_result.ping == 'pong'"
+-
+-- name: test win_ping.ps1 with data
+-  win_ping.ps1: data=bleep
++- name: test win_ping.ps1 with data as complex args
++  win_ping.ps1:
++    data: bleep
+   register: win_ping_ps1_result
+ 
+ - name: check win_ping.ps1 result with data
+@@ -60,13 +50,32 @@
+       - "not win_ping_ps1_result|changed"
+       - "win_ping_ps1_result.ping == 'bleep'"
+ 
+-#- name: test win_ping with invalid args
+-#  win_ping: arg=invalid
+-#  register: win_ping_ps1_invalid_args_result
+-
+-#- name: check that win_ping.ps1 with invalid args fails
+-#  assert:
+-#    that:
+-#      - "win_ping_ps1_invalid_args_result|failed"
+-#      - "win_ping_ps1_invalid_args_result.msg"
++- name: test win_ping with extra args to verify that v2 module replacer escaping works as expected
++  win_ping:
++    data: bloop
++    a_null: null
++    a_boolean: true
++    another_boolean: false
++    a_number: 299792458
++    another_number: 22.7
++    yet_another_number: 6.022e23
++    a_string: |
++      it's magic
++      "@'
++      '@"
++    an_array:
++      - first
++      - 2
++      - 3.0
++    an_object:
++      - the_thing: the_value
++      - the_other_thing: 0
++      - the_list_of_things: [1, 2, 3, 5]
++  register: win_ping_extra_args_result
+ 
++- name: check that win_ping with extra args succeeds and ignores everything except data
++  assert:
++    that:
++      - "not win_ping_extra_args_result|failed"
++      - "not win_ping_extra_args_result|changed"
++      - "win_ping_extra_args_result.ping == 'bloop'"
+diff --git a/test/integration/roles/test_win_raw/tasks/main.yml b/test/integration/roles/test_win_raw/tasks/main.yml
+index c51ba4b2cc..dffc04ab34 100644
+--- a/test/integration/roles/test_win_raw/tasks/main.yml
++++ b/test/integration/roles/test_win_raw/tasks/main.yml
+@@ -72,7 +72,7 @@
+       - "not unknown_result|changed"
+ 
+ - name: run a command that takes longer than 60 seconds
+-  raw: PowerShell -Command Start-Sleep -s 75
++  raw: Start-Sleep -s 75
+   register: sleep_command
+ 
+ - name: assert that the sleep command ran
+diff --git a/test/integration/roles/test_win_script/defaults/main.yml b/test/integration/roles/test_win_script/defaults/main.yml
+index a2c6475e75..90b756af0a 100644
+--- a/test/integration/roles/test_win_script/defaults/main.yml
++++ b/test/integration/roles/test_win_script/defaults/main.yml
+@@ -3,3 +3,4 @@
+ # Parameters to pass to test scripts.
+ test_win_script_value: VaLuE
+ test_win_script_splat: "@{This='THIS'; That='THAT'; Other='OTHER'}"
++test_win_script_filename: "C:/Users/{{ansible_ssh_user}}/testing_win_script.txt"
+diff --git a/test/integration/roles/test_win_script/files/test_script.cmd b/test/integration/roles/test_win_script/files/test_script.cmd
+new file mode 100644
+index 0000000000..0e36312d0f
+--- /dev/null
++++ b/test/integration/roles/test_win_script/files/test_script.cmd
+@@ -0,0 +1,2 @@
++@ECHO OFF
++ECHO We can even run a batch file with cmd extension!
+diff --git a/test/integration/roles/test_win_script/files/test_script_creates_file.ps1 b/test/integration/roles/test_win_script/files/test_script_creates_file.ps1
+new file mode 100644
+index 0000000000..47f85a2d49
+--- /dev/null
++++ b/test/integration/roles/test_win_script/files/test_script_creates_file.ps1
+@@ -0,0 +1,3 @@
++# Test script to create a file.
++
++echo $null > $args[0]
+diff --git a/test/integration/roles/test_win_script/files/test_script_removes_file.ps1 b/test/integration/roles/test_win_script/files/test_script_removes_file.ps1
+new file mode 100644
+index 0000000000..f0549a5b3b
+--- /dev/null
++++ b/test/integration/roles/test_win_script/files/test_script_removes_file.ps1
+@@ -0,0 +1,3 @@
++# Test script to remove a file.
++
++Remove-Item $args[0] -Force
+diff --git a/test/integration/roles/test_win_script/tasks/main.yml b/test/integration/roles/test_win_script/tasks/main.yml
+index e1e5f25611..313569face 100644
+--- a/test/integration/roles/test_win_script/tasks/main.yml
++++ b/test/integration/roles/test_win_script/tasks/main.yml
+@@ -30,24 +30,24 @@
+       - "not test_script_result|failed"
+       - "test_script_result|changed"
+ 
+-- name: run test script that takes arguments
+-  script: test_script_with_args.ps1 /this /that /other
++- name: run test script that takes arguments including a unicode char
++  script: test_script_with_args.ps1 /this /that /Ӧther
+   register: test_script_with_args_result
+ 
+-- name: check that script ran and received arguments
++- name: check that script ran and received arguments and returned unicode
+   assert:
+     that:
+       - "test_script_with_args_result.rc == 0"
+       - "test_script_with_args_result.stdout"
+       - "test_script_with_args_result.stdout_lines[0] == '/this'"
+       - "test_script_with_args_result.stdout_lines[1] == '/that'"
+-      - "test_script_with_args_result.stdout_lines[2] == '/other'"
++      - "test_script_with_args_result.stdout_lines[2] == '/Ӧther'"
+       - "not test_script_with_args_result.stderr"
+       - "not test_script_with_args_result|failed"
+       - "test_script_with_args_result|changed"
+ 
+ - name: run test script that takes parameters passed via splatting
+-  script: test_script_with_splatting.ps1 "@{ This = 'this'; That = '{{ test_win_script_value }}'; Other = 'other'}"
++  script: test_script_with_splatting.ps1 @{ This = 'this'; That = '{{ test_win_script_value }}'; Other = 'other'}
+   register: test_script_with_splatting_result
+ 
+ - name: check that script ran and received parameters via splatting
+@@ -63,7 +63,7 @@
+       - "test_script_with_splatting_result|changed"
+ 
+ - name: run test script that takes splatted parameters from a variable
+-  script: test_script_with_splatting.ps1 {{ test_win_script_splat|quote }}
++  script: test_script_with_splatting.ps1 {{ test_win_script_splat }}
+   register: test_script_with_splatting2_result
+ 
+ - name: check that script ran and received parameters via splatting from a variable
+@@ -92,6 +92,58 @@
+       - "test_script_with_errors_result|failed"
+       - "test_script_with_errors_result|changed"
+ 
++- name: cleanup test file if it exists
++  raw: Remove-Item "{{test_win_script_filename}}" -Force
++  ignore_errors: true
++
++- name: run test script that creates a file
++  script: test_script_creates_file.ps1 "{{test_win_script_filename}}" creates="{{test_win_script_filename}}"
++  register: test_script_creates_file_result
++
++- name: check that script ran and indicated a change
++  assert:
++    that:
++      - "test_script_creates_file_result.rc == 0"
++      - "not test_script_creates_file_result.stdout"
++      - "not test_script_creates_file_result.stderr"
++      - "not test_script_creates_file_result|failed"
++      - "test_script_creates_file_result|changed"
++
++- name: run test script that creates a file again
++  script: test_script_creates_file.ps1 "{{test_win_script_filename}}" creates="{{test_win_script_filename}}"
++  register: test_script_creates_file_again_result
++
++- name: check that the script did not run since the remote file exists
++  assert:
++    that:
++      - "not test_script_creates_file_again_result|failed"
++      - "not test_script_creates_file_again_result|changed"
++      - "test_script_creates_file_again_result|skipped"
++
++- name: run test script that removes a file
++  script: test_script_removes_file.ps1 "{{test_win_script_filename}}" removes="{{test_win_script_filename}}"
++  register: test_script_removes_file_result
++
++- name: check that the script ran since the remote file exists
++  assert:
++    that:
++      - "test_script_removes_file_result.rc == 0"
++      - "not test_script_removes_file_result.stdout"
++      - "not test_script_removes_file_result.stderr"
++      - "not test_script_removes_file_result|failed"
++      - "test_script_removes_file_result|changed"
++
++- name: run test script that removes a file again
++  script: test_script_removes_file.ps1 "{{test_win_script_filename}}" removes="{{test_win_script_filename}}"
++  register: test_script_removes_file_again_result
++
++- name: check that the script did not run since the remote file does not exist
++  assert:
++    that:
++      - "not test_script_removes_file_again_result|failed"
++      - "not test_script_removes_file_again_result|changed"
++      - "test_script_removes_file_again_result|skipped"
++
+ - name: run simple batch file
+   script: test_script.bat
+   register: test_batch_result
+@@ -105,3 +157,17 @@
+       - "not test_batch_result.stderr"
+       - "not test_batch_result|failed"
+       - "test_batch_result|changed"
++
++- name: run simple batch file with .cmd extension
++  script: test_script.cmd
++  register: test_cmd_result
++
++- name: check that batch file with .cmd extension ran
++  assert:
++    that:
++      - "test_cmd_result.rc == 0"
++      - "test_cmd_result.stdout"
++      - "'cmd extension' in test_cmd_result.stdout"
++      - "not test_cmd_result.stderr"
++      - "not test_cmd_result|failed"
++      - "test_cmd_result|changed"
+diff --git a/test/integration/roles/test_win_setup/tasks/main.yml b/test/integration/roles/test_win_setup/tasks/main.yml
+index c2f4728b21..fb13da1542 100644
+--- a/test/integration/roles/test_win_setup/tasks/main.yml
++++ b/test/integration/roles/test_win_setup/tasks/main.yml
+@@ -20,7 +20,7 @@
+   action: setup
+   register: setup_result
+ 
+-- name: check setup result
++- name: check windows setup result
+   assert: 
+     that:
+       - "not setup_result|failed"
+@@ -38,6 +38,8 @@
+       - "setup_result.ansible_facts.ansible_interfaces[0]"
+       - "setup_result.ansible_facts.ansible_interfaces[0].interface_name"
+       - "setup_result.ansible_facts.ansible_interfaces[0].interface_index"
++      - "setup_result.ansible_facts.ansible_architecture"
++      - "setup_result.ansible_facts.ansible_os_name"
+       - "setup_result.ansible_facts.ansible_powershell_version"
+ 
+ - name: check setup result only when using https
+diff --git a/test/integration/roles/test_win_stat/tasks/main.yml b/test/integration/roles/test_win_stat/tasks/main.yml
+index 5069f51a80..5197c27fef 100644
+--- a/test/integration/roles/test_win_stat/tasks/main.yml
++++ b/test/integration/roles/test_win_stat/tasks/main.yml
+@@ -27,6 +27,12 @@
+       - "not win_stat_file.stat.isdir"
+       - "win_stat_file.stat.size > 0"
+       - "win_stat_file.stat.md5"
++      - "win_stat_file.stat.extension"
++      - "win_stat_file.stat.attributes"
++      - "win_stat_file.stat.owner"
++      - "win_stat_file.stat.creationtime"
++      - "win_stat_file.stat.lastaccesstime"
++      - "win_stat_file.stat.lastwritetime"
+       - "not win_stat_file|failed"
+       - "not win_stat_file|changed"
+ 
+@@ -34,13 +40,19 @@
+   win_stat: path="C:\Windows\win.ini" get_md5=no
+   register: win_stat_file_no_md5
+ 
+-- name: check win_stat file result without md
++- name: check win_stat file result without md5
+   assert: 
+     that:
+       - "win_stat_file_no_md5.stat.exists"
+       - "not win_stat_file_no_md5.stat.isdir"
+       - "win_stat_file_no_md5.stat.size > 0"
+       - "not win_stat_file_no_md5.stat.md5|default('')"
++      - "win_stat_file_no_md5.stat.extension"
++      - "win_stat_file_no_md5.stat.attributes"
++      - "win_stat_file_no_md5.stat.owner"
++      - "win_stat_file_no_md5.stat.creationtime"
++      - "win_stat_file_no_md5.stat.lastaccesstime"
++      - "win_stat_file_no_md5.stat.lastwritetime"
+       - "not win_stat_file_no_md5|failed"
+       - "not win_stat_file_no_md5|changed"
+ 
+@@ -53,6 +65,12 @@
+     that:
+       - "win_stat_dir.stat.exists"
+       - "win_stat_dir.stat.isdir"
++      - "win_stat_dir.stat.extension == ''"
++      - "win_stat_dir.stat.attributes"
++      - "win_stat_dir.stat.owner"
++      - "win_stat_dir.stat.creationtime"
++      - "win_stat_dir.stat.lastaccesstime"
++      - "win_stat_dir.stat.lastwritetime"
+       - "not win_stat_dir|failed"
+       - "not win_stat_dir|changed"
+ 
+diff --git a/test/integration/roles/test_win_template/tasks/main.yml b/test/integration/roles/test_win_template/tasks/main.yml
+index 9c2ea920ff..73d4bcb495 100644
+--- a/test/integration/roles/test_win_template/tasks/main.yml
++++ b/test/integration/roles/test_win_template/tasks/main.yml
+@@ -42,10 +42,10 @@
+ # VERIFY CONTENTS
+ 
+ - name: copy known good into place
+-  win_copy: src=foo.txt dest={{win_output_dir}}\foo.txt
++  win_copy: src=foo.txt dest={{win_output_dir}}\\foo.txt
+ 
+ - name: compare templated file to known good
+-  raw: fc.exe {{win_output_dir}}\foo.templated {{win_output_dir}}\foo.txt 
++  raw: fc.exe {{win_output_dir}}\\foo.templated {{win_output_dir}}\\foo.txt 
+   register: diff_result
+ 
+ - debug: var=diff_result
+diff --git a/test/integration/roles/test_win_user/tasks/main.yml b/test/integration/roles/test_win_user/tasks/main.yml
+index 0e22e332ae..0316afb61b 100644
+--- a/test/integration/roles/test_win_user/tasks/main.yml
++++ b/test/integration/roles/test_win_user/tasks/main.yml
+@@ -51,7 +51,7 @@
+       - "win_user_missing_query_result.state == 'absent'"
+ 
+ - name: test create user
+-  win_user: name="{{ test_win_user_name }}" password="{{ test_win_user_password }}" groups="Guests"
++  win_user: name="{{ test_win_user_name }}" password="{{ test_win_user_password }}" fullname="Test User" description="Test user account" groups="Guests"
+   register: win_user_create_result
+ 
+ - name: check user creation result
+@@ -59,7 +59,8 @@
+     that:
+       - "win_user_create_result|changed"
+       - "win_user_create_result.name == '{{ test_win_user_name }}'"
+-      - "win_user_create_result.fullname == '{{ test_win_user_name }}'"
++      - "win_user_create_result.fullname == 'Test User'"
++      - "win_user_create_result.description == 'Test user account'"
+       - "win_user_create_result.path"
+       - "win_user_create_result.state == 'present'"
+ 

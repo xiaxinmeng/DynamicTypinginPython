@@ -1,0 +1,675 @@
+commit 9c7a2412d239ebcd395ff9ed3136eae967267e8c
+Author: alexcjohnson <alex@plot.ly>
+Date:   Sun Apr 26 03:05:07 2020 -0400
+
+    fix #1200 - all inputs missing acts like PreventUpdate
+    except when all inputs have multivalued wildcards and all outputs exist
+
+diff --git a/dash-renderer/src/actions/index.js b/dash-renderer/src/actions/index.js
+index 999ade85..239ba5cb 100644
+--- a/dash-renderer/src/actions/index.js
++++ b/dash-renderer/src/actions/index.js
+@@ -154,9 +154,6 @@ function unwrapIfNotMulti(paths, idProps, spec, anyVals, depType) {
+                         ']'
+                 );
+             }
+-            // TODO: unwrapped list of wildcard ids?
+-            // eslint-disable-next-line no-console
+-            console.log(paths.objs);
+             throw new ReferenceError(
+                 'A nonexistent object was used in an `' +
+                     depType +
+@@ -247,20 +244,47 @@ async function fireReadyCallbacks(dispatch, getState, callbacks) {
+ 
+         let payload;
+         try {
+-            const outputs = allOutputs.map((out, i) =>
+-                unwrapIfNotMulti(
+-                    paths,
+-                    map(pick(['id', 'property']), out),
+-                    cb.callback.outputs[i],
+-                    cb.anyVals,
+-                    'Output'
+-                )
+-            );
++            const inVals = fillVals(paths, layout, cb, inputs, 'Input', true);
++
++            const preventCallback = () => {
++                removeCallbackFromPending();
++                // no server call here; for performance purposes pretend this is
++                // a clientside callback and defer fireNext for the end
++                // of the currently-ready callbacks.
++                hasClientSide = true;
++                return null;
++            };
++
++            if (inVals === null) {
++                return preventCallback();
++            }
++
++            let outputs;
++            try {
++                outputs = allOutputs.map((out, i) =>
++                    unwrapIfNotMulti(
++                        paths,
++                        map(pick(['id', 'property']), out),
++                        cb.callback.outputs[i],
++                        cb.anyVals,
++                        'Output'
++                    )
++                );
++            } catch (e) {
++                if (e instanceof ReferenceError && !flatten(inVals).length) {
++                    // This case is all-empty multivalued wildcard inputs,
++                    // which we would normally fire the callback for, except
++                    // some outputs are missing. So instead we treat it like
++                    // regular missing inputs and just silently prevent it.
++                    return preventCallback();
++                }
++                throw e;
++            }
+ 
+             payload = {
+                 output,
+                 outputs: isMultiOutputProp(output) ? outputs : outputs[0],
+-                inputs: fillVals(paths, layout, cb, inputs, 'Input'),
++                inputs: inVals,
+                 changedPropIds: keys(cb.changedPropIds),
+             };
+             if (cb.callback.state.length) {
+@@ -360,7 +384,7 @@ async function fireReadyCallbacks(dispatch, getState, callbacks) {
+             updatePending(pendingCallbacks, without(updated, allPropIds));
+         }
+ 
+-        function handleError(err) {
++        function removeCallbackFromPending() {
+             const {pendingCallbacks} = getState();
+             if (requestIsActive(pendingCallbacks, resolvedId, requestId)) {
+                 // Skip all prop updates from this callback, and remove
+@@ -368,6 +392,10 @@ async function fireReadyCallbacks(dispatch, getState, callbacks) {
+                 // that have other changed inputs will still fire.
+                 updatePending(pendingCallbacks, allPropIds);
+             }
++        }
++
++        function handleError(err) {
++            removeCallbackFromPending();
+             const outputs = payload
+                 ? map(combineIdAndProp, flatten([payload.outputs])).join(', ')
+                 : output;
+@@ -398,9 +426,12 @@ async function fireReadyCallbacks(dispatch, getState, callbacks) {
+     return hasClientSide ? fireNext().then(done) : done;
+ }
+ 
+-function fillVals(paths, layout, cb, specs, depType) {
++function fillVals(paths, layout, cb, specs, depType, allowAllMissing) {
+     const getter = depType === 'Input' ? cb.getInputs : cb.getState;
+-    return getter(paths).map((inputList, i) =>
++    const errors = [];
++    let emptyMultiValues = 0;
++
++    const fillInputs = (inputList, i) =>
+         unwrapIfNotMulti(
+             paths,
+             inputList.map(({id, property, path: path_}) => ({
+@@ -411,8 +442,45 @@ function fillVals(paths, layout, cb, specs, depType) {
+             specs[i],
+             cb.anyVals,
+             depType
+-        )
+-    );
++        );
++
++    const tryFill = (inputList, i) => {
++        try {
++            const inputs = fillInputs(inputList, i);
++            if (isMultiValued(specs[i]) && !inputs.length) {
++                emptyMultiValues++;
++            }
++            return inputs;
++        } catch (e) {
++            if (e instanceof ReferenceError) {
++                errors.push(e);
++                return null;
++            }
++            // any other error we still want to see!
++            throw e;
++        }
++    };
++
++    const inputVals = getter(paths).map(allowAllMissing ? tryFill : fillInputs);
++
++    if (errors.length) {
++        if (errors.length + emptyMultiValues === inputVals.length) {
++            // We have at least one non-multivalued input, but all simple and
++            // multi-valued inputs are missing.
++            // (if all inputs are multivalued and all missing we still return
++            // them as normal, and fire the callback.)
++            return null;
++        }
++        // If we get here we have some missing and some present inputs.
++        // That's a real error, so rethrow the first missing error.
++        // Wildcard reference errors mention a list of wildcard specs logged
++        // TODO: unwrapped list of wildcard ids?
++        // eslint-disable-next-line no-console
++        console.log(paths.objs);
++        throw errors[0];
++    }
++
++    return inputVals;
+ }
+ 
+ function handleServerside(config, payload, hooks) {
+diff --git a/tests/integration/callbacks/test_missing_inputs.py b/tests/integration/callbacks/test_missing_inputs.py
+new file mode 100644
+index 00000000..2cfffb8e
+--- /dev/null
++++ b/tests/integration/callbacks/test_missing_inputs.py
+@@ -0,0 +1,484 @@
++import json
++import dash_html_components as html
++import dash
++from dash.testing import wait
++from dash.dependencies import Input, Output, State, ALL, MATCH
++
++
++def wait_for_queue(dash_duo):
++    # mostly for cases where no callbacks should fire:
++    # just wait until we have the button and the queue is empty
++    dash_duo.wait_for_text_to_equal("#btn", "click")
++    wait.until(lambda: dash_duo.redux_state_rqs == [], 3)
++
++
++def test_cbmi001_all_missing_inputs(dash_duo):
++    app = dash.Dash(__name__, suppress_callback_exceptions=True)
++    app.layout = html.Div(
++        [
++            html.Div("Title", id="title"),
++            html.Button("click", id="btn"),
++            html.Div(id="content"),
++            html.Div("output1 init", id="out1"),
++            html.Div("output2 init", id="out2"),
++            html.Div("output3 init", id="out3"),
++        ]
++    )
++
++    @app.callback(Output("content", "children"), [Input("btn", "n_clicks")])
++    def content(n):
++        return (
++            [html.Div("A", id="a"), html.Div("B", id="b"), html.Div("C", id="c")]
++            if n
++            else "content init"
++        )
++
++    @app.callback(
++        Output("out1", "children"),
++        [Input("a", "children"), Input("b", "children")],
++        [State("c", "children"), State("title", "children")],
++    )
++    def out1(a, b, c, title):
++        # title exists at the start but State isn't enough to fire the callback
++        assert c == "C"
++        assert title == "Title"
++        return a + b
++
++    @app.callback(
++        Output("out2", "children"),
++        [Input("out1", "children")],
++        [State("title", "children")],
++    )
++    def out2(out1, title):
++        return out1 + " - 2 - " + title
++
++    @app.callback(
++        Output("out3", "children"),
++        [Input("out1", "children"), Input("title", "children")],
++    )
++    def out3(out1, title):
++        return out1 + " - 3 - " + title
++
++    dash_duo.start_server(app)
++    wait_for_queue(dash_duo)
++
++    # out3 fires because it has another Input besides out1
++    dash_duo.wait_for_text_to_equal("#out3", "output1 init - 3 - Title")
++
++    assert dash_duo.find_element("#out1").text == "output1 init"
++
++    # out2 doesn't fire because its only input (out1) is "prevented"
++    # State items don't matter for this.
++    assert dash_duo.find_element("#out2").text == "output2 init"
++
++    dash_duo.find_element("#btn").click()
++
++    # after a button click all inputs are present so all callbacks fire.
++    dash_duo.wait_for_text_to_equal("#out1", "AB")
++    dash_duo.wait_for_text_to_equal("#out2", "AB - 2 - Title")
++    dash_duo.wait_for_text_to_equal("#out3", "AB - 3 - Title")
++
++    assert not dash_duo.get_logs()
++
++
++def test_cbmi002_follow_on_to_two_skipped_callbacks(dash_duo):
++    app = dash.Dash(__name__, suppress_callback_exceptions=True)
++    app.layout = html.Div(
++        [
++            html.Button("click", id="btn"),
++            html.Div(id="content"),
++            html.Div("output1 init", id="out1"),
++            html.Div("output2 init", id="out2"),
++            html.Div("output3 init", id="out3"),
++        ]
++    )
++
++    @app.callback(Output("content", "children"), [Input("btn", "n_clicks")])
++    def content(n):
++        return [html.Div("A", id="a"), html.Div("B", id="b")] if n else "content init"
++
++    @app.callback(Output("out1", "children"), [Input("a", "children")])
++    def out1(a):
++        return a
++
++    @app.callback(Output("out2", "children"), [Input("b", "children")])
++    def out2(b):
++        return b
++
++    @app.callback(
++        Output("out3", "children"),
++        [Input("out1", "children"), Input("out2", "children")],
++    )
++    def out3(out1, out2):
++        return out1 + out2
++
++    dash_duo.start_server(app)
++    wait_for_queue(dash_duo)
++
++    for i in ["1", "2", "3"]:
++        assert dash_duo.find_element("#out" + i).text == "output{} init".format(i)
++
++    dash_duo.find_element("#btn").click()
++    # now all callbacks fire
++    dash_duo.wait_for_text_to_equal("#out1", "A")
++    dash_duo.wait_for_text_to_equal("#out2", "B")
++    dash_duo.wait_for_text_to_equal("#out3", "AB")
++
++    assert not dash_duo.get_logs()
++
++
++def test_cbmi003_some_missing_inputs(dash_duo):
++    # this one is an error!
++    app = dash.Dash(__name__, suppress_callback_exceptions=True)
++    app.layout = html.Div(
++        [
++            html.Div("Title", id="title"),
++            html.Button("click", id="btn"),
++            html.Div(id="content"),
++            html.Div("output1 init", id="out1"),
++            html.Div("output2 init", id="out2"),
++        ]
++    )
++
++    @app.callback(Output("content", "children"), [Input("btn", "n_clicks")])
++    def content(n):
++        return [html.Div("A", id="a"), html.Div("B", id="b")] if n else "content init"
++
++    @app.callback(
++        Output("out1", "children"), [Input("a", "children"), Input("title", "children")]
++    )
++    def out1(a, title):
++        return a + title
++
++    @app.callback(Output("out2", "children"), [Input("out1", "children")])
++    def out2(out1):
++        return out1 + " - 2"
++
++    dash_duo.start_server(app)
++    wait_for_queue(dash_duo)
++
++    dash_duo.wait_for_text_to_equal("#content", "content init")
++
++    logs = json.dumps(dash_duo.get_logs())
++    assert "ReferenceError" in logs
++    assert "The id of this object is `a` and the property is `children`." in logs
++
++    # after the error we can still use the app - and no more errors
++    dash_duo.find_element("#btn").click()
++    dash_duo.wait_for_text_to_equal("#out2", "ATitle - 2")
++    assert not dash_duo.get_logs()
++
++
++def test_cbmi004_some_missing_outputs(dash_duo):
++    app = dash.Dash(__name__, suppress_callback_exceptions=True)
++    app.layout = html.Div(
++        [
++            html.Button("click", id="btn"),
++            html.Div(id="content"),
++            html.Div("output1 init", id="out1"),
++        ]
++    )
++
++    @app.callback(Output("content", "children"), [Input("btn", "n_clicks")])
++    def content(n):
++        return [html.Div("A", id="a"), html.Div("B", id="b")] if n else "content init"
++
++    @app.callback(
++        [Output("out1", "children"), Output("b", "children")], [Input("a", "children")]
++    )
++    def out1(a):
++        return a, a
++
++    dash_duo.start_server(app)
++    wait_for_queue(dash_duo)
++
++    dash_duo.wait_for_text_to_equal("#content", "content init")
++
++    assert dash_duo.find_element("#out1").text == "output1 init"
++
++    dash_duo.find_element("#btn").click()
++
++    # after a button click all inputs are present so all callbacks fire.
++    dash_duo.wait_for_text_to_equal("#out1", "A")
++    dash_duo.wait_for_text_to_equal("#b", "A")
++
++    assert not dash_duo.get_logs()
++
++
++def test_cbmi005_all_multi_wildcards_with_output(dash_duo):
++    # if all the inputs are multi wildcards, AND there's an output,
++    # we DO fire the callback
++    app = dash.Dash(__name__, suppress_callback_exceptions=True)
++    app.layout = html.Div(
++        [
++            html.Div("Title", id="title"),
++            html.Button("click", id="btn"),
++            html.Div(id="content"),
++            html.Div("output1 init", id="out1"),
++            html.Div("output2 init", id="out2"),
++        ]
++    )
++
++    @app.callback(Output("content", "children"), [Input("btn", "n_clicks")])
++    def content(n):
++        out = [html.Div("item {}".format(i), id={"i": i}) for i in range(n or 0)]
++        return out or "content init"
++
++    @app.callback(Output("out1", "children"), [Input({"i": ALL}, "children")])
++    def out1(items):
++        return ", ".join(items) or "no items"
++
++    @app.callback(Output("out2", "children"), [Input("out1", "children")])
++    def out2(out1):
++        return out1 + " - 2"
++
++    dash_duo.start_server(app)
++    wait_for_queue(dash_duo)
++
++    dash_duo.wait_for_text_to_equal("#out2", "no items - 2")
++
++    assert dash_duo.find_element("#out1").text == "no items"
++    assert dash_duo.find_element("#content").text == "content init"
++
++    dash_duo.find_element("#btn").click()
++    dash_duo.wait_for_text_to_equal("#out1", "item 0")
++    dash_duo.wait_for_text_to_equal("#out2", "item 0 - 2")
++
++    dash_duo.find_element("#btn").click()
++    dash_duo.wait_for_text_to_equal("#out1", "item 0, item 1")
++    dash_duo.wait_for_text_to_equal("#out2", "item 0, item 1 - 2")
++
++    assert not dash_duo.get_logs()
++
++
++def test_cbmi006_all_multi_wildcards_no_outputs(dash_duo):
++    # if all the inputs are multi wildcards, but there's NO output,
++    # we DO NOT fire the callback
++    app = dash.Dash(__name__, suppress_callback_exceptions=True)
++    app.layout = html.Div(
++        [
++            html.Div("Title", id="title"),
++            html.Button("click", id="btn"),
++            html.Div(id="content"),
++            html.Div("output2 init", id="out2"),
++        ]
++    )
++
++    @app.callback(Output("content", "children"), [Input("btn", "n_clicks")])
++    def content(n):
++        out = [html.Div("item {}".format(i), id={"i": i}) for i in range(n or 0)]
++        return (out + [html.Div("output1 init", id="out1")]) if out else "content init"
++
++    @app.callback(Output("out1", "children"), [Input({"i": ALL}, "children")])
++    def out1(items):
++        return ", ".join(items) or "no items"
++
++    @app.callback(Output("out2", "children"), [Input("out1", "children")])
++    def out2(out1):
++        return out1 + " - 2"
++
++    dash_duo.start_server(app)
++    wait_for_queue(dash_duo)
++
++    dash_duo.wait_for_text_to_equal("#out2", "output2 init")
++
++    assert dash_duo.find_element("#content").text == "content init"
++
++    dash_duo.find_element("#btn").click()
++    dash_duo.wait_for_text_to_equal("#out1", "item 0")
++    dash_duo.wait_for_text_to_equal("#out2", "item 0 - 2")
++
++    dash_duo.find_element("#btn").click()
++    dash_duo.wait_for_text_to_equal("#out1", "item 0, item 1")
++    dash_duo.wait_for_text_to_equal("#out2", "item 0, item 1 - 2")
++
++    assert not dash_duo.get_logs()
++
++
++def test_cbmi007_all_multi_wildcards_some_outputs(dash_duo):
++    # same as above (cbmi006) but multi-output, some outputs present some missing.
++    # Again we DO NOT fire the callback
++    app = dash.Dash(__name__, suppress_callback_exceptions=True)
++    app.layout = html.Div(
++        [
++            html.Div("Title", id="title"),
++            html.Button("click", id="btn"),
++            html.Div(id="content"),
++            html.Div("output2 init", id="out2"),
++            html.Div("output3 init", id="out3"),
++        ]
++    )
++
++    @app.callback(Output("content", "children"), [Input("btn", "n_clicks")])
++    def content(n):
++        out = [html.Div("item {}".format(i), id={"i": i}) for i in range(n or 0)]
++        return (out + [html.Div("output1 init", id="out1")]) if out else "content init"
++
++    @app.callback(
++        [Output("out1", "children"), Output("out3", "children")],
++        [Input({"i": ALL}, "children")],
++    )
++    def out1(items):
++        out = ", ".join(items) or "no items"
++        return out, (out + " - 3")
++
++    @app.callback(Output("out2", "children"), [Input("out1", "children")])
++    def out2(out1):
++        return out1 + " - 2"
++
++    dash_duo.start_server(app)
++    wait_for_queue(dash_duo)
++
++    dash_duo.wait_for_text_to_equal("#out2", "output2 init")
++    dash_duo.wait_for_text_to_equal("#out3", "output3 init")
++
++    assert dash_duo.find_element("#content").text == "content init"
++
++    dash_duo.find_element("#btn").click()
++    dash_duo.wait_for_text_to_equal("#out1", "item 0")
++    dash_duo.wait_for_text_to_equal("#out2", "item 0 - 2")
++    dash_duo.wait_for_text_to_equal("#out3", "item 0 - 3")
++
++    dash_duo.find_element("#btn").click()
++    dash_duo.wait_for_text_to_equal("#out1", "item 0, item 1")
++    dash_duo.wait_for_text_to_equal("#out2", "item 0, item 1 - 2")
++    dash_duo.wait_for_text_to_equal("#out3", "item 0, item 1 - 3")
++
++    assert not dash_duo.get_logs()
++
++
++def test_cbmi008_multi_wildcards_and_simple_all_missing(dash_duo):
++    # if only SOME of the inputs are multi wildcards, even with an output,
++    # we DO NOT fire the callback
++    app = dash.Dash(__name__, suppress_callback_exceptions=True)
++    app.layout = html.Div(
++        [
++            html.Div("Title", id="title"),
++            html.Button("click", id="btn"),
++            html.Div(id="content"),
++            html.Div("output1 init", id="out1"),
++            html.Div("output2 init", id="out2"),
++        ]
++    )
++
++    @app.callback(Output("content", "children"), [Input("btn", "n_clicks")])
++    def content(n):
++        out = [html.Div("item {}".format(i), id={"i": i}) for i in range(n or 0)]
++        return (out + [html.Div("A", id="a")]) if out else "content init"
++
++    @app.callback(
++        Output("out1", "children"),
++        [Input({"i": ALL}, "children"), Input("a", "children")],
++    )
++    def out1(items, a):
++        return a + " - " + (", ".join(items) or "no items")
++
++    @app.callback(Output("out2", "children"), [Input("out1", "children")])
++    def out2(out1):
++        return out1 + " - 2"
++
++    dash_duo.start_server(app)
++    wait_for_queue(dash_duo)
++
++    dash_duo.wait_for_text_to_equal("#content", "content init")
++
++    assert dash_duo.find_element("#out1").text == "output1 init"
++    assert dash_duo.find_element("#out2").text == "output2 init"
++
++    dash_duo.find_element("#btn").click()
++    dash_duo.wait_for_text_to_equal("#out1", "A - item 0")
++    dash_duo.wait_for_text_to_equal("#out2", "A - item 0 - 2")
++
++    dash_duo.find_element("#btn").click()
++    dash_duo.wait_for_text_to_equal("#out1", "A - item 0, item 1")
++    dash_duo.wait_for_text_to_equal("#out2", "A - item 0, item 1 - 2")
++
++    assert not dash_duo.get_logs()
++
++
++def test_cbmi009_match_wildcards_all_missing(dash_duo):
++    # Kind of contrived - MATCH will always be 0. Just want to make sure
++    # that this behaves the same as cbmi001
++    app = dash.Dash(__name__, suppress_callback_exceptions=True)
++    app.layout = html.Div(
++        [
++            html.Div("Title", id={"i": 0, "id": "title"}),
++            html.Button("click", id="btn"),
++            html.Div(id="content"),
++            html.Div("output1 init", id={"i": 0, "id": "out1"}),
++            html.Div("output2 init", id={"i": 0, "id": "out2"}),
++            html.Div("output3 init", id={"i": 0, "id": "out3"}),
++        ]
++    )
++
++    @app.callback(Output("content", "children"), [Input("btn", "n_clicks")])
++    def content(n):
++        return (
++            [
++                html.Div("A", id={"i": 0, "id": "a"}),
++                html.Div("B", id={"i": 0, "id": "b"}),
++                html.Div("C", id={"i": 0, "id": "c"}),
++            ]
++            if n
++            else "content init"
++        )
++
++    @app.callback(
++        Output({"i": MATCH, "id": "out1"}, "children"),
++        [
++            Input({"i": MATCH, "id": "a"}, "children"),
++            Input({"i": MATCH, "id": "b"}, "children"),
++        ],
++        [
++            State({"i": MATCH, "id": "c"}, "children"),
++            State({"i": MATCH, "id": "title"}, "children"),
++        ],
++    )
++    def out1(a, b, c, title):
++        # title exists at the start but State isn't enough to fire the callback
++        assert c == "C"
++        assert title == "Title"
++        return a + b
++
++    @app.callback(
++        Output({"i": MATCH, "id": "out2"}, "children"),
++        [Input({"i": MATCH, "id": "out1"}, "children")],
++        [State({"i": MATCH, "id": "title"}, "children")],
++    )
++    def out2(out1, title):
++        return out1 + " - 2 - " + title
++
++    @app.callback(
++        Output({"i": MATCH, "id": "out3"}, "children"),
++        [
++            Input({"i": MATCH, "id": "out1"}, "children"),
++            Input({"i": MATCH, "id": "title"}, "children"),
++        ],
++    )
++    def out3(out1, title):
++        return out1 + " - 3 - " + title
++
++    dash_duo.start_server(app)
++    wait_for_queue(dash_duo)
++
++    def cssid(v):
++        # escaped CSS for object IDs
++        return r"#\{\"i\"\:0\,\"id\"\:\"" + v + r"\"\}"
++
++    # out3 fires because it has another Input besides out1
++    dash_duo.wait_for_text_to_equal(cssid("out3"), "output1 init - 3 - Title")
++
++    assert dash_duo.find_element(cssid("out1")).text == "output1 init"
++
++    # out2 doesn't fire because its only input (out1) is "prevented"
++    # State items don't matter for this.
++    assert dash_duo.find_element(cssid("out2")).text == "output2 init"
++
++    dash_duo.find_element("#btn").click()
++
++    # after a button click all inputs are present so all callbacks fire.
++    dash_duo.wait_for_text_to_equal(cssid("out1"), "AB")
++    dash_duo.wait_for_text_to_equal(cssid("out2"), "AB - 2 - Title")
++    dash_duo.wait_for_text_to_equal(cssid("out3"), "AB - 3 - Title")
++
++    assert not dash_duo.get_logs()
+diff --git a/tests/integration/devtools/test_callback_validation.py b/tests/integration/devtools/test_callback_validation.py
+index 423b534e..a006e23e 100644
+--- a/tests/integration/devtools/test_callback_validation.py
++++ b/tests/integration/devtools/test_callback_validation.py
+@@ -423,15 +423,10 @@ def bad_id_app(**kwargs):
+     return app
+ 
+ 
+-# These ones are raised by bad_id_app whether suppressing callback exceptions or not
++# This one is raised by bad_id_app whether suppressing callback exceptions or not
++# yeah-no no longer raises an error on dispatch due to the no-input regression fix
++# for issue #1200
+ dispatch_specs = [
+-    [
+-        "A nonexistent object was used in an `Input` of a Dash callback. "
+-        "The id of this object is `yeah-no` and the property is `value`. "
+-        "The string ids in the current layout are: "
+-        "[main, outer-div, inner-div, inner-input, outer-input]",
+-        [],
+-    ],
+     [
+         "A nonexistent object was used in an `Output` of a Dash callback. "
+         "The id of this object is `nope` and the property is `children`. "

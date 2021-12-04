@@ -1,0 +1,230 @@
+commit 74f5d6d52f47ce86a607769df68bdf9c68b7292a
+Author: Wes McKinney <wesmckinn@gmail.com>
+Date:   Sun Nov 13 17:31:00 2011 -0500
+
+    ENH: Cython Reducer, speed up DataFrame.apply significantly, GH #309
+
+diff --git a/RELEASE.rst b/RELEASE.rst
+index 93a7ed917..c35d219a0 100644
+--- a/RELEASE.rst
++++ b/RELEASE.rst
+@@ -54,8 +54,11 @@ pandas 0.5.1
+     for fast conversion to DataFrame (GH #357)
+   - Can pass multiple levels to groupby, e.g. `df.groupby(level=[0, 1])` (GH
+     #103)
++  - Can sort by multiple columns in `DataFrame.sort_index` (GH #92, PR #362)
+   - Add fast `get_value` and `put_value` methods to DataFrame and
+     micro-performance tweaks (GH #360)
++  - Add `cov` instance methods to Series and DataFrame (GH #194, PR #362)
++
+ 
+ **Improvements to existing features**
+ 
+diff --git a/pandas/core/frame.py b/pandas/core/frame.py
+index 682a13217..8f419eed6 100644
+--- a/pandas/core/frame.py
++++ b/pandas/core/frame.py
+@@ -1520,7 +1520,6 @@ class DataFrame(NDFrame):
+             else:
+                 to_sort = self[by].values
+ 
+-            # stable sort
+             indexer = to_sort.argsort()
+         else:
+             indexer = labels.argsort()
+@@ -2187,7 +2186,10 @@ class DataFrame(NDFrame):
+                 return self._apply_broadcast(func, axis)
+ 
+     def _apply_raw(self, func, axis):
+-        result = np.apply_along_axis(func, axis, self.values)
++        try:
++            result = lib.reduce(self.values, func, axis=axis)
++        except Exception:
++            result = np.apply_along_axis(func, axis, self.values)
+ 
+         # TODO: mixed type case
+         if result.ndim == 2:
+@@ -2197,6 +2199,15 @@ class DataFrame(NDFrame):
+             return Series(result, index=self._get_agg_axis(axis))
+ 
+     def _apply_standard(self, func, axis, ignore_failures=False):
++        try:
++            values = self.values
++            dummy = Series(np.nan, index=self._get_axis(axis),
++                           dtype=values.dtype)
++            result = lib.reduce(values, func, axis=axis, dummy=dummy)
++            return Series(result, index=self._get_agg_axis(axis))
++        except Exception:
++            pass
++
+         if axis == 0:
+             series_gen = ((c, self[c]) for c in self.columns)
+             res_index = self.columns
+diff --git a/pandas/src/reduce.pyx b/pandas/src/reduce.pyx
+new file mode 100644
+index 000000000..262aa2f9d
+--- /dev/null
++++ b/pandas/src/reduce.pyx
+@@ -0,0 +1,83 @@
++from numpy cimport *
++import numpy as np
++
++cdef class Reducer:
++    '''
++    Performs generic reduction operation on a C or Fortran-contiguous ndarray
++    while avoiding ndarray construction overhead
++    '''
++    cdef:
++        Py_ssize_t increment, chunksize, nresults
++        object arr, dummy, f
++
++    def __init__(self, object arr, object f, axis=1, dummy=None):
++        n, k = arr.shape
++
++        if axis == 0:
++            if not arr.flags.f_contiguous:
++                arr = arr.copy('F')
++
++            self.nresults = k
++            self.chunksize = n
++            self.increment = n * arr.dtype.itemsize
++        else:
++            if not arr.flags.c_contiguous:
++                arr = arr.copy('C')
++
++            self.nresults = n
++            self.chunksize = k
++            self.increment = k * arr.dtype.itemsize
++
++        self.f = f
++        self.arr = arr
++        self.dummy = self._check_dummy(dummy)
++
++    def _check_dummy(self, dummy=None):
++        if dummy is None:
++            dummy = np.empty(self.chunksize, dtype=self.arr.dtype)
++        else:
++            if dummy.dtype != self.arr.dtype:
++                raise ValueError('Dummy array must be same dtype')
++            if len(dummy) != self.chunksize:
++                raise ValueError('Dummy array must be length %d' %
++                                 self.chunksize)
++
++        return dummy
++
++    def get_result(self):
++        cdef:
++            char* dummy_buf
++            ndarray arr, result, chunk
++            Py_ssize_t i
++            flatiter it
++
++        arr = self.arr
++        chunk = self.dummy
++
++        result = np.empty(self.nresults, dtype=self.arr.dtype)
++        it = <flatiter> PyArray_IterNew(result)
++
++        test = self.f(self.chunk)
++        try:
++            result[0] = test
++        except Exception:
++            raise ValueError('function does not reduce')
++
++        dummy_buf = chunk.data
++        chunk.data = arr.data
++
++        try:
++            for i in range(self.nresults):
++                PyArray_SETITEM(result, PyArray_ITER_DATA(it),
++                                self.f(self.dummy))
++                chunk.data = chunk.data + self.increment
++                PyArray_ITER_NEXT(it)
++        finally:
++            # so we don't free the wrong memory
++            chunk.data = dummy_buf
++
++        return result
++
++def reduce(arr, f, axis=0, dummy=None):
++    reducer = Reducer(arr, f, axis=axis, dummy=dummy)
++    return reducer.get_result()
+diff --git a/pandas/src/sandbox.pyx b/pandas/src/sandbox.pyx
+index 91a9a613e..a019930eb 100644
+--- a/pandas/src/sandbox.pyx
++++ b/pandas/src/sandbox.pyx
+@@ -3,46 +3,10 @@ import numpy as np
+ 
+ import_array()
+ 
+-cdef class ArrayCruncher:
++cdef class SeriesIterator:
+ 
+-    cdef:
+-        ndarray arr
+-        object f
+-        bint raw
+-        Py_ssize_t N, K
++    def __init__(self, arr):
++        pass
+ 
+-    def __init__(self, arr, f, axis=0, raw=True):
+-        self.arr = arr
+-        self.f = f
+-        self.raw = raw
+-        self.N, self.K = arr.shape
+-
+-    def reduce(self):
+-        cdef:
+-            char* dummy_buf
+-            ndarray arr, result, chunk
+-            Py_ssize_t i, increment
+-            flatiter it
+-
+-        if not self.arr.flags.c_contiguous:
+-            arr = self.arr.copy('C')
+-        else:
+-            arr = self.arr
+-
+-        increment = self.K * self.arr.dtype.itemsize
+-        chunk = np.empty(self.K, dtype=arr.dtype)
+-        result = np.empty(self.N, dtype=arr.dtype)
+-        it = <flatiter> PyArray_IterNew(result)
+-
+-        dummy_buf = chunk.data
+-        chunk.data = arr.data
+-
+-        for i in range(self.N):
+-            PyArray_SETITEM(result, PyArray_ITER_DATA(it), self.f(chunk))
+-            chunk.data = chunk.data + increment
+-            PyArray_ITER_NEXT(it)
+-
+-        # so we don't free the wrong memory
+-        chunk.data = dummy_buf
+-
+-        return result
++    def next(self):
++        pass
+diff --git a/pandas/src/tseries.pyx b/pandas/src/tseries.pyx
+index 520f83ba4..a0e760561 100644
+--- a/pandas/src/tseries.pyx
++++ b/pandas/src/tseries.pyx
+@@ -473,4 +473,4 @@ include "moments.pyx"
+ include "reindex.pyx"
+ include "generated.pyx"
+ include "parsing.pyx"
+-
++include "reduce.pyx"
+diff --git a/setup.py b/setup.py
+index 1b8a52d0f..4f3a19c35 100755
+--- a/setup.py
++++ b/setup.py
+@@ -275,7 +275,7 @@ else:
+     cmdclass['sdist'] =  CheckSDist
+ 
+ tseries_depends = ['reindex', 'groupby', 'skiplist', 'moments',
+-                   'generated', 'parsing']
++                   'generated', 'parsing', 'reduce']
+ def srcpath(name=None, suffix='.pyx', subdir='src'):
+     return pjoin('pandas', subdir, name+suffix)
+ 

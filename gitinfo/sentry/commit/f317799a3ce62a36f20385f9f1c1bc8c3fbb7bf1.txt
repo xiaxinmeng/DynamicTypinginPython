@@ -1,0 +1,1170 @@
+commit f317799a3ce62a36f20385f9f1c1bc8c3fbb7bf1
+Author: Radu Woinaroski <5281987+RaduW@users.noreply.github.com>
+Date:   Fri Sep 27 13:18:18 2019 +0200
+
+    feat(outcome): Move event signals to outcomes consumer (#14811)
+    
+    Moves event signal emission from the store endpoint code to a consumer of related outcomes.
+    
+    When an event is filtered or rate limited ("dropped"), we emit respective signals. Plugins can hook those signals and run callbacks on these actions. In the future, event ingestion will be moved into Relay, which means signals cannot be emitted directly anymore.
+    
+    To solve this, signals are now emitted for the `FILTERED` and `RATE_LIMITED` outcomes. During migration, we use a key in the Django cache (i.e. memcache) to detect if signals have been emitted already.
+
+diff --git a/src/sentry/ingest/__init__.py b/src/sentry/ingest/__init__.py
+new file mode 100644
+index 0000000000..c3961685ab
+--- /dev/null
++++ b/src/sentry/ingest/__init__.py
+@@ -0,0 +1 @@
++from __future__ import absolute_import
+diff --git a/src/sentry/ingest/ingest_consumer.py b/src/sentry/ingest/ingest_consumer.py
+new file mode 100644
+index 0000000000..1cb0eaa173
+--- /dev/null
++++ b/src/sentry/ingest/ingest_consumer.py
+@@ -0,0 +1,105 @@
++from __future__ import absolute_import
++
++import logging
++import msgpack
++
++from django.conf import settings
++from django.core.cache import cache
++
++from sentry.coreapi import cache_key_from_project_id_and_event_id
++from sentry.cache import default_cache
++from sentry.tasks.store import preprocess_event
++from sentry.utils.kafka import SimpleKafkaConsumer
++
++logger = logging.getLogger(__name__)
++
++
++class ConsumerType(object):
++    """
++    Defines the types of ingestion consumers
++    """
++
++    Events = "events"  # consumes simple events ( from the Events topic)
++    Attachments = "attachments"  # consumes events with attachments ( from the Attachments topic)
++    Transactions = "transactions"  # consumes transaction events ( from the Transactions topic)
++
++    @staticmethod
++    def get_topic_name(consumer_type):
++        if consumer_type == ConsumerType.Events:
++            return settings.KAFKA_INGEST_EVENTS
++        elif consumer_type == ConsumerType.Attachments:
++            return settings.KAFKA_INGEST_ATTACHMENTS
++        elif consumer_type == ConsumerType.Transactions:
++            return settings.KAFKA_INGEST_TRANSACTIONS
++        raise ValueError("Invalid consumer type", consumer_type)
++
++
++class IngestConsumer(SimpleKafkaConsumer):
++    def process_message(self, message):
++        message = msgpack.unpackb(message.value(), use_list=False)
++        body = message["payload"]
++        start_time = float(message["start_time"])
++        event_id = message["event_id"]
++        project_id = message["project_id"]
++
++        # check that we haven't already processed this event (a previous instance of the forwarder
++        # died before it could commit the event queue offset)
++        deduplication_key = "ev:{}:{}".format(project_id, event_id)
++        if cache.get(deduplication_key) is not None:
++            logger.warning(
++                "pre-process-forwarder detected a duplicated event" " with id:%s for project:%s.",
++                event_id,
++                project_id,
++            )
++            return  # message already processed do not reprocess
++
++        cache_key = cache_key_from_project_id_and_event_id(project_id=project_id, event_id=event_id)
++        cache_timeout = 3600
++        default_cache.set(cache_key, body, cache_timeout, raw=True)
++
++        # queue the event for processing
++        preprocess_event.delay(cache_key=cache_key, start_time=start_time, event_id=event_id)
++
++        # remember for an 1 hour that we saved this event (deduplication protection)
++        cache.set(deduplication_key, "", 3600)
++
++
++def run_ingest_consumer(
++    commit_batch_size,
++    consumer_group,
++    consumer_type,
++    max_fetch_time_seconds,
++    initial_offset_reset="latest",
++    is_shutdown_requested=lambda: False,
++):
++    """
++    Handles events coming via a kafka queue.
++
++    The events should have already been processed (normalized... ) upstream (by Relay).
++
++    :param commit_batch_size: the number of message the consumer will try to process/commit in one loop
++    :param consumer_group: kafka consumer group name
++    :param consumer_type: an enumeration defining the types of ingest messages see `ConsumerType`
++    :param max_fetch_time_seconds: the maximum number of seconds a consume operation will be blocked waiting
++        for the specified commit_batch_size number of messages to appear in the queue before it returns. At the
++        end of the specified time the consume operation will return however many messages it has ( including
++        an empty array if no new messages are available).
++    :param initial_offset_reset: offset reset policy when there's no available offset for the consumer
++    :param is_shutdown_requested: Callable[[],bool] predicate checked after each loop, if it returns
++        True the forwarder stops (by default is lambda: False). In normal operation this should be left to default.
++        For unit testing it offers a way to cleanly stop the forwarder after some particular condition is achieved.
++    """
++    logger.debug("Starting ingest-consumer...")
++    topic_name = ConsumerType.get_topic_name(consumer_type)
++
++    ingest_consumer = IngestConsumer(
++        commit_batch_size=commit_batch_size,
++        consumer_group=consumer_group,
++        topic_name=topic_name,
++        max_fetch_time_seconds=max_fetch_time_seconds,
++        initial_offset_reset=initial_offset_reset,
++    )
++
++    ingest_consumer.run(is_shutdown_requested)
++
++    logger.debug("ingest-consumer terminated.")
+diff --git a/src/sentry/ingest/outcomes_consumer.py b/src/sentry/ingest/outcomes_consumer.py
+new file mode 100644
+index 0000000000..5e47ec7dc6
+--- /dev/null
++++ b/src/sentry/ingest/outcomes_consumer.py
+@@ -0,0 +1,131 @@
++"""
++The OutcomeConsumer is a task that runs a loop in which it reads outcome messages coming on a kafka queue and
++processes them.
++
++Long Story: Event outcomes are placed on the same Kafka event queue by both Sentry and Relay.
++When Sentry generates an outcome for a message it also sends a signal ( a Django signal) that
++is used by getSentry for internal accounting.
++
++Relay (running as a Rust process) cannot send django signals so in order to get outcome signals sent from
++Relay into getSentry we have this outcome consumers which listens to all outcomes in the kafka queue and
++for outcomes that were sent from Relay sends the signals to getSentry.
++
++In conclusion the OutcomeConsumer listens on the the outcomes kafka topic, filters the outcomes by dropping
++the outcomes that originate from sentry and keeping the outcomes originating in relay and sends
++signals to getSentry for these outcomes.
++
++"""
++from __future__ import absolute_import
++
++import logging
++
++from django.conf import settings
++from django.core.cache import cache
++
++from sentry.models.project import Project
++from sentry.signals import event_filtered, event_dropped
++from sentry.utils.kafka import SimpleKafkaConsumer
++from sentry.utils import json
++from sentry.utils.outcomes import Outcome
++
++logger = logging.getLogger(__name__)
++
++
++def _get_signal_cache_key(project_id, event_id):
++    return "signal:{}:{}".format(project_id, event_id)
++
++
++def mark_signal_sent(project_id, event_id):
++    """
++    Remembers that a signal was emitted.
++
++    Sets a boolean flag to remember (for one hour) that a signal for a
++    particular event id (in a project) was sent. This is used by the signals
++    forwarder to avoid double-emission.
++
++    :param project_id: :param event_id: :return:
++    """
++    key = _get_signal_cache_key(project_id, event_id)
++    cache.set(key, True, 3600)
++
++
++def is_signal_sent(project_id, event_id):
++    """
++    Checks a signal was sent previously.
++    """
++    key = _get_signal_cache_key(project_id, event_id)
++    return cache.get(key, None) is not None
++
++
++class OutcomesConsumer(SimpleKafkaConsumer):
++    def process_message(self, message):
++        msg = json.loads(message.value())
++
++        project_id = int(msg.get("project_id", 0))
++        if project_id == 0:
++            return  # no project. this is valid, so ignore silently.
++
++        outcome = int(msg.get("outcome", -1))
++        if outcome not in (Outcome.FILTERED, Outcome.RATE_LIMITED):
++            return  # nothing to do here
++
++        event_id = msg.get("event_id")
++        if is_signal_sent(project_id=project_id, event_id=event_id):
++            return  # message already processed nothing left to do
++
++        try:
++            project = Project.objects.get_from_cache(id=project_id)
++        except Project.DoesNotExist:
++            logger.error("OutcomesConsumer could not find project with id: %s", project_id)
++            return
++
++        reason = msg.get("reason")
++        remote_addr = msg.get("remote_addr")
++
++        if outcome == Outcome.FILTERED:
++            event_filtered.send_robust(ip=remote_addr, project=project, sender=self.process_message)
++        elif outcome == Outcome.RATE_LIMITED:
++            event_dropped.send_robust(
++                ip=remote_addr, project=project, reason_code=reason, sender=self.process_message
++            )
++
++        # remember that we sent the signal just in case the processor dies before
++        mark_signal_sent(project_id=project_id, event_id=event_id)
++
++
++def run_outcomes_consumer(
++    commit_batch_size,
++    consumer_group,
++    max_fetch_time_seconds,
++    initial_offset_reset,
++    is_shutdown_requested=lambda: False,
++):
++    """
++    Handles outcome requests coming via a kafka queue from Relay.
++
++    :param commit_batch_size: the number of message the consumer will try to process/commit in one loop
++    :param consumer_group: kafka consumer group name
++    :param max_fetch_time_seconds: the maximum number of seconds a consume operation will be blocked waiting
++        for the specified commit_batch_size number of messages to appear in the queue before it returns. At the
++        end of the specified time the consume operation will return however many messages it has ( including
++        an empty array if no new messages are available).
++    :param initial_offset_reset: offset reset policy when there's no available offset for the consumer
++    :param is_shutdown_requested: Callable[[],bool] predicate checked after each loop, if it returns
++        True the forwarder stops (by default is lambda: False). In normal operation this should be left to default.
++        For unit testing it offers a way to cleanly stop the forwarder after some particular condition is achieved.
++    """
++
++    logger.debug("Starting outcomes-consumer...")
++    topic_name = settings.KAFKA_OUTCOMES
++
++    outcomes_consumer = OutcomesConsumer(
++        commit_batch_size=commit_batch_size,
++        consumer_group=consumer_group,
++        topic_name=topic_name,
++        max_fetch_time_seconds=max_fetch_time_seconds,
++        initial_offset_reset=initial_offset_reset,
++    )
++
++    outcomes_consumer.run(is_shutdown_requested)
++
++    logger.debug("outcomes-consumer terminated.")
+diff --git a/src/sentry/ingest_consumer.py b/src/sentry/ingest_consumer.py
+deleted file mode 100644
+index e14379c388..0000000000
+--- a/src/sentry/ingest_consumer.py
++++ /dev/null
+@@ -1,174 +0,0 @@
+-from __future__ import absolute_import
+-
+-import logging
+-import msgpack
+-import signal
+-from contextlib import contextmanager
+-
+-from django.conf import settings
+-from django.core.cache import cache
+-import confluent_kafka as kafka
+-
+-from sentry.coreapi import cache_key_from_project_id_and_event_id
+-from sentry.cache import default_cache
+-from sentry.tasks.store import preprocess_event
+-
+-logger = logging.getLogger(__name__)
+-
+-
+-class ConsumerType(object):
+-    """
+-    Defines the types of ingestion consumers
+-    """
+-
+-    Events = "events"  # consumes simple events ( from the Events topic)
+-    Attachments = "attachments"  # consumes events with attachments ( from the Attachments topic)
+-    Transactions = "transactions"  # consumes transaction events ( from the Transactions topic)
+-
+-    @staticmethod
+-    def get_topic_name(consumer_type):
+-        if consumer_type == ConsumerType.Events:
+-            return settings.KAFKA_INGEST_EVENTS
+-        elif consumer_type == ConsumerType.Attachments:
+-            return settings.KAFKA_INGEST_ATTACHMENTS
+-        elif consumer_type == ConsumerType.Transactions:
+-            return settings.KAFKA_INGEST_TRANSACTIONS
+-        raise ValueError("Invalid consumer type", consumer_type)
+-
+-
+-def _create_consumer(consumer_group, consumer_type, initial_offset_reset):
+-    """
+-    Creates a kafka consumer based on the
+-    :param consumer_group:
+-    :return:
+-    """
+-    topic_name = ConsumerType.get_topic_name(consumer_type)
+-    cluster_name = settings.KAFKA_TOPICS[topic_name]["cluster"]
+-    bootstrap_servers = settings.KAFKA_CLUSTERS[cluster_name]["bootstrap.servers"]
+-
+-    consumer_configuration = {
+-        "bootstrap.servers": bootstrap_servers,
+-        "group.id": consumer_group,
+-        "enable.auto.commit": "false",  # we commit manually
+-        "enable.auto.offset.store": "true",  # we let the broker keep count of the current offset (when committing)
+-        "enable.partition.eof": "false",  # stop EOF errors when we read all messages in the topic
+-        "default.topic.config": {"auto.offset.reset": initial_offset_reset},
+-    }
+-
+-    return kafka.Consumer(consumer_configuration)
+-
+-
+-@contextmanager
+-def set_termination_request_handlers(handler):
+-    # hook the new handlers
+-    old_sigint = signal.signal(signal.SIGINT, handler)
+-    old_sigterm = signal.signal(signal.SIGTERM, handler)
+-    try:
+-        # run the code inside the with context ( with the hooked handler)
+-        yield
+-    finally:
+-        # restore the old handlers when exiting the with context
+-        signal.signal(signal.SIGINT, old_sigint)
+-        signal.signal(signal.SIGTERM, old_sigterm)
+-
+-
+-def run_ingest_consumer(
+-    commit_batch_size,
+-    consumer_group,
+-    consumer_type,
+-    max_fetch_time_seconds,
+-    initial_offset_reset="latest",
+-    is_shutdown_requested=lambda: False,
+-):
+-    """
+-    Handles events coming via a kafka queue.
+-
+-    The events should have already been processed (normalized... ) upstream (by Relay).
+-
+-    :param commit_batch_size: the number of message the consumer will try to process/commit in one loop
+-    :param consumer_group: kafka consumer group name
+-    :param consumer_type: an enumeration defining the types of ingest messages see `ConsumerType`
+-    :param max_fetch_time_seconds: the maximum number of seconds a consume operation will be blocked waiting
+-        for the specified commit_batch_size number of messages to appear in the queue before it returns. At the
+-        end of the specified time the consume operation will return however many messages it has ( including
+-        an empty array if no new messages are available).
+-    :param initial_offset_reset: offset reset policy when there's no available offset for the consumer
+-    :param is_shutdown_requested: Callable[[],bool] predicate checked after each loop, if it returns
+-        True the forwarder stops (by default is lambda: False). In normal operation this should be left to default.
+-        For unit testing it offers a way to cleanly stop the forwarder after some particular condition is achieved.
+-    """
+-
+-    logger.debug("Starting ingest-consumer...")
+-    consumer = _create_consumer(consumer_group, consumer_type, initial_offset_reset)
+-
+-    consumer.subscribe([ConsumerType.get_topic_name(consumer_type)])
+-    # setup a flag to mark termination signals received, see below why we use an array
+-    termination_signal_received = [False]
+-
+-    def termination_signal_handler(_sig_id, _frame):
+-        """
+-        Function to use a hook for SIGINT and SIGTERM
+-
+-        This signal handler only remembers that the signal was emitted.
+-        The batch processing loop detects that the signal was emitted
+-        and stops once the whole batch is processed.
+-        """
+-        # We need to use an array so that terminal_signal_received is not a
+-        # local variable assignment, but a lookup in the clojure's outer scope.
+-        termination_signal_received[0] = True
+-
+-    with set_termination_request_handlers(termination_signal_handler):
+-        while not (is_shutdown_requested() or termination_signal_received[0]):
+-            # get up to commit_batch_size messages
+-            messages = consumer.consume(
+-                num_messages=commit_batch_size, timeout=max_fetch_time_seconds
+-            )
+-
+-            for message in messages:
+-                message_error = message.error()
+-                if message_error is not None:
+-                    logger.error(
+-                        "Received message with error on %s, error:'%s'",
+-                        consumer_type,
+-                        message_error,
+-                    )
+-                    raise ValueError(
+-                        "Bad message received from consumer", consumer_type, message_error
+-                    )
+-
+-                message = msgpack.unpackb(message.value(), use_list=False)
+-                body = message["payload"]
+-                start_time = float(message["start_time"])
+-                event_id = message["event_id"]
+-                project_id = message["project_id"]
+-
+-                # check that we haven't already processed this event (a previous instance of the forwarder
+-                # died before it could commit the event queue offset)
+-                deduplication_key = "ev:{}:{}".format(project_id, event_id)
+-                if cache.get(deduplication_key) is not None:
+-                    logger.warning(
+-                        "pre-process-forwarder detected a duplicated event"
+-                        " with id:%s for project:%s.",
+-                        event_id,
+-                        project_id,
+-                    )
+-                    continue
+-
+-                cache_key = cache_key_from_project_id_and_event_id(
+-                    project_id=project_id, event_id=event_id
+-                )
+-                cache_timeout = 3600
+-                default_cache.set(cache_key, body, cache_timeout, raw=True)
+-                preprocess_event.delay(
+-                    cache_key=cache_key, start_time=start_time, event_id=event_id
+-                )
+-
+-                # remember for an 1 hour that we saved this event (deduplication protection)
+-                cache.set(deduplication_key, "", 3600)
+-
+-            if len(messages) > 0:
+-                # we have read some messages in the previous consume, commit the offset
+-                consumer.commit(asynchronous=False)
+-
+-    logger.debug("Closing ingest-consumer %s...", consumer_type)
+-    consumer.close()
+diff --git a/src/sentry/runner/commands/run.py b/src/sentry/runner/commands/run.py
+index 8f354e1a0c..815f282af1 100644
+--- a/src/sentry/runner/commands/run.py
++++ b/src/sentry/runner/commands/run.py
+@@ -394,7 +394,7 @@ def ingest_consumer(**options):
+     The "ingest consumer" tasks read events from a kafka topic (coming from Relay) and schedules
+     process event celery tasks for them
+     """
+-    from sentry.ingest_consumer import ConsumerType, run_ingest_consumer
++    from sentry.ingest.ingest_consumer import ConsumerType, run_ingest_consumer
+ 
+     consumer_type = options["consumer_type"]
+     if consumer_type == "events":
+@@ -413,3 +413,47 @@ def ingest_consumer(**options):
+         max_fetch_time_seconds=max_fetch_time_seconds,
+         initial_offset_reset=options["initial_offset_reset"],
+     )
++
++
++@run.command("outcomes-consumer")
++@log_options()
++@click.option(
++    "--group", default="outcomes-consumer", help="Kafka consumer group for the outcomes consumer. "
++)
++@click.option(
++    "--commit-batch-size",
++    default=100,
++    type=int,
++    help="How many messages to process before committing offsets.",
++)
++@click.option(
++    "--max-fetch-time-ms",
++    default=100,
++    type=int,
++    help="Timeout (in milliseconds) for a consume operation. Max time the kafka consumer will wait "
++    "before returning the available messages in the topic.",
++)
++@click.option(
++    "--initial-offset-reset",
++    default="latest",
++    type=click.Choice(["earliest", "latest", "error"]),
++    help="Position in the commit log topic to begin reading from when no prior offset has been recorded.",
++)
++@configuration
++def outcome_consumer(**options):
++    """
++    Runs an "outcomes consumer" task.
++
++    The "outcomes consumer" tasks read outcomes from a kafka topic and sends
++    signals for some of them.
++    """
++    from sentry.ingest.outcome_consumer import run_outcomes_consumer
++
++    max_fetch_time_seconds = options["max_fetch_time_ms"] / 1000.0
++
++    run_outcomes_consumer(
++        commit_batch_size=options["commit_batch_size"],
++        consumer_group=options["group"],
++        max_fetch_time_seconds=max_fetch_time_seconds,
++        initial_offset_reset=options["initial_offset_reset"],
++    )
+diff --git a/src/sentry/utils/kafka.py b/src/sentry/utils/kafka.py
+index 88149f9795..11c858a87c 100644
+--- a/src/sentry/utils/kafka.py
++++ b/src/sentry/utils/kafka.py
+@@ -1,15 +1,21 @@
+ from __future__ import absolute_import
+ 
+ import logging
++import abc
++from contextlib import contextmanager
++import signal as os_signal
+ 
++import six
++import confluent_kafka as kafka
+ from django.conf import settings
+ 
++from sentry.utils.safe import safe_execute
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+ class ProducerManager(object):
+-    """\
++    """
+     Manages one `confluent_kafka.Producer` per Kafka cluster.
+ 
+     See `KAFKA_CLUSTERS` and `KAFKA_TOPICS` in settings.
+@@ -33,3 +39,121 @@ class ProducerManager(object):
+ 
+ 
+ producers = ProducerManager()
++
++
++@contextmanager
++def set_termination_request_handlers(handler):
++    # hook the new handlers
++    old_sigint = os_signal.signal(os_signal.SIGINT, handler)
++    old_sigterm = os_signal.signal(os_signal.SIGTERM, handler)
++    try:
++        # run the code inside the with context ( with the hooked handler)
++        yield
++    finally:
++        # restore the old handlers when exiting the with context
++        os_signal.signal(os_signal.SIGINT, old_sigint)
++        os_signal.signal(os_signal.SIGTERM, old_sigterm)
++
++
++@six.add_metaclass(abc.ABCMeta)
++class SimpleKafkaConsumer(object):
++    def __init__(
++        self,
++        commit_batch_size,
++        consumer_group,
++        topic_name,
++        max_fetch_time_seconds,
++        initial_offset_reset="latest",
++        consumer_configuration=None,
++    ):
++        """
++        Base class for implementing kafka consumers.
++        """
++
++        self.commit_batch_size = commit_batch_size
++        self.topic_name = topic_name
++        self.max_fetch_time_seconds = max_fetch_time_seconds
++        self.initial_offset_reset = initial_offset_reset
++        self.consumer_group = consumer_group
++
++        cluster_name = settings.KAFKA_TOPICS[topic_name]["cluster"]
++        bootstrap_servers = settings.KAFKA_CLUSTERS[cluster_name]["bootstrap.servers"]
++
++        self.consumer_configuration = {
++            "bootstrap.servers": bootstrap_servers,
++            "group.id": consumer_group,
++            "enable.auto.commit": "false",  # we commit manually
++            "enable.auto.offset.store": "true",  # we let the broker keep count of the current offset (when committing)
++            "enable.partition.eof": "false",  # stop EOF errors when we read all messages in the topic
++            "default.topic.config": {"auto.offset.reset": initial_offset_reset},
++        }
++
++        if consumer_configuration is not None:
++            for key in six.iterkeys(consumer_configuration):
++                self.consumer_configuration[key] = consumer_configuration[key]
++
++    @abc.abstractmethod
++    def process_message(self, message):
++        """
++        This function is called for each message
++        :param message: the kafka message:
++        """
++        pass
++
++    def run(self, is_shutdown_requested=lambda: False):
++        """
++        Runs the message processing loop
++        """
++        logger.debug(
++            "Staring kafka consumer for topic:{} with consumer group:{}",
++            self.topic_name,
++            self.consumer_group,
++        )
++
++        consumer = kafka.Consumer(self.consumer_configuration)
++        consumer.subscribe([self.topic_name])
++
++        # setup a flag to mark termination signals received, see below why we use an array
++        termination_signal_received = [False]
++
++        def termination_signal_handler(_sig_id, _frame):
++            """
++            Function to use a hook for SIGINT and SIGTERM
++
++            This signal handler only remembers that the signal was emitted.
++            The batch processing loop detects that the signal was emitted
++            and stops once the whole batch is processed.
++            """
++            # We need to use an array so that terminal_signal_received is not a
++            # local variable assignment, but a lookup in the clojure's outer scope.
++            termination_signal_received[0] = True
++
++        with set_termination_request_handlers(termination_signal_handler):
++            while not (is_shutdown_requested() or termination_signal_received[0]):
++                # get up to commit_batch_size messages
++                messages = consumer.consume(
++                    num_messages=self.commit_batch_size, timeout=self.max_fetch_time_seconds
++                )
++
++                for message in messages:
++                    message_error = message.error()
++                    if message_error is not None:
++                        logger.error(
++                            "Received message with error on %s: %s", self.topic_name, message_error
++                        )
++                        raise ValueError(
++                            "Bad message received from consumer", self.topic_name, message_error
++                        )
++
++                    safe_execute(self.process_message, message, _with_transaction=False)
++
++                if len(messages) > 0:
++                    # we have read some messages in the previous consume, commit the offset
++                    consumer.commit(asynchronous=False)
++
++        consumer.close()
++        logger.debug(
++            "Closing kafka consumer for topic:{} with consumer group:{}",
++            self.topic_name,
++            self.consumer_group,
++        )
+diff --git a/src/sentry/utils/outcomes.py b/src/sentry/utils/outcomes.py
+index 099a6be738..d797ec6ccf 100644
+--- a/src/sentry/utils/outcomes.py
++++ b/src/sentry/utils/outcomes.py
+@@ -3,11 +3,10 @@ from __future__ import absolute_import
+ from datetime import datetime
+ from django.conf import settings
+ from enum import IntEnum
+-import random
+ import six
+ import time
+ 
+-from sentry import tsdb, options
++from sentry import tsdb
+ from sentry.utils import json, metrics
+ from sentry.utils.data_filters import FILTER_STAT_KEYS_TO_VALUES
+ from sentry.utils.dates import to_datetime
+@@ -89,21 +88,20 @@ def track_outcome(org_id, project_id, key_id, outcome, reason=None, timestamp=No
+         tsdb.incr_multi(increment_list, timestamp=timestamp)
+ 
+     # Send a snuba metrics payload.
+-    if random.random() <= options.get("snuba.track-outcomes-sample-rate"):
+-        outcomes_publisher.publish(
+-            outcomes["topic"],
+-            json.dumps(
+-                {
+-                    "timestamp": timestamp,
+-                    "org_id": org_id,
+-                    "project_id": project_id,
+-                    "key_id": key_id,
+-                    "outcome": outcome.value,
+-                    "reason": reason,
+-                    "event_id": event_id,
+-                }
+-            ),
+-        )
++    outcomes_publisher.publish(
++        outcomes["topic"],
++        json.dumps(
++            {
++                "timestamp": timestamp,
++                "org_id": org_id,
++                "project_id": project_id,
++                "key_id": key_id,
++                "outcome": outcome.value,
++                "reason": reason,
++                "event_id": event_id,
++            }
++        ),
++    )
+ 
+     metrics.incr(
+         "events.outcomes",
+diff --git a/src/sentry/utils/pytest/kafka.py b/src/sentry/utils/pytest/kafka.py
+index f0236aff9f..b6b8adac87 100644
+--- a/src/sentry/utils/pytest/kafka.py
++++ b/src/sentry/utils/pytest/kafka.py
+@@ -1,22 +1,10 @@
+ from __future__ import absolute_import
+ 
+ import pytest
+-
+ import six
+ from confluent_kafka.admin import AdminClient
+ from confluent_kafka import Producer
+ 
+-_EVENTS_TOPIC_NAME = "test-ingest-events"
+-_ATTACHMENTS_TOPIC_NAME = "test-ingest-attachments"
+-_TRANSACTIONS_TOPIC_NAME = "test-ingest-transactions"
+-
+-
+-def _get_topic_name(base_topic_name, test_name):
+-    if test_name is None:
+-        return base_topic_name
+-    else:
+-        return "{}--{}".format(_EVENTS_TOPIC_NAME, test_name)
+-
+ 
+ @pytest.fixture
+ def kafka_producer():
+@@ -39,11 +27,7 @@ class _KafkaAdminWrapper:
+ 
+         self.admin_client = AdminClient(kafka_config)
+ 
+-    def delete_events_topic(self):
+-        self._delete_topic(_EVENTS_TOPIC_NAME)
+-
+-    def _delete_topic(self, base_topic_name):
+-        topic_name = _get_topic_name(base_topic_name, self.test_name)
++    def delete_topic(self, topic_name):
+         try:
+             futures_dict = self.admin_client.delete_topics([topic_name])
+             self._sync_wait_on_result(futures_dict)
+diff --git a/src/sentry/web/api.py b/src/sentry/web/api.py
+index be94f1b04a..471aa1df1f 100644
+--- a/src/sentry/web/api.py
++++ b/src/sentry/web/api.py
+@@ -44,6 +44,7 @@ from sentry.coreapi import (
+     logger as api_logger,
+ )
+ from sentry.event_manager import EventManager
++from sentry.ingest.outcomes_consumer import mark_signal_sent
+ from sentry.interfaces import schemas
+ from sentry.interfaces.base import get_interface
+ from sentry.lang.native.unreal import (
+@@ -200,6 +201,11 @@ def process_event(event_manager, project, key, remote_addr, helper, attachments,
+     event_id = data["event_id"]
+ 
+     if should_filter:
++        # Mark that the event_filtered signal is sent. Do this before emitting
++        # the outcome to avoid a potential race between OutcomesConsumer and
++        # `event_filtered.send_robust` below.
++        mark_signal_sent(project_config.project_id, event_id)
++
+         track_outcome(
+             project_config.organization_id,
+             project_config.project_id,
+@@ -225,6 +231,11 @@ def process_event(event_manager, project, key, remote_addr, helper, attachments,
+         if rate_limit is None:
+             api_logger.debug("Dropped event due to error with rate limiter")
+ 
++        # Mark that the event_dropped signal is sent. Do this before emitting
++        # the outcome to avoid a potential race between OutcomesConsumer and
++        # `event_dropped.send_robust` below.
++        mark_signal_sent(project_config.project_id, event_id)
++
+         reason = rate_limit.reason_code if rate_limit else None
+         track_outcome(
+             project_config.organization_id,
+diff --git a/tests/relay/test_ingest_consumer.py b/tests/relay/test_ingest_consumer.py
+index 1efebc52cf..3915416e14 100644
+--- a/tests/relay/test_ingest_consumer.py
++++ b/tests/relay/test_ingest_consumer.py
+@@ -8,7 +8,7 @@ import msgpack
+ import pytest
+ 
+ from sentry.event_manager import EventManager
+-from sentry.ingest_consumer import ConsumerType, run_ingest_consumer
++from sentry.ingest.ingest_consumer import ConsumerType, run_ingest_consumer
+ from sentry.models.event import Event
+ from sentry.testutils.factories import Factories
+ from django.conf import settings
+@@ -76,15 +76,15 @@ def test_ingest_consumer_reads_from_topic_and_calls_celery_task(
+     task_runner, kafka_producer, kafka_admin
+ ):
+     consumer_group = "test-consumer"
++    topic_event_name = ConsumerType.get_topic_name(ConsumerType.Events)
++
+     admin = kafka_admin(settings)
+-    admin.delete_events_topic()
++    admin.delete_topic(topic_event_name)
+     producer = kafka_producer(settings)
+ 
+     organization = Factories.create_organization()
+     project = Factories.create_project(organization=organization)
+ 
+-    topic_event_name = ConsumerType.get_topic_name(ConsumerType.Events)
+-
+     event_ids = set()
+     for _ in range(3):
+         message, event_id = _get_test_message(project)
+diff --git a/tests/relay/test_outcome_consumer.py b/tests/relay/test_outcome_consumer.py
+new file mode 100644
+index 0000000000..c3351c963c
+--- /dev/null
++++ b/tests/relay/test_outcome_consumer.py
+@@ -0,0 +1,346 @@
++from __future__ import absolute_import
++
++import logging
++import time
++import pytest
++import six.moves
++
++from sentry.ingest.outcomes_consumer import run_outcomes_consumer, mark_signal_sent
++from sentry.signals import event_filtered, event_dropped
++from sentry.testutils.factories import Factories
++from sentry.utils.outcomes import Outcome
++from django.conf import settings
++from sentry.utils import json
++
++logger = logging.getLogger(__name__)
++
++
++def _get_event_id(base_event_id):
++    return "{:032}".format(int(base_event_id))
++
++
++def _get_outcome(
++    event_id=None,
++    project_id=None,
++    org_id=None,
++    key_id=None,
++    outcome=None,
++    reason=None,
++    remote_addr=None,
++):
++    message = {}
++    if event_id is not None:
++        event_id = _get_event_id(event_id)
++        message["event_id"] = event_id
++    if project_id is not None:
++        message["project_id"] = project_id
++    if org_id is not None:
++        message["org_id"] = org_id
++    if key_id is not None:
++        message["key_id"] = key_id
++    if org_id is not None:
++        message["org_id"] = org_id
++    if outcome is not None:
++        message["outcome"] = outcome
++    if reason is not None:
++        message["reason"] = reason
++    if remote_addr is not None:
++        message["remote_addr"] = remote_addr
++
++    msg = json.dumps(message)
++    return msg
++
++
++def _get_outcome_topic_name():
++    return settings.KAFKA_OUTCOMES
++
++
++def _shutdown_requested(max_secs, num_outcomes, signal_sink):
++    """
++    Requests a shutdown after the specified interval has passed or the specified number
++    of outcomes are detected
++
++    :param max_secs: number of seconds after which to request a shutdown
++    :param num_outcomes: number of events after which to request a shutdown
++    :param signal_sink: a list where the signal handler accumulates the outcomes
++    :return: True if a shutdown is requested False otherwise
++    """
++
++    def inner():
++        end_time = time.time()
++        if end_time - start_time > max_secs:
++            logger.debug("Shutdown requested because max secs exceeded")
++            return True
++        elif len(signal_sink) >= num_outcomes:
++            logger.debug("Shutdown requested because num outcomes reached")
++            return True
++        else:
++            return False
++
++    start_time = time.time()
++    return inner
++
++
++def _setup_outcome_test(kafka_producer, kafka_admin):
++    topic_name = _get_outcome_topic_name()
++    organization = Factories.create_organization()
++    project = Factories.create_project(organization=organization)
++    project_id = project.id
++    producer = kafka_producer(settings)
++    admin = kafka_admin(settings)
++    admin.delete_topic(topic_name)
++    return producer, project_id, topic_name
++
++
++@pytest.mark.skip(reason="extreamly slow test, reading the first kafka message takes many seconds")
++@pytest.mark.django_db
++def test_outcome_consumer_ignores_outcomes_already_handled(
++    kafka_producer, task_runner, kafka_admin
++):
++    producer, project_id, topic_name = _setup_outcome_test(kafka_producer, kafka_admin)
++
++    consumer_group = "test-outcome-consumer-1"
++
++    # put a few outcome messages on the kafka topic and also mark them in the cache
++    for i in six.moves.range(1, 3):
++        msg = _get_outcome(
++            event_id=i,
++            project_id=project_id,
++            outcome=Outcome.FILTERED,
++            reason="some_reason",
++            remote_addr="127.33.44.{}".format(i),
++        )
++        # pretend that we have already processed this outcome before
++        mark_signal_sent(project_id=project_id, event_id=_get_event_id(i))
++        # put the outcome on the kafka topic
++        producer.produce(topic_name, msg)
++
++    # setup django signals for event_filtered and event_dropped
++    event_filtered_sink = []
++    event_dropped_sink = []
++
++    def event_filtered_receiver(**kwargs):
++        event_filtered_sink.append(kwargs.get("ip"))
++
++    def event_dropped_receiver(**kwargs):
++        event_dropped_sink.append("something")
++
++    event_filtered.connect(event_filtered_receiver)
++    event_dropped.connect(event_dropped_receiver)
++
++    # run the outcome consumer
++    with task_runner():
++        run_outcomes_consumer(
++            commit_batch_size=2,
++            consumer_group=consumer_group,
++            max_fetch_time_seconds=0.1,
++            initial_offset_reset="earliest",
++            is_shutdown_requested=_shutdown_requested(
++                max_secs=10, num_outcomes=1, signal_sink=event_filtered_sink
++            ),
++        )
++
++    # verify that no signal was called (since the events have been previously processed)
++    assert len(event_filtered_sink) == 0
++    assert len(event_dropped_sink) == 0
++
++
++@pytest.mark.skip(reason="extreamly slow test, reading the first kafka message takes many seconds")
++@pytest.mark.django_db
++def test_outcome_consumer_ignores_invalid_outcomes(kafka_producer, task_runner, kafka_admin):
++    producer, project_id, topic_name = _setup_outcome_test(kafka_producer, kafka_admin)
++
++    consumer_group = "test-outcome-consumer-2"
++
++    # put a few outcome messages on the kafka topic
++    for i in six.moves.range(1, 3):
++        msg = _get_outcome(
++            event_id=i,
++            project_id=project_id,
++            outcome=Outcome.INVALID,
++            reason="some_reason",
++            remote_addr="127.33.44.{}".format(i),
++        )
++
++        producer.produce(topic_name, msg)
++
++    # setup django signals for event_filtered and event_dropped
++    event_filtered_sink = []
++    event_dropped_sink = []
++
++    def event_filtered_receiver(**kwargs):
++        event_filtered_sink.append(kwargs.get("ip"))
++
++    def event_dropped_receiver(**kwargs):
++        event_dropped_sink.append("something")
++
++    event_filtered.connect(event_filtered_receiver)
++    event_dropped.connect(event_dropped_receiver)
++
++    # run the outcome consumer
++    with task_runner():
++        run_outcomes_consumer(
++            commit_batch_size=2,
++            consumer_group=consumer_group,
++            max_fetch_time_seconds=0.1,
++            initial_offset_reset="earliest",
++            is_shutdown_requested=_shutdown_requested(
++                max_secs=10, num_outcomes=1, signal_sink=event_filtered_sink
++            ),
++        )
++
++    # verify that the appropriate filters were called
++    assert len(event_filtered_sink) == 0
++    assert len(event_dropped_sink) == 0
++
++
++@pytest.mark.skip(reason="extreamly slow test, reading the first kafka message takes many seconds")
++@pytest.mark.django_db
++def test_outcome_consumer_remembers_handled_outcomes(kafka_producer, task_runner, kafka_admin):
++    producer, project_id, topic_name = _setup_outcome_test(kafka_producer, kafka_admin)
++
++    consumer_group = "test-outcome-consumer-3"
++
++    # put a few outcome messages on the kafka topic
++    for i in six.moves.range(1, 3):
++        # emit the same outcome twice ( simulate the case when the  producer goes down without
++        # committing the kafka offsets and is restarted)
++        msg = _get_outcome(
++            event_id=1,
++            project_id=project_id,
++            outcome=Outcome.FILTERED,
++            reason="some_reason",
++            remote_addr="127.33.44.{}".format(1),
++        )
++
++        producer.produce(topic_name, msg)
++
++    # setup django signals for event_filtered and event_dropped
++    event_filtered_sink = []
++    event_dropped_sink = []
++
++    def event_filtered_receiver(**kwargs):
++        event_filtered_sink.append(kwargs.get("ip"))
++
++    def event_dropped_receiver(**kwargs):
++        event_dropped_sink.append("something")
++
++    event_filtered.connect(event_filtered_receiver)
++    event_dropped.connect(event_dropped_receiver)
++
++    # run the outcome consumer
++    with task_runner():
++        run_outcomes_consumer(
++            commit_batch_size=2,
++            consumer_group=consumer_group,
++            max_fetch_time_seconds=0.1,
++            initial_offset_reset="earliest",
++            is_shutdown_requested=_shutdown_requested(
++                max_secs=10, num_outcomes=1, signal_sink=event_filtered_sink
++            ),
++        )
++
++    # verify that the appropriate filters were called
++    assert len(event_filtered_sink) == 1
++    assert event_filtered_sink == ["127.33.44.1"]
++    assert len(event_dropped_sink) == 0
++
++
++@pytest.mark.skip(reason="extreamly slow test, reading the first kafka message takes many seconds")
++@pytest.mark.django_db
++def test_outcome_consumer_handles_filtered_outcomes(kafka_producer, task_runner, kafka_admin):
++    producer, project_id, topic_name = _setup_outcome_test(kafka_producer, kafka_admin)
++
++    consumer_group = "test-outcome-consumer-4"
++
++    # put a few outcome messages on the kafka topic
++    for i in six.moves.range(1, 3):
++        msg = _get_outcome(
++            event_id=i,
++            project_id=project_id,
++            outcome=Outcome.FILTERED,
++            reason="some_reason",
++            remote_addr="127.33.44.{}".format(i),
++        )
++
++        producer.produce(topic_name, msg)
++
++    # setup django signals for event_filtered and event_dropped
++    event_filtered_sink = []
++    event_dropped_sink = []
++
++    def event_filtered_receiver(**kwargs):
++        event_filtered_sink.append(kwargs.get("ip"))
++
++    def event_dropped_receiver(**kwargs):
++        event_dropped_sink.append("something")
++
++    event_filtered.connect(event_filtered_receiver)
++    event_dropped.connect(event_dropped_receiver)
++
++    # run the outcome consumer
++    with task_runner():
++        run_outcomes_consumer(
++            commit_batch_size=2,
++            consumer_group=consumer_group,
++            max_fetch_time_seconds=0.1,
++            initial_offset_reset="earliest",
++            is_shutdown_requested=_shutdown_requested(
++                max_secs=10, num_outcomes=1, signal_sink=event_filtered_sink
++            ),
++        )
++
++    # verify that the appropriate filters were called
++    assert len(event_filtered_sink) == 2
++    assert event_filtered_sink == ["127.33.44.1", "127.33.44.2"]
++    assert len(event_dropped_sink) == 0
++
++
++@pytest.mark.skip(reason="extreamly slow test, reading the first kafka message takes many seconds")
++@pytest.mark.django_db
++def test_outcome_consumer_handles_rate_limited_outcomes(kafka_producer, task_runner, kafka_admin):
++    producer, project_id, topic_name = _setup_outcome_test(kafka_producer, kafka_admin)
++
++    consumer_group = "test-outcome-consumer-5"
++
++    # put a few outcome messages on the kafka topic
++    for i in six.moves.range(1, 3):
++        msg = _get_outcome(
++            event_id=i,
++            project_id=project_id,
++            outcome=Outcome.RATE_LIMITED,
++            reason="reason_{}".format(i),
++            remote_addr="127.33.44.{}".format(i),
++        )
++
++        producer.produce(topic_name, msg)
++
++    # setup django signals for event_filtered and event_dropped
++    event_filtered_sink = []
++    event_dropped_sink = []
++
++    def event_filtered_receiver(**kwargs):
++        event_filtered_sink.append("something")
++
++    def event_dropped_receiver(**kwargs):
++        event_dropped_sink.append((kwargs.get("ip"), kwargs.get("reason_code")))
++
++    event_filtered.connect(event_filtered_receiver)
++    event_dropped.connect(event_dropped_receiver)
++
++    # run the outcome consumer
++    with task_runner():
++        run_outcomes_consumer(
++            commit_batch_size=2,
++            consumer_group=consumer_group,
++            max_fetch_time_seconds=0.1,
++            initial_offset_reset="earliest",
++            is_shutdown_requested=_shutdown_requested(
++                max_secs=10, num_outcomes=1, signal_sink=event_filtered_sink
++            ),
++        )
++
++    # verify that the appropriate filters were called
++    assert len(event_filtered_sink) == 0
++    assert len(event_dropped_sink) == 2
++    assert event_dropped_sink == [("127.33.44.1", "reason_1"), ("127.33.44.2", "reason_2")]

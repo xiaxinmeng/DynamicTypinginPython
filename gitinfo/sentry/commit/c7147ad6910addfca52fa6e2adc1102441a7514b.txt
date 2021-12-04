@@ -1,0 +1,418 @@
+commit c7147ad6910addfca52fa6e2adc1102441a7514b
+Author: David Cramer <dcramer@gmail.com>
+Date:   Sat Jan 18 23:29:58 2014 -0800
+
+    New buffer implementation
+
+diff --git a/docs/buffer/index.rst b/docs/buffer/index.rst
+index 12be7673e7..d889572f6c 100644
+--- a/docs/buffer/index.rst
++++ b/docs/buffer/index.rst
+@@ -17,9 +17,7 @@ To specify a backend, simply modify the ``SENTRY_BUFFER`` and ``SENTRY_BUFFER_OP
+ ::
+ 
+     SENTRY_BUFFER = 'sentry.buffer.base.Buffer'
+-    SENTRY_BUFFER_OPTIONS = {
+-        'delay': 5,  # delay for queued tasks, in second(s)
+-    }
++    SENTRY_BUFFER_OPTIONS = {}
+ 
+ The Redis Backend
+ -----------------
+diff --git a/src/sentry/buffer/base.py b/src/sentry/buffer/base.py
+index 97a9e897a8..f8d9ee5fde 100644
+--- a/src/sentry/buffer/base.py
++++ b/src/sentry/buffer/base.py
+@@ -24,9 +24,6 @@ class Buffer(object):
+     This is useful in situations where a single event might be happening so fast that the queue cant
+     keep up with the updates.
+     """
+-    def __init__(self, delay=5, **options):
+-        self.delay = delay
+-
+     def incr(self, model, columns, filters, extra=None):
+         """
+         >>> incr(Group, columns={'times_seen': 1}, filters={'pk': group.pk})
+@@ -36,7 +33,10 @@ class Buffer(object):
+             'columns': columns,
+             'filters': filters,
+             'extra': extra,
+-        }, countdown=self.delay)
++        })
++
++    def process_pending(self):
++        return []
+ 
+     def process(self, model, columns, filters, extra=None):
+         update_kwargs = dict((c, F(c) + v) for c, v in columns.iteritems())
+diff --git a/src/sentry/buffer/redis.py b/src/sentry/buffer/redis.py
+index 6fc897e38d..3ddb185758 100644
+--- a/src/sentry/buffer/redis.py
++++ b/src/sentry/buffer/redis.py
+@@ -7,24 +7,28 @@ sentry.buffer.redis
+ """
+ from __future__ import absolute_import
+ 
++from time import time
++
+ from django.conf import settings
+ from django.db import models
+ from django.utils.encoding import smart_str
+ from hashlib import md5
+ from nydus.db import create_cluster
+ from sentry.buffer import Buffer
++from sentry.tasks.process_buffer import process_incr
+ from sentry.utils.compat import pickle
++from sentry.utils.imports import import_string
+ 
+ 
+ class RedisBuffer(Buffer):
+     key_expire = 60 * 60  # 1 hour
++    pending_key = 'b:p'
+ 
+     def __init__(self, **options):
+         if not options:
+             # inherit default options from REDIS_OPTIONS
+             options = settings.SENTRY_REDIS_OPTIONS
+ 
+-        super(RedisBuffer, self).__init__(**options)
+         options.setdefault('hosts', {
+             0: {},
+         })
+@@ -40,78 +44,80 @@ class RedisBuffer(Buffer):
+             value = value.pk
+         return smart_str(value)
+ 
+-    def _make_key(self, model, filters, column):
++    def _make_key(self, model, filters):
+         """
+         Returns a Redis-compatible key for the model given filters.
+         """
+-        return '%s:%s:%s' % (
+-            model._meta,
+-            md5(smart_str('&'.join('%s=%s' % (k, self._coerce_val(v))
+-                for k, v in sorted(filters.iteritems())))).hexdigest(),
+-            column,
+-        )
+-
+-    def _make_extra_key(self, model, filters):
+-        return '%s:extra:%s' % (
++        return 'b:k:%s:%s' % (
+             model._meta,
+             md5(smart_str('&'.join('%s=%s' % (k, self._coerce_val(v))
+                 for k, v in sorted(filters.iteritems())))).hexdigest(),
+         )
+ 
+-    def _make_lock_key(self, model, filters):
+-        return '%s:lock:%s' % (
+-            model._meta,
+-            md5(smart_str('&'.join('%s=%s' % (k, self._coerce_val(v))
+-                for k, v in sorted(filters.iteritems())))).hexdigest(),
+-        )
++    def _make_lock_key(self, key):
++        return 'l:%s' % (key,)
+ 
+     def incr(self, model, columns, filters, extra=None):
+-        with self.conn.map() as conn:
+-            for column, amount in columns.iteritems():
+-                key = self._make_key(model, filters, column)
+-                conn.incr(key, amount)
+-                conn.expire(key, self.key_expire)
+-
+-            # Store extra in a hashmap so it can easily be removed
+-            if extra:
+-                key = self._make_extra_key(model, filters)
+-                for column, value in extra.iteritems():
+-                    conn.hset(key, column, pickle.dumps(value))
+-                    conn.expire(key, self.key_expire)
+-        super(RedisBuffer, self).incr(model, columns, filters, extra)
+-
+-    def process(self, model, columns, filters, extra=None):
+-        lock_key = self._make_lock_key(model, filters)
++        """
++        Increment the key by doing the following:
++
++        - Insert/update a hashmap based on (model, columns)
++            - Perform an incrby on counters
++            - Perform a set (last write wins) on extra
++        - Add hashmap key to pending flushes
++        """
++        # TODO(dcramer): longer term we'd rather not have to serialize values
++        # here (unless it's to JSON)
++        key = self._make_key(model, filters)
++        # We can't use conn.map() due to wanting to support multiple pending
++        # keys (one per Redis shard)
++        conn = self.conn.get_conn(key)
++
++        pipe = conn.pipeline()
++        pipe.hsetnx(key, 'm', '%s.%s' % (model.__module__, model.__name__))
++        pipe.hsetnx(key, 'f', pickle.dumps(filters))
++        for column, amount in columns.iteritems():
++            pipe.hincrby(key, 'i+' + column, amount)
++
++        if extra:
++            for column, value in extra.iteritems():
++                pipe.hset(key, 'e+' + column, pickle.dumps(value))
++        pipe.expire(key, self.key_expire)
++        pipe.zadd(self.pending_key, key, time())
++        pipe.execute()
++
++    def process_pending(self):
++        for conn in self.conn.hosts.itervalues():
++            keys = conn.zrange(self.pending_key, 0, -1)
++            for key in keys:
++                process_incr.apply_async(kwargs={
++                    'key': key,
++                })
++            conn.zrem(self.pending_key, *keys)
++
++    def process(self, key):
++        lock_key = self._make_lock_key(key)
+         # prevent a stampede due to the way we use celery etas + duplicate
+         # tasks
+         if not self.conn.setnx(lock_key, '1'):
+             return
+-        self.conn.expire(lock_key, self.delay)
++        self.conn.expire(lock_key, 10)
+ 
+-        results = {}
+         with self.conn.map() as conn:
+-            for column, amount in columns.iteritems():
+-                key = self._make_key(model, filters, column)
+-                results[column] = conn.getset(key, 0)
+-                conn.expire(key, 60)  # drop expiration as it was just emptied
+-
+-            hash_key = self._make_extra_key(model, filters)
+-            extra_results = conn.hgetall(hash_key)
+-            conn.delete(hash_key)
+-
+-        # We combine the stored extra values with whatever was passed.
+-        # This ensures that static values get updated to their latest value,
+-        # and dynamic values (usually query expressions) are still dynamic.
+-        if extra_results:
+-            if not extra:
+-                extra = {}
+-            for key, value in extra_results.iteritems():
+-                if not value:
+-                    continue
+-                extra[key] = pickle.loads(str(value))
+-
+-        # Filter out empty or zero'd results to avoid a potentially unnecessary update
+-        results = dict((k, int(v)) for k, v in results.iteritems() if int(v or 0) > 0)
+-        if not results:
++            values = conn.hgetall(key)
++            conn.delete(key)
++
++        if not values:
+             return
+-        super(RedisBuffer, self).process(model, results, filters, extra)
++
++        model = import_string(values['m'])
++        filters = pickle.loads(values['f'])
++        incr_values = {}
++        extra_values = {}
++        for k, v in values.iteritems():
++            if k.startswith('i+'):
++                incr_values[k[2:]] = int(v)
++            elif k.startswith('e+'):
++                extra_values[k[2:]] = pickle.loads(v)
++
++        super(RedisBuffer, self).process(model, incr_values, filters, extra_values)
+diff --git a/src/sentry/conf/server.py b/src/sentry/conf/server.py
+index b868e5dd0d..f53cfb811d 100644
+--- a/src/sentry/conf/server.py
++++ b/src/sentry/conf/server.py
+@@ -289,7 +289,11 @@ CELERYBEAT_SCHEDULE = {
+     'check-version': {
+         'task': 'sentry.tasks.check_update',
+         'schedule': timedelta(hours=1),
+-    }
++    },
++    'flush-buffers': {
++        'task': 'sentry.tasks.process_buffer.process_pending',
++        'schedule': timedelta(seconds=10),
++    },
+ }
+ 
+ # Disable South in tests as it is sending incorrect create signals
+diff --git a/src/sentry/tasks/process_buffer.py b/src/sentry/tasks/process_buffer.py
+index 48ac04ccfa..2fb6baca87 100644
+--- a/src/sentry/tasks/process_buffer.py
++++ b/src/sentry/tasks/process_buffer.py
+@@ -9,6 +9,16 @@ sentry.tasks.process_buffer
+ from celery.task import task
+ 
+ 
++@task(name='sentry.tasks.process_buffer.process_pending', queue='counters')
++def process_pending():
++    """
++    Process pending buffers.
++    """
++    from sentry import app
++
++    app.buffer.process_pending()
++
++
+ @task(name='sentry.tasks.process_buffer.process_incr', queue='counters')
+ def process_incr(**kwargs):
+     """
+diff --git a/tests/sentry/buffer/base/tests.py b/tests/sentry/buffer/base/tests.py
+index 05ffde1806..2d4e845013 100644
+--- a/tests/sentry/buffer/base/tests.py
++++ b/tests/sentry/buffer/base/tests.py
+@@ -23,7 +23,7 @@ class BufferTest(TestCase):
+         self.buf.incr(model, columns, filters)
+         kwargs = dict(model=model, columns=columns, filters=filters, extra=None)
+         process_incr.apply_async.assert_called_once_with(
+-            kwargs=kwargs, countdown=5)
++            kwargs=kwargs)
+ 
+     def test_process_saves_data(self):
+         group = Group.objects.create(project=Project(id=1))
+diff --git a/tests/sentry/buffer/redis/tests.py b/tests/sentry/buffer/redis/tests.py
+index 4fba98198f..791f97ec06 100644
+--- a/tests/sentry/buffer/redis/tests.py
++++ b/tests/sentry/buffer/redis/tests.py
+@@ -4,11 +4,8 @@ from __future__ import absolute_import
+ 
+ import mock
+ 
+-from datetime import timedelta
+-from django.utils import timezone
+ from sentry.buffer.redis import RedisBuffer
+ from sentry.models import Group, Project
+-from sentry.utils.compat import pickle
+ from sentry.testutils import TestCase
+ 
+ 
+@@ -30,88 +27,57 @@ class RedisBufferTest(TestCase):
+     def test_coerce_val_handles_unicode(self):
+         assert self.buf._coerce_val(u'\u201d') == '”'
+ 
+-    def test_make_key_response(self):
+-        column = 'times_seen'
+-        filters = {'pk': 1}
+-        self.assertEquals(self.buf._make_key(Group, filters, column), 'sentry.group:88b48b31b5f100719c64316596b10b0f:times_seen')
+-
+-    def test_make_extra_key_response(self):
+-        filters = {'pk': 1}
+-        self.assertEquals(self.buf._make_extra_key(Group, filters), 'sentry.group:extra:88b48b31b5f100719c64316596b10b0f')
+-
+-    @mock.patch('sentry.buffer.redis.RedisBuffer._make_extra_key', mock.Mock(return_value='extra'))
+-    @mock.patch('sentry.buffer.redis.RedisBuffer._make_key', mock.Mock(return_value='foo'))
+-    @mock.patch('sentry.buffer.base.process_incr')
+-    def test_incr_delays_task(self, process_incr):
+-        model = mock.Mock()
+-        columns = {'times_seen': 1}
+-        filters = {'pk': 1}
+-        self.buf.incr(model, columns, filters)
+-        kwargs = dict(model=model, columns=columns, filters=filters, extra=None)
+-        process_incr.apply_async.assert_called_once_with(
+-            kwargs=kwargs, countdown=5)
+-
+-    @mock.patch('sentry.buffer.redis.RedisBuffer._make_extra_key', mock.Mock(return_value='extra'))
+-    @mock.patch('sentry.buffer.redis.RedisBuffer._make_key', mock.Mock(return_value='foo'))
+-    @mock.patch('sentry.buffer.base.process_incr', mock.Mock())
+-    def test_incr_does_buffer_to_conn(self):
+-        model = mock.Mock()
+-        columns = {'times_seen': 1}
+-        filters = {'pk': 1}
+-        self.buf.incr(model, columns, filters)
+-        self.assertEquals(self.buf.conn.get('foo'), '1')
+-
+-    @mock.patch('sentry.buffer.redis.RedisBuffer._make_extra_key', mock.Mock(return_value='extra'))
+-    @mock.patch('sentry.buffer.redis.RedisBuffer._make_key', mock.Mock(return_value='foo'))
+-    @mock.patch('sentry.buffer.base.Buffer.process')
+-    def test_process_does_not_save_empty_results(self, process):
+-        group = Group.objects.create(project=Project(id=1))
+-        columns = {'times_seen': 1}
+-        filters = {'pk': group.pk}
+-        self.buf.process(Group, columns, filters)
+-        self.assertFalse(process.called)
+-
+-    @mock.patch('sentry.buffer.redis.RedisBuffer._make_extra_key', mock.Mock(return_value='extra'))
+     @mock.patch('sentry.buffer.redis.RedisBuffer._make_key', mock.Mock(return_value='foo'))
+-    @mock.patch('sentry.buffer.base.Buffer.process')
+-    def test_process_does_save_call_with_results(self, process):
+-        group = Group.objects.create(project=Project(id=1))
+-        columns = {'times_seen': 1}
+-        filters = {'pk': group.pk}
+-        self.buf.conn.set('foo', 2)
+-        self.buf.process(Group, columns, filters)
+-        process.assert_called_once_with(Group, {'times_seen': 2}, filters, None)
++    @mock.patch('sentry.buffer.redis.process_incr')
++    def test_process_pending(self, process_incr):
++        self.buf.conn.zadd('b:p', 'foo', 1)
++        self.buf.conn.zadd('b:p', 'bar', 2)
++        self.buf.process_pending()
++        assert len(process_incr.apply_async.mock_calls) == 2
++        process_incr.apply_async.assert_any_call(kwargs={'key': 'foo'})
++        process_incr.apply_async.assert_any_call(kwargs={'key': 'bar'})
++        assert self.buf.conn.zrange('b:p', 0, -1) == []
+ 
+-    @mock.patch('sentry.buffer.redis.RedisBuffer._make_extra_key', mock.Mock(return_value='extra'))
+     @mock.patch('sentry.buffer.redis.RedisBuffer._make_key', mock.Mock(return_value='foo'))
+     @mock.patch('sentry.buffer.base.Buffer.process')
+-    def test_process_does_clear_buffer(self, process):
++    def test_process_does_bubble_up(self, process):
++        self.buf.conn.hmset('foo', {
++            'e+foo': "S'bar'\np1\n.",
++            'f': "(dp1\nS'pk'\np2\nI1\ns.",
++            'i+times_seen': '2',
++            'm': 'sentry.models.Group',
++        })
+         group = Group.objects.create(project=Project(id=1))
+-        columns = {'times_seen': 1}
++        columns = {'times_seen': 2}
+         filters = {'pk': group.pk}
+-        self.buf.conn.set('foo', 2)
+-        self.buf.process(Group, columns, filters)
+-        self.assertEquals(self.buf.conn.get('foo'), '0')
++        extra = {'foo': 'bar'}
++        self.buf.process('foo')
++        process.assert_called_once_with(Group, columns, filters, extra)
+ 
+-    @mock.patch('sentry.buffer.redis.RedisBuffer._make_extra_key', mock.Mock(return_value='extra'))
+     @mock.patch('sentry.buffer.redis.RedisBuffer._make_key', mock.Mock(return_value='foo'))
+-    @mock.patch('sentry.buffer.base.process_incr', mock.Mock())
+-    def test_incr_does_buffer_extra_to_conn(self):
++    @mock.patch('sentry.buffer.redis.process_incr', mock.Mock())
++    def test_incr_saves_to_redis(self):
+         model = mock.Mock()
++        model.__name__ = 'Mock'
+         columns = {'times_seen': 1}
+         filters = {'pk': 1}
+         self.buf.incr(model, columns, filters, extra={'foo': 'bar'})
+-        self.assertEquals(self.buf.conn.hget('extra', 'foo'), pickle.dumps('bar'))
+-
+-    @mock.patch('sentry.buffer.redis.RedisBuffer._make_key', mock.Mock(return_value='foo'))
+-    @mock.patch('sentry.buffer.redis.RedisBuffer._make_extra_key', mock.Mock(return_value='extra'))
+-    def test_process_saves_extra(self):
+-        group = Group.objects.create(project=Project(id=1))
+-        columns = {'times_seen': 1}
+-        filters = {'pk': group.pk}
+-        the_date = (timezone.now() + timedelta(days=5)).replace(microsecond=0)
+-        self.buf.conn.set('foo', 1)
+-        self.buf.conn.hset('extra', 'last_seen', pickle.dumps(the_date))
+-        self.buf.process(Group, columns, filters)
+-        group_ = Group.objects.get(pk=group.pk)
+-        self.assertEquals(group_.last_seen.replace(microsecond=0), the_date)
++        result = self.buf.conn.hgetall('foo')
++        assert result == {
++            'e+foo': "S'bar'\np1\n.",
++            'f': "(dp1\nS'pk'\np2\nI1\ns.",
++            'i+times_seen': '1',
++            'm': 'mock.Mock',
++        }
++        pending = self.buf.conn.zrange('b:p', 0, -1)
++        assert pending == ['foo']
++        self.buf.incr(model, columns, filters, extra={'foo': 'bar'})
++        result = self.buf.conn.hgetall('foo')
++        assert result == {
++            'e+foo': "S'bar'\np1\n.",
++            'f': "(dp1\nS'pk'\np2\nI1\ns.",
++            'i+times_seen': '2',
++            'm': 'mock.Mock',
++        }
++        pending = self.buf.conn.zrange('b:p', 0, -1)
++        assert pending == ['foo']

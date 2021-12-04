@@ -1,0 +1,2287 @@
+commit ec86dc56a386546a355f84b98dded53a5ce288db
+Author: David Cramer <dcramer@gmail.com>
+Date:   Fri May 19 14:55:57 2017 -0700
+
+    [quotas] add rate limits to project keys (#5405)
+    
+    - add per-key rate limits
+    - add stats for events per key
+    - fix acceptance tests predictability
+
+diff --git a/.babelrc b/.babelrc
+index 2c1272ec3e..8995d20e9b 100644
+--- a/.babelrc
++++ b/.babelrc
+@@ -19,7 +19,8 @@
+           "Array"
+         ]
+       }
+-    ]
++    ],
++    "idx"
+   ],
+   "env": {
+     "test": {
+@@ -29,4 +30,4 @@
+       ]
+     }
+   }
+-}
+\ No newline at end of file
++}
+diff --git a/CHANGES b/CHANGES
+index 958784134b..f94097092f 100644
+--- a/CHANGES
++++ b/CHANGES
+@@ -6,6 +6,8 @@ Version 8.17 (Unreleased)
+ - Turned on reprocessing by default
+ - Added basics for Data Forwarding integrations.
+ - The threads interface now contributes to grouping if it contains a single thread.
++- Added per-key (DSN) rate limits (``project:rate-limits`` feature).
++- Added tsdb statistics for events per-key.
+ 
+ Schema Changes
+ ~~~~~~~~~~~~~~
+diff --git a/bin/load-mocks b/bin/load-mocks
+index 96a7a00074..2671ff539a 100755
+--- a/bin/load-mocks
++++ b/bin/load-mocks
+@@ -135,6 +135,8 @@ def create_sample_time_series(event, release=None):
+     group = event.group
+     project = group.project
+ 
++    key = project.key_set.all()[0]
++
+     now = datetime.utcnow().replace(tzinfo=utc)
+ 
+     environment = Environment.get_or_create(
+@@ -167,10 +169,12 @@ def create_sample_time_series(event, release=None):
+             (tsdb.models.organization_total_received, project.organization_id),
+             (tsdb.models.project_total_forwarded, project.id),
+             (tsdb.models.project_total_received, project.id),
++            (tsdb.models.key_total_received, key.id),
+         ), now, int(count * 1.1))
+         tsdb.incr_multi((
+             (tsdb.models.organization_total_rejected, project.organization_id),
+             (tsdb.models.project_total_rejected, project.id),
++            (tsdb.models.key_total_rejected, key.id),
+         ), now, int(count * 0.1))
+ 
+         frequencies = [
+@@ -210,12 +214,14 @@ def create_sample_time_series(event, release=None):
+             (tsdb.models.group, group.id),
+         ), now, count)
+         tsdb.incr_multi((
+-            (tsdb.models.organization_total_received, group.project.organization_id),
+-            (tsdb.models.project_total_received, group.project.id),
++            (tsdb.models.organization_total_received, project.organization_id),
++            (tsdb.models.project_total_received, project.id),
++            (tsdb.models.key_total_received, key.id),
+         ), now, int(count * 1.1))
+         tsdb.incr_multi((
+-            (tsdb.models.organization_total_rejected, group.project.organization_id),
+-            (tsdb.models.project_total_rejected, group.project.id),
++            (tsdb.models.organization_total_rejected, project.organization_id),
++            (tsdb.models.project_total_rejected, project.id),
++            (tsdb.models.key_total_rejected, key.id),
+         ), now, int(count * 0.1))
+ 
+         frequencies = [
+diff --git a/package.json b/package.json
+index bb8e1ade3b..6e72677d8f 100644
+--- a/package.json
++++ b/package.json
+@@ -10,6 +10,7 @@
+     "babel-gettext-extractor": "^2.0.0",
+     "babel-loader": "6.2.10",
+     "babel-plugin-add-module-exports": "^0.2.1",
++    "babel-plugin-idx": "^1.5.1",
+     "babel-plugin-transform-builtin-extend": "^1.1.0",
+     "babel-plugin-transform-object-rest-spread": "^6.20.2",
+     "babel-polyfill": "6.20.0",
+@@ -24,6 +25,7 @@
+     "file-loader": "0.8.4",
+     "gettext-parser": "1.1.1",
+     "history": "1.13.0",
++    "idx": "^1.5.0",
+     "ios-device-list": "^1.1.17",
+     "jed": "^1.1.0",
+     "jquery": "2.1.4",
+diff --git a/src/sentry/api/endpoints/project_key_details.py b/src/sentry/api/endpoints/project_key_details.py
+index 6f93dfe45f..7da032a041 100644
+--- a/src/sentry/api/endpoints/project_key_details.py
++++ b/src/sentry/api/endpoints/project_key_details.py
+@@ -3,6 +3,7 @@ from __future__ import absolute_import
+ from rest_framework import serializers, status
+ from rest_framework.response import Response
+ 
++from sentry import features
+ from sentry.api.base import DocSection
+ from sentry.api.bases.project import ProjectEndpoint
+ from sentry.api.exceptions import ResourceDoesNotExist
+@@ -34,9 +35,16 @@ def update_key_scenario(runner):
+     )
+ 
+ 
++class RateLimitSerializer(serializers.Serializer):
++    count = serializers.IntegerField(min_value=0, required=False)
++    window = serializers.IntegerField(min_value=0, max_value=60 * 24,
++                                      required=False)
++
++
+ class KeySerializer(serializers.Serializer):
+     name = serializers.CharField(max_length=200, required=False)
+     isActive = serializers.BooleanField(required=False)
++    rateLimit = RateLimitSerializer(required=False)
+ 
+ 
+ class ProjectKeyDetailsEndpoint(ProjectEndpoint):
+@@ -54,7 +62,6 @@ class ProjectKeyDetailsEndpoint(ProjectEndpoint):
+ 
+         return Response(serialize(key, request.user), status=200)
+ 
+-    @attach_scenarios([update_key_scenario])
+     def put(self, request, project, key_id):
+         """
+         Update a Client Key
+@@ -92,6 +99,14 @@ class ProjectKeyDetailsEndpoint(ProjectEndpoint):
+             elif result.get('isActive') is False:
+                 key.status = ProjectKeyStatus.INACTIVE
+ 
++            if features.has('projects:rate-limits', project):
++                if result.get('rateLimit', -1) is None:
++                    key.rate_limit_count = None
++                    key.rate_limit_window = None
++                elif result.get('rateLimit'):
++                    key.rate_limit_count = result['rateLimit']['count']
++                    key.rate_limit_window = result['rateLimit']['window']
++
+             key.save()
+ 
+             self.create_audit_entry(
+diff --git a/src/sentry/api/endpoints/project_key_stats.py b/src/sentry/api/endpoints/project_key_stats.py
+new file mode 100644
+index 0000000000..743bb5b8e7
+--- /dev/null
++++ b/src/sentry/api/endpoints/project_key_stats.py
+@@ -0,0 +1,51 @@
++from __future__ import absolute_import
++
++import six
++
++from collections import OrderedDict
++from rest_framework.response import Response
++
++from sentry import tsdb
++from sentry.api.base import StatsMixin
++from sentry.api.bases.project import ProjectEndpoint
++from sentry.api.exceptions import ResourceDoesNotExist
++from sentry.models import ProjectKey
++
++
++class ProjectKeyStatsEndpoint(ProjectEndpoint, StatsMixin):
++    def get(self, request, project, key_id):
++        try:
++            key = ProjectKey.objects.get(
++                project=project,
++                public_key=key_id,
++                roles=ProjectKey.roles.store,
++            )
++        except ProjectKey.DoesNotExist:
++            raise ResourceDoesNotExist
++
++        stat_args = self._parse_args(request)
++
++        stats = OrderedDict()
++        for model, name in (
++            (tsdb.models.key_total_received, 'total'),
++            (tsdb.models.key_total_blacklisted, 'filtered'),
++            (tsdb.models.key_total_rejected, 'dropped'),
++        ):
++            result = tsdb.get_range(
++                model=model,
++                keys=[key.id],
++                **stat_args
++            )[key.id]
++            for ts, count in result:
++                stats.setdefault(int(ts), {})[name] = count
++
++        return Response([
++            {
++                'ts': ts,
++                'total': data['total'],
++                'dropped': data['dropped'],
++                'filtered': data['filtered'],
++                'accepted': data['total'] - data['dropped'] - data['filtered'],
++            }
++            for ts, data in six.iteritems(stats)
++        ])
+diff --git a/src/sentry/api/serializers/models/project.py b/src/sentry/api/serializers/models/project.py
+index 32e9c862ae..65043e89de 100644
+--- a/src/sentry/api/serializers/models/project.py
++++ b/src/sentry/api/serializers/models/project.py
+@@ -96,7 +96,7 @@ class ProjectSerializer(Serializer):
+         from sentry import features
+ 
+         feature_list = []
+-        for feature in ('global-events', 'data-forwarding'):
++        for feature in ('global-events', 'data-forwarding', 'rate-limits'):
+             if features.has('projects:' + feature, obj, actor=user):
+                 feature_list.append(feature)
+ 
+diff --git a/src/sentry/api/serializers/models/project_key.py b/src/sentry/api/serializers/models/project_key.py
+index fbbcc941e4..4c75f0a2c0 100644
+--- a/src/sentry/api/serializers/models/project_key.py
++++ b/src/sentry/api/serializers/models/project_key.py
+@@ -17,6 +17,10 @@ class ProjectKeySerializer(Serializer):
+             'secret': obj.secret_key,
+             'projectId': obj.project_id,
+             'isActive': obj.is_active,
++            'rateLimit': {
++                'window': obj.rate_limit_window,
++                'count': obj.rate_limit_count,
++            } if (obj.rate_limit_window and obj.rate_limit_count) else None,
+             'dsn': {
+                 'secret': obj.dsn_private,
+                 'public': obj.dsn_public,
+diff --git a/src/sentry/api/urls.py b/src/sentry/api/urls.py
+index cdcf0b65d7..7764529adb 100644
+--- a/src/sentry/api/urls.py
++++ b/src/sentry/api/urls.py
+@@ -70,6 +70,7 @@ from .endpoints.project_group_stats import ProjectGroupStatsEndpoint
+ from .endpoints.project_index import ProjectIndexEndpoint
+ from .endpoints.project_keys import ProjectKeysEndpoint
+ from .endpoints.project_key_details import ProjectKeyDetailsEndpoint
++from .endpoints.project_key_stats import ProjectKeyStatsEndpoint
+ from .endpoints.project_member_index import ProjectMemberIndexEndpoint
+ from .endpoints.project_plugins import ProjectPluginsEndpoint
+ from .endpoints.project_plugin_details import ProjectPluginDetailsEndpoint
+@@ -320,6 +321,8 @@ urlpatterns = patterns(
+     url(r'^projects/(?P<organization_slug>[^\/]+)/(?P<project_slug>[^\/]+)/keys/(?P<key_id>[^\/]+)/$',
+         ProjectKeyDetailsEndpoint.as_view(),
+         name='sentry-api-0-project-key-details'),
++    url(r'^projects/(?P<organization_slug>[^\/]+)/(?P<project_slug>[^\/]+)/keys/(?P<key_id>[^\/]+)/stats/$',
++        ProjectKeyStatsEndpoint.as_view()),
+     url(r'^projects/(?P<organization_slug>[^/]+)/(?P<project_slug>[^/]+)/members/$',
+         ProjectMemberIndexEndpoint.as_view(),
+         name='sentry-api-0-project-member-index'),
+diff --git a/src/sentry/conf/server.py b/src/sentry/conf/server.py
+index 07a7923eda..ce0963566b 100644
+--- a/src/sentry/conf/server.py
++++ b/src/sentry/conf/server.py
+@@ -751,6 +751,7 @@ SENTRY_FEATURES = {
+     'projects:dsym': False,
+     'projects:sample-events': True,
+     'projects:data-forwarding': True,
++    'projects:rate-limits': True,
+ }
+ 
+ # Default time zone for localization in the UI.
+diff --git a/src/sentry/coreapi.py b/src/sentry/coreapi.py
+index 394425cad4..33f93d4cbf 100644
+--- a/src/sentry/coreapi.py
++++ b/src/sentry/coreapi.py
+@@ -222,7 +222,7 @@ class ClientApiHelper(object):
+         """
+         return origin_from_request(request)
+ 
+-    def project_id_from_auth(self, auth):
++    def project_key_from_auth(self, auth):
+         if not auth.public_key:
+             raise APIUnauthorized('Invalid api key')
+ 
+@@ -247,7 +247,10 @@ class ClientApiHelper(object):
+         if not pk.roles.store:
+             raise APIUnauthorized('Key does not allow event storage access')
+ 
+-        return pk.project_id
++        return pk
++
++    def project_id_from_auth(self, auth):
++        return self.project_key_from_auth(auth).project_id
+ 
+     def decode_data(self, encoded_data):
+         try:
+diff --git a/src/sentry/features/__init__.py b/src/sentry/features/__init__.py
+index 75b216df4d..5cf23f1e58 100644
+--- a/src/sentry/features/__init__.py
++++ b/src/sentry/features/__init__.py
+@@ -17,6 +17,7 @@ default_manager.add('organizations:release-commits', OrganizationFeature)  # NOQ
+ default_manager.add('projects:global-events', ProjectFeature)  # NOQA
+ default_manager.add('projects:plugins', ProjectPluginFeature)  # NOQA
+ default_manager.add('projects:data-forwarding', ProjectFeature)  # NOQA
++default_manager.add('projects:rate-limits', ProjectFeature)  # NOQA
+ default_manager.add('workflow:release-emails', ProjectFeature)  # NOQA
+ default_manager.add('projects:sample-events', ProjectFeature)  # NOQA
+ default_manager.add('projects:similarity-indexing', ProjectFeature)  # NOQA
+diff --git a/src/sentry/models/projectkey.py b/src/sentry/models/projectkey.py
+index 13297f3d47..7702a88f9f 100644
+--- a/src/sentry/models/projectkey.py
++++ b/src/sentry/models/projectkey.py
+@@ -56,6 +56,9 @@ class ProjectKey(Model):
+     ), db_index=True)
+     date_added = models.DateTimeField(default=timezone.now, null=True)
+ 
++    rate_limit_count = BoundedPositiveIntegerField(null=True)
++    rate_limit_window = BoundedPositiveIntegerField(null=True)
++
+     objects = BaseManager(cache_fields=(
+         'public_key',
+         'secret_key',
+@@ -122,6 +125,12 @@ class ProjectKey(Model):
+     def is_active(self):
+         return self.status == ProjectKeyStatus.ACTIVE
+ 
++    @property
++    def rate_limit(self):
++        if self.rate_limit_count and self.rate_limit_window:
++            return (self.rate_limit_count, self.rate_limit_window)
++        return (0, 0)
++
+     def save(self, *args, **kwargs):
+         if not self.public_key:
+             self.public_key = ProjectKey.generate_api_key()
+@@ -182,6 +191,8 @@ class ProjectKey(Model):
+             'secret_key': self.secret_key,
+             'roles': int(self.roles),
+             'status': self.status,
++            'rate_limit_count': self.rate_limit_count,
++            'rate_limit_window': self.rate_limit_window,
+         }
+ 
+     def get_scopes(self):
+diff --git a/src/sentry/quotas/base.py b/src/sentry/quotas/base.py
+index 0f24e89c10..cb2eb7b58b 100644
+--- a/src/sentry/quotas/base.py
++++ b/src/sentry/quotas/base.py
+@@ -53,7 +53,7 @@ class Quota(Service):
+     def __init__(self, **options):
+         pass
+ 
+-    def is_rate_limited(self, project):
++    def is_rate_limited(self, project, key=None):
+         return NotRateLimited()
+ 
+     def get_time_remaining(self):
+@@ -67,6 +67,13 @@ class Quota(Service):
+             return int(parent_quota or 0)
+         return int(quota or 0)
+ 
++    def get_key_quota(self, key):
++        from sentry import features
++
++        if features.has('projects:rate-limits', key.project):
++            return key.rate_limit
++        return (0, 0)
++
+     def get_project_quota(self, project):
+         from sentry.models import Organization, OrganizationOption
+ 
+@@ -78,9 +85,6 @@ class Quota(Service):
+         max_quota_share = int(OrganizationOption.objects.get_value(
+             org, 'sentry:project-rate-limit', 100))
+ 
+-        if max_quota_share == 100:
+-            return (0, 60)
+-
+         org_quota, window = self.get_organization_quota(org)
+ 
+         if max_quota_share != 100 and org_quota:
+diff --git a/src/sentry/quotas/redis.py b/src/sentry/quotas/redis.py
+index 5bd8e3d977..7d9ba153c2 100644
+--- a/src/sentry/quotas/redis.py
++++ b/src/sentry/quotas/redis.py
+@@ -52,10 +52,12 @@ class RedisQuota(Quota):
+         except Exception as e:
+             raise InvalidConfiguration(six.text_type(e))
+ 
+-    def get_quotas(self, project):
++    def get_quotas(self, project, key=None):
++        if key:
++            key.project = project
+         pquota = self.get_project_quota(project)
+         oquota = self.get_organization_quota(project.organization)
+-        return (
++        results = [
+             BasicRedisQuota(
+                 key='p:{}'.format(project.id),
+                 limit=pquota[0],
+@@ -68,17 +70,26 @@ class RedisQuota(Quota):
+                 window=oquota[1],
+                 reason_code='org_quota',
+             ),
+-        )
++        ]
++        if key:
++            kquota = self.get_key_quota(key)
++            results.append(BasicRedisQuota(
++                key='k:{}'.format(key.id),
++                limit=kquota[0],
++                window=kquota[1],
++                reason_code='key_quota',
++            ))
++        return tuple(results)
+ 
+     def get_redis_key(self, key, timestamp, interval):
+         return '{}:{}:{}'.format(self.namespace, key, int(timestamp // interval))
+ 
+-    def is_rate_limited(self, project):
++    def is_rate_limited(self, project, key=None):
+         timestamp = time()
+ 
+         quotas = [
+             quota
+-            for quota in self.get_quotas(project)
++            for quota in self.get_quotas(project, key=key)
+             # x = (key, limit, interval)
+             if quota.limit > 0  # a zero limit means "no limit", not "reject all"
+         ]
+diff --git a/src/sentry/south_migrations/0321_auto__add_field_projectkey_rate_limit_count__add_field_projectkey_rate.py b/src/sentry/south_migrations/0321_auto__add_field_projectkey_rate_limit_count__add_field_projectkey_rate.py
+new file mode 100644
+index 0000000000..96031f908e
+--- /dev/null
++++ b/src/sentry/south_migrations/0321_auto__add_field_projectkey_rate_limit_count__add_field_projectkey_rate.py
+@@ -0,0 +1,860 @@
++# -*- coding: utf-8 -*-
++from south.utils import datetime_utils as datetime
++from south.db import db
++from south.v2 import SchemaMigration
++from django.db import models
++
++
++class Migration(SchemaMigration):
++
++    def forwards(self, orm):
++        # Adding field 'ProjectKey.rate_limit_count'
++        db.add_column('sentry_projectkey', 'rate_limit_count',
++                      self.gf('sentry.db.models.fields.bounded.BoundedPositiveIntegerField')(null=True),
++                      keep_default=False)
++
++        # Adding field 'ProjectKey.rate_limit_window'
++        db.add_column('sentry_projectkey', 'rate_limit_window',
++                      self.gf('sentry.db.models.fields.bounded.BoundedPositiveIntegerField')(null=True),
++                      keep_default=False)
++
++
++    def backwards(self, orm):
++        # Deleting field 'ProjectKey.rate_limit_count'
++        db.delete_column('sentry_projectkey', 'rate_limit_count')
++
++        # Deleting field 'ProjectKey.rate_limit_window'
++        db.delete_column('sentry_projectkey', 'rate_limit_window')
++
++
++    models = {
++        'sentry.activity': {
++            'Meta': {'object_name': 'Activity'},
++            'data': ('sentry.db.models.fields.gzippeddict.GzippedDictField', [], {'null': 'True'}),
++            'datetime': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'group': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Group']", 'null': 'True'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'ident': ('django.db.models.fields.CharField', [], {'max_length': '64', 'null': 'True'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Project']"}),
++            'type': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {}),
++            'user': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.User']", 'null': 'True'})
++        },
++        'sentry.apiapplication': {
++            'Meta': {'object_name': 'ApiApplication'},
++            'allowed_origins': ('django.db.models.fields.TextField', [], {'null': 'True', 'blank': 'True'}),
++            'client_id': ('django.db.models.fields.CharField', [], {'default': "'c2dd3e9b18634cef90492066bc1c85b6d19219a3a5084a128d3a3e0ad5b7f994'", 'unique': 'True', 'max_length': '64'}),
++            'client_secret': ('sentry.db.models.fields.encrypted.EncryptedTextField', [], {'default': "'b07789acac8e4f03a7dd74d12def05e622fae8c7668041928b6f19e29d8b03b0'"}),
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'homepage_url': ('django.db.models.fields.URLField', [], {'max_length': '200', 'null': 'True'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'name': ('django.db.models.fields.CharField', [], {'default': "'Brave Zebra'", 'max_length': '64', 'blank': 'True'}),
++            'owner': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.User']"}),
++            'privacy_url': ('django.db.models.fields.URLField', [], {'max_length': '200', 'null': 'True'}),
++            'redirect_uris': ('django.db.models.fields.TextField', [], {}),
++            'status': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'default': '0', 'db_index': 'True'}),
++            'terms_url': ('django.db.models.fields.URLField', [], {'max_length': '200', 'null': 'True'})
++        },
++        'sentry.apiauthorization': {
++            'Meta': {'unique_together': "(('user', 'application'),)", 'object_name': 'ApiAuthorization'},
++            'application': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.ApiApplication']", 'null': 'True'}),
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'scope_list': ('sentry.db.models.fields.array.ArrayField', [], {'of': ('django.db.models.fields.TextField', [], {})}),
++            'scopes': ('django.db.models.fields.BigIntegerField', [], {'default': 'None'}),
++            'user': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.User']"})
++        },
++        'sentry.apigrant': {
++            'Meta': {'object_name': 'ApiGrant'},
++            'application': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.ApiApplication']"}),
++            'code': ('django.db.models.fields.CharField', [], {'default': "'50b4ae54f54147098fabd993d81c4e25'", 'max_length': '64', 'db_index': 'True'}),
++            'expires_at': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime(2017, 5, 16, 0, 0)', 'db_index': 'True'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'redirect_uri': ('django.db.models.fields.CharField', [], {'max_length': '255'}),
++            'scope_list': ('sentry.db.models.fields.array.ArrayField', [], {'of': ('django.db.models.fields.TextField', [], {})}),
++            'scopes': ('django.db.models.fields.BigIntegerField', [], {'default': 'None'}),
++            'user': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.User']"})
++        },
++        'sentry.apikey': {
++            'Meta': {'object_name': 'ApiKey'},
++            'allowed_origins': ('django.db.models.fields.TextField', [], {'null': 'True', 'blank': 'True'}),
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'key': ('django.db.models.fields.CharField', [], {'unique': 'True', 'max_length': '32'}),
++            'label': ('django.db.models.fields.CharField', [], {'default': "'Default'", 'max_length': '64', 'blank': 'True'}),
++            'organization': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'related_name': "'key_set'", 'to': "orm['sentry.Organization']"}),
++            'scope_list': ('sentry.db.models.fields.array.ArrayField', [], {'of': ('django.db.models.fields.TextField', [], {})}),
++            'scopes': ('django.db.models.fields.BigIntegerField', [], {'default': 'None'}),
++            'status': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'default': '0', 'db_index': 'True'})
++        },
++        'sentry.apitoken': {
++            'Meta': {'object_name': 'ApiToken'},
++            'application': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.ApiApplication']", 'null': 'True'}),
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'expires_at': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime(2017, 6, 15, 0, 0)', 'null': 'True'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'refresh_token': ('django.db.models.fields.CharField', [], {'default': "'028e1545549c4f1fa333a9c4102b283fa2aa5386aa2049c0802f66dfd6a4eb3d'", 'max_length': '64', 'unique': 'True', 'null': 'True'}),
++            'scope_list': ('sentry.db.models.fields.array.ArrayField', [], {'of': ('django.db.models.fields.TextField', [], {})}),
++            'scopes': ('django.db.models.fields.BigIntegerField', [], {'default': 'None'}),
++            'token': ('django.db.models.fields.CharField', [], {'default': "'27ce21bddc404f59b10b76020f0d1988fe4944e0433e4672922484078c0c360c'", 'unique': 'True', 'max_length': '64'}),
++            'user': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.User']"})
++        },
++        'sentry.auditlogentry': {
++            'Meta': {'object_name': 'AuditLogEntry'},
++            'actor': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'blank': 'True', 'related_name': "'audit_actors'", 'null': 'True', 'to': "orm['sentry.User']"}),
++            'actor_key': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.ApiKey']", 'null': 'True', 'blank': 'True'}),
++            'actor_label': ('django.db.models.fields.CharField', [], {'max_length': '64', 'null': 'True', 'blank': 'True'}),
++            'data': ('sentry.db.models.fields.gzippeddict.GzippedDictField', [], {}),
++            'datetime': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'event': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'ip_address': ('django.db.models.fields.GenericIPAddressField', [], {'max_length': '39', 'null': 'True'}),
++            'organization': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Organization']"}),
++            'target_object': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'null': 'True'}),
++            'target_user': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'blank': 'True', 'related_name': "'audit_targets'", 'null': 'True', 'to': "orm['sentry.User']"})
++        },
++        'sentry.authenticator': {
++            'Meta': {'unique_together': "(('user', 'type'),)", 'object_name': 'Authenticator', 'db_table': "'auth_authenticator'"},
++            'config': ('sentry.db.models.fields.encrypted.EncryptedPickledObjectField', [], {}),
++            'created_at': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedAutoField', [], {'primary_key': 'True'}),
++            'last_used_at': ('django.db.models.fields.DateTimeField', [], {'null': 'True'}),
++            'type': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {}),
++            'user': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.User']"})
++        },
++        'sentry.authidentity': {
++            'Meta': {'unique_together': "(('auth_provider', 'ident'), ('auth_provider', 'user'))", 'object_name': 'AuthIdentity'},
++            'auth_provider': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.AuthProvider']"}),
++            'data': ('sentry.db.models.fields.encrypted.EncryptedJsonField', [], {'default': '{}'}),
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'ident': ('django.db.models.fields.CharField', [], {'max_length': '128'}),
++            'last_synced': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'last_verified': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'user': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.User']"})
++        },
++        'sentry.authprovider': {
++            'Meta': {'object_name': 'AuthProvider'},
++            'config': ('sentry.db.models.fields.encrypted.EncryptedJsonField', [], {'default': '{}'}),
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'default_global_access': ('django.db.models.fields.BooleanField', [], {'default': 'True'}),
++            'default_role': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'default': '50'}),
++            'default_teams': ('django.db.models.fields.related.ManyToManyField', [], {'to': "orm['sentry.Team']", 'symmetrical': 'False', 'blank': 'True'}),
++            'flags': ('django.db.models.fields.BigIntegerField', [], {'default': '0'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'last_sync': ('django.db.models.fields.DateTimeField', [], {'null': 'True'}),
++            'organization': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Organization']", 'unique': 'True'}),
++            'provider': ('django.db.models.fields.CharField', [], {'max_length': '128'}),
++            'sync_time': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'null': 'True'})
++        },
++        'sentry.broadcast': {
++            'Meta': {'object_name': 'Broadcast'},
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'date_expires': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime(2017, 5, 23, 0, 0)', 'null': 'True', 'blank': 'True'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'is_active': ('django.db.models.fields.BooleanField', [], {'default': 'True', 'db_index': 'True'}),
++            'link': ('django.db.models.fields.URLField', [], {'max_length': '200', 'null': 'True', 'blank': 'True'}),
++            'message': ('django.db.models.fields.CharField', [], {'max_length': '256'}),
++            'title': ('django.db.models.fields.CharField', [], {'max_length': '32'}),
++            'upstream_id': ('django.db.models.fields.CharField', [], {'max_length': '32', 'null': 'True', 'blank': 'True'})
++        },
++        'sentry.broadcastseen': {
++            'Meta': {'unique_together': "(('broadcast', 'user'),)", 'object_name': 'BroadcastSeen'},
++            'broadcast': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Broadcast']"}),
++            'date_seen': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'user': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.User']"})
++        },
++        'sentry.commit': {
++            'Meta': {'unique_together': "(('repository_id', 'key'),)", 'object_name': 'Commit', 'index_together': "(('repository_id', 'date_added'),)"},
++            'author': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.CommitAuthor']", 'null': 'True'}),
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'key': ('django.db.models.fields.CharField', [], {'max_length': '64'}),
++            'message': ('django.db.models.fields.TextField', [], {'null': 'True'}),
++            'organization_id': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'db_index': 'True'}),
++            'repository_id': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {})
++        },
++        'sentry.commitauthor': {
++            'Meta': {'unique_together': "(('organization_id', 'email'), ('organization_id', 'external_id'))", 'object_name': 'CommitAuthor'},
++            'email': ('django.db.models.fields.EmailField', [], {'max_length': '75'}),
++            'external_id': ('django.db.models.fields.CharField', [], {'max_length': '164', 'null': 'True'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'name': ('django.db.models.fields.CharField', [], {'max_length': '128', 'null': 'True'}),
++            'organization_id': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'db_index': 'True'})
++        },
++        'sentry.commitfilechange': {
++            'Meta': {'unique_together': "(('commit', 'filename'),)", 'object_name': 'CommitFileChange'},
++            'commit': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Commit']"}),
++            'filename': ('django.db.models.fields.CharField', [], {'max_length': '255'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'organization_id': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'db_index': 'True'}),
++            'type': ('django.db.models.fields.CharField', [], {'max_length': '1'})
++        },
++        'sentry.counter': {
++            'Meta': {'object_name': 'Counter', 'db_table': "'sentry_projectcounter'"},
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Project']", 'unique': 'True'}),
++            'value': ('sentry.db.models.fields.bounded.BoundedBigIntegerField', [], {})
++        },
++        'sentry.deploy': {
++            'Meta': {'object_name': 'Deploy'},
++            'date_finished': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'date_started': ('django.db.models.fields.DateTimeField', [], {'null': 'True', 'blank': 'True'}),
++            'environment_id': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'db_index': 'True'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'name': ('django.db.models.fields.CharField', [], {'max_length': '64', 'null': 'True', 'blank': 'True'}),
++            'notified': ('django.db.models.fields.NullBooleanField', [], {'db_index': 'True', 'null': 'True', 'blank': 'True'}),
++            'organization_id': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'db_index': 'True'}),
++            'release': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Release']"}),
++            'url': ('django.db.models.fields.URLField', [], {'max_length': '200', 'null': 'True', 'blank': 'True'})
++        },
++        'sentry.distribution': {
++            'Meta': {'unique_together': "(('release', 'name'),)", 'object_name': 'Distribution'},
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'name': ('django.db.models.fields.CharField', [], {'max_length': '64'}),
++            'organization_id': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'db_index': 'True'}),
++            'release': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Release']"})
++        },
++        'sentry.dsymapp': {
++            'Meta': {'unique_together': "(('project', 'platform', 'app_id'),)", 'object_name': 'DSymApp'},
++            'app_id': ('django.db.models.fields.CharField', [], {'max_length': '64'}),
++            'data': ('jsonfield.fields.JSONField', [], {'default': '{}'}),
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'last_synced': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'platform': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'default': '0'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Project']"}),
++            'sync_id': ('django.db.models.fields.CharField', [], {'max_length': '64', 'null': 'True'})
++        },
++        'sentry.dsymbundle': {
++            'Meta': {'object_name': 'DSymBundle'},
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'object': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.DSymObject']"}),
++            'sdk': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.DSymSDK']"})
++        },
++        'sentry.dsymobject': {
++            'Meta': {'object_name': 'DSymObject'},
++            'cpu_name': ('django.db.models.fields.CharField', [], {'max_length': '40'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'object_path': ('django.db.models.fields.TextField', [], {'db_index': 'True'}),
++            'uuid': ('django.db.models.fields.CharField', [], {'max_length': '36', 'db_index': 'True'}),
++            'vmaddr': ('sentry.db.models.fields.bounded.BoundedBigIntegerField', [], {'null': 'True'}),
++            'vmsize': ('sentry.db.models.fields.bounded.BoundedBigIntegerField', [], {'null': 'True'})
++        },
++        'sentry.dsymsdk': {
++            'Meta': {'object_name': 'DSymSDK', 'index_together': "[('version_major', 'version_minor', 'version_patchlevel', 'version_build')]"},
++            'dsym_type': ('django.db.models.fields.CharField', [], {'max_length': '20', 'db_index': 'True'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'sdk_name': ('django.db.models.fields.CharField', [], {'max_length': '20'}),
++            'version_build': ('django.db.models.fields.CharField', [], {'max_length': '40'}),
++            'version_major': ('django.db.models.fields.IntegerField', [], {}),
++            'version_minor': ('django.db.models.fields.IntegerField', [], {}),
++            'version_patchlevel': ('django.db.models.fields.IntegerField', [], {})
++        },
++        'sentry.dsymsymbol': {
++            'Meta': {'unique_together': "[('object', 'address')]", 'object_name': 'DSymSymbol'},
++            'address': ('sentry.db.models.fields.bounded.BoundedBigIntegerField', [], {'db_index': 'True'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'object': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.DSymObject']"}),
++            'symbol': ('django.db.models.fields.TextField', [], {})
++        },
++        'sentry.environment': {
++            'Meta': {'unique_together': "(('project_id', 'name'),)", 'object_name': 'Environment'},
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'name': ('django.db.models.fields.CharField', [], {'max_length': '64'}),
++            'organization_id': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {}),
++            'project_id': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'null': 'True'}),
++            'projects': ('django.db.models.fields.related.ManyToManyField', [], {'to': "orm['sentry.Project']", 'through': "orm['sentry.EnvironmentProject']", 'symmetrical': 'False'})
++        },
++        'sentry.environmentproject': {
++            'Meta': {'unique_together': "(('project', 'environment'),)", 'object_name': 'EnvironmentProject'},
++            'environment': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Environment']"}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Project']"})
++        },
++        'sentry.event': {
++            'Meta': {'unique_together': "(('project_id', 'event_id'),)", 'object_name': 'Event', 'db_table': "'sentry_message'", 'index_together': "(('group_id', 'datetime'),)"},
++            'data': ('sentry.db.models.fields.node.NodeField', [], {'null': 'True', 'blank': 'True'}),
++            'datetime': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now', 'db_index': 'True'}),
++            'event_id': ('django.db.models.fields.CharField', [], {'max_length': '32', 'null': 'True', 'db_column': "'message_id'"}),
++            'group_id': ('sentry.db.models.fields.bounded.BoundedBigIntegerField', [], {'null': 'True', 'blank': 'True'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'message': ('django.db.models.fields.TextField', [], {}),
++            'platform': ('django.db.models.fields.CharField', [], {'max_length': '64', 'null': 'True'}),
++            'project_id': ('sentry.db.models.fields.bounded.BoundedBigIntegerField', [], {'null': 'True', 'blank': 'True'}),
++            'time_spent': ('sentry.db.models.fields.bounded.BoundedIntegerField', [], {'null': 'True'})
++        },
++        'sentry.eventmapping': {
++            'Meta': {'unique_together': "(('project_id', 'event_id'),)", 'object_name': 'EventMapping'},
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'event_id': ('django.db.models.fields.CharField', [], {'max_length': '32'}),
++            'group_id': ('sentry.db.models.fields.bounded.BoundedBigIntegerField', [], {}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'project_id': ('sentry.db.models.fields.bounded.BoundedBigIntegerField', [], {})
++        },
++        'sentry.eventprocessingissue': {
++            'Meta': {'unique_together': "(('raw_event', 'processing_issue'),)", 'object_name': 'EventProcessingIssue'},
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'processing_issue': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.ProcessingIssue']"}),
++            'raw_event': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.RawEvent']"})
++        },
++        'sentry.eventtag': {
++            'Meta': {'unique_together': "(('event_id', 'key_id', 'value_id'),)", 'object_name': 'EventTag', 'index_together': "(('project_id', 'key_id', 'value_id'), ('group_id', 'key_id', 'value_id'))"},
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now', 'db_index': 'True'}),
++            'event_id': ('sentry.db.models.fields.bounded.BoundedBigIntegerField', [], {}),
++            'group_id': ('sentry.db.models.fields.bounded.BoundedBigIntegerField', [], {'null': 'True'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'key_id': ('sentry.db.models.fields.bounded.BoundedBigIntegerField', [], {}),
++            'project_id': ('sentry.db.models.fields.bounded.BoundedBigIntegerField', [], {}),
++            'value_id': ('sentry.db.models.fields.bounded.BoundedBigIntegerField', [], {})
++        },
++        'sentry.eventuser': {
++            'Meta': {'unique_together': "(('project', 'ident'), ('project', 'hash'))", 'object_name': 'EventUser', 'index_together': "(('project', 'email'), ('project', 'username'), ('project', 'ip_address'))"},
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now', 'db_index': 'True'}),
++            'email': ('django.db.models.fields.EmailField', [], {'max_length': '75', 'null': 'True'}),
++            'hash': ('django.db.models.fields.CharField', [], {'max_length': '32'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'ident': ('django.db.models.fields.CharField', [], {'max_length': '128', 'null': 'True'}),
++            'ip_address': ('django.db.models.fields.GenericIPAddressField', [], {'max_length': '39', 'null': 'True'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Project']"}),
++            'username': ('django.db.models.fields.CharField', [], {'max_length': '128', 'null': 'True'})
++        },
++        'sentry.file': {
++            'Meta': {'object_name': 'File'},
++            'blob': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'related_name': "'legacy_blob'", 'null': 'True', 'to': "orm['sentry.FileBlob']"}),
++            'blobs': ('django.db.models.fields.related.ManyToManyField', [], {'to': "orm['sentry.FileBlob']", 'through': "orm['sentry.FileBlobIndex']", 'symmetrical': 'False'}),
++            'checksum': ('django.db.models.fields.CharField', [], {'max_length': '40', 'null': 'True'}),
++            'headers': ('jsonfield.fields.JSONField', [], {'default': '{}'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'name': ('django.db.models.fields.CharField', [], {'max_length': '128'}),
++            'path': ('django.db.models.fields.TextField', [], {'null': 'True'}),
++            'size': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'null': 'True'}),
++            'timestamp': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now', 'db_index': 'True'}),
++            'type': ('django.db.models.fields.CharField', [], {'max_length': '64'})
++        },
++        'sentry.fileblob': {
++            'Meta': {'object_name': 'FileBlob'},
++            'checksum': ('django.db.models.fields.CharField', [], {'unique': 'True', 'max_length': '40'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'path': ('django.db.models.fields.TextField', [], {'null': 'True'}),
++            'size': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'null': 'True'}),
++            'timestamp': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now', 'db_index': 'True'})
++        },
++        'sentry.fileblobindex': {
++            'Meta': {'unique_together': "(('file', 'blob', 'offset'),)", 'object_name': 'FileBlobIndex'},
++            'blob': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.FileBlob']"}),
++            'file': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.File']"}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'offset': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {})
++        },
++        'sentry.globaldsymfile': {
++            'Meta': {'object_name': 'GlobalDSymFile'},
++            'cpu_name': ('django.db.models.fields.CharField', [], {'max_length': '40'}),
++            'file': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.File']"}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'object_name': ('django.db.models.fields.TextField', [], {}),
++            'uuid': ('django.db.models.fields.CharField', [], {'unique': 'True', 'max_length': '36'})
++        },
++        'sentry.group': {
++            'Meta': {'unique_together': "(('project', 'short_id'),)", 'object_name': 'Group', 'db_table': "'sentry_groupedmessage'", 'index_together': "(('project', 'first_release'),)"},
++            'active_at': ('django.db.models.fields.DateTimeField', [], {'null': 'True', 'db_index': 'True'}),
++            'culprit': ('django.db.models.fields.CharField', [], {'max_length': '200', 'null': 'True', 'db_column': "'view'", 'blank': 'True'}),
++            'data': ('sentry.db.models.fields.gzippeddict.GzippedDictField', [], {'null': 'True', 'blank': 'True'}),
++            'first_release': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Release']", 'null': 'True', 'on_delete': 'models.PROTECT'}),
++            'first_seen': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now', 'db_index': 'True'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'is_public': ('django.db.models.fields.NullBooleanField', [], {'default': 'False', 'null': 'True', 'blank': 'True'}),
++            'last_seen': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now', 'db_index': 'True'}),
++            'level': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'default': '40', 'db_index': 'True', 'blank': 'True'}),
++            'logger': ('django.db.models.fields.CharField', [], {'default': "''", 'max_length': '64', 'db_index': 'True', 'blank': 'True'}),
++            'message': ('django.db.models.fields.TextField', [], {}),
++            'num_comments': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'default': '0', 'null': 'True'}),
++            'platform': ('django.db.models.fields.CharField', [], {'max_length': '64', 'null': 'True'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Project']", 'null': 'True'}),
++            'resolved_at': ('django.db.models.fields.DateTimeField', [], {'null': 'True', 'db_index': 'True'}),
++            'score': ('sentry.db.models.fields.bounded.BoundedIntegerField', [], {'default': '0'}),
++            'short_id': ('sentry.db.models.fields.bounded.BoundedBigIntegerField', [], {'null': 'True'}),
++            'status': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'default': '0', 'db_index': 'True'}),
++            'time_spent_count': ('sentry.db.models.fields.bounded.BoundedIntegerField', [], {'default': '0'}),
++            'time_spent_total': ('sentry.db.models.fields.bounded.BoundedIntegerField', [], {'default': '0'}),
++            'times_seen': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'default': '1', 'db_index': 'True'})
++        },
++        'sentry.groupassignee': {
++            'Meta': {'object_name': 'GroupAssignee', 'db_table': "'sentry_groupasignee'"},
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'group': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'related_name': "'assignee_set'", 'unique': 'True', 'to': "orm['sentry.Group']"}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'related_name': "'assignee_set'", 'to': "orm['sentry.Project']"}),
++            'user': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'related_name': "'sentry_assignee_set'", 'to': "orm['sentry.User']"})
++        },
++        'sentry.groupbookmark': {
++            'Meta': {'unique_together': "(('project', 'user', 'group'),)", 'object_name': 'GroupBookmark'},
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now', 'null': 'True'}),
++            'group': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'related_name': "'bookmark_set'", 'to': "orm['sentry.Group']"}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'related_name': "'bookmark_set'", 'to': "orm['sentry.Project']"}),
++            'user': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'related_name': "'sentry_bookmark_set'", 'to': "orm['sentry.User']"})
++        },
++        'sentry.groupcommitresolution': {
++            'Meta': {'unique_together': "(('group_id', 'commit_id'),)", 'object_name': 'GroupCommitResolution'},
++            'commit_id': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {}),
++            'datetime': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now', 'db_index': 'True'}),
++            'group_id': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'})
++        },
++        'sentry.groupemailthread': {
++            'Meta': {'unique_together': "(('email', 'group'), ('email', 'msgid'))", 'object_name': 'GroupEmailThread'},
++            'date': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now', 'db_index': 'True'}),
++            'email': ('django.db.models.fields.EmailField', [], {'max_length': '75'}),
++            'group': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'related_name': "'groupemail_set'", 'to': "orm['sentry.Group']"}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'msgid': ('django.db.models.fields.CharField', [], {'max_length': '100'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'related_name': "'groupemail_set'", 'to': "orm['sentry.Project']"})
++        },
++        'sentry.grouphash': {
++            'Meta': {'unique_together': "(('project', 'hash'),)", 'object_name': 'GroupHash'},
++            'group': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Group']", 'null': 'True'}),
++            'hash': ('django.db.models.fields.CharField', [], {'max_length': '32'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Project']", 'null': 'True'})
++        },
++        'sentry.groupmeta': {
++            'Meta': {'unique_together': "(('group', 'key'),)", 'object_name': 'GroupMeta'},
++            'group': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Group']"}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'key': ('django.db.models.fields.CharField', [], {'max_length': '64'}),
++            'value': ('django.db.models.fields.TextField', [], {})
++        },
++        'sentry.groupredirect': {
++            'Meta': {'object_name': 'GroupRedirect'},
++            'group_id': ('sentry.db.models.fields.bounded.BoundedBigIntegerField', [], {'db_index': 'True'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'previous_group_id': ('sentry.db.models.fields.bounded.BoundedBigIntegerField', [], {'unique': 'True'})
++        },
++        'sentry.grouprelease': {
++            'Meta': {'unique_together': "(('group_id', 'release_id', 'environment'),)", 'object_name': 'GroupRelease'},
++            'environment': ('django.db.models.fields.CharField', [], {'default': "''", 'max_length': '64'}),
++            'first_seen': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'group_id': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'last_seen': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now', 'db_index': 'True'}),
++            'project_id': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'db_index': 'True'}),
++            'release_id': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'db_index': 'True'})
++        },
++        'sentry.groupresolution': {
++            'Meta': {'object_name': 'GroupResolution'},
++            'datetime': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now', 'db_index': 'True'}),
++            'group': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Group']", 'unique': 'True'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'release': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Release']"}),
++            'status': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'default': '0'})
++        },
++        'sentry.grouprulestatus': {
++            'Meta': {'unique_together': "(('rule', 'group'),)", 'object_name': 'GroupRuleStatus'},
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'group': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Group']"}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'last_active': ('django.db.models.fields.DateTimeField', [], {'null': 'True'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Project']"}),
++            'rule': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Rule']"}),
++            'status': ('django.db.models.fields.PositiveSmallIntegerField', [], {'default': '0'})
++        },
++        'sentry.groupseen': {
++            'Meta': {'unique_together': "(('user', 'group'),)", 'object_name': 'GroupSeen'},
++            'group': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Group']"}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'last_seen': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Project']"}),
++            'user': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.User']", 'db_index': 'False'})
++        },
++        'sentry.groupsnooze': {
++            'Meta': {'object_name': 'GroupSnooze'},
++            'group': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Group']", 'unique': 'True'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'until': ('django.db.models.fields.DateTimeField', [], {})
++        },
++        'sentry.groupsubscription': {
++            'Meta': {'unique_together': "(('group', 'user'),)", 'object_name': 'GroupSubscription'},
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now', 'null': 'True'}),
++            'group': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'related_name': "'subscription_set'", 'to': "orm['sentry.Group']"}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'is_active': ('django.db.models.fields.BooleanField', [], {'default': 'True'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'related_name': "'subscription_set'", 'to': "orm['sentry.Project']"}),
++            'reason': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'default': '0'}),
++            'user': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.User']"})
++        },
++        'sentry.grouptagkey': {
++            'Meta': {'unique_together': "(('project', 'group', 'key'),)", 'object_name': 'GroupTagKey'},
++            'group': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Group']"}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'key': ('django.db.models.fields.CharField', [], {'max_length': '32'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Project']", 'null': 'True'}),
++            'values_seen': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'default': '0'})
++        },
++        'sentry.grouptagvalue': {
++            'Meta': {'unique_together': "(('group_id', 'key', 'value'),)", 'object_name': 'GroupTagValue', 'db_table': "'sentry_messagefiltervalue'", 'index_together': "(('project_id', 'key', 'value', 'last_seen'),)"},
++            'first_seen': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now', 'null': 'True', 'db_index': 'True'}),
++            'group_id': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'key': ('django.db.models.fields.CharField', [], {'max_length': '32'}),
++            'last_seen': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now', 'null': 'True', 'db_index': 'True'}),
++            'project_id': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'null': 'True'}),
++            'times_seen': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'default': '0'}),
++            'value': ('django.db.models.fields.CharField', [], {'max_length': '200'})
++        },
++        'sentry.lostpasswordhash': {
++            'Meta': {'object_name': 'LostPasswordHash'},
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'hash': ('django.db.models.fields.CharField', [], {'max_length': '32'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'user': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.User']", 'unique': 'True'})
++        },
++        'sentry.option': {
++            'Meta': {'object_name': 'Option'},
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'key': ('django.db.models.fields.CharField', [], {'unique': 'True', 'max_length': '64'}),
++            'last_updated': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'value': ('sentry.db.models.fields.encrypted.EncryptedPickledObjectField', [], {})
++        },
++        'sentry.organization': {
++            'Meta': {'object_name': 'Organization'},
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'default_role': ('django.db.models.fields.CharField', [], {'default': "'member'", 'max_length': '32'}),
++            'flags': ('django.db.models.fields.BigIntegerField', [], {'default': '1'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'members': ('django.db.models.fields.related.ManyToManyField', [], {'related_name': "'org_memberships'", 'symmetrical': 'False', 'through': "orm['sentry.OrganizationMember']", 'to': "orm['sentry.User']"}),
++            'name': ('django.db.models.fields.CharField', [], {'max_length': '64'}),
++            'slug': ('django.db.models.fields.SlugField', [], {'unique': 'True', 'max_length': '50'}),
++            'status': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'default': '0'})
++        },
++        'sentry.organizationaccessrequest': {
++            'Meta': {'unique_together': "(('team', 'member'),)", 'object_name': 'OrganizationAccessRequest'},
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'member': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.OrganizationMember']"}),
++            'team': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Team']"})
++        },
++        'sentry.organizationavatar': {
++            'Meta': {'object_name': 'OrganizationAvatar'},
++            'avatar_type': ('django.db.models.fields.PositiveSmallIntegerField', [], {'default': '0'}),
++            'file': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.File']", 'unique': 'True', 'null': 'True', 'on_delete': 'models.SET_NULL'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'ident': ('django.db.models.fields.CharField', [], {'unique': 'True', 'max_length': '32', 'db_index': 'True'}),
++            'organization': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'related_name': "'avatar'", 'unique': 'True', 'to': "orm['sentry.Organization']"})
++        },
++        'sentry.organizationmember': {
++            'Meta': {'unique_together': "(('organization', 'user'), ('organization', 'email'))", 'object_name': 'OrganizationMember'},
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'email': ('django.db.models.fields.EmailField', [], {'max_length': '75', 'null': 'True', 'blank': 'True'}),
++            'flags': ('django.db.models.fields.BigIntegerField', [], {'default': '0'}),
++            'has_global_access': ('django.db.models.fields.BooleanField', [], {'default': 'True'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'organization': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'related_name': "'member_set'", 'to': "orm['sentry.Organization']"}),
++            'role': ('django.db.models.fields.CharField', [], {'default': "'member'", 'max_length': '32'}),
++            'teams': ('django.db.models.fields.related.ManyToManyField', [], {'to': "orm['sentry.Team']", 'symmetrical': 'False', 'through': "orm['sentry.OrganizationMemberTeam']", 'blank': 'True'}),
++            'token': ('django.db.models.fields.CharField', [], {'max_length': '64', 'unique': 'True', 'null': 'True', 'blank': 'True'}),
++            'type': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'default': '50', 'blank': 'True'}),
++            'user': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'blank': 'True', 'related_name': "'sentry_orgmember_set'", 'null': 'True', 'to': "orm['sentry.User']"})
++        },
++        'sentry.organizationmemberteam': {
++            'Meta': {'unique_together': "(('team', 'organizationmember'),)", 'object_name': 'OrganizationMemberTeam', 'db_table': "'sentry_organizationmember_teams'"},
++            'id': ('sentry.db.models.fields.bounded.BoundedAutoField', [], {'primary_key': 'True'}),
++            'is_active': ('django.db.models.fields.BooleanField', [], {'default': 'True'}),
++            'organizationmember': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.OrganizationMember']"}),
++            'team': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Team']"})
++        },
++        'sentry.organizationonboardingtask': {
++            'Meta': {'unique_together': "(('organization', 'task'),)", 'object_name': 'OrganizationOnboardingTask'},
++            'data': ('jsonfield.fields.JSONField', [], {'default': '{}'}),
++            'date_completed': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'organization': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Organization']"}),
++            'project_id': ('sentry.db.models.fields.bounded.BoundedBigIntegerField', [], {'null': 'True', 'blank': 'True'}),
++            'status': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {}),
++            'task': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {}),
++            'user': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.User']", 'null': 'True'})
++        },
++        'sentry.organizationoption': {
++            'Meta': {'unique_together': "(('organization', 'key'),)", 'object_name': 'OrganizationOption', 'db_table': "'sentry_organizationoptions'"},
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'key': ('django.db.models.fields.CharField', [], {'max_length': '64'}),
++            'organization': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Organization']"}),
++            'value': ('sentry.db.models.fields.encrypted.EncryptedPickledObjectField', [], {})
++        },
++        'sentry.processingissue': {
++            'Meta': {'unique_together': "(('project', 'checksum', 'type'),)", 'object_name': 'ProcessingIssue'},
++            'checksum': ('django.db.models.fields.CharField', [], {'max_length': '40', 'db_index': 'True'}),
++            'data': ('sentry.db.models.fields.gzippeddict.GzippedDictField', [], {}),
++            'datetime': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Project']"}),
++            'type': ('django.db.models.fields.CharField', [], {'max_length': '30'})
++        },
++        'sentry.project': {
++            'Meta': {'unique_together': "(('team', 'slug'), ('organization', 'slug'))", 'object_name': 'Project'},
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'first_event': ('django.db.models.fields.DateTimeField', [], {'null': 'True'}),
++            'flags': ('django.db.models.fields.BigIntegerField', [], {'default': '0', 'null': 'True'}),
++            'forced_color': ('django.db.models.fields.CharField', [], {'max_length': '6', 'null': 'True', 'blank': 'True'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'name': ('django.db.models.fields.CharField', [], {'max_length': '200'}),
++            'organization': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Organization']"}),
++            'public': ('django.db.models.fields.BooleanField', [], {'default': 'False'}),
++            'slug': ('django.db.models.fields.SlugField', [], {'max_length': '50', 'null': 'True'}),
++            'status': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'default': '0', 'db_index': 'True'}),
++            'team': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Team']"})
++        },
++        'sentry.projectbookmark': {
++            'Meta': {'unique_together': "(('project_id', 'user'),)", 'object_name': 'ProjectBookmark'},
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now', 'null': 'True'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'project_id': ('sentry.db.models.fields.bounded.BoundedBigIntegerField', [], {'null': 'True', 'blank': 'True'}),
++            'user': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.User']"})
++        },
++        'sentry.projectdsymfile': {
++            'Meta': {'unique_together': "(('project', 'uuid'),)", 'object_name': 'ProjectDSymFile'},
++            'cpu_name': ('django.db.models.fields.CharField', [], {'max_length': '40'}),
++            'file': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.File']"}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'object_name': ('django.db.models.fields.TextField', [], {}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Project']", 'null': 'True'}),
++            'uuid': ('django.db.models.fields.CharField', [], {'max_length': '36'})
++        },
++        'sentry.projectkey': {
++            'Meta': {'object_name': 'ProjectKey'},
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now', 'null': 'True'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'label': ('django.db.models.fields.CharField', [], {'max_length': '64', 'null': 'True', 'blank': 'True'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'related_name': "'key_set'", 'to': "orm['sentry.Project']"}),
++            'public_key': ('django.db.models.fields.CharField', [], {'max_length': '32', 'unique': 'True', 'null': 'True'}),
++            'rate_limit_count': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'null': 'True'}),
++            'rate_limit_window': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'null': 'True'}),
++            'roles': ('django.db.models.fields.BigIntegerField', [], {'default': '1'}),
++            'secret_key': ('django.db.models.fields.CharField', [], {'max_length': '32', 'unique': 'True', 'null': 'True'}),
++            'status': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'default': '0', 'db_index': 'True'})
++        },
++        'sentry.projectoption': {
++            'Meta': {'unique_together': "(('project', 'key'),)", 'object_name': 'ProjectOption', 'db_table': "'sentry_projectoptions'"},
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'key': ('django.db.models.fields.CharField', [], {'max_length': '64'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Project']"}),
++            'value': ('sentry.db.models.fields.encrypted.EncryptedPickledObjectField', [], {})
++        },
++        'sentry.projectplatform': {
++            'Meta': {'unique_together': "(('project_id', 'platform'),)", 'object_name': 'ProjectPlatform'},
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'last_seen': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'platform': ('django.db.models.fields.CharField', [], {'max_length': '64'}),
++            'project_id': ('sentry.db.models.fields.bounded.BoundedBigIntegerField', [], {})
++        },
++        'sentry.rawevent': {
++            'Meta': {'unique_together': "(('project', 'event_id'),)", 'object_name': 'RawEvent'},
++            'data': ('sentry.db.models.fields.node.NodeField', [], {'null': 'True', 'blank': 'True'}),
++            'datetime': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'event_id': ('django.db.models.fields.CharField', [], {'max_length': '32', 'null': 'True'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Project']"})
++        },
++        'sentry.release': {
++            'Meta': {'unique_together': "(('organization', 'version'),)", 'object_name': 'Release'},
++            'data': ('jsonfield.fields.JSONField', [], {'default': '{}'}),
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'date_released': ('django.db.models.fields.DateTimeField', [], {'null': 'True', 'blank': 'True'}),
++            'date_started': ('django.db.models.fields.DateTimeField', [], {'null': 'True', 'blank': 'True'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'new_groups': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'default': '0'}),
++            'organization': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Organization']"}),
++            'owner': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.User']", 'null': 'True', 'blank': 'True'}),
++            'project_id': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'null': 'True'}),
++            'projects': ('django.db.models.fields.related.ManyToManyField', [], {'related_name': "'releases'", 'symmetrical': 'False', 'through': "orm['sentry.ReleaseProject']", 'to': "orm['sentry.Project']"}),
++            'ref': ('django.db.models.fields.CharField', [], {'max_length': '64', 'null': 'True', 'blank': 'True'}),
++            'url': ('django.db.models.fields.URLField', [], {'max_length': '200', 'null': 'True', 'blank': 'True'}),
++            'version': ('django.db.models.fields.CharField', [], {'max_length': '64'})
++        },
++        'sentry.releasecommit': {
++            'Meta': {'unique_together': "(('release', 'commit'), ('release', 'order'))", 'object_name': 'ReleaseCommit'},
++            'commit': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Commit']"}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'order': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {}),
++            'organization_id': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'db_index': 'True'}),
++            'project_id': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'null': 'True', 'db_index': 'True'}),
++            'release': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Release']"})
++        },
++        'sentry.releaseenvironment': {
++            'Meta': {'unique_together': "(('project_id', 'release_id', 'environment_id'),)", 'object_name': 'ReleaseEnvironment', 'db_table': "'sentry_environmentrelease'"},
++            'environment_id': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'db_index': 'True'}),
++            'first_seen': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'last_seen': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now', 'db_index': 'True'}),
++            'organization_id': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'db_index': 'True'}),
++            'project_id': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'null': 'True', 'db_index': 'True'}),
++            'release_id': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'db_index': 'True'})
++        },
++        'sentry.releasefile': {
++            'Meta': {'unique_together': "(('release', 'ident'),)", 'object_name': 'ReleaseFile'},
++            'dist': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Distribution']", 'null': 'True'}),
++            'file': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.File']"}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'ident': ('django.db.models.fields.CharField', [], {'max_length': '40'}),
++            'name': ('django.db.models.fields.TextField', [], {}),
++            'organization': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Organization']"}),
++            'project_id': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'null': 'True'}),
++            'release': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Release']"})
++        },
++        'sentry.releaseheadcommit': {
++            'Meta': {'unique_together': "(('repository_id', 'release'),)", 'object_name': 'ReleaseHeadCommit'},
++            'commit': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Commit']"}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'organization_id': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'db_index': 'True'}),
++            'release': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Release']"}),
++            'repository_id': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {})
++        },
++        'sentry.releaseproject': {
++            'Meta': {'unique_together': "(('project', 'release'),)", 'object_name': 'ReleaseProject', 'db_table': "'sentry_release_project'"},
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'new_groups': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'default': '0', 'null': 'True'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Project']"}),
++            'release': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Release']"})
++        },
++        'sentry.repository': {
++            'Meta': {'unique_together': "(('organization_id', 'name'), ('organization_id', 'provider', 'external_id'))", 'object_name': 'Repository'},
++            'config': ('jsonfield.fields.JSONField', [], {'default': '{}'}),
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'external_id': ('django.db.models.fields.CharField', [], {'max_length': '64', 'null': 'True'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'name': ('django.db.models.fields.CharField', [], {'max_length': '200'}),
++            'organization_id': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'db_index': 'True'}),
++            'provider': ('django.db.models.fields.CharField', [], {'max_length': '64', 'null': 'True'}),
++            'status': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'default': '0', 'db_index': 'True'}),
++            'url': ('django.db.models.fields.URLField', [], {'max_length': '200', 'null': 'True'})
++        },
++        'sentry.reprocessingreport': {
++            'Meta': {'unique_together': "(('project', 'event_id'),)", 'object_name': 'ReprocessingReport'},
++            'datetime': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'event_id': ('django.db.models.fields.CharField', [], {'max_length': '32', 'null': 'True'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Project']"})
++        },
++        'sentry.rule': {
++            'Meta': {'object_name': 'Rule'},
++            'data': ('sentry.db.models.fields.gzippeddict.GzippedDictField', [], {}),
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'label': ('django.db.models.fields.CharField', [], {'max_length': '64'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Project']"}),
++            'status': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'default': '0', 'db_index': 'True'})
++        },
++        'sentry.savedsearch': {
++            'Meta': {'unique_together': "(('project', 'name'),)", 'object_name': 'SavedSearch'},
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'is_default': ('django.db.models.fields.BooleanField', [], {'default': 'False'}),
++            'name': ('django.db.models.fields.CharField', [], {'max_length': '128'}),
++            'owner': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.User']", 'null': 'True'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Project']"}),
++            'query': ('django.db.models.fields.TextField', [], {})
++        },
++        'sentry.savedsearchuserdefault': {
++            'Meta': {'unique_together': "(('project', 'user'),)", 'object_name': 'SavedSearchUserDefault', 'db_table': "'sentry_savedsearch_userdefault'"},
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Project']"}),
++            'savedsearch': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.SavedSearch']"}),
++            'user': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.User']"})
++        },
++        'sentry.tagkey': {
++            'Meta': {'unique_together': "(('project', 'key'),)", 'object_name': 'TagKey', 'db_table': "'sentry_filterkey'"},
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'key': ('django.db.models.fields.CharField', [], {'max_length': '32'}),
++            'label': ('django.db.models.fields.CharField', [], {'max_length': '64', 'null': 'True'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Project']"}),
++            'status': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'default': '0'}),
++            'values_seen': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'default': '0'})
++        },
++        'sentry.tagvalue': {
++            'Meta': {'unique_together': "(('project', 'key', 'value'),)", 'object_name': 'TagValue', 'db_table': "'sentry_filtervalue'"},
++            'data': ('sentry.db.models.fields.gzippeddict.GzippedDictField', [], {'null': 'True', 'blank': 'True'}),
++            'first_seen': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now', 'null': 'True', 'db_index': 'True'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'key': ('django.db.models.fields.CharField', [], {'max_length': '32'}),
++            'last_seen': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now', 'null': 'True', 'db_index': 'True'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Project']", 'null': 'True'}),
++            'times_seen': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'default': '0'}),
++            'value': ('django.db.models.fields.CharField', [], {'max_length': '200'})
++        },
++        'sentry.team': {
++            'Meta': {'unique_together': "(('organization', 'slug'),)", 'object_name': 'Team'},
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now', 'null': 'True'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'name': ('django.db.models.fields.CharField', [], {'max_length': '64'}),
++            'organization': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Organization']"}),
++            'slug': ('django.db.models.fields.SlugField', [], {'max_length': '50'}),
++            'status': ('sentry.db.models.fields.bounded.BoundedPositiveIntegerField', [], {'default': '0'})
++        },
++        'sentry.user': {
++            'Meta': {'object_name': 'User', 'db_table': "'auth_user'"},
++            'date_joined': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'email': ('django.db.models.fields.EmailField', [], {'max_length': '75', 'blank': 'True'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedAutoField', [], {'primary_key': 'True'}),
++            'is_active': ('django.db.models.fields.BooleanField', [], {'default': 'True'}),
++            'is_managed': ('django.db.models.fields.BooleanField', [], {'default': 'False'}),
++            'is_password_expired': ('django.db.models.fields.BooleanField', [], {'default': 'False'}),
++            'is_staff': ('django.db.models.fields.BooleanField', [], {'default': 'False'}),
++            'is_superuser': ('django.db.models.fields.BooleanField', [], {'default': 'False'}),
++            'last_login': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'last_password_change': ('django.db.models.fields.DateTimeField', [], {'null': 'True'}),
++            'name': ('django.db.models.fields.CharField', [], {'max_length': '200', 'db_column': "'first_name'", 'blank': 'True'}),
++            'password': ('django.db.models.fields.CharField', [], {'max_length': '128'}),
++            'session_nonce': ('django.db.models.fields.CharField', [], {'max_length': '12', 'null': 'True'}),
++            'username': ('django.db.models.fields.CharField', [], {'unique': 'True', 'max_length': '128'})
++        },
++        'sentry.useravatar': {
++            'Meta': {'object_name': 'UserAvatar'},
++            'avatar_type': ('django.db.models.fields.PositiveSmallIntegerField', [], {'default': '0'}),
++            'file': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.File']", 'unique': 'True', 'null': 'True', 'on_delete': 'models.SET_NULL'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'ident': ('django.db.models.fields.CharField', [], {'unique': 'True', 'max_length': '32', 'db_index': 'True'}),
++            'user': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'related_name': "'avatar'", 'unique': 'True', 'to': "orm['sentry.User']"})
++        },
++        'sentry.useremail': {
++            'Meta': {'unique_together': "(('user', 'email'),)", 'object_name': 'UserEmail'},
++            'date_hash_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'email': ('django.db.models.fields.EmailField', [], {'max_length': '75'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'is_verified': ('django.db.models.fields.BooleanField', [], {'default': 'False'}),
++            'user': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'related_name': "'emails'", 'to': "orm['sentry.User']"}),
++            'validation_hash': ('django.db.models.fields.CharField', [], {'default': "u'Qo5GXL77EnVDRwqPWVPJi5r30GPqApSy'", 'max_length': '32'})
++        },
++        'sentry.useroption': {
++            'Meta': {'unique_together': "(('user', 'project', 'key'), ('user', 'organization', 'key'))", 'object_name': 'UserOption'},
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'key': ('django.db.models.fields.CharField', [], {'max_length': '64'}),
++            'organization': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Organization']", 'null': 'True'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Project']", 'null': 'True'}),
++            'user': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.User']"}),
++            'value': ('sentry.db.models.fields.encrypted.EncryptedPickledObjectField', [], {})
++        },
++        'sentry.userreport': {
++            'Meta': {'unique_together': "(('project', 'event_id'),)", 'object_name': 'UserReport', 'index_together': "(('project', 'event_id'), ('project', 'date_added'))"},
++            'comments': ('django.db.models.fields.TextField', [], {}),
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'email': ('django.db.models.fields.EmailField', [], {'max_length': '75'}),
++            'event_id': ('django.db.models.fields.CharField', [], {'max_length': '32'}),
++            'group': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Group']", 'null': 'True'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'name': ('django.db.models.fields.CharField', [], {'max_length': '128'}),
++            'project': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.Project']"})
++        },
++        'sentry.versiondsymfile': {
++            'Meta': {'unique_together': "(('dsym_file', 'version', 'build'),)", 'object_name': 'VersionDSymFile'},
++            'build': ('django.db.models.fields.CharField', [], {'max_length': '32', 'null': 'True'}),
++            'date_added': ('django.db.models.fields.DateTimeField', [], {'default': 'datetime.datetime.now'}),
++            'dsym_app': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.DSymApp']"}),
++            'dsym_file': ('sentry.db.models.fields.foreignkey.FlexibleForeignKey', [], {'to': "orm['sentry.ProjectDSymFile']", 'null': 'True'}),
++            'id': ('sentry.db.models.fields.bounded.BoundedBigAutoField', [], {'primary_key': 'True'}),
++            'version': ('django.db.models.fields.CharField', [], {'max_length': '32'})
++        }
++    }
++
++    complete_apps = ['sentry']
+\ No newline at end of file
+diff --git a/src/sentry/static/sentry/app/components/forms/select2Field.jsx b/src/sentry/static/sentry/app/components/forms/select2Field.jsx
+index 5302a9f2b8..fb51b9caeb 100644
+--- a/src/sentry/static/sentry/app/components/forms/select2Field.jsx
++++ b/src/sentry/static/sentry/app/components/forms/select2Field.jsx
+@@ -50,7 +50,12 @@ class Select2Field extends InputField {
+   }
+ 
+   componentDidMount() {
+-    jQuery(this.refs.input).select2().on('change', this.onChange);
++    jQuery(this.refs.input)
++      .select2({
++        allowClear: this.props.allowClear,
++        width: 'element'
++      })
++      .on('change', this.onChange);
+   }
+ 
+   componentWillUnmount() {
+@@ -60,7 +65,8 @@ class Select2Field extends InputField {
+ 
+ Select2Field.propTypes = Object.assign(
+   {
+-    choices: React.PropTypes.array.isRequired
++    choices: React.PropTypes.array.isRequired,
++    allowClear: React.PropTypes.bool
+   },
+   InputField.propTypes
+ );
+diff --git a/src/sentry/static/sentry/app/components/group/releaseChart.jsx b/src/sentry/static/sentry/app/components/group/releaseChart.jsx
+index 391c03f9ad..4258193c9b 100644
+--- a/src/sentry/static/sentry/app/components/group/releaseChart.jsx
++++ b/src/sentry/static/sentry/app/components/group/releaseChart.jsx
+@@ -136,7 +136,7 @@ const GroupReleaseChart = React.createClass({
+         <h6><span>{this.props.title}</span></h6>
+         <StackedBarChart
+           points={points}
+-          height={150}
++          height={40}
+           className="sparkline"
+           markers={markers}
+           barClasses={['release', 'environment', 'inactive']}
+diff --git a/src/sentry/static/sentry/app/components/stackedBarChart.jsx b/src/sentry/static/sentry/app/components/stackedBarChart.jsx
+index 8905fc870d..333597f8e7 100644
+--- a/src/sentry/static/sentry/app/components/stackedBarChart.jsx
++++ b/src/sentry/static/sentry/app/components/stackedBarChart.jsx
+@@ -182,7 +182,11 @@ const StackedBarChart = React.createClass({
+     let key = ['m', marker.className, marker.x].join('-');
+ 
+     return (
+-      <a key={key} className={className} data-title={title}>
++      <a
++        key={key}
++        className={className}
++        style={{height: this.props.height}}
++        data-title={title}>
+         <span>{marker.label}</span>
+       </a>
+     );
+@@ -231,7 +235,7 @@ const StackedBarChart = React.createClass({
+         key={point.x}
+         className="chart-column tip"
+         data-point-index={pointIdx}
+-        style={{width: pointWidth}}>
++        style={{width: pointWidth, height: this.props.height}}>
+         {pts}
+       </a>
+     );
+@@ -268,7 +272,9 @@ const StackedBarChart = React.createClass({
+     let maxval = this.maxPointValue();
+ 
+     return (
+-      <figure className={figureClass} height={this.props.height} width={this.props.width}>
++      <figure
++        className={figureClass}
++        style={{height: this.props.height, width: this.props.width}}>
+         <span className="max-y">{maxval}</span>
+         <span className="min-y">0</span>
+         <span>{this.renderChart()}</span>
+diff --git a/src/sentry/static/sentry/app/stores/hookStore.jsx b/src/sentry/static/sentry/app/stores/hookStore.jsx
+index 0add917667..13cd4a4382 100644
+--- a/src/sentry/static/sentry/app/stores/hookStore.jsx
++++ b/src/sentry/static/sentry/app/stores/hookStore.jsx
+@@ -7,7 +7,8 @@ let validHookNames = new Set([
+   'organization:sidebar',
+   'routes',
+   'routes:admin',
+-  'routes:organization'
++  'routes:organization',
++  'project:rate-limits:disabled'
+ ]);
+ 
+ const HookStore = Reflux.createStore({
+diff --git a/src/sentry/static/sentry/app/views/projectKeyDetails.jsx b/src/sentry/static/sentry/app/views/projectKeyDetails.jsx
+index 5fbbed74e8..5287eb0cb6 100644
+--- a/src/sentry/static/sentry/app/views/projectKeyDetails.jsx
++++ b/src/sentry/static/sentry/app/views/projectKeyDetails.jsx
+@@ -2,26 +2,141 @@ import React from 'react';
+ import DocumentTitle from 'react-document-title';
+ import underscore from 'underscore';
+ import {browserHistory} from 'react-router';
++import idx from 'idx';
+ 
+ import ApiMixin from '../mixins/apiMixin';
+ import AutoSelectText from '../components/autoSelectText';
+ import DateTime from '../components/dateTime';
++import HookStore from '../stores/hookStore';
+ import IndicatorStore from '../stores/indicatorStore';
+ import LoadingError from '../components/loadingError';
+ import LoadingIndicator from '../components/loadingIndicator';
+-import OrganizationState from '../mixins/organizationState';
+-import {BooleanField, FormState, TextField} from '../components/forms';
++import ProjectState from '../mixins/projectState';
++import StackedBarChart from '../components/stackedBarChart';
++import {
++  BooleanField,
++  FormState,
++  NumberField,
++  Select2Field,
++  TextField
++} from '../components/forms';
+ import {t, tct} from '../locale';
+ 
++const KeyStats = React.createClass({
++  mixins: [ApiMixin],
++
++  getInitialState() {
++    let until = Math.floor(new Date().getTime() / 1000);
++    let since = until - 3600 * 24 * 30;
++
++    return {
++      since: since,
++      until: until,
++      loading: true,
++      error: false,
++      stats: null,
++      emptyStats: false
++    };
++  },
++
++  componentWillMount() {
++    this.fetchData();
++  },
++
++  fetchData() {
++    let {keyId, orgId, projectId} = this.props.params;
++    this.api.request(`/projects/${orgId}/${projectId}/keys/${keyId}/stats/`, {
++      query: {
++        since: this.state.since,
++        until: this.state.until,
++        resolution: '1d'
++      },
++      success: data => {
++        let emptyStats = true;
++        let stats = data.map(p => {
++          if (p.total) emptyStats = false;
++          return {
++            x: p.ts,
++            y: [p.accepted, p.dropped, p.filtered]
++          };
++        });
++        this.setState({
++          stats: stats,
++          emptyStats: emptyStats,
++          error: false,
++          loading: false
++        });
++      },
++      error: () => {
++        this.setState({error: true, loading: false});
++      }
++    });
++  },
++
++  renderTooltip(point, pointIdx, chart) {
++    let timeLabel = chart.getTimeLabel(point);
++    let [accepted, dropped, filtered] = point.y;
++
++    let value = `${accepted.toLocaleString()} accepted`;
++    if (dropped) {
++      value += `<br>${dropped.toLocaleString()} rate limited`;
++    }
++    if (filtered) {
++      value += `<br>${filtered.toLocaleString()} filtered`;
++    }
++
++    return (
++      '<div style="width:150px">' +
++      `<div class="time-label">${underscore.escape(timeLabel)}</div>` +
++      `<div class="value-label">${underscore.escape(value)}</div>` +
++      '</div>'
++    );
++  },
++
++  render() {
++    if (this.state.loading) return <div className="box"><LoadingIndicator /></div>;
++    else if (this.state.error) return <LoadingError onRetry={this.fetchData} />;
++
++    return (
++      <div className="panel panel-default">
++        <div className="panel-heading">
++          <h6>{t('Key usage in the last 30 days (by day)')}</h6>
++        </div>
++        <div className="panel-body p-a-0">
++          {!this.state.emptyStats
++            ? <div className="inbound-filters-stats p-a-1">
++                <div className="bar-chart">
++                  <StackedBarChart
++                    points={this.state.stats}
++                    height={100}
++                    barClasses={['accepted', 'rate-limited', 'black-listed']}
++                    className="sparkline m-b-0"
++                    tooltip={this.renderTooltip}
++                  />
++                </div>
++              </div>
++            : <div className="blankslate p-y-2">
++                <h5>{t('Nothing recorded in the last 30 days.')}</h5>
++                <p className="m-b-0">
++                  {t('Total events captured using these credentials.')}
++                </p>
++              </div>}
++        </div>
++      </div>
++    );
++  }
++});
++
+ const KeySettings = React.createClass({
+   propTypes: {
++    organization: React.PropTypes.object.isRequired,
++    project: React.PropTypes.object.isRequired,
+     access: React.PropTypes.object.isRequired,
+-    orgId: React.PropTypes.string.isRequired,
+-    projectId: React.PropTypes.string.isRequired,
+     data: React.PropTypes.object.isRequired,
+     initialData: React.PropTypes.object,
+     onRemove: React.PropTypes.func.isRequired,
+-    onSave: React.PropTypes.func.isRequired
++    onSave: React.PropTypes.func.isRequired,
++    rateLimitsEnabled: React.PropTypes.bool
+   },
+ 
+   mixins: [ApiMixin],
+@@ -29,16 +144,33 @@ const KeySettings = React.createClass({
+   getInitialState() {
+     return {
+       formData: Object.assign({}, this.props.initialData),
+-      errors: {}
++      errors: {},
++      hooksDisabled: HookStore.get('project:rate-limits:disabled')
+     };
+   },
+ 
+   onFieldChange(name, value) {
+-    this.setState({
+-      formData: {
+-        ...this.state.formData,
+-        [name]: value
+-      }
++    this.setState(state => {
++      return {
++        formData: {
++          ...state.formData,
++          [name]: value
++        }
++      };
++    });
++  },
++
++  onRateLimitChange(name, value) {
++    this.setState(state => {
++      return {
++        formData: {
++          ...state.formData,
++          rateLimit: {
++            ...(state.formData.rateLimit || {}),
++            [name]: value
++          }
++        }
++      };
+     });
+   },
+ 
+@@ -54,8 +186,8 @@ const KeySettings = React.createClass({
+       },
+       () => {
+         let loadingIndicator = IndicatorStore.add(t('Saving changes..'));
+-        let {orgId, projectId} = this.props;
+-        this.api.request(`/projects/${orgId}/${projectId}/`, {
++        let {keyId, orgId, projectId} = this.props.params;
++        this.api.request(`/projects/${orgId}/${projectId}/keys/${keyId}/`, {
+           method: 'PUT',
+           data: this.state.formData,
+           success: data => {
+@@ -84,8 +216,8 @@ const KeySettings = React.createClass({
+     if (this.state.loading) return;
+ 
+     let loadingIndicator = IndicatorStore.add(t('Saving changes..'));
+-    let {orgId, projectId, data} = this.props;
+-    this.api.request(`/projects/${orgId}/${projectId}/keys/${data.id}/`, {
++    let {keyId, orgId, projectId} = this.props.params;
++    this.api.request(`/projects/${orgId}/${projectId}/keys/${keyId}/`, {
+       method: 'DELETE',
+       success: (d, _, jqXHR) => {
+         this.props.onRemove();
+@@ -101,12 +233,26 @@ const KeySettings = React.createClass({
+     });
+   },
+ 
++  getRateLimitWindows() {
++    return [
++      ['', ''],
++      [1, '1 minute'],
++      [5, '5 minutes'],
++      [15, '15 minutes'],
++      [60, '1 hour'],
++      [120, '2 hours'],
++      [240, '4 hours'],
++      [360, '6 hours'],
++      [720, '12 hours'],
++      [1440, '24 hours']
++    ];
++  },
++
+   render() {
+     let isSaving = this.state.state === FormState.SAVING;
+     let {errors, formData} = this.state;
+     let hasChanges = !underscore.isEqual(this.props.initialData, formData);
+-    let {access, data} = this.props;
+-
++    let {access, data, rateLimitsEnabled, organization, project} = this.props;
+     return (
+       <form onSubmit={this.onSubmit} className="form-stacked">
+         {this.state.state === FormState.ERROR &&
+@@ -129,6 +275,7 @@ const KeySettings = React.createClass({
+               error={errors.name}
+               onChange={this.onFieldChange.bind(this, 'name')}
+             />
++
+             <BooleanField
+               key="isActive"
+               name="isActive"
+@@ -141,6 +288,7 @@ const KeySettings = React.createClass({
+               }
+               onChange={this.onFieldChange.bind(this, 'isActive')}
+             />
++
+             <div className="form-group">
+               <label>{t('Created')}</label>
+               <div className="controls">
+@@ -159,6 +307,73 @@ const KeySettings = React.createClass({
+           </div>
+         </div>
+ 
++        {!rateLimitsEnabled
++          ? this.state.hooksDisabled
++              .map(hook => {
++                return hook(organization, project, data);
++              })
++              .shift()
++          : <div className="box">
++              <div className="box-header">
++                <h3>{t('Rate Limits')}</h3>
++              </div>
++              <div className="box-content with-padding">
++                <p>
++                  {
++                    'Rate limits provide a flexible way to manage your event volume. If you have a noisy project or environment you can configure a rate limit for this key to reduce the number of events processed.'
++                  }
++                </p>
++                <div className="form-group">
++                  <label>{t('Rate Limit')}</label>
++                  <div>
++                    <div style={{width: 80, display: 'inline-block'}}>
++                      <NumberField
++                        key="rateLimit.count"
++                        name="rateLimit.count"
++                        min={0}
++                        value={idx(formData, _ => _.rateLimit.count)}
++                        required={false}
++                        error={errors.rateLimit}
++                        placeholder={t('count')}
++                        onChange={this.onRateLimitChange.bind(this, 'count')}
++                        className=""
++                      />
++                    </div>
++                    <div style={{display: 'inline-block', margin: '0 10px'}}>
++                      <small>event(s) in</small>
++                    </div>
++                    <div style={{width: 150, display: 'inline-block'}}>
++                      <Select2Field
++                        width="100%"
++                        key="rateLimit.window"
++                        name="rateLimit.window"
++                        choices={this.getRateLimitWindows()}
++                        value={idx(formData, _ => _.rateLimit.window)}
++                        required={false}
++                        error={errors.rateLimit}
++                        placeholder={t('window')}
++                        allowClear={true}
++                        onChange={this.onRateLimitChange.bind(this, 'window')}
++                        className=""
++                      />
++                    </div>
++                    <div className="help-block">
++                      {t(
++                        'Apply a rate limit to this credential to cap the amount of events accepted during a time window.'
++                      )}
++                    </div>
++                  </div>
++                </div>
++                <fieldset className="form-actions">
++                  <button
++                    type="submit"
++                    className="btn btn-primary"
++                    disabled={isSaving || !hasChanges}>
++                    {t('Save Changes')}
++                  </button>
++                </fieldset>
++              </div>
++            </div>}
+         <div className="box dsn-credentials">
+           <div className="box-header">
+             <h3>{t('Credentials')}</h3>
+@@ -248,14 +463,13 @@ const KeySettings = React.createClass({
+               </fieldset>
+             </div>
+           </div>}
+-
+       </form>
+     );
+   }
+ });
+ 
+ export default React.createClass({
+-  mixins: [ApiMixin, OrganizationState],
++  mixins: [ApiMixin, ProjectState],
+ 
+   getInitialState() {
+     return {
+@@ -310,20 +524,26 @@ export default React.createClass({
+     else if (this.state.error) return <LoadingError onRetry={this.fetchData} />;
+ 
+     let {data} = this.state;
+-    let {orgId, projectId} = this.props.params;
++    let {params} = this.props;
+ 
+     return (
+       <DocumentTitle title={t('Key Details')}>
+         <div className="ref-key-details">
+           <h2>{t('Key Details')}</h2>
++
++          <KeyStats params={params} />
++
+           <KeySettings
++            organization={this.getOrganization()}
++            project={this.getProject()}
+             access={this.getAccess()}
+-            orgId={orgId}
+-            projectId={projectId}
++            params={params}
+             initialData={{
+               isActive: data.isActive,
+-              name: data.name
++              name: data.name,
++              rateLimit: data.rateLimit
+             }}
++            rateLimitsEnabled={this.getProjectFeatures().has('rate-limits')}
+             data={data}
+             onSave={this.handleSave}
+             onRemove={this.handleRemove}
+diff --git a/src/sentry/static/sentry/app/views/projectKeys.jsx b/src/sentry/static/sentry/app/views/projectKeys.jsx
+index 465bcfd866..d157f6a386 100644
+--- a/src/sentry/static/sentry/app/views/projectKeys.jsx
++++ b/src/sentry/static/sentry/app/views/projectKeys.jsx
+@@ -104,7 +104,7 @@ const KeyRow = React.createClass({
+     let editUrl = `/${orgId}/${projectId}/settings/keys/${data.id}/`;
+     let controls = [
+       <Link key="edit" to={editUrl} className="btn btn-default btn-sm">
+-        <span className="icon icon-settings" />
++        {t('Details')}
+       </Link>
+     ];
+     if (access.has('project:write')) {
+diff --git a/src/sentry/static/sentry/less/organization.less b/src/sentry/static/sentry/less/organization.less
+index da63a70981..52f308e5f5 100644
+--- a/src/sentry/static/sentry/less/organization.less
++++ b/src/sentry/static/sentry/less/organization.less
+@@ -525,40 +525,6 @@ table.project-list {
+ .organization-stats {
+   height: 150px;
+   margin-bottom: 20px;
+-
+-  .bar-chart figure a {
+-    height: 150px;
+-
+-    span {
+-      &.accepted {
+-        background: @gray-lightest;
+-      }
+-
+-      &.rate-limited {
+-        background: @red;
+-        min-height: 0;
+-      }
+-
+-      &.black-listed {
+-        background: @orange-light;
+-        min-height: 0;
+-      }
+-    }
+-
+-    &:hover span {
+-      &.accepted {
+-        background: @gray-light;
+-      }
+-
+-      &.rate-limited {
+-        background: @red-dark;
+-      }
+-
+-      &.black-listed {
+-        background: @orange-dark;
+-      }
+-    }
+-  }
+ }
+ 
+ /**
+diff --git a/src/sentry/static/sentry/less/shared-components.less b/src/sentry/static/sentry/less/shared-components.less
+index 53622c4f42..1c300e885d 100644
+--- a/src/sentry/static/sentry/less/shared-components.less
++++ b/src/sentry/static/sentry/less/shared-components.less
+@@ -1433,6 +1433,7 @@ table.integrations {
+ 
+   figure {
+     .clearfix();
++    height: 90px;
+     margin-bottom: 20px;
+     position: relative;
+ 
+@@ -1444,6 +1445,38 @@ table.integrations {
+       span {
+         display: block;
+         min-height: 2px;
++
++        &.accepted {
++          background: @gray-lightest;
++        }
++
++        &.rate-limited,
++        &.dropped {
++          background: @red;
++          min-height: 0;
++        }
++
++        &.black-listed,
++        &.filtered {
++          background: @orange-light;
++          min-height: 0;
++        }
++      }
++
++      &:hover span {
++        &.accepted {
++          background: @gray-light;
++        }
++
++        &.rate-limited,
++        &.dropped {
++          background: @red-dark;
++        }
++
++        &.black-listed,
++        &.filtered {
++          background: @orange-dark;
++        }
+       }
+     }
+   }
+diff --git a/src/sentry/static/sentry/less/stream.less b/src/sentry/static/sentry/less/stream.less
+index a4e27ef8a4..4fb7d550f2 100644
+--- a/src/sentry/static/sentry/less/stream.less
++++ b/src/sentry/static/sentry/less/stream.less
+@@ -1249,11 +1249,14 @@
+   border-radius: 0 0 2px 2px;
+   text-align: center;
+   font-size: 22px;
+-  padding: 48px 0 48px;
++  padding: 48px 0;
+ 
+   p {
+     line-height: 1.2;
+-    margin: 0 auto 10px;
++    margin: 0 auto 20px;
++    &:last-child {
++      margin-bottom: 0;
++    }
+   }
+ 
+   .icon {
+@@ -1266,7 +1269,6 @@
+ }
+ 
+ 
+-
+ /**
+ * Responsive small screen
+ * ============================================================================
+diff --git a/src/sentry/testutils/cases.py b/src/sentry/testutils/cases.py
+index bf485fb976..0c72c1eedc 100644
+--- a/src/sentry/testutils/cases.py
++++ b/src/sentry/testutils/cases.py
+@@ -23,14 +23,17 @@ import types
+ 
+ from click.testing import CliRunner
+ from contextlib import contextmanager
++from datetime import datetime
+ from django.conf import settings
+ from django.contrib.auth import login
+ from django.core.cache import cache
+ from django.core.urlresolvers import reverse
+ from django.http import HttpRequest
+ from django.test import TestCase, TransactionTestCase
++from django.utils import timezone
+ from django.utils.importlib import import_module
+ from exam import before, fixture, Exam
++from mock import patch
+ from pkg_resources import iter_entry_points
+ from rest_framework.test import APITestCase as BaseAPITestCase
+ from six.moves.urllib.parse import urlencode
+@@ -451,6 +454,14 @@ class CliTestCase(TestCase):
+ 
+ @pytest.mark.usefixtures('browser')
+ class AcceptanceTestCase(TransactionTestCase):
++    def setUp(self):
++        patcher = patch('django.utils.timezone.now', return_value=(
++            datetime(2013, 5, 18, 15, 13, 58, 132928, tzinfo=timezone.utc)
++        ))
++        patcher.start()
++        self.addCleanup(patcher.stop)
++        super(AcceptanceTestCase, self).setUp()
++
+     def save_session(self):
+         self.session.save()
+         self.browser.save_cookie(
+diff --git a/src/sentry/tsdb/base.py b/src/sentry/tsdb/base.py
+index 81376eb9a7..2d07f978e2 100644
+--- a/src/sentry/tsdb/base.py
++++ b/src/sentry/tsdb/base.py
+@@ -76,6 +76,13 @@ class TSDBModel(Enum):
+     # number of events seen for an environment, by issue
+     frequent_environments_by_group = 408
+ 
++    # the number of events sent to the server
++    key_total_received = 500
++    # the number of events rejected due to rate limiting
++    key_total_rejected = 501
++    # the number of events blocked due to being blacklisted
++    key_total_blacklisted = 502
++
+ 
+ class BaseTSDB(Service):
+     __all__ = (
+diff --git a/src/sentry/web/api.py b/src/sentry/web/api.py
+index 0071fee5f8..852df89db4 100644
+--- a/src/sentry/web/api.py
++++ b/src/sentry/web/api.py
+@@ -186,13 +186,13 @@ class APIView(BaseView):
+         else:
+             auth = self._parse_header(request, helper, project)
+ 
+-            project_id = helper.project_id_from_auth(auth)
++            key = helper.project_key_from_auth(auth)
+ 
+             # Legacy API was /api/store/ and the project ID was only available elsewhere
+             if not project:
+-                project = Project.objects.get_from_cache(id=project_id)
++                project = Project.objects.get_from_cache(id=key.project_id)
+                 helper.context.bind_project(project)
+-            elif project_id != project.id:
++            elif key.project_id != project.id:
+                 raise APIError('Two different projects were specified')
+ 
+             helper.context.bind_auth(auth)
+@@ -224,6 +224,7 @@ class APIView(BaseView):
+                 project=project,
+                 auth=auth,
+                 helper=helper,
++                key=key,
+                 **kwargs
+             )
+ 
+@@ -312,7 +313,7 @@ class StoreView(APIView):
+             response['X-Sentry-ID'] = response_or_event_id
+         return response
+ 
+-    def process(self, request, project, auth, helper, data, **kwargs):
++    def process(self, request, project, key, auth, helper, data, **kwargs):
+         metrics.incr('events.total')
+ 
+         if not data:
+@@ -341,6 +342,8 @@ class StoreView(APIView):
+                 (tsdb.models.project_total_blacklisted, project.id),
+                 (tsdb.models.organization_total_received, project.organization_id),
+                 (tsdb.models.organization_total_blacklisted, project.organization_id),
++                (tsdb.models.key_total_received, key.id),
++                (tsdb.models.key_total_blacklisted, key.id),
+             ])
+             metrics.incr('events.blacklisted')
+             event_filtered.send_robust(
+@@ -352,7 +355,7 @@ class StoreView(APIView):
+ 
+         # TODO: improve this API (e.g. make RateLimit act on __ne__)
+         rate_limit = safe_execute(quotas.is_rate_limited, project=project,
+-                                  _with_transaction=False)
++                                  key=key, _with_transaction=False)
+         if isinstance(rate_limit, bool):
+             rate_limit = RateLimit(is_limited=rate_limit, retry_after=None)
+ 
+@@ -366,6 +369,8 @@ class StoreView(APIView):
+                 (tsdb.models.project_total_rejected, project.id),
+                 (tsdb.models.organization_total_received, project.organization_id),
+                 (tsdb.models.organization_total_rejected, project.organization_id),
++                (tsdb.models.key_total_received, key.id),
++                (tsdb.models.key_total_rejected, key.id),
+             ])
+             metrics.incr('events.dropped', tags={
+                 'reason': rate_limit.reason_code if rate_limit else 'unknown',
+@@ -382,6 +387,7 @@ class StoreView(APIView):
+             tsdb.incr_multi([
+                 (tsdb.models.project_total_received, project.id),
+                 (tsdb.models.organization_total_received, project.organization_id),
++                (tsdb.models.key_total_received, key.id),
+             ])
+ 
+         org_options = OrganizationOption.objects.get_all_values(project.organization_id)
+@@ -481,8 +487,8 @@ class CspReportView(StoreView):
+         # `sentry_version` to be set in querystring
+         auth = helper.auth_from_request(request)
+ 
+-        project_id = helper.project_id_from_auth(auth)
+-        if project_id != project.id:
++        key = helper.project_key_from_auth(auth)
++        if key.project_id != project.id:
+             raise APIError('Two different projects were specified')
+ 
+         helper.context.bind_auth(auth)
+@@ -493,10 +499,11 @@ class CspReportView(StoreView):
+             project=project,
+             auth=auth,
+             helper=helper,
++            key=key,
+             **kwargs
+         )
+ 
+-    def post(self, request, project, auth, helper, **kwargs):
++    def post(self, request, project, helper, **kwargs):
+         data = helper.safely_load_json_string(request.body)
+ 
+         # Do origin check based on the `document-uri` key as explained
+@@ -524,7 +531,6 @@ class CspReportView(StoreView):
+         response_or_event_id = self.process(
+             request,
+             project=project,
+-            auth=auth,
+             helper=helper,
+             data=report,
+             **kwargs
+diff --git a/tests/acceptance/test_project_keys.py b/tests/acceptance/test_project_keys.py
+index 09445b86e9..738bc1e446 100644
+--- a/tests/acceptance/test_project_keys.py
++++ b/tests/acceptance/test_project_keys.py
+@@ -28,6 +28,13 @@ class ProjectKeysTest(AcceptanceTestCase):
+             teams=[self.team],
+         )
+ 
++        ProjectKey.objects.filter(project=self.project).delete()
++        ProjectKey.objects.create(
++            project=self.project,
++            public_key='5cc0482a13d248ff99f9717101dd6356',
++            secret_key='410fd998318844b8894775f36184ec28',
++        )
++
+         self.login_as(self.user)
+         self.path = '/{}/{}/settings/keys/'.format(self.org.slug, self.project.slug)
+ 
+@@ -62,7 +69,11 @@ class ProjectKeyDetailsTest(AcceptanceTestCase):
+             teams=[self.team],
+         )
+ 
+-        self.pk = ProjectKey.objects.create(project=self.project)
++        self.pk = ProjectKey.objects.create(
++            project=self.project,
++            public_key='5cc0482a13d248ff99f9717101dd6356',
++            secret_key='410fd998318844b8894775f36184ec28',
++        )
+ 
+         self.login_as(self.user)
+         self.path = '/{}/{}/settings/keys/{}/'.format(
+diff --git a/tests/sentry/api/endpoints/test_project_key_details.py b/tests/sentry/api/endpoints/test_project_key_details.py
+index 64d61acd5a..03efafa1b8 100644
+--- a/tests/sentry/api/endpoints/test_project_key_details.py
++++ b/tests/sentry/api/endpoints/test_project_key_details.py
+@@ -21,6 +21,63 @@ class UpdateProjectKeyTest(APITestCase):
+         key = ProjectKey.objects.get(id=key.id)
+         assert key.label == 'hello world'
+ 
++    def test_no_rate_limit(self):
++        project = self.create_project()
++        key = ProjectKey.objects.create(
++            project=project,
++            rate_limit_window=60,
++            rate_limit_count=1,
++        )
++        self.login_as(user=self.user)
++        url = reverse('sentry-api-0-project-key-details', kwargs={
++            'organization_slug': project.organization.slug,
++            'project_slug': project.slug,
++            'key_id': key.public_key,
++        })
++        response = self.client.put(url, {'rateLimit': None})
++        assert response.status_code == 200
++        key = ProjectKey.objects.get(id=key.id)
++        assert key.rate_limit_count is None
++        assert key.rate_limit_window is None
++
++    def test_unset_rate_limit(self):
++        project = self.create_project()
++        key = ProjectKey.objects.create(
++            project=project,
++            rate_limit_window=60,
++            rate_limit_count=1,
++        )
++        self.login_as(user=self.user)
++        url = reverse('sentry-api-0-project-key-details', kwargs={
++            'organization_slug': project.organization.slug,
++            'project_slug': project.slug,
++            'key_id': key.public_key,
++        })
++        response = self.client.put(url)
++        assert response.status_code == 200
++        key = ProjectKey.objects.get(id=key.id)
++        assert key.rate_limit_count == 1
++        assert key.rate_limit_window == 60
++
++    def test_simple_rate_limit(self):
++        project = self.create_project()
++        key = ProjectKey.objects.create(
++            project=project,
++            rate_limit_window=None,
++            rate_limit_count=None,
++        )
++        self.login_as(user=self.user)
++        url = reverse('sentry-api-0-project-key-details', kwargs={
++            'organization_slug': project.organization.slug,
++            'project_slug': project.slug,
++            'key_id': key.public_key,
++        })
++        response = self.client.put(url, {'rateLimit': {'count': 1, 'window': 60}})
++        assert response.status_code == 200
++        key = ProjectKey.objects.get(id=key.id)
++        assert key.rate_limit_count == 1
++        assert key.rate_limit_window == 60
++
+ 
+ class DeleteProjectKeTest(APITestCase):
+     def test_simple(self):
+diff --git a/tests/sentry/api/endpoints/test_project_key_stats.py b/tests/sentry/api/endpoints/test_project_key_stats.py
+new file mode 100644
+index 0000000000..2a58165588
+--- /dev/null
++++ b/tests/sentry/api/endpoints/test_project_key_stats.py
+@@ -0,0 +1,33 @@
++from __future__ import absolute_import
++
++from sentry import tsdb
++from sentry.models import ProjectKey
++from sentry.testutils import APITestCase
++
++
++class ProjectKeyStatsTest(APITestCase):
++    def setUp(self):
++        self.project = self.create_project()
++        self.key = ProjectKey.objects.create(
++            project=self.project
++        )
++        self.login_as(user=self.user)
++        self.path = '/api/0/projects/{}/{}/keys/{}/stats/'.format(
++            self.project.organization.slug,
++            self.project.slug,
++            self.key.public_key,
++        )
++
++    def test_simple(self):
++        tsdb.incr(tsdb.models.key_total_received, self.key.id, count=3)
++        tsdb.incr(tsdb.models.key_total_blacklisted, self.key.id, count=1)
++
++        response = self.client.get(self.path)
++        assert response.status_code == 200
++
++        assert response.status_code == 200, response.content
++        assert response.data[-1]['total'] == 3, response.data
++        assert response.data[-1]['filtered'] == 1, response.data
++        for point in response.data[:-1]:
++            assert point['total'] == 0
++        assert len(response.data) == 24
+diff --git a/tests/sentry/quotas/test_base.py b/tests/sentry/quotas/test_base.py
+index 4540350908..901aa01fc2 100644
+--- a/tests/sentry/quotas/test_base.py
++++ b/tests/sentry/quotas/test_base.py
+@@ -2,7 +2,7 @@
+ 
+ from __future__ import absolute_import
+ 
+-from sentry.models import OrganizationOption
++from sentry.models import OrganizationOption, ProjectKey
+ from sentry.quotas.base import Quota
+ from sentry.testutils import TestCase
+ 
+@@ -28,3 +28,12 @@ class QuotaTest(TestCase):
+ 
+             with self.options({'system.rate-limit': 0}):
+                 assert self.backend.get_project_quota(project) == (0, 60)
++
++    def test_get_key_quota(self):
++        key = ProjectKey.objects.create(
++            project=self.project, rate_limit_window=5, rate_limit_count=60)
++        assert self.backend.get_key_quota(key) == (60, 5)
++
++        key = ProjectKey.objects.create(
++            project=self.project, rate_limit_window=None, rate_limit_count=None)
++        assert self.backend.get_key_quota(key) == (0, 0)
+diff --git a/yarn.lock b/yarn.lock
+index f23ecd967d..34e719e317 100644
+--- a/yarn.lock
++++ b/yarn.lock
+@@ -467,6 +467,10 @@ babel-plugin-check-es2015-constants@^6.3.13:
+   dependencies:
+     babel-runtime "^6.0.0"
+ 
++babel-plugin-idx@^1.5.1:
++  version "1.5.1"
++  resolved "https://registry.yarnpkg.com/babel-plugin-idx/-/babel-plugin-idx-1.5.1.tgz#29eff29f91b22e1f0a314827a94695bd6fbc8e00"
++
+ babel-plugin-istanbul@^4.0.0:
+   version "4.1.1"
+   resolved "https://registry.yarnpkg.com/babel-plugin-istanbul/-/babel-plugin-istanbul-4.1.1.tgz#c12de0fc6fe42adfb16be56f1ad11e4a9782eca9"
+@@ -844,16 +848,16 @@ babel-runtime@^5.8.38:
+   dependencies:
+     core-js "^1.0.0"
+ 
+-babel-runtime@^6.0.0, babel-runtime@^6.11.6, babel-runtime@^6.18.0, babel-runtime@^6.2.0, babel-runtime@^6.20.0, babel-runtime@^6.9.0:
+-  version "6.20.0"
+-  resolved "https://registry.yarnpkg.com/babel-runtime/-/babel-runtime-6.20.0.tgz#87300bdcf4cd770f09bf0048c64204e17806d16f"
++babel-runtime@^6.0.0, babel-runtime@^6.11.6, babel-runtime@^6.18.0, babel-runtime@^6.22.0, babel-runtime@^6.9.0:
++  version "6.23.0"
++  resolved "https://registry.yarnpkg.com/babel-runtime/-/babel-runtime-6.23.0.tgz#0a9489f144de70efb3ce4300accdb329e2fc543b"
+   dependencies:
+     core-js "^2.4.0"
+     regenerator-runtime "^0.10.0"
+ 
+-babel-runtime@^6.22.0:
+-  version "6.23.0"
+-  resolved "https://registry.yarnpkg.com/babel-runtime/-/babel-runtime-6.23.0.tgz#0a9489f144de70efb3ce4300accdb329e2fc543b"
++babel-runtime@^6.2.0, babel-runtime@^6.20.0:
++  version "6.20.0"
++  resolved "https://registry.yarnpkg.com/babel-runtime/-/babel-runtime-6.20.0.tgz#87300bdcf4cd770f09bf0048c64204e17806d16f"
+   dependencies:
+     core-js "^2.4.0"
+     regenerator-runtime "^0.10.0"
+@@ -2497,6 +2501,10 @@ iconv-lite@0.4.13, iconv-lite@~0.4.13:
+   version "0.4.13"
+   resolved "https://registry.yarnpkg.com/iconv-lite/-/iconv-lite-0.4.13.tgz#1f88aba4ab0b1508e8312acc39345f36e992e2f2"
+ 
++idx@^1.5.0:
++  version "1.5.0"
++  resolved "https://registry.yarnpkg.com/idx/-/idx-1.5.0.tgz#2ce9665945fdb36544308f930c78e3f1ef6c4315"
++
+ ieee754@^1.1.4:
+   version "1.1.8"
+   resolved "https://registry.yarnpkg.com/ieee754/-/ieee754-1.1.8.tgz#be33d40ac10ef1926701f6f08a2d86fbfd1ad3e4"

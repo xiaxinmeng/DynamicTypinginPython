@@ -1,0 +1,237 @@
+commit 1482dda3c25b901b4f6b381cfce6d48655220f0a
+Author: David Cramer <dcramer@gmail.com>
+Date:   Mon Feb 20 13:58:08 2017 -0800
+
+    [vcs] improve fixes matching
+    
+    This adds support for handling "Fixes XXX YYY" and "Fixes XXX, YYY".
+
+diff --git a/CHANGES b/CHANGES
+index 08a040589b..4309433bb3 100644
+--- a/CHANGES
++++ b/CHANGES
+@@ -13,6 +13,7 @@ Version 8.14 (Unreleased)
+ - Added OrganizationReleasesEndpoint
+ - Added context type app for cocoa events
+ - Added basic encryption facilities (``sentry.utils.encryption``).
++- Added support for "Fixes XXX, YYY" and "Fixes XXX YYY" notations.
+ 
+ Schema Changes
+ ~~~~~~~~~~~~~~
+diff --git a/src/sentry/models/commit.py b/src/sentry/models/commit.py
+index 697e9bace5..d058b62505 100644
+--- a/src/sentry/models/commit.py
++++ b/src/sentry/models/commit.py
+@@ -1,5 +1,7 @@
+ from __future__ import absolute_import, print_function
+ 
++import re
++
+ from django.db import models
+ from django.utils import timezone
+ 
+@@ -8,6 +10,9 @@ from sentry.db.models import (
+ )
+ from sentry.utils.cache import memoize
+ 
++_fixes_re = re.compile(r'\bFixes\s+([A-Za-z0-9_\-\s\,]+)\b', re.I)
++_short_id_re = re.compile(r'\b([A-Z0-9_-]+-[A-Z0-9]+)\b', re.I)
++
+ 
+ class Commit(Model):
+     __core__ = False
+@@ -44,3 +49,24 @@ class Commit(Model):
+         if len(self.key) == 40:
+             return self.key[:12]
+         return self.key
++
++    def find_referenced_groups(self):
++        from sentry.models import Group
++
++        if not self.message:
++            return []
++
++        results = set()
++        for fmatch in _fixes_re.finditer(self.message):
++            for smatch in _short_id_re.finditer(fmatch.group(1)):
++                short_id = smatch.group(1)
++                try:
++                    group = Group.objects.by_qualified_short_id(
++                        organization_id=self.organization_id,
++                        short_id=short_id,
++                    )
++                except Group.DoesNotExist:
++                    continue
++                else:
++                    results.add(group)
++        return results
+diff --git a/src/sentry/receivers/releases.py b/src/sentry/receivers/releases.py
+index 54b7df2162..34bae34fe0 100644
+--- a/src/sentry/receivers/releases.py
++++ b/src/sentry/receivers/releases.py
+@@ -1,17 +1,13 @@
+ from __future__ import absolute_import, print_function
+ 
+-import re
+-
+ from django.db import IntegrityError, transaction
+ from django.db.models.signals import post_save
+ 
+ from sentry.models import (
+-    Activity, Commit, Group, GroupCommitResolution, Release, TagValue
++    Activity, Commit, GroupCommitResolution, Release, TagValue
+ )
+ from sentry.tasks.clear_expired_resolutions import clear_expired_resolutions
+ 
+-_fixes_re = re.compile(r'\bFixes\s+([A-Za-z0-9_-]+-[A-Z0-9]+)\b', re.I)
+-
+ 
+ def ensure_release_exists(instance, created, **kwargs):
+     if instance.key != 'sentry:release':
+@@ -51,56 +47,42 @@ def resolved_in_commit(instance, created, **kwargs):
+     if not created:
+         return
+ 
+-    if not instance.message:
+-        return
+-
+-    match = _fixes_re.search(instance.message)
+-    if not match:
+-        return
+-
+-    short_id = match.group(1)
+-    try:
+-        group = Group.objects.by_qualified_short_id(
+-            organization_id=instance.organization_id,
+-            short_id=short_id,
+-        )
+-    except Group.DoesNotExist:
+-        return
+-
+-    try:
+-        with transaction.atomic():
+-            GroupCommitResolution.objects.create(
+-                group_id=group.id,
+-                commit_id=instance.id,
+-            )
+-            if instance.author:
+-                user_list = list(instance.author.find_users())
+-            else:
+-                user_list = ()
+-            if user_list:
+-                for user in user_list:
++    groups = instance.find_referenced_groups()
++    for group in groups:
++        try:
++            with transaction.atomic():
++                GroupCommitResolution.objects.create(
++                    group_id=group.id,
++                    commit_id=instance.id,
++                )
++                if instance.author:
++                    user_list = list(instance.author.find_users())
++                else:
++                    user_list = ()
++                if user_list:
++                    for user in user_list:
++                        Activity.objects.create(
++                            project_id=group.project_id,
++                            group=group,
++                            type=Activity.SET_RESOLVED_IN_COMMIT,
++                            ident=instance.id,
++                            user=user,
++                            data={
++                                'commit': instance.id,
++                            }
++                        )
++                else:
+                     Activity.objects.create(
+                         project_id=group.project_id,
+                         group=group,
+                         type=Activity.SET_RESOLVED_IN_COMMIT,
+                         ident=instance.id,
+-                        user=user,
+                         data={
+                             'commit': instance.id,
+                         }
+                     )
+-            else:
+-                Activity.objects.create(
+-                    project_id=group.project_id,
+-                    group=group,
+-                    type=Activity.SET_RESOLVED_IN_COMMIT,
+-                    ident=instance.id,
+-                    data={
+-                        'commit': instance.id,
+-                    }
+-                )
+-    except IntegrityError:
+-        pass
++        except IntegrityError:
++            pass
+ 
+ 
+ post_save.connect(
+diff --git a/tests/sentry/models/test_commit.py b/tests/sentry/models/test_commit.py
+new file mode 100644
+index 0000000000..f99380e357
+--- /dev/null
++++ b/tests/sentry/models/test_commit.py
+@@ -0,0 +1,57 @@
++from __future__ import absolute_import
++
++from hashlib import sha1
++from uuid import uuid4
++
++from sentry.models import Commit, Repository
++from sentry.testutils import TestCase
++
++
++class FindReferencedGroupsTest(TestCase):
++    def test_multiple_matches_basic(self):
++        group = self.create_group()
++        group2 = self.create_group()
++
++        repo = Repository.objects.create(
++            name='example',
++            organization_id=self.group.organization.id,
++        )
++
++        commit = Commit.objects.create(
++            key=sha1(uuid4().hex).hexdigest(),
++            repository_id=repo.id,
++            organization_id=group.organization.id,
++            message='Foo Biz\n\nFixes {} {}'.format(
++                group.qualified_short_id,
++                group2.qualified_short_id,
++            ),
++        )
++
++        groups = commit.find_referenced_groups()
++        assert len(groups) == 2
++        assert group in groups
++        assert group2 in groups
++
++    def test_multiple_matches_comma_separated(self):
++        group = self.create_group()
++        group2 = self.create_group()
++
++        repo = Repository.objects.create(
++            name='example',
++            organization_id=self.group.organization.id,
++        )
++
++        commit = Commit.objects.create(
++            key=sha1(uuid4().hex).hexdigest(),
++            repository_id=repo.id,
++            organization_id=group.organization.id,
++            message='Foo Biz\n\nFixes {}, {}'.format(
++                group.qualified_short_id,
++                group2.qualified_short_id,
++            ),
++        )
++
++        groups = commit.find_referenced_groups()
++        assert len(groups) == 2
++        assert group in groups
++        assert group2 in groups

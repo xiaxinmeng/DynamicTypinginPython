@@ -1,0 +1,196 @@
+commit 96ba01ed08f1e51cbaededa0669908cb834072d4
+Author: David Cramer <dcramer@gmail.com>
+Date:   Wed May 9 08:55:45 2012 -0500
+
+    handle them race conditions
+
+diff --git a/sentry/manager.py b/sentry/manager.py
+index 3a2ab7d9d1..6a4a18c49a 100644
+--- a/sentry/manager.py
++++ b/sentry/manager.py
+@@ -14,7 +14,6 @@ import logging
+ import re
+ import warnings
+ 
+-from django.core.cache import cache
+ from django.core.signals import request_finished
+ from django.db import models, transaction, IntegrityError
+ from django.db.models import Sum, F
+@@ -26,6 +25,7 @@ from sentry.conf import settings
+ from sentry.processors.base import send_group_processors
+ from sentry.signals import regression_signal
+ from sentry.tasks.index import index_event
++from sentry.utils.cache import cache, Lock
+ from sentry.utils.dates import utc_to_local, get_sql_date_trunc
+ from sentry.utils.db import get_db_engine, has_charts
+ from sentry.utils.queue import maybe_delay
+@@ -51,6 +51,30 @@ class BaseManager(models.Manager):
+         'iexact': lambda x: x.upper(),
+     }
+ 
++    def get_or_create(self, **kwargs):
++        """
++        A modified version of Django's get_or_create which will create a distributed
++        lock (using the cache backend) whenever it hits the create clause.
++        """
++        defaults = kwargs.pop('defaults', {})
++
++        # before locking attempt to fetch the instance
++        try:
++            return self.get(**kwargs), False
++        except self.model.DoesNotExist:
++            pass
++        lock_key = self._make_key('lock', kwargs)
++
++        # instance not found, lets grab a lock and attempt to create it
++        with Lock(lock_key):
++            # its important we get() before create() to ensure that if
++            # someone beat us to creating it from the time we did our very
++            # first .get(), that we get the result back as we cannot
++            # rely on unique constraints existing
++            instance, created = super(BaseManager, self).get_or_create(defaults=defaults, **kwargs)
++
++        return instance, created
++
+     def __init__(self, *args, **kwargs):
+         self.cache_fields = kwargs.pop('cache_fields', [])
+         self.cache_ttl = kwargs.pop('cache_ttl', 60 * 5)
+@@ -91,7 +115,6 @@ class BaseManager(models.Manager):
+         """
+         if not self.cache_fields:
+             return
+-        sender.__cache_data = {}
+         post_init.connect(self._post_init, sender=sender, weak=False)
+         post_save.connect(self._post_save, sender=sender, weak=False)
+         post_delete.connect(self._post_delete, sender=sender, weak=False)
+@@ -319,7 +342,7 @@ class GroupManager(BaseManager, ChartMixin):
+         event = Event(
+             project=project,
+             event_id=event_id,
+-            culprit=culprit,
++            culprit=culprit or '',
+             logger=logger_name,
+             data=data,
+             server_name=server_name,
+@@ -421,13 +444,26 @@ class GroupManager(BaseManager, ChartMixin):
+         time_spent = event.time_spent
+         project = event.project
+ 
+-        group, is_new = self.get_or_create(
+-            project=project,
+-            culprit=event.culprit,
+-            logger=event.logger,
+-            checksum=event.checksum,
+-            defaults=kwargs
+-        )
++        try:
++            group, is_new = self.get_or_create(
++                project=project,
++                culprit=event.culprit,
++                logger=event.logger,
++                checksum=event.checksum,
++                defaults=kwargs
++            )
++        except self.model.MultipleObjectsReturned:
++            # Fix for multiple groups existing due to a race
++            groups = list(self.filter(
++                project=project,
++                culprit=event.culprit,
++                logger=event.logger,
++                checksum=event.checksum,
++            ))
++            for g in groups[1:]:
++                g.delete()
++            group = groups[0]
++
+         if not is_new:
+             if group.status == STATUS_RESOLVED:
+                 # Group has changed from resolved -> unresolved
+diff --git a/sentry/utils/cache.py b/sentry/utils/cache.py
+index 94ce044464..51dd92a73c 100644
+--- a/sentry/utils/cache.py
++++ b/sentry/utils/cache.py
+@@ -1,5 +1,57 @@
++import logging
++import time
++
+ from django.core.cache import get_cache
+ 
+ from sentry.conf import settings
+ 
+-cache = get_cache(settings.CACHE_BACKEND)
++_cache = cache = get_cache(settings.CACHE_BACKEND)
++
++
++logger = logging.getLogger(__name__)
++
++
++class UnableToGetLock(Exception):
++    pass
++
++
++class Lock(object):
++    """
++    Uses the defined cache backend to create a lock.
++
++    >>> with Lock('key name'):
++    >>>     # do something
++    """
++    def __init__(self, lock_key, timeout=10, cache=None):
++        if cache is None:
++            self.cache = _cache
++        else:
++            self.cache = cache
++        self.timeout = timeout
++        self.lock_key = lock_key
++
++    def __enter__(self):
++        start = time.time()
++        lock_key = self.lock_key
++        cache = self.cache
++
++        delay = 0.1
++        attempt = 0
++        max_attempts = self.timeout / delay
++        got_lock = None
++        while not got_lock and attempt < max_attempts:
++            got_lock = cache.add(lock_key, '', self.timeout)
++            if not got_lock:
++                time.sleep(delay)
++                attempt += 1
++
++        if not got_lock:
++            raise UnableToGetLock('Unable to fetch lock after %.2fs' % (time.time() - start,))
++
++        return self
++
++    def __exit__(self, exc_type, exc_value, traceback):
++        try:
++            self.cache.delete(self.lock_key)
++        except Exception, e:
++            logger.exception(e)
+diff --git a/sentry/utils/models.py b/sentry/utils/models.py
+index 20cd743e71..aa3267d5e5 100644
+--- a/sentry/utils/models.py
++++ b/sentry/utils/models.py
+@@ -14,6 +14,7 @@ from django.db import models, router
+ from django.db.models import signals
+ from django.db.models.expressions import ExpressionNode, F
+ 
++from sentry.utils import cache
+ from sentry.utils.compat import pickle
+ 
+ logger = logging.getLogger(__name__)
+diff --git a/setup.py b/setup.py
+index f657c05f3c..60c9ebd6bf 100755
+--- a/setup.py
++++ b/setup.py
+@@ -60,7 +60,7 @@ install_requires = [
+ 
+ setup(
+     name='sentry',
+-    version='4.1.1',
++    version='4.1.2',
+     author='David Cramer',
+     author_email='dcramer@gmail.com',
+     url='http://github.com/dcramer/sentry',

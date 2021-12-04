@@ -1,0 +1,944 @@
+commit dba7d4162dc01e3b85b87bd389306a34e5854aeb
+Author: torzdf <36920800+torzdf@users.noreply.github.com>
+Date:   Sun Mar 17 09:25:39 2019 +0000
+
+    VRAM Improvement Options (#671)
+    
+    * Implement ping-pong training
+    
+    * Disable tensorboard for pingpong training
+    
+    * Implement Memory Saving Gradients
+
+diff --git a/lib/cli.py b/lib/cli.py
+index 1f8646a..ec74616 100644
+--- a/lib/cli.py
++++ b/lib/cli.py
+@@ -879,6 +879,25 @@ class TrainArgs(FaceSwapArgs):
+                               "help": "Disables TensorBoard logging. NB: Disabling logs means "
+                                       "that you will not be able to use the graph or analysis "
+                                       "for this session in the GUI."})
++        argument_list.append({"opts": ("-pp", "--ping-pong"),
++                              "action": "store_true",
++                              "dest": "pingpong",
++                              "default": False,
++                              "help": "Enable ping pong training. Trains one side at a time, "
++                                      "switching sides at each save iteration. Training will take "
++                                      "2 to 4 times longer, with about a 30%%-50%% reduction in "
++                                      "VRAM useage. NB: Preview won't show until both sides have "
++                                      "been trained once."})
++        argument_list.append({"opts": ("-msg", "--memory-saving-gradients"),
++                              "action": "store_true",
++                              "dest": "memory_saving_gradients",
++                              "default": False,
++                              "help": "Trades off VRAM useage against computation time. Can fit "
++                                      "larger models into memory at a cost of slower training "
++                                      "speed. 50%%-150%% batch size increase for 20%%-50%% longer "
++                                      "training time. NB: Launch time will be significantly "
++                                      "delayed. Switching sides using ping-pong training will "
++                                      "take longer."})
+         argument_list.append({"opts": ("-wl", "--warp-to-landmarks"),
+                               "action": "store_true",
+                               "dest": "warp_to_landmarks",
+diff --git a/lib/gui/display_command.py b/lib/gui/display_command.py
+index 01af853..35de142 100644
+--- a/lib/gui/display_command.py
++++ b/lib/gui/display_command.py
+@@ -193,7 +193,7 @@ class GraphDisplay(DisplayOptionalPage):  # pylint: disable=too-many-ancestors
+         session = get_config().session
+         if session.initialized and session.logging_disabled:
+             logger.trace("Logs disabled. Hiding graph")
+-            self.set_info("Graph is disabled as 'no-logs' has been selected")
++            self.set_info("Graph is disabled as 'no-logs' or 'pingpong' has been selected")
+             self.display_item = None
+         elif session.initialized:
+             logger.trace("Loading graph")
+diff --git a/lib/gui/stats.py b/lib/gui/stats.py
+index a5cb760..1542f82 100644
+--- a/lib/gui/stats.py
++++ b/lib/gui/stats.py
+@@ -136,7 +136,7 @@ class Session():
+     @property
+     def logging_disabled(self):
+         """ Return whether logging is disabled for this session """
+-        return self.session["no_logs"]
++        return self.session["no_logs"] or self.session["pingpong"]
+ 
+     @property
+     def loss(self):
+diff --git a/lib/model/memory_saving_gradients.py b/lib/model/memory_saving_gradients.py
+new file mode 100644
+index 0000000..8a893a2
+--- /dev/null
++++ b/lib/model/memory_saving_gradients.py
+@@ -0,0 +1,439 @@
++#!/usr/bin/env python3
++""" Memory saving gradients.
++Adapted from: https://github.com/openai/gradient-checkpointing
++
++The MIT License
++
++Copyright (c) 2018 OpenAI (http://openai.com)
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in
++all copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++THE SOFTWARE.
++"""
++
++import contextlib
++import logging
++import time
++import sys
++
++import numpy as np
++import tensorflow as tf
++import tensorflow.contrib.graph_editor as ge  # pylint: disable=no-name-in-module
++from toposort import toposort
++
++
++logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
++sys.setrecursionlimit(10000)
++# refers back to current module if we decide to split helpers out
++util = sys.modules[__name__]
++
++# getting rid of "WARNING:tensorflow:VARIABLES collection name is deprecated"
++setattr(tf.GraphKeys, "VARIABLES", "variables")
++
++# save original gradients since tf.gradient could be monkey-patched to point
++# to our version
++from tensorflow.python.ops import gradients as tf_grads_lib  # pylint: disable=no-name-in-module
++tf_gradients = tf_grads_lib.gradients
++
++MIN_CHECKPOINT_NODE_SIZE = 1024    # use lower value during testing
++
++
++# specific versions we can use to do process-wide replacement of tf.gradients
++def gradients_speed(ys, xs, grad_ys=None, **kwargs):
++    return gradients(ys, xs, grad_ys, checkpoints='speed', **kwargs)
++
++
++def gradients_memory(ys, xs, grad_ys=None, **kwargs):
++    return gradients(ys, xs, grad_ys, checkpoints='memory', **kwargs)
++
++
++def gradients_collection(ys, xs, grad_ys=None, **kwargs):
++    return gradients(ys, xs, grad_ys, checkpoints='collection', **kwargs)
++
++
++def gradients(ys, xs,   # pylint: disable: too-many-statements, too-many-branches
++              grad_ys=None, checkpoints='collection', **kwargs):
++    '''
++    Authors: Tim Salimans & Yaroslav Bulatov
++
++    memory efficient gradient implementation inspired by "Training Deep Nets with Sublinear Memory
++    Cost" by Chen et al. 2016 (https://arxiv.org/abs/1604.06174)
++
++    ys,xs,grad_ys,kwargs are the arguments to standard tensorflow tf.gradients
++    (https://www.tensorflow.org/versions/r0.12/api_docs/python/train.html#gradients)
++
++    'checkpoints' can either be
++        - a list consisting of tensors from the forward pass of the neural net
++          that we should re-use when calculating the gradients in the backward pass
++          all other tensors that do not appear in this list will be re-computed
++        - a string specifying how this list should be determined. currently we support
++            - 'speed':  checkpoint all outputs of convolutions and matmuls. these ops are usually
++                        the most expensive, so checkpointing them maximizes the running speed
++                        (this is a good option if nonlinearities, concats, batchnorms, etc are
++                        taking up a lot of memory)
++            - 'memory': try to minimize the memory usage
++                        (currently using a very simple strategy that identifies a number of
++                        bottleneck tensors in the graph to checkpoint)
++            - 'collection': look for a tensorflow collection named 'checkpoints', which holds the
++                            tensors to checkpoint
++    '''
++
++    #    print("Calling memsaving gradients with", checkpoints)
++    if not isinstance(ys, list):
++        ys = [ys]
++    if not isinstance(xs, list):
++        xs = [xs]
++
++    bwd_ops = ge.get_backward_walk_ops([y.op for y in ys],
++                                       inclusive=True)
++
++    debug_print("bwd_ops: {}".format(bwd_ops))
++
++    # forward ops are all ops that are candidates for recomputation
++    fwd_ops = ge.get_forward_walk_ops([x.op for x in xs],
++                                      inclusive=True,
++                                      within_ops=bwd_ops)
++    debug_print("fwd_ops: {}".format(fwd_ops))
++
++    # exclude ops with no inputs
++    fwd_ops = [op for op in fwd_ops if op.inputs]
++
++    # don't recompute xs, remove variables
++    xs_ops = _to_ops(xs)
++    fwd_ops = [op for op in fwd_ops if op not in xs_ops]
++    fwd_ops = [op for op in fwd_ops if '/assign' not in op.name]
++    fwd_ops = [op for op in fwd_ops if '/Assign' not in op.name]
++    fwd_ops = [op for op in fwd_ops if '/read' not in op.name]
++    ts_all = ge.filter_ts(fwd_ops, True)  # get the tensors
++    ts_all = [t for t in ts_all if '/read' not in t.name]
++    ts_all = set(ts_all) - set(xs) - set(ys)
++
++    # construct list of tensors to checkpoint during forward pass, if not
++    # given as input
++    if type(checkpoints) is not list:
++        if checkpoints == 'collection':
++            checkpoints = tf.get_collection('checkpoints')
++
++        elif checkpoints == 'speed':
++            # checkpoint all expensive ops to maximize running speed
++            checkpoints = ge.filter_ts_from_regex(fwd_ops, 'conv2d|Conv|MatMul')
++
++        elif checkpoints == 'memory':
++
++            # remove very small tensors and some weird ops
++            def fixdims(t):  # tf.Dimension values are not compatible with int, convert manually
++                try:
++                    return [int(e if e.value is not None else 64) for e in t]
++                except:
++                    return [0]  # unknown shape
++            ts_all = [t for t in ts_all if np.prod(fixdims(t.shape)) > MIN_CHECKPOINT_NODE_SIZE]
++            ts_all = [t for t in ts_all if 'L2Loss' not in t.name]
++            ts_all = [t for t in ts_all if 'entropy' not in t.name]
++            ts_all = [t for t in ts_all if 'FusedBatchNorm' not in t.name]
++            ts_all = [t for t in ts_all if 'Switch' not in t.name]
++            ts_all = [t for t in ts_all if 'dropout' not in t.name]
++            # DV: FP16_FIX - need to add 'Cast' layer here to make it work for FP16
++            ts_all = [t for t in ts_all if 'Cast' not in t.name]
++
++            # filter out all tensors that are inputs of the backward graph
++            with util.capture_ops() as bwd_ops:
++                tf_gradients(ys, xs, grad_ys, **kwargs)
++
++            bwd_inputs = [t for op in bwd_ops for t in op.inputs]
++            # list of tensors in forward graph that is in input to bwd graph
++            ts_filtered = list(set(bwd_inputs).intersection(ts_all))
++            debug_print("Using tensors {}".format(ts_filtered))
++
++            # try two slightly different ways of getting bottlenecks tensors
++            # to checkpoint
++            for ts in [ts_filtered, ts_all]:
++
++                # get all bottlenecks in the graph
++                bottleneck_ts = []
++                for t in ts:
++                    b = set(ge.get_backward_walk_ops(t.op, inclusive=True, within_ops=fwd_ops))
++                    f = set(ge.get_forward_walk_ops(t.op, inclusive=False, within_ops=fwd_ops))
++                    # check that there are not shortcuts
++                    b_inp = set([inp for op in b for inp in op.inputs]).intersection(ts_all)
++                    f_inp = set([inp for op in f for inp in op.inputs]).intersection(ts_all)
++                    if not set(b_inp).intersection(f_inp) and len(b_inp)+len(f_inp) >= len(ts_all):
++                        bottleneck_ts.append(t)  # we have a bottleneck!
++                    else:
++                        debug_print("Rejected bottleneck candidate and ops {}".format(
++                            [t] + list(set(ts_all) - set(b_inp) - set(f_inp))))
++
++                # success? or try again without filtering?
++                if len(bottleneck_ts) >= np.sqrt(len(ts_filtered)):  # enough bottlenecks found!
++                    break
++
++            if not bottleneck_ts:
++                raise Exception('unable to find bottleneck tensors! please provide checkpoint '
++                                'nodes manually, or use checkpoints="speed".')
++
++            # sort the bottlenecks
++            bottlenecks_sorted_lists = tf_toposort(bottleneck_ts, within_ops=fwd_ops)
++            sorted_bottlenecks = [t for ts in bottlenecks_sorted_lists for t in ts]
++
++            # save an approximately optimal number ~ sqrt(N)
++            N = len(ts_filtered)
++            if len(bottleneck_ts) <= np.ceil(np.sqrt(N)):
++                checkpoints = sorted_bottlenecks
++            else:
++                step = int(np.ceil(len(bottleneck_ts) / np.sqrt(N)))
++                checkpoints = sorted_bottlenecks[step::step]
++
++        else:
++            raise Exception('%s is unsupported input for "checkpoints"' % (checkpoints,))
++
++    checkpoints = list(set(checkpoints).intersection(ts_all))
++
++    # at this point automatic selection happened and checkpoints is list of nodes
++    assert isinstance(checkpoints, list)
++
++    debug_print("Checkpoint nodes used: {}".format(checkpoints))
++    # better error handling of special cases
++    # xs are already handled as checkpoint nodes, so no need to include them
++    xs_intersect_checkpoints = set(xs).intersection(set(checkpoints))
++    if xs_intersect_checkpoints:
++        debug_print("Warning, some input nodes are also checkpoint nodes: {}".format(
++            xs_intersect_checkpoints))
++    ys_intersect_checkpoints = set(ys).intersection(set(checkpoints))
++    debug_print("ys: {}, checkpoints:{}, intersect: {}".format(
++        ys, checkpoints, ys_intersect_checkpoints))
++    # saving an output node (ys) gives no benefit in memory while creating
++    # new edge cases, exclude them
++    if ys_intersect_checkpoints:
++        debug_print("Warning, some output nodes are also checkpoints nodes: {}".format(
++            format_ops(ys_intersect_checkpoints)))
++
++    # remove initial and terminal nodes from checkpoints list if present
++    checkpoints = list(set(checkpoints) - set(ys) - set(xs))
++
++    # check that we have some nodes to checkpoint
++    if not checkpoints:
++        raise Exception('no checkpoints nodes found or given as input! ')
++
++    # disconnect dependencies between checkpointed tensors
++    checkpoints_disconnected = {}
++    for x in checkpoints:
++        if x.op and x.op.name is not None:
++            grad_node = tf.stop_gradient(x, name=x.op.name+"_sg")
++        else:
++            grad_node = tf.stop_gradient(x)
++        checkpoints_disconnected[x] = grad_node
++
++    # partial derivatives to the checkpointed tensors and xs
++    ops_to_copy = fast_backward_ops(seed_ops=[y.op for y in ys],
++                                    stop_at_ts=checkpoints, within_ops=fwd_ops)
++    debug_print("Found {} ops to copy within fwd_ops {}, seed {}, stop_at {}".format(
++        len(ops_to_copy), fwd_ops, [r.op for r in ys], checkpoints))
++    debug_print("ops_to_copy = {}".format(ops_to_copy))
++    debug_print("Processing list {}".format(ys))
++    _, info = ge.copy_with_input_replacements(ge.sgv(ops_to_copy), {})
++    for origin_op, op in info._transformed_ops.items():
++        op._set_device(origin_op.node_def.device)
++    copied_ops = info._transformed_ops.values()
++    debug_print("Copied {} to {}".format(ops_to_copy, copied_ops))
++    ge.reroute_ts(checkpoints_disconnected.values(),
++                  checkpoints_disconnected.keys(),
++                  can_modify=copied_ops)
++    debug_print("Rewired {} in place of {} restricted to {}".format(
++        checkpoints_disconnected.values(), checkpoints_disconnected.keys(), copied_ops))
++
++    # get gradients with respect to current boundary + original x's
++    copied_ys = [info._transformed_ops[y.op]._outputs[0] for y in ys]
++    boundary = list(checkpoints_disconnected.values())
++    dv = tf_gradients(ys=copied_ys, xs=boundary+xs, grad_ys=grad_ys, **kwargs)
++    debug_print("Got gradients {}".format(dv))
++    debug_print("for %s", copied_ys)
++    debug_print("with respect to {}".format(boundary+xs))
++
++    inputs_to_do_before = [y.op for y in ys]
++    if grad_ys is not None:
++        inputs_to_do_before += grad_ys
++    wait_to_do_ops = list(copied_ops) + [g.op for g in dv if g is not None]
++    my_add_control_inputs(wait_to_do_ops, inputs_to_do_before)
++
++    # partial derivatives to the checkpointed nodes
++    # dictionary of "node: backprop" for nodes in the boundary
++    d_checkpoints = {r: dr for r, dr in zip(checkpoints_disconnected.keys(),
++                                            dv[:len(checkpoints_disconnected)])}
++    # partial derivatives to xs (usually the params of the neural net)
++    d_xs = dv[len(checkpoints_disconnected):]
++
++    # incorporate derivatives flowing through the checkpointed nodes
++    checkpoints_sorted_lists = tf_toposort(checkpoints, within_ops=fwd_ops)
++    for ts in checkpoints_sorted_lists[::-1]:
++        debug_print("Processing list {}".format(ts))
++        checkpoints_other = [r for r in checkpoints if r not in ts]
++        checkpoints_disconnected_other = [checkpoints_disconnected[r] for r in checkpoints_other]
++
++        # copy part of the graph below current checkpoint node, stopping at
++        # other checkpoints nodes
++        ops_to_copy = fast_backward_ops(within_ops=fwd_ops,
++                                        seed_ops=[r.op for r in ts],
++                                        stop_at_ts=checkpoints_other)
++        debug_print("Found {} ops to copy within {}, seed {}, stop_at {}".format(
++            len(ops_to_copy), fwd_ops, [r.op for r in ts], checkpoints_other))
++        debug_print("ops_to_copy = {}".format(ops_to_copy))
++        if not ops_to_copy:  # we're done!
++            break
++        _, info = ge.copy_with_input_replacements(ge.sgv(ops_to_copy), {})
++        for origin_op, op in info._transformed_ops.items():
++            op._set_device(origin_op.node_def.device)
++        copied_ops = info._transformed_ops.values()
++        debug_print("Copied {} to {}".format(ops_to_copy, copied_ops))
++        ge.reroute_ts(checkpoints_disconnected_other, checkpoints_other, can_modify=copied_ops)
++        debug_print("Rewired %s in place of %s restricted to %s",
++                    checkpoints_disconnected_other, checkpoints_other, copied_ops)
++
++        # gradient flowing through the checkpointed node
++        boundary = [info._transformed_ops[r.op]._outputs[0] for r in ts]
++        substitute_backprops = [d_checkpoints[r] for r in ts]
++        dv = tf_gradients(boundary,
++                          checkpoints_disconnected_other+xs,
++                          grad_ys=substitute_backprops, **kwargs)
++        debug_print("Got gradients {}".format(dv))
++        debug_print("for {}".format(boundary))
++        debug_print("with respect to {}".format(checkpoints_disconnected_other+xs))
++        debug_print("with boundary backprop substitutions {}".format(substitute_backprops))
++
++        inputs_to_do_before = [d_checkpoints[r].op for r in ts]
++        wait_to_do_ops = list(copied_ops) + [g.op for g in dv if g is not None]
++        my_add_control_inputs(wait_to_do_ops, inputs_to_do_before)
++
++        # partial derivatives to the checkpointed nodes
++        for r, dr in zip(checkpoints_other, dv[:len(checkpoints_other)]):
++            if dr is not None:
++                if d_checkpoints[r] is None:
++                    d_checkpoints[r] = dr
++                else:
++                    d_checkpoints[r] += dr
++
++        def _unsparsify(var_x):
++            if not isinstance(var_x, tf.IndexedSlices):
++                return var_x
++            assert var_x.dense_shape is not None, \
++                "memory_saving_gradients encountered sparse gradients of unknown shape"
++            indices = var_x.indices
++            while indices.shape.ndims < var_x.values.shape.ndims:
++                indices = tf.expand_dims(indices, -1)
++            return tf.scatter_nd(indices, var_x.values, var_x.dense_shape)
++
++        # partial derivatives to xs (usually the params of the neural net)
++        d_xs_new = dv[len(checkpoints_other):]
++        for j in range(len(xs)):
++            if d_xs_new[j] is not None:
++                if d_xs[j] is None:
++                    d_xs[j] = _unsparsify(d_xs_new[j])
++                else:
++                    d_xs[j] += _unsparsify(d_xs_new[j])
++
++    return d_xs
++
++
++def tf_toposort(ts_inp, within_ops=None):
++    """ Tensorflow topological sort """
++    all_ops = ge.get_forward_walk_ops([x.op for x in ts_inp], within_ops=within_ops)
++
++    deps = {}
++    for tf_op in all_ops:
++        for outp in tf_op.outputs:
++            deps[outp] = set(tf_op.inputs)
++    sorted_ts = toposort(deps)
++
++    # only keep the tensors from our original list
++    ts_sorted_lists = []
++    for lst in sorted_ts:
++        keep = list(set(lst).intersection(ts_inp))
++        if keep:
++            ts_sorted_lists.append(keep)
++    return ts_sorted_lists
++
++
++def fast_backward_ops(within_ops, seed_ops, stop_at_ts):
++    """ Fast backward ops """
++    bwd_ops = set(ge.get_backward_walk_ops(seed_ops, stop_at_ts=stop_at_ts))
++    ops = bwd_ops.intersection(within_ops).difference([t.op for t in stop_at_ts])
++    return list(ops)
++
++
++@contextlib.contextmanager
++def capture_ops():
++    """Decorator to capture ops created in the block.
++    with capture_ops() as ops:
++        # create some ops
++    print(ops) # => prints ops created.
++    """
++
++    micros = int(time.time()*10**6)
++    scope_name = str(micros)
++    op_list = []
++    with tf.name_scope(scope_name):
++        yield op_list
++
++    graph = tf.get_default_graph()
++    op_list.extend(ge.select_ops(scope_name+"/.*", graph=graph))
++
++
++def _to_op(tensor_or_op):
++    """ Convert to op """
++    if hasattr(tensor_or_op, "op"):
++        return tensor_or_op.op
++    return tensor_or_op
++
++
++def _to_ops(iterable):
++    """ Convert to ops """
++    if not _is_iterable(iterable):
++        return iterable
++    return [_to_op(i) for i in iterable]
++
++
++def _is_iterable(obj):
++    """ Check if object is iterable """
++    try:
++        _ = iter(obj)
++    except Exception:  # pylint: disable=broad-except
++        return False
++    return True
++
++
++def debug_print(msg, *args):
++    """ Debug logging """
++    formatted_args = [format_ops(arg) for arg in args]
++    logger.debug("%s: %s", msg, formatted_args)
++
++
++def format_ops(ops, sort_outputs=True):
++    """Helper method for printing ops. Converts Tensor/Operation op to op.name,
++       rest to str(op)."""
++
++    if hasattr(ops, '__iter__') and not isinstance(ops, str):
++        lst = [(op.name if hasattr(op, "name") else str(op)) for op in ops]
++        if sort_outputs:
++            return sorted(lst)
++        return lst
++    return ops.name if hasattr(ops, "name") else str(ops)
++
++
++def my_add_control_inputs(wait_to_do_ops, inputs_to_do_before):
++    """ Add control inputs """
++    for tf_op in wait_to_do_ops:
++        ctl_inp = [i for i in inputs_to_do_before
++                   if tf_op.control_inputs is None or i not in tf_op.control_inputs]
++        ge.add_control_inputs(tf_op, ctl_inp)
+diff --git a/plugins/train/model/_base.py b/plugins/train/model/_base.py
+index 63d5864..fbddf0a 100644
+--- a/plugins/train/model/_base.py
++++ b/plugins/train/model/_base.py
+@@ -14,7 +14,7 @@ from json import JSONDecodeError
+ import keras
+ from keras import losses
+ from keras import backend as K
+-from keras.models import load_model
++from keras.models import load_model, Model
+ from keras.optimizers import Adam
+ from keras.utils import get_custom_objects, multi_gpu_model
+ 
+@@ -42,12 +42,16 @@ class ModelBase():
+                  input_shape=None,
+                  encoder_dim=None,
+                  trainer="original",
++                 pingpong=False,
++                 memory_saving_gradients=False,
+                  predict=False):
+-        logger.debug("Initializing ModelBase (%s): (model_dir: '%s', gpus: %s, "
++        logger.debug("Initializing ModelBase (%s): (model_dir: '%s', gpus: %s, no_logs: %s"
+                      "training_image_size, %s, alignments_paths: %s, preview_scale: %s, "
+-                     "input_shape: %s, encoder_dim: %s)", self.__class__.__name__, model_dir, gpus,
+-                     training_image_size, alignments_paths, preview_scale, input_shape,
+-                     encoder_dim)
++                     "input_shape: %s, encoder_dim: %s, trainer: %s, pingpong: %s, "
++                     "memory_saving_gradients: %s, predict: %s)",
++                     self.__class__.__name__, model_dir, gpus, no_logs, training_image_size,
++                     alignments_paths, preview_scale, input_shape, encoder_dim, trainer,
++                     pingpong, memory_saving_gradients, predict)
+ 
+         self.predict = predict
+         self.model_dir = model_dir
+@@ -60,7 +64,7 @@ class ModelBase():
+         self.encoder_dim = encoder_dim
+         self.trainer = trainer
+ 
+-        self.state = State(self.model_dir, self.name, no_logs, training_image_size)
++        self.state = State(self.model_dir, self.name, no_logs, pingpong, training_image_size)
+         self.is_legacy = False
+         self.rename_legacy()
+         self.load_state_info()
+@@ -74,8 +78,10 @@ class ModelBase():
+         self.training_opts = {"alignments": alignments_paths,
+                               "preview_scaling": preview_scale / 100,
+                               "warp_to_landmarks": warp_to_landmarks,
+-                              "no_flip": no_flip}
++                              "no_flip": no_flip,
++                              "pingpong": pingpong}
+ 
++        self.set_gradient_type(memory_saving_gradients)
+         self.build()
+         self.set_training_data()
+         logger.debug("Initialized ModelBase (%s)", self.__class__.__name__)
+@@ -105,6 +111,15 @@ class ModelBase():
+         logger.debug("Pre-existing models exist: %s", retval)
+         return retval
+ 
++    @staticmethod
++    def set_gradient_type(memory_saving_gradients):
++        """ Monkeypatch Memory Saving Gradients if requested """
++        if not memory_saving_gradients:
++            return
++        logger.info("Using Memory Saving Gradients")
++        from lib.model import memory_saving_gradients
++        K.__dict__["gradients"] = memory_saving_gradients.gradients_memory
++
+     def set_training_data(self):
+         """ Override to set model specific training data.
+ 
+@@ -132,7 +147,7 @@ class ModelBase():
+         self.load_models(swapped=False)
+         self.build_autoencoders()
+         self.log_summary()
+-        self.compile_predictors()
++        self.compile_predictors(initialize=True)
+ 
+     def build_autoencoders(self):
+         """ Override for Model Specific autoencoder builds
+@@ -215,24 +230,42 @@ class ModelBase():
+         self.output_shape = tuple(out[0])
+         logger.debug("Added output shape: %s", self.output_shape)
+ 
+-    def compile_predictors(self):
++    def reset_pingpong(self):
++        """ Reset the models for pingpong training """
++        logger.debug("Resetting models")
++
++        # Clear models and graph
++        self.predictors = dict()
++        K.clear_session()
++
++        # Load Models for current training run
++        for model in self.networks.values():
++            model.network = Model.from_config(model.config)
++            model.network.set_weights(model.weights)
++
++        self.build_autoencoders()
++        self.compile_predictors(initialize=False)
++        logger.debug("Reset models")
++
++    def compile_predictors(self, initialize=True):
+         """ Compile the predictors """
+         logger.debug("Compiling Predictors")
+         optimizer = self.get_optimizer(lr=5e-5, beta_1=0.5, beta_2=0.999)
+ 
+         for side, model in self.predictors.items():
+             loss_names = ["loss"]
+-            loss_funcs = [self.loss_function(side)]
++            loss_funcs = [self.loss_function(side, initialize)]
+             mask = [inp for inp in model.inputs if inp.name.startswith("mask")]
+             if mask:
+                 loss_names.insert(0, "mask_loss")
+-                loss_funcs.insert(0, self.mask_loss_function(mask[0], side))
++                loss_funcs.insert(0, self.mask_loss_function(mask[0], side, initialize))
+             model.compile(optimizer=optimizer, loss=loss_funcs)
+ 
+             if len(loss_names) > 1:
+                 loss_names.insert(0, "total_loss")
+-            self.state.add_session_loss_names(side, loss_names)
+-            self.history[side] = list()
++            if initialize:
++                self.state.add_session_loss_names(side, loss_names)
++                self.history[side] = list()
+         logger.debug("Compiled Predictors. Losses: %s", loss_names)
+ 
+     def get_optimizer(self, lr=5e-5, beta_1=0.5, beta_2=0.999):  # pylint: disable=invalid-name
+@@ -250,24 +283,24 @@ class ModelBase():
+         logger.debug("Optimizer kwargs: %s", opt_kwargs)
+         return Adam(**opt_kwargs)
+ 
+-    def loss_function(self, side):
++    def loss_function(self, side, initialize):
+         """ Set the loss function """
+         if self.config.get("dssim_loss", False):
+-            if side == "a" and not self.predict:
++            if side == "a" and not self.predict and initialize:
+                 logger.verbose("Using DSSIM Loss")
+             loss_func = DSSIMObjective()
+         else:
+-            if side == "a" and not self.predict:
++            if side == "a" and not self.predict and initialize:
+                 logger.verbose("Using Mean Absolute Error Loss")
+             loss_func = losses.mean_absolute_error
+         logger.debug(loss_func)
+         return loss_func
+ 
+-    def mask_loss_function(self, mask, side):
++    def mask_loss_function(self, mask, side, initialize):
+         """ Set the loss function for masks
+             Side is input so we only log once """
+         if self.config.get("dssim_mask_loss", False):
+-            if side == "a" and not self.predict:
++            if side == "a" and not self.predict and initialize:
+                 logger.verbose("Using DSSIM Loss for mask")
+             mask_loss_func = DSSIMObjective()
+         else:
+@@ -276,7 +309,7 @@ class ModelBase():
+             mask_loss_func = losses.mean_absolute_error
+ 
+         if self.config.get("penalized_mask_loss", False):
+-            if side == "a" and not self.predict:
++            if side == "a" and not self.predict and initialize:
+                 logger.verbose("Using Penalized Loss for mask")
+             mask_loss_func = PenalizedLoss(mask, mask_loss_func)
+         logger.debug(mask_loss_func)
+@@ -329,7 +362,7 @@ class ModelBase():
+ 
+         if not self.models_exist and not self.predict:
+             logger.info("Creating new '%s' model in folder: '%s'", self.name, self.model_dir)
+-            return
++            return None
+         if not self.models_exist and self.predict:
+             logger.error("Model could not be found in folder '%s'. Exiting", self.model_dir)
+             exit(0)
+@@ -495,6 +528,8 @@ class NNMeta():
+         self.name = self.set_name()
+         self.network = network
+         self.network.name = self.name
++        self.config = network.get_config()  # For pingpong restore
++        self.weights = network.get_weights()  # For pingpong restore
+         logger.debug("Initialized %s", self.__class__.__name__)
+ 
+     def set_name(self):
+@@ -521,6 +556,7 @@ class NNMeta():
+             logger.warning("Failed loading existing training data. Generating new models")
+             logger.debug("Exception: %s", str(err))
+             return False
++        self.config = network.get_config()
+         self.network = network  # Update network with saved model
+         self.network.name = self.type
+         return True
+@@ -531,6 +567,7 @@ class NNMeta():
+         if should_backup:
+             self.backup(fullpath=fullpath)
+         logger.debug("Saving model: '%s'", fullpath)
++        self.weights = self.network.get_weights()
+         self.network.save(fullpath)
+ 
+     def backup(self, fullpath=None):
+@@ -553,10 +590,10 @@ class NNMeta():
+ 
+ class State():
+     """ Class to hold the model's current state and autoencoder structure """
+-    def __init__(self, model_dir, model_name, no_logs, training_image_size):
++    def __init__(self, model_dir, model_name, no_logs, pingpong, training_image_size):
+         logger.debug("Initializing %s: (model_dir: '%s', model_name: '%s', no_logs: %s, "
+-                     "training_image_size: '%s'", self.__class__.__name__, model_dir,
+-                     model_name, no_logs, training_image_size)
++                     "pingpong: %s, training_image_size: '%s'", self.__class__.__name__, model_dir,
++                     model_name, no_logs, pingpong, training_image_size)
+         self.serializer = Serializer.get_serializer("json")
+         filename = "{}_state.{}".format(model_name, self.serializer.ext)
+         self.filename = str(model_dir / filename)
+@@ -570,7 +607,7 @@ class State():
+         self.config = dict()
+         self.load()
+         self.session_id = self.new_session_id()
+-        self.create_new_session(no_logs)
++        self.create_new_session(no_logs, pingpong)
+         logger.debug("Initialized %s:", self.__class__.__name__)
+ 
+     @property
+@@ -602,11 +639,12 @@ class State():
+         logger.debug(session_id)
+         return session_id
+ 
+-    def create_new_session(self, no_logs):
++    def create_new_session(self, no_logs, pingpong):
+         """ Create a new session """
+         logger.debug("Creating new session. id: %s", self.session_id)
+         self.sessions[self.session_id] = {"timestamp": time.time(),
+                                           "no_logs": no_logs,
++                                          "pingpong": pingpong,
+                                           "loss_names": dict(),
+                                           "batchsize": 0,
+                                           "iterations": 0}
+diff --git a/plugins/train/trainer/_base.py b/plugins/train/trainer/_base.py
+index da74b8f..c51c18c 100644
+--- a/plugins/train/trainer/_base.py
++++ b/plugins/train/trainer/_base.py
+@@ -16,6 +16,7 @@
+         no_logs:            Disable tensorboard logging
+         warp_to_landmarks:  Use random_warp_landmarks instead of random_warp
+         no_flip:            Don't perform a random flip on the image
++        pingpong:           Train each side seperately per save iteration rather than together
+ """
+ 
+ import logging
+@@ -45,15 +46,17 @@ class TrainerBase():
+         self.model = model
+         self.model.state.add_session_batchsize(batch_size)
+         self.images = images
++        self.sides = sorted(key for key in self.images.keys())
+ 
+         self.process_training_opts()
++        self.pingpong = PingPong(model, self.sides)
+ 
+         self.batchers = {side: Batcher(side,
+                                        images[side],
+                                        self.model,
+                                        self.use_mask,
+                                        batch_size)
+-                         for side in images.keys()}
++                         for side in self.sides}
+ 
+         self.tensorboard = self.set_tensorboard()
+         self.samples = Samples(self.model,
+@@ -98,10 +101,18 @@ class TrainerBase():
+         if self.model.training_opts["no_logs"]:
+             logger.verbose("TensorBoard logging disabled")
+             return None
++        if self.pingpong.active:
++            # Currently TensorBoard uses the tf.session, meaning that VRAM does not
++            # get cleared when model switching
++            # TODO find a fix for this
++            logger.warning("Currently TensorBoard logging is not supported for Ping-Pong "
++                           "training. Session stats and graphing will not be available for this "
++                           "training session.")
++            return None
+ 
+         logger.debug("Enabling TensorBoard Logging")
+         tensorboard = dict()
+-        for side in self.images.keys():
++        for side in self.sides:
+             logger.debug("Setting up TensorBoard Logging. Side: %s", side)
+             log_dir = os.path.join(str(self.model.model_dir),
+                                    "{}_logs".format(self.model.name),
+@@ -119,6 +130,7 @@ class TrainerBase():
+ 
+     def print_loss(self, loss):
+         """ Override for specific model loss formatting """
++        logger.trace(loss)
+         output = list()
+         for side in sorted(list(loss.keys())):
+             display = ", ".join(["{}_{}: {:.5f}".format(self.model.state.loss_names[side][idx],
+@@ -126,8 +138,8 @@ class TrainerBase():
+                                                         this_loss)
+                                  for idx, this_loss in enumerate(loss[side])])
+             output.append(display)
+-        print("[{}] [#{:05d}] {}, {}".format(
+-            self.timestamp, self.model.iterations, output[0], output[1]), end='\r')
++        output = ", ".join(output)
++        print("[{}] [#{:05d}] {}".format(self.timestamp, self.model.iterations, output), end='\r')
+ 
+     def train_one_step(self, viewer, timelapse_kwargs):
+         """ Train a batch """
+@@ -136,6 +148,8 @@ class TrainerBase():
+         do_timelapse = False if timelapse_kwargs is None else True
+         loss = dict()
+         for side, batcher in self.batchers.items():
++            if self.pingpong.active and side != self.pingpong.side:
++                continue
+             loss[side] = batcher.train_one_batch(do_preview)
+             if not do_preview and not do_timelapse:
+                 continue
+@@ -149,11 +163,18 @@ class TrainerBase():
+         for side, side_loss in loss.items():
+             self.store_history(side, side_loss)
+             self.log_tensorboard(side, side_loss)
+-        self.print_loss(loss)
++
++        if not self.pingpong.active:
++            self.print_loss(loss)
++        else:
++            for key, val in loss.items():
++                self.pingpong.loss[key] = val
++            self.print_loss(self.pingpong.loss)
+ 
+         if do_preview:
+-            viewer(self.samples.show_sample(),
+-                   "Training - 'S': Save Now. 'ENTER': Save and Quit")
++            samples = self.samples.show_sample()
++            if samples is not None:
++                viewer(samples, "Training - 'S': Save Now. 'ENTER': Save and Quit")
+ 
+         if do_timelapse:
+             self.timelapse.output_timelapse()
+@@ -287,6 +308,9 @@ class Samples():
+ 
+     def show_sample(self):
+         """ Display preview data """
++        if len(self.images) != 2:
++            logger.debug("Ping Pong training - Only one side trained. Aborting preview")
++            return None
+         logger.debug("Showing sample")
+         feeds = dict()
+         figures = dict()
+@@ -536,12 +560,40 @@ class Timelapse():
+         """ Set the timelapse dictionary """
+         logger.debug("Ouputting timelapse")
+         image = self.samples.show_sample()
++        if image is None:
++            return
+         filename = os.path.join(self.output_file, str(int(time.time())) + ".jpg")
+ 
+         cv2.imwrite(filename, image)  # pylint: disable=no-member
+         logger.debug("Created timelapse: '%s'", filename)
+ 
+ 
++class PingPong():
++    """ Side switcher for pingpong training """
++    def __init__(self, model, sides):
++        logger.debug("Initializing %s: (model: '%s')", self.__class__.__name__, model)
++        self.active = model.training_opts.get("pingpong", False)
++        self.model = model
++        self.sides = sides
++        self.side = sorted(sides)[0]
++        self.loss = {side: dict() for side in sides}
++        logger.debug("Initialized %s", self.__class__.__name__)
++
++    def switch(self):
++        """ Switch pingpong side """
++        if not self.active:
++            return
++        retval = [side for side in self.sides if side != self.side][0]
++        logger.info("Switching training to side %s", retval.title())
++        self.side = retval
++        self.reload_model()
++
++    def reload_model(self):
++        """ Load the model for just the current side """
++        logger.verbose("Ping-Pong re-loading model")
++        self.model.reset_pingpong()
++
++
+ class Landmarks():
+     """ Set Landmarks for training into the model's training options"""
+     def __init__(self, training_opts):
+diff --git a/requirements.txt b/requirements.txt
+index e983ad3..2c6e67e 100755
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -5,6 +5,7 @@ numpy==1.15.4
+ opencv-python
+ scikit-image
+ scikit-learn
++toposort
+ matplotlib==2.2.2
+ ffmpy==0.2.2
+ nvidia-ml-py3
+diff --git a/scripts/train.py b/scripts/train.py
+index dfa616b..c9efb95 100644
+--- a/scripts/train.py
++++ b/scripts/train.py
+@@ -163,7 +163,10 @@ class Train():
+             no_flip=self.args.no_flip,
+             training_image_size=self.image_size,
+             alignments_paths=self.alignments_paths,
+-            preview_scale=self.args.preview_scale)
++            preview_scale=self.args.preview_scale,
++            pingpong=self.args.pingpong,
++            memory_saving_gradients=self.args.memory_saving_gradients,
++            predict=False)
+         logger.debug("Loaded Model")
+         return model
+ 
+@@ -217,7 +220,11 @@ class Train():
+                 break
+             elif save_iteration:
+                 logger.trace("Save Iteration: (iteration: %s", iteration)
+-                model.save_models()
++                if self.args.pingpong:
++                    model.save_models()
++                    trainer.pingpong.switch()
++                else:
++                    model.save_models()
+             elif self.save_now:
+                 logger.trace("Save Requested: (iteration: %s", iteration)
+                 model.save_models()

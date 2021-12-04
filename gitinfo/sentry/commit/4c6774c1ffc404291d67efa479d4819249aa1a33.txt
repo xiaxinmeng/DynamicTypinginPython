@@ -1,0 +1,266 @@
+commit 4c6774c1ffc404291d67efa479d4819249aa1a33
+Author: Lauryn Brown <lauryndbrown@gmail.com>
+Date:   Wed Oct 10 13:29:37 2018 -0700
+
+    fix(integrations): VSTS Subscription check tasks. (#9644)
+    
+    * rough outline of what vsts subscription check should look like.
+    
+    * added kickoff to celery schedule.
+    
+    * made the indidviual check async
+    
+    * Revised the kickoff method.
+    
+    * vsts sub check test.
+    
+    * added changes that matte suggested
+    
+    * fixed issues Matte brought up.
+    
+    * fixed merge mistakes.
+    
+    * made the smaller changes that matte suggested.
+    
+    * fixed test.
+    
+    * fixed mysql int/long id compatibility issue.
+    
+    * Removed a comment
+
+diff --git a/src/sentry/conf/server.py b/src/sentry/conf/server.py
+index 3b362be6bd..f86d6de704 100644
+--- a/src/sentry/conf/server.py
++++ b/src/sentry/conf/server.py
+@@ -606,6 +606,13 @@ CELERYBEAT_SCHEDULE = {
+             'expires': 60 * 60 * 3,
+         },
+     },
++    'schedule-vsts-integration-subscription-check': {
++        'task': 'sentry.tasks.integrations.kickoff_vsts_subscription_check',
++        'schedule': timedelta(hours=6),
++        'options': {
++            'expires': 60 * 25,
++        }
++    }
+ }
+ 
+ BGTASKS = {
+diff --git a/src/sentry/integrations/vsts/client.py b/src/sentry/integrations/vsts/client.py
+index 29d44a86f6..266e2f1162 100644
+--- a/src/sentry/integrations/vsts/client.py
++++ b/src/sentry/integrations/vsts/client.py
+@@ -263,8 +263,24 @@ class VstsApiClient(ApiClient, OAuth2RefreshMixin):
+             },
+         )
+ 
++    def get_subscription(self, instance, subscription_id):
++        return self.get(
++            VstsApiPath.subscription.format(
++                instance=instance,
++                subscription_id=subscription_id,
++            )
++        )
++
+     def delete_subscription(self, instance, subscription_id):
+-        self.delete(
++        return self.delete(
++            VstsApiPath.subscription.format(
++                instance=instance,
++                subscription_id=subscription_id,
++            )
++        )
++
++    def update_subscription(self, instance, subscription_id):
++        return self.put(
+             VstsApiPath.subscription.format(
+                 instance=instance,
+                 subscription_id=subscription_id,
+diff --git a/src/sentry/tasks/integrations.py b/src/sentry/tasks/integrations.py
+index bbe397d858..04a6f07478 100644
+--- a/src/sentry/tasks/integrations.py
++++ b/src/sentry/tasks/integrations.py
+@@ -1,14 +1,18 @@
+ from __future__ import absolute_import
+ 
++from time import time
++from datetime import timedelta
++
+ import logging
+ 
+ from sentry import analytics, features
+ from sentry.models import (
+     ExternalIssue, Group, GroupLink, GroupStatus, Integration, Organization,
+-    ObjectStatus, Repository, User
++    ObjectStatus, OrganizationIntegration, Repository, User
+ )
+-from sentry.integrations.exceptions import IntegrationError
++
+ from sentry.mediators.plugins import Migrator
++from sentry.integrations.exceptions import ApiError, ApiUnauthorized, IntegrationError
+ from sentry.tasks.base import instrumented_task, retry
+ 
+ logger = logging.getLogger('sentry.tasks.integrations')
+@@ -207,3 +211,63 @@ def migrate_repo(repo_id, integration_id, organization_id):
+             integration=integration,
+             organization=Organization.objects.get(id=organization_id),
+         )
++
++
++@instrumented_task(
++    name='sentry.tasks.integrations.kickoff_vsts_subscription_check',
++    queue='integrations',
++    default_retry_delay=60 * 5,
++    max_retries=5,
++)
++@retry()
++def kickoff_vsts_subscription_check():
++    organization_integrations = OrganizationIntegration.objects.filter(
++        integration__provider='vsts',
++        integration__status=ObjectStatus.VISIBLE,
++        status=ObjectStatus.VISIBLE,
++    ).select_related('integration')
++    six_hours_ago = time() - timedelta(hours=6).seconds
++    for org_integration in organization_integrations:
++        organization_id = org_integration.organization_id
++        integration = org_integration.integration
++
++        try:
++            if 'subscription' not in integration.metadata or integration.metadata[
++                    'subscription']['check'] > six_hours_ago:
++                continue
++        except KeyError:
++            pass
++
++        vsts_subscription_check.apply_async(
++            kwargs={
++                'integration_id': integration.id,
++                'organization_id': organization_id,
++            }
++        )
++
++
++@instrumented_task(
++    name='sentry.tasks.integrations.vsts_subscription_check',
++    queue='integrations',
++    default_retry_delay=60 * 5,
++    max_retries=5,
++)
++@retry(exclude=(ApiError, ApiUnauthorized, Integration.DoesNotExist))
++def vsts_subscription_check(integration_id, organization_id, **kwargs):
++    integration = Integration.objects.get(id=integration_id)
++    installation = integration.get_installation(organization_id=organization_id)
++    client = installation.get_client()
++    subscription_id = integration.metadata['subscription']['id']
++    subscription = client.get_subscription(
++        instance=installation.instance,
++        subscription_id=subscription_id,
++    )
++
++    # https://docs.microsoft.com/en-us/rest/api/vsts/hooks/subscriptions/replace%20subscription?view=vsts-rest-4.1#subscriptionstatus
++    if subscription['status'] == 'disabledBySystem':
++        client.update_subscription(
++            instance=installation.instance,
++            subscription_id=subscription_id,
++        )
++        integration.metadata['subscription']['check'] = time()
++        integration.save()
+diff --git a/tests/sentry/tasks/test_integrations.py b/tests/sentry/tasks/test_integrations.py
+new file mode 100644
+index 0000000000..606dbd7d24
+--- /dev/null
++++ b/tests/sentry/tasks/test_integrations.py
+@@ -0,0 +1,93 @@
++from __future__ import absolute_import, print_function
++
++from time import time
++
++from sentry.models import Integration, Identity, IdentityProvider
++from sentry.testutils import TestCase
++from sentry.tasks.integrations import kickoff_vsts_subscription_check
++
++import responses
++
++
++class VstsSubscriptionCheckTest(TestCase):
++    def setUp(self):
++        responses.add(
++            responses.GET,
++            'https://vsts1.visualstudio.com/_apis/hooks/subscriptions/subscription1',
++            json={'status': 'disabledBySystem'}
++        )
++        responses.add(
++            responses.PUT,
++            'https://vsts1.visualstudio.com/_apis/hooks/subscriptions/subscription1',
++            json={}
++        )
++        responses.add(
++            responses.GET,
++            'https://vsts1.visualstudio.com/_apis/hooks/subscriptions/subscription3',
++            json={'status': 'enabled'}
++        )
++        responses.add(
++            responses.PUT,
++            'https://vsts1.visualstudio.com/_apis/hooks/subscriptions/subscription3',
++            json={}
++        )
++        self.identity = Identity.objects.create(
++            idp=IdentityProvider.objects.create(
++                type='vsts',
++                config={}
++            ),
++            user=self.user,
++            external_id='user_identity',
++            data={
++                'access_token': 'vsts-access-token',
++                'expires': time() + 50000,
++            }
++        )
++
++    @responses.activate
++    def test_kickoff_subscription(self):
++        integration3_check_time = time()
++        integration1 = Integration.objects.create(
++            provider='vsts',
++            name='vsts1',
++            external_id='vsts1',
++            metadata={
++                'domain_name': 'https://vsts1.visualstudio.com/',
++                'subscription': {
++                    'id': 'subscription1',
++                }
++            }
++        )
++        integration1.add_organization(self.organization, default_auth_id=self.identity.id)
++        integration2 = Integration.objects.create(
++            provider='vsts',
++            name='vsts2',
++            external_id='vsts2',
++            metadata={},
++        )
++        integration2.add_organization(self.organization, default_auth_id=self.identity.id)
++        integration3 = Integration.objects.create(
++            provider='vsts',
++            name='vsts3',
++            external_id='vsts3',
++            metadata={
++                'subscription': {
++                    'id': 'subscription3',
++                    'check': integration3_check_time,
++                }
++            }
++        )
++        integration3.add_organization(self.organization, default_auth_id=self.identity.id)
++
++        with self.tasks():
++            kickoff_vsts_subscription_check()
++
++        assert 'check' in Integration.objects.get(
++            provider='vsts',
++            external_id='vsts1',
++        ).metadata['subscription']
++
++        assert integration3_check_time == Integration.objects.get(
++            provider='vsts',
++            external_id='vsts3',
++        ).metadata['subscription']['check']

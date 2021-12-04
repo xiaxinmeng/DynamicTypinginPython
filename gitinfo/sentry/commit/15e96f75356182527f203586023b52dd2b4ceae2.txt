@@ -1,0 +1,496 @@
+commit 15e96f75356182527f203586023b52dd2b4ceae2
+Author: Jess MacQueen <macqueen@users.noreply.github.com>
+Date:   Fri Nov 17 12:05:15 2017 -0800
+
+    feat(quotas): Subtract events matching discards from quotas (#6479)
+
+diff --git a/src/sentry/quotas/base.py b/src/sentry/quotas/base.py
+index 0ecd377032..594e4a2928 100644
+--- a/src/sentry/quotas/base.py
++++ b/src/sentry/quotas/base.py
+@@ -46,7 +46,7 @@ class Quota(Service):
+     """
+     __all__ = (
+         'get_maximum_quota', 'get_organization_quota', 'get_project_quota', 'is_rate_limited',
+-        'translate_quota', 'validate',
++        'translate_quota', 'validate', 'refund',
+     )
+ 
+     def __init__(self, **options):
+@@ -55,6 +55,9 @@ class Quota(Service):
+     def is_rate_limited(self, project, key=None):
+         return NotRateLimited()
+ 
++    def refund(self, project, key=None, timestamp=None):
++        raise NotImplementedError
++
+     def get_time_remaining(self):
+         return 0
+ 
+diff --git a/src/sentry/quotas/redis.py b/src/sentry/quotas/redis.py
+index 024c1b5985..26405eda68 100644
+--- a/src/sentry/quotas/redis.py
++++ b/src/sentry/quotas/redis.py
+@@ -59,6 +59,13 @@ class RedisQuota(Quota):
+             int((timestamp - shift) // interval),
+         )
+ 
++    def get_quotas_with_limits(self, project, key=None):
++        return [
++            quota for quota in self.get_quotas(project, key=key)
++            # x = (key, limit, interval)
++            if quota.limit > 0  # a zero limit means "no limit", not "reject all"
++        ]
++
+     def get_quotas(self, project, key=None):
+         if key:
+             key.project = project
+@@ -72,7 +79,7 @@ class RedisQuota(Quota):
+                 reason_code='project_quota',
+             ),
+             BasicRedisQuota(
+-                key='o:{}'.format(project.organization.id),
++                key='o:{}'.format(project.organization_id),
+                 limit=oquota[0],
+                 window=oquota[1],
+                 reason_code='org_quota',
+@@ -96,19 +103,20 @@ class RedisQuota(Quota):
+ 
+         def get_usage_for_quota(client, quota):
+             if quota.limit == 0:
+-                return None
++                return (None, None)
+ 
+-            return client.get(
+-                self.__get_redis_key(
+-                    quota.key, timestamp, quota.window, organization_id % quota.window
+-                ),
++            key = self.__get_redis_key(
++                quota.key, timestamp, quota.window, organization_id % quota.window
+             )
++            refund_key = self.get_refunded_quota_key(key)
++
++            return (client.get(key), client.get(refund_key))
+ 
+-        def get_value_for_result(result):
++        def get_value_for_result(result, refund_result):
+             if result is None:
+                 return None
+ 
+-            return int(result.value or 0)
++            return int(result.value or 0) - int(refund_result.value or 0)
+ 
+         with self.cluster.fanout() as client:
+             results = map(
+@@ -121,38 +129,63 @@ class RedisQuota(Quota):
+                 quotas,
+             )
+ 
+-        return map(
+-            get_value_for_result,
+-            results,
+-        )
++        return [
++            get_value_for_result(*r) for r in results
++        ]
++
++    def get_refunded_quota_key(self, key):
++        return 'r:{}'.format(key)
++
++    def refund(self, project, key=None, timestamp=None):
++        if timestamp is None:
++            timestamp = time()
++
++        quotas = self.get_quotas_with_limits(project, key=key)
++
++        if not quotas:
++            return
++
++        client = self.cluster.get_local_client_for_key(six.text_type(project.organization_id))
++        pipe = client.pipeline()
++
++        for quota in quotas:
++            shift = project.organization_id % quota.window
++            # kind of arbitrary, but seems like we don't want this to expire til we're
++            # sure the window is over?
++            expiry = self.get_next_period_start(quota.window, shift, timestamp) + self.grace
++            return_key = self.get_refunded_quota_key(
++                self.__get_redis_key(quota.key, timestamp, quota.window, shift),
++            )
++            pipe.incr(return_key, 1)
++            pipe.expireat(return_key, int(expiry))
++
++        pipe.execute()
++
++    def get_next_period_start(self, interval, shift, timestamp):
++        """Return the timestamp when the next rate limit period begins for an interval."""
++        return (((timestamp - shift) // interval) + 1) * interval + shift
+ 
+     def is_rate_limited(self, project, key=None, timestamp=None):
+         if timestamp is None:
+             timestamp = time()
+ 
+-        quotas = [
+-            quota for quota in self.get_quotas(project, key=key)
+-            # x = (key, limit, interval)
+-            if quota.limit > 0  # a zero limit means "no limit", not "reject all"
+-        ]
++        quotas = self.get_quotas_with_limits(project, key=key)
+ 
+         # If there are no quotas to actually check, skip the trip to the database.
+         if not quotas:
+             return NotRateLimited()
+ 
+-        def get_next_period_start(interval, shift):
+-            """Return the timestamp when the next rate limit period begins for an interval."""
+-            return (((timestamp - shift) // interval) + 1) * interval + shift
+-
+         keys = []
+         args = []
+         for quota in quotas:
+             shift = project.organization_id % quota.window
+-            keys.append(self.__get_redis_key(quota.key, timestamp, quota.window, shift))
+-            expiry = get_next_period_start(quota.window, shift) + self.grace
++            key = self.__get_redis_key(quota.key, timestamp, quota.window, shift)
++            return_key = self.get_refunded_quota_key(key)
++            keys.extend((key, return_key))
++            expiry = self.get_next_period_start(quota.window, shift, timestamp) + self.grace
+             args.extend((quota.limit, int(expiry)))
+ 
+-        client = self.cluster.get_local_client_for_key(six.text_type(project.organization.pk))
++        client = self.cluster.get_local_client_for_key(six.text_type(project.organization_id))
+         rejections = is_rate_limited(client, keys, args)
+         if any(rejections):
+             enforce = False
+@@ -163,7 +196,7 @@ class RedisQuota(Quota):
+                 if quota.enforce:
+                     enforce = True
+                     shift = project.organization_id % quota.window
+-                    delay = get_next_period_start(quota.window, shift) - timestamp
++                    delay = self.get_next_period_start(quota.window, shift, timestamp) - timestamp
+                     if delay > worst_case[0]:
+                         worst_case = (delay, quota.reason_code)
+             if enforce:
+diff --git a/src/sentry/scripts/quotas/is_rate_limited.lua b/src/sentry/scripts/quotas/is_rate_limited.lua
+index e4ebcfba28..3fb07a1ebf 100644
+--- a/src/sentry/scripts/quotas/is_rate_limited.lua
++++ b/src/sentry/scripts/quotas/is_rate_limited.lua
+@@ -1,14 +1,15 @@
+ -- Check a collection of quota counters to identify if an item should be rate
+ -- limited. Values provided as ``KEYS`` specify the keys of the counters to
+--- check, and values provided as ``ARGV`` specify the maximum value (quota
+--- limit) and expiration time for each key.
++-- check and the keys of counters to subtract, and values provided as ``ARGV``
++-- specify the maximum value (quota limit) and expiration time for each key.
+ --
+--- For example, to check a quota ``foo`` that has a limit of 10 items and
+--- expires at the Unix timestamp ``100``, as well as a quota ``bar`` that has a
+--- limit of 20 items and should expire at the Unix timestamp ``100``, the
+--- ``KEYS`` and ``ARGV`` values would be as follows:
++-- For example, to check a quota ``foo`` that has a corresponding refund/negative
++-- counter "subtract_from_foo", a limit of 10 items and expires at the Unix timestamp
++-- ``100``, as well as a quota ``bar`` that has a corresponding refund/negative
++-- counter "subtract_from_bar" limit of 20 items and should expire at the Unix
++-- timestamp ``100``, the ``KEYS`` and ``ARGV`` values would be as follows:
+ --
+---   KEYS = {"foo", "bar"}
++--   KEYS = {"foo", "subtract_from_foo", "bar", "subtract_from_bar"}
+ --   ARGV = {10, 100, 20, 100}
+ --
+ -- If all checks pass (the item is accepted), the counters for all quotas are
+@@ -16,23 +17,24 @@
+ -- quotas are unaffected. The result is a Lua table/array (Redis multi bulk
+ -- reply) that specifies whether or not the item was *rejected* based on the
+ -- provided limit.
+-assert(#KEYS * 2 == #ARGV, "incorrect number of keys and arguments provided")
++assert(#KEYS == #ARGV, "incorrect number of keys and arguments provided")
++assert(#KEYS % 2 == 0, "there must be an even number of keys")
+ 
+ local results = {}
+ local failed = false
+-for i=1,#KEYS do
+-    local limit = tonumber(ARGV[(i * 2) - 1])
+-    local rejected = (redis.call('GET', KEYS[i]) or 0) + 1 > limit
++for i=1, #KEYS, 2 do
++    local limit = tonumber(ARGV[i])
++    local rejected = (redis.call('GET', KEYS[i]) or 0) - (redis.call('GET', KEYS[i + 1]) or 0) + 1 > limit
+     if rejected then
+         failed = true
+     end
+-    results[i] = rejected
++    results[(i + 1) / 2] = rejected
+ end
+ 
+ if not failed then
+-    for i=1,#KEYS do
++    for i=1, #KEYS, 2 do
+         redis.call('INCR', KEYS[i])
+-        redis.call('EXPIREAT', KEYS[i], ARGV[i * 2])
++        redis.call('EXPIREAT', KEYS[i], ARGV[i + 1])
+     end
+ end
+ 
+diff --git a/src/sentry/tasks/store.py b/src/sentry/tasks/store.py
+index ecb760d193..38851f8659 100644
+--- a/src/sentry/tasks/store.py
++++ b/src/sentry/tasks/store.py
+@@ -70,7 +70,9 @@ def _do_preprocess_event(cache_key, data, start_time, event_id, process_event):
+     # so we can jump directly to save_event
+     if cache_key:
+         data = None
+-    save_event.delay(cache_key=cache_key, data=data, start_time=start_time, event_id=event_id)
++    save_event.delay(
++        cache_key=cache_key, data=data, start_time=start_time, event_id=event_id,
++    )
+ 
+ 
+ @instrumented_task(
+@@ -142,7 +144,9 @@ def _do_process_event(cache_key, start_time, event_id):
+ 
+         default_cache.set(cache_key, data, 3600)
+ 
+-    save_event.delay(cache_key=cache_key, data=None, start_time=start_time, event_id=event_id)
++    save_event.delay(
++        cache_key=cache_key, data=None, start_time=start_time, event_id=event_id,
++    )
+ 
+ 
+ @instrumented_task(
+@@ -256,7 +260,8 @@ def save_event(cache_key=None, data=None, start_time=None, event_id=None, **kwar
+     Saves an event to the database.
+     """
+     from sentry.event_manager import HashDiscarded, EventManager
+-    from sentry import tsdb
++    from sentry import quotas, tsdb
++    from sentry.models import ProjectKey
+ 
+     if cache_key:
+         data = default_cache.get(cache_key)
+@@ -268,30 +273,50 @@ def save_event(cache_key=None, data=None, start_time=None, event_id=None, **kwar
+         metrics.incr('events.failed', tags={'reason': 'cache', 'stage': 'post'})
+         return
+ 
+-    project = data.pop('project')
++    project_id = data.pop('project')
+ 
+-    delete_raw_event(project, event_id, allow_hint_clear=True)
++    delete_raw_event(project_id, event_id, allow_hint_clear=True)
+ 
+     Raven.tags_context({
+-        'project': project,
++        'project': project_id,
+     })
+ 
+     try:
+         manager = EventManager(data)
+-        manager.save(project)
++        manager.save(project_id)
+     except HashDiscarded as exc:
+         # TODO(jess): remove this before it goes out to a wider audience
+         info_logger.info(
+             'discarded.hash', extra={
+-                'project_id': project,
++                'project_id': project_id,
+                 'description': exc.message,
+             }
+         )
++
+         tsdb.incr(
+             tsdb.models.project_total_received_discarded,
+-            project,
++            project_id,
+             timestamp=to_datetime(start_time) if start_time is not None else None,
+         )
++
++        try:
++            project = Project.objects.get_from_cache(id=project_id)
++        except Project.DoesNotExist:
++            pass
++        else:
++            project_key = None
++            if data.get('key_id') is not None:
++                try:
++                    project_key = ProjectKey.objects.get_from_cache(id=data['key_id'])
++                except ProjectKey.DoesNotExist:
++                    pass
++
++            quotas.refund(
++                project,
++                key=project_key,
++                timestamp=start_time,
++            )
++
+     finally:
+         if cache_key:
+             default_cache.delete(cache_key)
+diff --git a/tests/sentry/quotas/redis/tests.py b/tests/sentry/quotas/redis/tests.py
+index 464629bc32..7beafece99 100644
+--- a/tests/sentry/quotas/redis/tests.py
++++ b/tests/sentry/quotas/redis/tests.py
+@@ -25,18 +25,21 @@ def test_is_rate_limited_script():
+     client = cluster.get_local_client(six.next(iter(cluster.hosts)))
+ 
+     # The item should not be rate limited by either key.
+-    assert list(map(bool, is_rate_limited(client, ('foo', 'bar'), (1, now + 60, 2, now + 120)))
++    assert list(map(bool, is_rate_limited(
++                client, ('foo', 'r:foo', 'bar', 'r:bar'), (1, now + 60, 2, now + 120)))
+                 ) == [False, False]
+ 
+     # The item should be rate limited by the first key (1).
+-    assert list(map(bool, is_rate_limited(client, ('foo', 'bar'), (1, now + 60, 2, now + 120)))
++    assert list(map(bool, is_rate_limited(
++                client, ('foo', 'r:foo', 'bar', 'r:bar'), (1, now + 60, 2, now + 120)))
+                 ) == [True, False]
+ 
+     # The item should still be rate limited by the first key (1), but *not*
+     # rate limited by the second key (2) even though this is the third time
+     # we've checked the quotas. This ensures items that are rejected by a lower
+     # quota don't affect unrelated items that share a parent quota.
+-    assert list(map(bool, is_rate_limited(client, ('foo', 'bar'), (1, now + 60, 2, now + 120)))
++    assert list(map(bool, is_rate_limited(
++                client, ('foo', 'r:foo', 'bar', 'r:bar'), (1, now + 60, 2, now + 120)))
+                 ) == [True, False]
+ 
+     assert client.get('foo') == '1'
+@@ -45,6 +48,25 @@ def test_is_rate_limited_script():
+     assert client.get('bar') == '1'
+     assert 119 <= client.ttl('bar') <= 120
+ 
++    # make sure "refund/negative" keys haven't been incremented
++    assert client.get('r:foo') is None
++    assert client.get('r:bar') is None
++
++    # Test that refunded quotas work
++    client.set('apple', 5)
++    # increment
++    is_rate_limited(
++        client, ('orange', 'baz'), (1, now + 60)
++    )
++    # test that it's rate limited without refund
++    assert list(map(bool, is_rate_limited(
++        client, ('orange', 'baz'), (1, now + 60)
++    ))) == [True, ]
++    # test that refund key is used
++    assert list(map(bool, is_rate_limited(
++        client, ('orange', 'apple'), (1, now + 60)
++    ))) == [False, ]
++
+ 
+ class RedisQuotaTest(TestCase):
+     quota = fixture(RedisQuota)
+@@ -163,3 +185,69 @@ class RedisQuotaTest(TestCase):
+             ],
+             timestamp=timestamp,
+         ) == [n for _ in quotas] + [None, 0]
++
++    @mock.patch.object(RedisQuota, 'get_quotas')
++    def test_refund(self, mock_get_quotas):
++        timestamp = time.time()
++
++        mock_get_quotas.return_value = (
++            BasicRedisQuota(
++                key='p:1',
++                limit=1,
++                window=1,
++                reason_code='project_quota',
++                enforce=False,
++            ), BasicRedisQuota(
++                key='p:2',
++                limit=1,
++                window=1,
++                reason_code='project_quota',
++                enforce=True,
++            ),
++        )
++
++        self.quota.refund(self.project, timestamp=timestamp)
++        client = self.quota.cluster.get_local_client_for_key(
++            six.text_type(self.project.organization.pk)
++        )
++
++        keys = client.keys('r:quota:p:?:*')
++
++        assert len(keys) == 2
++
++        for key in keys:
++            assert client.get(key) == '1'
++
++    def test_get_usage_uses_refund(self):
++        timestamp = time.time()
++
++        self.get_project_quota.return_value = (200, 60)
++        self.get_organization_quota.return_value = (300, 60)
++
++        n = 10
++        for _ in xrange(n):
++            self.quota.is_rate_limited(self.project, timestamp=timestamp)
++
++        self.quota.refund(self.project, timestamp=timestamp)
++
++        quotas = self.quota.get_quotas(self.project)
++
++        assert self.quota.get_usage(
++            self.project.organization_id,
++            quotas + [
++                BasicRedisQuota(
++                    key='unlimited',
++                    limit=0,
++                    window=60,
++                    reason_code='unlimited',
++                ),
++                BasicRedisQuota(
++                    key='dummy',
++                    limit=10,
++                    window=60,
++                    reason_code='dummy',
++                ),
++            ],
++            timestamp=timestamp,
++            # the - 1 is because we refunded once
++        ) == [n - 1 for _ in quotas] + [None, 0]
+diff --git a/tests/sentry/tasks/test_store.py b/tests/sentry/tasks/test_store.py
+index 13e9c0a8ae..c1a556acb6 100644
+--- a/tests/sentry/tasks/test_store.py
++++ b/tests/sentry/tasks/test_store.py
+@@ -4,7 +4,7 @@ import mock
+ import uuid
+ from time import time
+ 
+-from sentry import tsdb
++from sentry import quotas, tsdb
+ from sentry.event_manager import EventManager, HashDiscarded
+ from sentry.plugins import Plugin2
+ from sentry.tasks.store import preprocess_event, process_event, save_event
+@@ -108,7 +108,7 @@ class StoreTasksTest(PluginTestCase):
+         )
+ 
+         mock_save_event.delay.assert_called_once_with(
+-            cache_key='e:1', data=None, start_time=1, event_id=None
++            cache_key='e:1', data=None, start_time=1, event_id=None,
+         )
+ 
+     @mock.patch('sentry.tasks.store.save_event')
+@@ -133,7 +133,7 @@ class StoreTasksTest(PluginTestCase):
+         mock_default_cache.set.call_count == 0
+ 
+         mock_save_event.delay.assert_called_once_with(
+-            cache_key='e:1', data=None, start_time=1, event_id=None
++            cache_key='e:1', data=None, start_time=1, event_id=None,
+         )
+ 
+     @mock.patch('sentry.tasks.store.save_event')
+@@ -167,11 +167,12 @@ class StoreTasksTest(PluginTestCase):
+         )
+ 
+         mock_save_event.delay.assert_called_once_with(
+-            cache_key='e:1', data=None, start_time=1, event_id=None
++            cache_key='e:1', data=None, start_time=1, event_id=None,
+         )
+ 
+     @mock.patch.object(tsdb, 'incr')
+-    def test_hash_discarded_raised(self, mock_incr):
++    @mock.patch.object(quotas, 'refund')
++    def test_hash_discarded_raised(self, mock_refund, mock_incr):
+         project = self.create_project()
+ 
+         data = {

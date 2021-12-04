@@ -1,0 +1,273 @@
+commit 881882742b086bc13744e27914275c14cece03d4
+Author: Jess MacQueen <macqueen@users.noreply.github.com>
+Date:   Wed Aug 15 14:39:17 2018 -0700
+
+    fix(integrations): Delete external issue models when an org integration is removed (#9357)
+
+diff --git a/src/sentry/api/endpoints/organization_integration_details.py b/src/sentry/api/endpoints/organization_integration_details.py
+index 039b20bb80..575eee04a3 100644
+--- a/src/sentry/api/endpoints/organization_integration_details.py
++++ b/src/sentry/api/endpoints/organization_integration_details.py
+@@ -1,5 +1,7 @@
+ from __future__ import absolute_import
+ 
++from uuid import uuid4
++
+ from django.http import Http404
+ 
+ from sentry.api.bases.organization import (
+@@ -7,7 +9,8 @@ from sentry.api.bases.organization import (
+ )
+ from sentry.api.serializers import serialize
+ from sentry.integrations.exceptions import IntegrationError
+-from sentry.models import Integration, OrganizationIntegration, ProjectIntegration
++from sentry.models import Integration, ObjectStatus, OrganizationIntegration
++from sentry.tasks.deletion import delete_organization_integration
+ 
+ 
+ class OrganizationIntegrationDetailsEndpoint(OrganizationEndpoint):
+@@ -25,16 +28,30 @@ class OrganizationIntegrationDetailsEndpoint(OrganizationEndpoint):
+         return self.respond(serialize(integration, request.user))
+ 
+     def delete(self, request, organization, integration_id):
+-        # Removing the integration removes both the organization and project
+-        # integration.
+-        OrganizationIntegration.objects.filter(
+-            integration_id=integration_id,
+-            organization=organization,
+-        ).delete()
+-        ProjectIntegration.objects.filter(
+-            integration_id=integration_id,
+-            project__organization=organization,
+-        ).delete()
++        # Removing the integration removes the organization and project
++        # integrations and all linked issues.
++        try:
++            org_integration = OrganizationIntegration.objects.get(
++                integration_id=integration_id,
++                organization=organization,
++            )
++        except OrganizationIntegration.DoesNotExist:
++            raise Http404
++
++        updated = OrganizationIntegration.objects.filter(
++            id=org_integration.id,
++            status=ObjectStatus.VISIBLE,
++        ).update(status=ObjectStatus.PENDING_DELETION)
++
++        if updated:
++            delete_organization_integration.apply_async(
++                kwargs={
++                    'object_id': org_integration.id,
++                    'transaction_id': uuid4().hex,
++                    'actor_id': request.user.id,
++                },
++                countdown=0,
++            )
+ 
+         return self.respond(status=204)
+ 
+diff --git a/src/sentry/api/endpoints/organization_integrations.py b/src/sentry/api/endpoints/organization_integrations.py
+index 933baa5038..5aefe856b7 100644
+--- a/src/sentry/api/endpoints/organization_integrations.py
++++ b/src/sentry/api/endpoints/organization_integrations.py
+@@ -5,14 +5,17 @@ from sentry.api.bases.organization import (
+ )
+ from sentry.api.paginator import OffsetPaginator
+ from sentry.api.serializers import serialize
+-from sentry.models import OrganizationIntegration
++from sentry.models import ObjectStatus, OrganizationIntegration
+ 
+ 
+ class OrganizationIntegrationsEndpoint(OrganizationEndpoint):
+     permission_classes = (OrganizationIntegrationsPermission, )
+ 
+     def get(self, request, organization):
+-        integrations = OrganizationIntegration.objects.filter(organization=organization)
++        integrations = OrganizationIntegration.objects.filter(
++            organization=organization,
++            status=ObjectStatus.VISIBLE,
++        )
+ 
+         if 'provider_key' in request.GET:
+             integrations = integrations.filter(
+diff --git a/src/sentry/deletions/__init__.py b/src/sentry/deletions/__init__.py
+index 3a7e6a07b4..3422133236 100644
+--- a/src/sentry/deletions/__init__.py
++++ b/src/sentry/deletions/__init__.py
+@@ -63,6 +63,9 @@ def load_defaults():
+     default_manager.register(models.GroupSnooze, BulkModelDeletionTask)
+     default_manager.register(models.GroupSubscription, BulkModelDeletionTask)
+     default_manager.register(models.Organization, defaults.OrganizationDeletionTask)
++    default_manager.register(
++        models.OrganizationIntegration,
++        defaults.OrganizationIntegrationDeletionTask)
+     default_manager.register(models.OrganizationMemberTeam, BulkModelDeletionTask)
+     default_manager.register(models.Project, defaults.ProjectDeletionTask)
+     default_manager.register(models.ProjectBookmark, BulkModelDeletionTask)
+diff --git a/src/sentry/deletions/defaults/organizationintegration.py b/src/sentry/deletions/defaults/organizationintegration.py
+new file mode 100644
+index 0000000000..3fc9f0e270
+--- /dev/null
++++ b/src/sentry/deletions/defaults/organizationintegration.py
+@@ -0,0 +1,19 @@
++from __future__ import absolute_import, print_function
++
++from ..base import ModelDeletionTask, ModelRelation
++
++
++class OrganizationIntegrationDeletionTask(ModelDeletionTask):
++    def get_child_relations(self, instance):
++        from sentry.models import ExternalIssue, ProjectIntegration
++
++        return [
++            ModelRelation(ProjectIntegration, {
++                'integration_id': instance.integration_id,
++                'project__organization': instance.organization_id,
++            }),
++            ModelRelation(ExternalIssue, {
++                'integration_id': instance.integration_id,
++                'organization_id': instance.organization_id,
++            }),
++        ]
+diff --git a/src/sentry/tasks/deletion.py b/src/sentry/tasks/deletion.py
+index 2af2183f8c..6c6a0baa2b 100644
+--- a/src/sentry/tasks/deletion.py
++++ b/src/sentry/tasks/deletion.py
+@@ -389,3 +389,42 @@ def delete_repository(object_id, transaction_id=None, actor_id=None, **kwargs):
+             },
+             countdown=15,
+         )
++
++
++@instrumented_task(
++    name='sentry.tasks.deletion.delete_organization_integration',
++    queue='cleanup',
++    default_retry_delay=60 * 5,
++    max_retries=MAX_RETRIES
++)
++@retry(exclude=(DeleteAborted, ))
++def delete_organization_integration(object_id, transaction_id=None, actor_id=None, **kwargs):
++    from sentry import deletions
++    from sentry.models import OrganizationIntegration
++
++    try:
++        instance = OrganizationIntegration.objects.get(id=object_id)
++    except OrganizationIntegration.DoesNotExist:
++        return
++
++    if instance.status == ObjectStatus.VISIBLE:
++        raise DeleteAborted
++
++    task = deletions.get(
++        model=OrganizationIntegration,
++        actor_id=actor_id,
++        query={
++            'id': object_id,
++        },
++        transaction_id=transaction_id or uuid4().hex,
++    )
++    has_more = task.chunk()
++    if has_more:
++        delete_organization_integration.apply_async(
++            kwargs={
++                'object_id': object_id,
++                'transaction_id': transaction_id,
++                'actor_id': actor_id,
++            },
++            countdown=15,
++        )
+diff --git a/tests/sentry/api/endpoints/test_organization_integration_details.py b/tests/sentry/api/endpoints/test_organization_integration_details.py
+index ba65316700..467f6bcdad 100644
+--- a/tests/sentry/api/endpoints/test_organization_integration_details.py
++++ b/tests/sentry/api/endpoints/test_organization_integration_details.py
+@@ -18,7 +18,8 @@ class OrganizationIntegrationDetailsTest(APITestCase):
+         )
+         self.integration.add_organization(self.org.id, config={'setting': 'value'})
+ 
+-        self.path = '/api/0/organizations/{}/integrations/{}/'.format(self.org.slug, self.integration.id)
++        self.path = '/api/0/organizations/{}/integrations/{}/'.format(
++            self.org.slug, self.integration.id)
+ 
+     def test_simple(self):
+         response = self.client.get(self.path, format='json')
+@@ -36,19 +37,20 @@ class OrganizationIntegrationDetailsTest(APITestCase):
+         assert self.integration.add_project(project1.id)
+         assert self.integration.add_project(project2.id)
+ 
+-        response = self.client.delete(self.path, format='json')
++        with self.tasks():
++            response = self.client.delete(self.path, format='json')
+ 
+-        assert response.status_code == 204, response.content
+-        assert Integration.objects.filter(id=self.integration.id).exists()
++            assert response.status_code == 204, response.content
++            assert Integration.objects.filter(id=self.integration.id).exists()
+ 
+-        # Ensure both Organization *and* Project integrations are removed
+-        assert not OrganizationIntegration.objects.filter(
+-            integration=self.integration,
+-            organization=self.org,
+-        ).exists()
+-        assert not ProjectIntegration.objects.filter(
+-            project__organization=self.org
+-        ).exists()
++            # Ensure both Organization *and* Project integrations are removed
++            assert not OrganizationIntegration.objects.filter(
++                integration=self.integration,
++                organization=self.org,
++            ).exists()
++            assert not ProjectIntegration.objects.filter(
++                project__organization=self.org
++            ).exists()
+ 
+     def test_update_config(self):
+         config = {
+diff --git a/tests/sentry/deletions/test_organizationintegration.py b/tests/sentry/deletions/test_organizationintegration.py
+new file mode 100644
+index 0000000000..6bce154e38
+--- /dev/null
++++ b/tests/sentry/deletions/test_organizationintegration.py
+@@ -0,0 +1,42 @@
++from __future__ import absolute_import
++
++from sentry.models import (
++    ExternalIssue, Integration, OrganizationIntegration, ProjectIntegration, ScheduledDeletion
++)
++from sentry.tasks.deletion import run_deletion
++from sentry.testutils import TestCase
++
++
++class DeleteOrganizationIntegrationTest(TestCase):
++    def test_simple(self):
++        org = self.create_organization()
++        project = self.create_project(organization=org)
++        integration = Integration.objects.create(
++            provider='example',
++            name='Example',
++        )
++        integration.add_organization(org.id)
++        integration.add_project(project.id)
++        organization_integration = OrganizationIntegration.objects.get(
++            integration_id=integration.id,
++            organization_id=org.id,
++        )
++        project_integration = ProjectIntegration.objects.get(
++            integration_id=integration.id,
++            project__organization=org,
++        )
++        external_issue = ExternalIssue.objects.create(
++            organization_id=org.id,
++            integration_id=integration.id,
++            key='ABC-123',
++        )
++
++        deletion = ScheduledDeletion.schedule(organization_integration, days=0)
++        deletion.update(in_progress=True)
++
++        with self.tasks():
++            run_deletion(deletion.id)
++
++        assert not OrganizationIntegration.objects.filter(id=organization_integration.id).exists()
++        assert not ExternalIssue.objects.filter(id=external_issue.id).exists()
++        assert not ProjectIntegration.objects.filter(id=project_integration.id).exists()

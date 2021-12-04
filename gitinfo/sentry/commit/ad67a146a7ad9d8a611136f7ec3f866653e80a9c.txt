@@ -1,0 +1,454 @@
+commit ad67a146a7ad9d8a611136f7ec3f866653e80a9c
+Author: Jess MacQueen <macqueen@users.noreply.github.com>
+Date:   Wed Jun 27 16:39:45 2018 -0700
+
+    feat(integrations): Add support for syncing sentry status to integrations (#8863)
+
+diff --git a/src/sentry/api/endpoints/project_group_index.py b/src/sentry/api/endpoints/project_group_index.py
+index 17d2caf4a0..d9385e3443 100644
+--- a/src/sentry/api/endpoints/project_group_index.py
++++ b/src/sentry/api/endpoints/project_group_index.py
+@@ -32,6 +32,7 @@ from sentry.receivers import DEFAULT_SAVED_SEARCHES
+ from sentry.search.utils import InvalidQuery, parse_query
+ from sentry.signals import advanced_search, issue_resolved_in_release
+ from sentry.tasks.deletion import delete_group
++from sentry.tasks.integrations import kick_off_status_syncs
+ from sentry.tasks.merge import merge_group
+ from sentry.utils.apidocs import attach_scenarios, scenario
+ from sentry.utils.cursors import Cursor, CursorResult
+@@ -597,6 +598,11 @@ class ProjectGroupIndexEndpoint(ProjectEndpoint, EnvironmentMixin):
+                     sender=acting_user,
+                 )
+ 
++                kick_off_status_syncs.apply_async(kwargs={
++                    'project_id': group.project_id,
++                    'group_id': group.id,
++                })
++
+             result.update({
+                 'status': 'resolved',
+                 'statusDetails': status_details,
+@@ -714,6 +720,12 @@ class ProjectGroupIndexEndpoint(ProjectEndpoint, EnvironmentMixin):
+                             )
+                         activity.send_notification()
+ 
++                    if new_status == GroupStatus.UNRESOLVED:
++                        kick_off_status_syncs.apply_async(kwargs={
++                            'project_id': group.project_id,
++                            'group_id': group.id,
++                        })
++
+         if 'assignedTo' in result:
+             assigned_actor = result['assignedTo']
+             if assigned_actor:
+diff --git a/src/sentry/event_manager.py b/src/sentry/event_manager.py
+index 222df27476..4f5dbe81c3 100644
+--- a/src/sentry/event_manager.py
++++ b/src/sentry/event_manager.py
+@@ -32,10 +32,12 @@ from sentry.lang.native.utils import get_sdk_from_event
+ from sentry.models import (
+     Activity, Environment, Event, EventError, EventMapping, EventUser, Group,
+     GroupEnvironment, GroupHash, GroupRelease, GroupResolution, GroupStatus,
+-    Project, Release, ReleaseEnvironment, ReleaseProject, ReleaseProjectEnvironment, UserReport
++    Organization, Project, Release, ReleaseEnvironment, ReleaseProject,
++    ReleaseProjectEnvironment, UserReport
+ )
+ from sentry.plugins import plugins
+ from sentry.signals import event_discarded, event_saved, first_event_received
++from sentry.tasks.integrations import kick_off_status_syncs
+ from sentry.tasks.merge import merge_group
+ from sentry.utils import metrics
+ from sentry.utils.cache import default_cache
+@@ -1222,6 +1224,14 @@ class EventManager(object):
+                 }
+             )
+             activity.send_notification()
++            organization = Organization.objects.get_from_cache(
++                id=group.project.organization_id,
++            )
++            if features.has('organizations:internal-catchall', organization):
++                kick_off_status_syncs.apply_async(kwargs={
++                    'project_id': group.project_id,
++                    'group_id': group.id,
++                })
+ 
+         return is_regression
+ 
+diff --git a/src/sentry/integrations/example/integration.py b/src/sentry/integrations/example/integration.py
+index a7bfb5e3e6..ae1388edf7 100644
+--- a/src/sentry/integrations/example/integration.py
++++ b/src/sentry/integrations/example/integration.py
+@@ -65,6 +65,9 @@ class ExampleIntegration(Integration, IssueSyncMixin):
+     def sync_assignee_outbound(self, external_issue, user, assign=True, **kwargs):
+         pass
+ 
++    def sync_status_outbound(external_issue, is_resolved):
++        pass
++
+ 
+ class ExampleIntegrationProvider(IntegrationProvider):
+     """
+diff --git a/src/sentry/integrations/issues.py b/src/sentry/integrations/issues.py
+index 30e77a0023..756d73b6cc 100644
+--- a/src/sentry/integrations/issues.py
++++ b/src/sentry/integrations/issues.py
+@@ -118,3 +118,9 @@ class IssueSyncMixin(object):
+         If assign=True, we're assigning the issue. Otherwise, deassign.
+         """
+         raise NotImplementedError
++
++    def sync_status_outbound(self, external_issue, is_resolved, **kwargs):
++        """
++        Propagate a sentry issue's status to a linked issue's status.
++        """
++        raise NotImplementedError
+diff --git a/src/sentry/tasks/integrations.py b/src/sentry/tasks/integrations.py
+index 8c542b8611..b404c21b07 100644
+--- a/src/sentry/tasks/integrations.py
++++ b/src/sentry/tasks/integrations.py
+@@ -1,9 +1,8 @@
+ from __future__ import absolute_import
+ 
+-from sentry.tasks.base import instrumented_task, retry
+-
+-from sentry.models import ExternalIssue, Integration, User
++from sentry.models import ExternalIssue, Group, GroupLink, GroupStatus, Integration, User
+ from sentry.integrations.exceptions import IntegrationError
++from sentry.tasks.base import instrumented_task, retry
+ 
+ 
+ @instrumented_task(
+@@ -51,3 +50,51 @@ def sync_assignee_outbound(external_issue_id, user_id, assign, **kwargs):
+     else:
+         user = User.objects.get(id=user_id)
+     integration.get_installation().sync_assignee_outbound(external_issue, user, assign=assign)
++
++
++@instrumented_task(
++    name='sentry.tasks.integrations.sync_status_outbound',
++    queue='integrations',
++    default_retry_delay=60 * 5,
++    max_retries=5
++)
++@retry(exclude=(ExternalIssue.DoesNotExist, Integration.DoesNotExist))
++def sync_status_outbound(group_id, external_issue_id, **kwargs):
++    try:
++        group_status = Group.objects.filter(
++            id=group_id,
++            status__in=[GroupStatus.UNRESOLVED, GroupStatus.RESOLVED],
++        ).values_list('status', flat=True)[0]
++    except IndexError:
++        return
++
++    external_issue = ExternalIssue.objects.get(id=external_issue_id)
++    integration = Integration.objects.get(id=external_issue.integration_id)
++    integration.get_installation().sync_status_outbound(
++        external_issue, group_status == GroupStatus.RESOLVED,
++    )
++
++
++@instrumented_task(
++    name='sentry.tasks.integrations.kick_off_status_syncs',
++    queue='integrations',
++    default_retry_delay=60 * 5,
++    max_retries=5
++)
++@retry()
++def kick_off_status_syncs(project_id, group_id, **kwargs):
++    # doing this in a task since this has to go in the event manager
++    # and didn't want to introduce additional queries there
++    external_issue_ids = GroupLink.objects.filter(
++        project_id=project_id,
++        group_id=group_id,
++        linked_type=GroupLink.LinkedType.issue,
++    ).values_list('linked_id', flat=True)
++
++    for external_issue_id in external_issue_ids:
++        sync_status_outbound.apply_async(
++            kwargs={
++                'group_id': group_id,
++                'external_issue_id': external_issue_id,
++            }
++        )
+diff --git a/tests/sentry/api/endpoints/test_project_group_index.py b/tests/sentry/api/endpoints/test_project_group_index.py
+index 50f7ff5ed4..84dafac85f 100644
+--- a/tests/sentry/api/endpoints/test_project_group_index.py
++++ b/tests/sentry/api/endpoints/test_project_group_index.py
+@@ -12,8 +12,8 @@ from mock import patch
+ from sentry import tagstore
+ from sentry.models import (
+     Activity, ApiToken, EventMapping, Group, GroupAssignee, GroupBookmark, GroupHash, GroupHashTombstone,
+-    GroupResolution, GroupSeen, GroupSnooze, GroupStatus, GroupSubscription, GroupTombstone, Release,
+-    UserOption, GroupShare,
++    GroupLink, GroupResolution, GroupSeen, GroupShare, GroupSnooze, GroupStatus, GroupSubscription,
++    GroupTombstone, ExternalIssue, Integration, Release, UserOption
+ )
+ from sentry.models.event import Event
+ from sentry.testutils import APITestCase
+@@ -429,6 +429,130 @@ class GroupUpdateTest(APITestCase):
+ 
+         assert len(response.data) == 0
+ 
++    @patch('sentry.integrations.example.integration.ExampleIntegration.sync_status_outbound')
++    def test_resolve_with_integration(self, mock_sync_status_outbound):
++        self.login_as(user=self.user)
++
++        org = self.organization
++
++        integration = Integration.objects.create(
++            provider='example',
++            name='Example',
++        )
++        integration.add_organization(org.id)
++
++        group = self.create_group(status=GroupStatus.UNRESOLVED, organization=org)
++        external_issue = ExternalIssue.objects.get_or_create(
++            organization_id=org.id,
++            integration_id=integration.id,
++            key='APP-%s' % group.id,
++        )[0]
++
++        GroupLink.objects.get_or_create(
++            group_id=group.id,
++            project_id=group.project_id,
++            linked_type=GroupLink.LinkedType.issue,
++            linked_id=external_issue.id,
++            relationship=GroupLink.Relationship.references,
++        )[0]
++
++        response = self.client.get(
++            '{}?sort_by=date&query=is:unresolved'.format(self.path),
++            format='json',
++        )
++
++        assert len(response.data) == 1
++
++        with self.tasks():
++            with self.feature('organizations:internal-catchall'):
++                response = self.client.put(
++                    '{}?status=unresolved'.format(self.path),
++                    data={
++                        'status': 'resolved',
++                    },
++                    format='json',
++                )
++                assert response.status_code == 200, response.data
++
++                group = Group.objects.get(id=group.id)
++                assert group.status == GroupStatus.RESOLVED
++
++                assert response.data == {
++                    'status': 'resolved',
++                    'statusDetails': {},
++                }
++                mock_sync_status_outbound.assert_called_once_with(
++                    external_issue, True
++                )
++
++        response = self.client.get(
++            '{}?sort_by=date&query=is:unresolved'.format(self.path),
++            format='json',
++        )
++        assert len(response.data) == 0
++
++    @patch('sentry.integrations.example.integration.ExampleIntegration.sync_status_outbound')
++    def test_set_unresolved_with_integration(self, mock_sync_status_outbound):
++        release = self.create_release(project=self.project, version='abc')
++        group = self.create_group(checksum='a' * 32, status=GroupStatus.RESOLVED)
++        org = self.organization
++        integration = Integration.objects.create(
++            provider='example',
++            name='Example',
++        )
++        integration.add_organization(org.id)
++        GroupResolution.objects.create(
++            group=group,
++            release=release,
++        )
++        external_issue = ExternalIssue.objects.get_or_create(
++            organization_id=org.id,
++            integration_id=integration.id,
++            key='APP-%s' % group.id,
++        )[0]
++
++        GroupLink.objects.get_or_create(
++            group_id=group.id,
++            project_id=group.project_id,
++            linked_type=GroupLink.LinkedType.issue,
++            linked_id=external_issue.id,
++            relationship=GroupLink.Relationship.references,
++        )[0]
++
++        self.login_as(user=self.user)
++
++        url = '{url}?id={group.id}'.format(
++            url=self.path,
++            group=group,
++        )
++
++        with self.tasks():
++            with self.feature('organizations:internal-catchall'):
++                response = self.client.put(
++                    url, data={
++                        'status': 'unresolved',
++                    }, format='json'
++                )
++                assert response.status_code == 200
++                assert response.data == {
++                    'status': 'unresolved',
++                    'statusDetails': {},
++                }
++
++                group = Group.objects.get(id=group.id)
++                assert group.status == GroupStatus.UNRESOLVED
++
++                self.assertNoResolution(group)
++
++                assert GroupSubscription.objects.filter(
++                    user=self.user,
++                    group=group,
++                    is_active=True,
++                ).exists()
++                mock_sync_status_outbound.assert_called_once_with(
++                    external_issue, False
++                )
++
+     def test_self_assign_issue(self):
+         group = self.create_group(checksum='b' * 32, status=GroupStatus.UNRESOLVED)
+         user = self.user
+diff --git a/tests/sentry/test_event_manager.py b/tests/sentry/test_event_manager.py
+index 5227c854e4..b4b942f770 100644
+--- a/tests/sentry/test_event_manager.py
++++ b/tests/sentry/test_event_manager.py
+@@ -20,8 +20,9 @@ from sentry.event_manager import (
+     md5_from_hash, process_timestamp
+ )
+ from sentry.models import (
+-    Activity, Environment, Event, Group, GroupEnvironment, GroupHash, GroupRelease, GroupResolution,
+-    GroupStatus, GroupTombstone, EventMapping, Release, ReleaseProjectEnvironment, UserReport
++    Activity, Environment, Event, ExternalIssue, Group, GroupEnvironment, GroupHash, GroupLink,
++    GroupRelease, GroupResolution, GroupStatus, GroupTombstone, EventMapping, Integration, Release,
++    ReleaseProjectEnvironment, UserReport
+ )
+ from sentry.signals import event_discarded, event_saved
+ from sentry.testutils import assert_mock_called_once_with_partial, TestCase, TransactionTestCase
+@@ -453,6 +454,119 @@ class EventManagerTest(TransactionTestCase):
+ 
+         mock_send_activity_notifications_delay.assert_called_once_with(activity.id)
+ 
++    @mock.patch('sentry.integrations.example.integration.ExampleIntegration.sync_status_outbound')
++    @mock.patch('sentry.tasks.activity.send_activity_notifications.delay')
++    @mock.patch('sentry.event_manager.plugin_is_regression')
++    def test_marks_as_unresolved_with_new_release_with_integration(
++        self, plugin_is_regression, mock_send_activity_notifications_delay, mock_sync_status_outbound
++    ):
++        plugin_is_regression.return_value = True
++
++        old_release = Release.objects.create(
++            version='a',
++            organization_id=self.project.organization_id,
++            date_added=timezone.now() - timedelta(minutes=30),
++        )
++        old_release.add_project(self.project)
++
++        manager = EventManager(
++            self.make_event(
++                event_id='a' * 32,
++                checksum='a' * 32,
++                timestamp=time() - 50000,  # need to work around active_at
++                release=old_release.version,
++            )
++        )
++        event = manager.save(1)
++
++        group = event.group
++
++        org = group.organization
++
++        integration = Integration.objects.create(
++            provider='example',
++            name='Example',
++        )
++        integration.add_organization(org.id)
++        external_issue = ExternalIssue.objects.get_or_create(
++            organization_id=org.id,
++            integration_id=integration.id,
++            key='APP-%s' % group.id,
++        )[0]
++
++        GroupLink.objects.get_or_create(
++            group_id=group.id,
++            project_id=group.project_id,
++            linked_type=GroupLink.LinkedType.issue,
++            linked_id=external_issue.id,
++            relationship=GroupLink.Relationship.references,
++        )[0]
++
++        group.update(status=GroupStatus.RESOLVED)
++
++        resolution = GroupResolution.objects.create(
++            release=old_release,
++            group=group,
++        )
++        activity = Activity.objects.create(
++            group=group,
++            project=group.project,
++            type=Activity.SET_RESOLVED_IN_RELEASE,
++            ident=resolution.id,
++            data={'version': ''},
++        )
++
++        manager = EventManager(
++            self.make_event(
++                event_id='b' * 32,
++                checksum='a' * 32,
++                timestamp=time(),
++                release=old_release.version,
++            )
++        )
++
++        with self.tasks():
++            with self.feature('organizations:internal-catchall'):
++                event = manager.save(1)
++                assert event.group_id == group.id
++
++                group = Group.objects.get(id=group.id)
++                assert group.status == GroupStatus.RESOLVED
++
++                activity = Activity.objects.get(id=activity.id)
++                assert activity.data['version'] == ''
++
++                assert GroupResolution.objects.filter(group=group).exists()
++
++                manager = EventManager(
++                    self.make_event(
++                        event_id='c' * 32,
++                        checksum='a' * 32,
++                        timestamp=time(),
++                        release='b',
++                    )
++                )
++                event = manager.save(1)
++                mock_sync_status_outbound.assert_called_once_with(
++                    external_issue, False
++                )
++                assert event.group_id == group.id
++
++                group = Group.objects.get(id=group.id)
++                assert group.status == GroupStatus.UNRESOLVED
++
++                activity = Activity.objects.get(id=activity.id)
++                assert activity.data['version'] == 'b'
++
++                assert not GroupResolution.objects.filter(group=group).exists()
++
++                activity = Activity.objects.get(
++                    group=group,
++                    type=Activity.SET_REGRESSION,
++                )
++
++                mock_send_activity_notifications_delay.assert_called_once_with(activity.id)
++
+     @mock.patch('sentry.models.Group.is_resolved')
+     def test_unresolves_group_with_auto_resolve(self, mock_is_resolved):
+         mock_is_resolved.return_value = False

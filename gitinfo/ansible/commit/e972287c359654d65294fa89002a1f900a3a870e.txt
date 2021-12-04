@@ -1,0 +1,4832 @@
+commit e972287c359654d65294fa89002a1f900a3a870e
+Author: Jordan Borean <jborean93@gmail.com>
+Date:   Wed Oct 3 08:55:53 2018 +1000
+
+    win_exec: refactor PS exec runner (#45334)
+    
+    * win_exec: refactor PS exec runner
+    
+    * more changes for PSCore compatibility
+    
+    * made some changes based on the recent review
+    
+    * split up module exec scripts for smaller payload
+    
+    * removed C# module support to focus on just error msg improvement
+    
+    * cleaned up c# test classifier code
+
+diff --git a/MANIFEST.in b/MANIFEST.in
+index ffc7cf0a14..27a901b6db 100644
+--- a/MANIFEST.in
++++ b/MANIFEST.in
+@@ -6,6 +6,8 @@ include requirements.txt
+ include .coveragerc
+ include examples/hosts
+ include examples/ansible.cfg
++recursive-include lib/ansible/executor/powershell *
++recursive-include lib/ansible/module_utils/csharp *
+ recursive-include lib/ansible/module_utils/powershell *
+ recursive-include lib/ansible/modules *
+ recursive-include lib/ansible/galaxy/data *
+diff --git a/changelogs/fragments/windows-exec-changes.yaml b/changelogs/fragments/windows-exec-changes.yaml
+new file mode 100644
+index 0000000000..bc3966f448
+--- /dev/null
++++ b/changelogs/fragments/windows-exec-changes.yaml
+@@ -0,0 +1,2 @@
++minor_changes:
++- include better error handling for Windows errors to help with debugging module errors
+diff --git a/lib/ansible/executor/module_common.py b/lib/ansible/executor/module_common.py
+index ed0a231643..f384b639c8 100644
+--- a/lib/ansible/executor/module_common.py
++++ b/lib/ansible/executor/module_common.py
+@@ -28,17 +28,15 @@ import json
+ import os
+ import shlex
+ import zipfile
+-import random
+ import re
+-from distutils.version import LooseVersion
+ from io import BytesIO
+ 
+ from ansible.release import __version__, __author__
+ from ansible import constants as C
+ from ansible.errors import AnsibleError
++from ansible.executor.powershell import module_manifest as ps_manifest
+ from ansible.module_utils._text import to_bytes, to_text, to_native
+-from ansible.plugins.loader import module_utils_loader, ps_module_utils_loader
+-from ansible.plugins.shell.powershell import async_watchdog, async_wrapper, become_wrapper, leaf_exec, exec_wrapper
++from ansible.plugins.loader import module_utils_loader
+ # Must import strategy and use write_locks from there
+ # If we import write_locks directly then we end up binding a
+ # variable to the object and then it never gets updated.
+@@ -430,74 +428,6 @@ class ModuleDepFinder(ast.NodeVisitor):
+         self.generic_visit(node)
+ 
+ 
+-class PSModuleDepFinder():
+-
+-    def __init__(self):
+-        self.modules = dict()
+-        self.ps_version = None
+-        self.os_version = None
+-        self.become = False
+-
+-        self._re_module = re.compile(to_bytes(r'(?i)^#\s*requires\s+\-module(?:s?)\s*(Ansible\.ModuleUtils\..+)'))
+-        self._re_ps_version = re.compile(to_bytes(r'(?i)^#requires\s+\-version\s+([0-9]+(\.[0-9]+){0,3})$'))
+-        self._re_os_version = re.compile(to_bytes(r'(?i)^#ansiblerequires\s+\-osversion\s+([0-9]+(\.[0-9]+){0,3})$'))
+-        self._re_become = re.compile(to_bytes(r'(?i)^#ansiblerequires\s+\-become$'))
+-
+-    def scan_module(self, module_data):
+-        lines = module_data.split(b'\n')
+-        module_utils = set()
+-
+-        for line in lines:
+-            module_util_match = self._re_module.match(line)
+-            if module_util_match:
+-                # tolerate windows line endings by stripping any remaining newline chars
+-                module_util_name = to_text(module_util_match.group(1).rstrip())
+-                if module_util_name not in self.modules.keys():
+-                    module_utils.add(module_util_name)
+-
+-            ps_version_match = self._re_ps_version.match(line)
+-            if ps_version_match:
+-                self._parse_version_match(ps_version_match, "ps_version")
+-
+-            os_version_match = self._re_os_version.match(line)
+-            if os_version_match:
+-                self._parse_version_match(os_version_match, "os_version")
+-
+-            # once become is set, no need to keep on checking recursively
+-            if not self.become:
+-                become_match = self._re_become.match(line)
+-                if become_match:
+-                    self.become = True
+-
+-        # recursively drill into each Requires to see if there are any more
+-        # requirements
+-        for m in set(module_utils):
+-            m = to_text(m)
+-            mu_path = ps_module_utils_loader.find_plugin(m, ".psm1")
+-            if not mu_path:
+-                raise AnsibleError('Could not find imported module support code for \'%s\'.' % m)
+-
+-            module_util_data = to_bytes(_slurp(mu_path))
+-            self.modules[m] = module_util_data
+-            self.scan_module(module_util_data)
+-
+-    def _parse_version_match(self, match, attribute):
+-        new_version = to_text(match.group(1)).rstrip()
+-
+-        # PowerShell cannot cast a string of "1" to Version, it must have at
+-        # least the major.minor for it to be valid so we append 0
+-        if match.group(2) is None:
+-            new_version = "%s.0" % new_version
+-
+-        existing_version = getattr(self, attribute, None)
+-        if existing_version is None:
+-            setattr(self, attribute, new_version)
+-        else:
+-            # determine which is the latest version and set that
+-            if LooseVersion(new_version) > LooseVersion(existing_version):
+-                setattr(self, attribute, new_version)
+-
+-
+ def _slurp(path):
+     if not os.path.exists(path):
+         raise AnsibleError("imported module support code does not exist at %s" % os.path.abspath(path))
+@@ -688,69 +618,6 @@ def _is_binary(b_module_data):
+     return bool(start.translate(None, textchars))
+ 
+ 
+-def _create_powershell_wrapper(b_module_data, module_args, environment,
+-                               async_timeout, become, become_method,
+-                               become_user, become_password, become_flags,
+-                               scan_dependencies=True):
+-    # creates the manifest/wrapper used in PowerShell modules to enable things
+-    # like become and async - this is also called in action/script.py
+-    exec_manifest = dict(
+-        module_entry=to_text(base64.b64encode(b_module_data)),
+-        powershell_modules=dict(),
+-        module_args=module_args,
+-        actions=['exec'],
+-        environment=environment
+-    )
+-
+-    exec_manifest['exec'] = to_text(base64.b64encode(to_bytes(leaf_exec)))
+-
+-    if async_timeout > 0:
+-        exec_manifest["actions"].insert(0, 'async_watchdog')
+-        exec_manifest["async_watchdog"] = to_text(
+-            base64.b64encode(to_bytes(async_watchdog)))
+-        exec_manifest["actions"].insert(0, 'async_wrapper')
+-        exec_manifest["async_wrapper"] = to_text(
+-            base64.b64encode(to_bytes(async_wrapper)))
+-        exec_manifest["async_jid"] = str(random.randint(0, 999999999999))
+-        exec_manifest["async_timeout_sec"] = async_timeout
+-
+-    if become and become_method == 'runas':
+-        exec_manifest["actions"].insert(0, 'become')
+-        exec_manifest["become_user"] = become_user
+-        exec_manifest["become_password"] = become_password
+-        exec_manifest['become_flags'] = become_flags
+-        exec_manifest["become"] = to_text(
+-            base64.b64encode(to_bytes(become_wrapper)))
+-
+-    finder = PSModuleDepFinder()
+-
+-    # we don't want to scan for any module_utils or other module related flags
+-    # if scan_dependencies=False - action/script sets to False
+-    if scan_dependencies:
+-        finder.scan_module(b_module_data)
+-
+-    for name, data in finder.modules.items():
+-        b64_data = to_text(base64.b64encode(data))
+-        exec_manifest['powershell_modules'][name] = b64_data
+-
+-    exec_manifest['min_ps_version'] = finder.ps_version
+-    exec_manifest['min_os_version'] = finder.os_version
+-    if finder.become and 'become' not in exec_manifest['actions']:
+-        exec_manifest['actions'].insert(0, 'become')
+-        exec_manifest['become_user'] = 'SYSTEM'
+-        exec_manifest['become_password'] = None
+-        exec_manifest['become_flags'] = None
+-        exec_manifest['become'] = to_text(
+-            base64.b64encode(to_bytes(become_wrapper)))
+-
+-    # FUTURE: smuggle this back as a dict instead of serializing here;
+-    # the connection plugin may need to modify it
+-    b_json = to_bytes(json.dumps(exec_manifest))
+-    b_data = exec_wrapper.replace(b"$json_raw = ''",
+-                                  b"$json_raw = @'\r\n%s\r\n'@" % b_json)
+-    return b_data
+-
+-
+ def _find_module_utils(module_name, b_module_data, module_path, module_args, task_vars, templar, module_compression, async_timeout, become,
+                        become_method, become_user, become_password, become_flags, environment):
+     """
+@@ -932,10 +799,10 @@ def _find_module_utils(module_name, b_module_data, module_path, module_args, tas
+         shebang = u'#!powershell'
+         # create the common exec wrapper payload and set that as the module_data
+         # bytes
+-        b_module_data = _create_powershell_wrapper(
++        b_module_data = ps_manifest._create_powershell_wrapper(
+             b_module_data, module_args, environment, async_timeout, become,
+             become_method, become_user, become_password, become_flags,
+-            scan_dependencies=True
++            module_substyle
+         )
+ 
+     elif module_substyle == 'jsonargs':
+diff --git a/lib/ansible/executor/powershell/__init__.py b/lib/ansible/executor/powershell/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/lib/ansible/executor/powershell/async_watchdog.ps1 b/lib/ansible/executor/powershell/async_watchdog.ps1
+new file mode 100644
+index 0000000000..cd3de81b81
+--- /dev/null
++++ b/lib/ansible/executor/powershell/async_watchdog.ps1
+@@ -0,0 +1,110 @@
++# (c) 2018 Ansible Project
++# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
++
++param(
++    [Parameter(Mandatory=$true)][System.Collections.IDictionary]$Payload
++)
++
++# help with debugging errors as we don't have visibility of this running process
++trap {
++    $watchdog_path = "$($env:TEMP)\ansible-async-watchdog-error-$(Get-Date -Format "yyyy-MM-ddTHH-mm-ss.ffffZ").txt"
++    $error_msg = "Error while running the async exec wrapper`r`n$(Format-AnsibleException -ErrorRecord $_)"
++    Set-Content -Path $watchdog_path -Value $error_msg
++    break
++}
++
++$ErrorActionPreference = "Stop"
++
++Write-AnsibleLog "INFO - starting async_watchdog" "async_watchdog"
++
++# pop 0th action as entrypoint
++$payload.actions = $payload.actions[1..99]
++
++$actions = $Payload.actions
++$entrypoint = $payload.($actions[0])
++$entrypoint = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($entrypoint))
++
++$resultfile_path = $payload.async_results_path
++$max_exec_time_sec = $payload.async_timeout_sec
++
++Write-AnsibleLog "INFO - deserializing existing result file args at: '$resultfile_path'" "async_watchdog"
++if (-not (Test-Path -Path $resultfile_path)) {
++    $msg = "result file at '$resultfile_path' does not exist"
++    Write-AnsibleLog "ERROR - $msg" "async_watchdog"
++    throw $msg
++}
++$result_json = Get-Content -Path $resultfile_path -Raw
++Write-AnsibleLog "INFO - result file json is: $result_json" "async_watchdog"
++$result = ConvertFrom-AnsibleJson -InputObject $result_json
++
++Write-AnsibleLog "INFO - creating async runspace" "async_watchdog"
++$rs = [RunspaceFactory]::CreateRunspace()
++$rs.Open()
++
++Write-AnsibleLog "INFO - creating async PowerShell pipeline" "async_watchdog"
++$ps = [PowerShell]::Create()
++$ps.Runspace = $rs
++
++# these functions are set in exec_wrapper
++Write-AnsibleLog "INFO - adding global functions to PowerShell pipeline script" "async_watchdog"
++$ps.AddScript($script:common_functions).AddStatement() > $null
++$ps.AddScript($script:wrapper_functions).AddStatement() > $null
++$ps.AddCommand("Set-Variable").AddParameters(@{Name="common_functions"; Value=$script:common_functions; Scope="script"}).AddStatement() > $null
++
++Write-AnsibleLog "INFO - adding $($actions[0]) to PowerShell pipeline script" "async_watchdog"
++$ps.AddScript($entrypoint).AddArgument($payload) > $null
++
++Write-AnsibleLog "INFO - async job start, calling BeginInvoke()" "async_watchdog"
++$job_async_result = $ps.BeginInvoke()
++
++Write-AnsibleLog "INFO - waiting '$max_exec_time_sec' seconds for async job to complete" "async_watchdog"
++$job_async_result.AsyncWaitHandle.WaitOne($max_exec_time_sec * 1000) > $null
++$result.finished = 1
++
++if ($job_async_result.IsCompleted) {
++    Write-AnsibleLog "INFO - async job completed, calling EndInvoke()" "async_watchdog"
++
++    $job_output = $ps.EndInvoke($job_async_result)
++    $job_error = $ps.Streams.Error
++
++    Write-AnsibleLog "INFO - raw module stdout:`r`n$($job_output | Out-String)" "async_watchdog"
++    if ($job_error) {
++        Write-AnsibleLog "WARN - raw module stderr:`r`n$($job_error | Out-String)" "async_watchdog"
++    }
++
++    # write success/output/error to result object
++    # TODO: cleanse leading/trailing junk
++    try {
++        Write-AnsibleLog "INFO - deserializing Ansible stdout" "async_watchdog"
++        $module_result = ConvertFrom-AnsibleJson -InputObject $job_output
++        # TODO: check for conflicting keys
++        $result = $result + $module_result
++    } catch {
++        $result.failed = $true
++        $result.msg = "failed to parse module output: $($_.Exception.Message)"
++        # return output back to Ansible to help with debugging errors
++        $result.stdout = $job_output | Out-String
++        $result.stderr = $job_error | Out-String
++    }
++
++    $result_json = ConvertTo-Json -InputObject $result -Depth 99 -Compress
++    Set-Content -Path $resultfile_path -Value $result_json
++
++    Write-AnsibleLog "INFO - wrote output to $resultfile_path" "async_watchdog"
++} else {
++    Write-AnsibleLog "ERROR - reached timeout on async job, stopping job" "async_watchdog"
++    $ps.BeginStop($null, $null)  > $null # best effort stop
++
++    # write timeout to result object
++    $result.failed = $true
++    $result.msg = "timed out waiting for module completion"
++    $result_json = ConvertTo-Json -InputObject $result -Depth 99 -Compress
++    Set-Content -Path $resultfile_path -Value $result_json
++
++    Write-AnsibleLog "INFO - wrote timeout to '$resultfile_path'" "async_watchdog"
++}
++
++# in the case of a hung pipeline, this will cause the process to stay alive until it's un-hung...
++#$rs.Close() | Out-Null
++
++Write-AnsibleLog "INFO - ending async_watchdog" "async_watchdog"
+diff --git a/lib/ansible/executor/powershell/async_wrapper.ps1 b/lib/ansible/executor/powershell/async_wrapper.ps1
+new file mode 100644
+index 0000000000..f91216c15f
+--- /dev/null
++++ b/lib/ansible/executor/powershell/async_wrapper.ps1
+@@ -0,0 +1,163 @@
++# (c) 2018 Ansible Project
++# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
++
++param(
++    [Parameter(Mandatory=$true)][System.Collections.IDictionary]$Payload
++)
++
++$ErrorActionPreference = "Stop"
++
++Write-AnsibleLog "INFO - starting async_wrapper" "async_wrapper"
++
++if (-not $Payload.environment.ContainsKey("ANSIBLE_ASYNC_DIR")) {
++    Write-AnsibleError -Message "internal error: the environment variable ANSIBLE_ASYNC_DIR is not set and is required for an async task"
++    $host.SetShouldExit(1)
++    return
++}
++$async_dir = [System.Environment]::ExpandEnvironmentVariables($Payload.environment.ANSIBLE_ASYNC_DIR)
++
++# calculate the result path so we can include it in the worker payload
++$jid = $Payload.async_jid
++$local_jid = $jid + "." + $pid
++
++$results_path = [System.IO.Path]::Combine($async_dir, $local_jid)
++
++Write-AnsibleLog "INFO - creating async results path at '$results_path'" "async_wrapper"
++
++$Payload.async_results_path = $results_path
++[System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($results_path)) > $null
++
++# we use Win32_Process to escape the current process job, CreateProcess with a
++# breakaway flag won't work for psrp as the psrp process does not have breakaway
++# rights. Unfortunately we can't read/write to the spawned process as we can't
++# inherit the handles. We use a locked down named pipe to send the exec_wrapper
++# payload. Anonymous pipes won't work as the spawned process will not be a child
++# of the current one and will not be able to inherit the handles
++
++# pop the async_wrapper action so we don't get stuck in a loop and create new
++# exec_wrapper for our async process
++$Payload.actions = $Payload.actions[1..99]
++$payload_json = ConvertTo-Json -InputObject $Payload -Depth 99 -Compress
++
++$exec_wrapper = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($Payload.exec_wrapper))
++$exec_wrapper = $exec_wrapper.Replace("`$json_raw = ''", "`$json_raw = @'`r`n$payload_json`r`n'@")
++$payload_bytes = [System.Text.Encoding]::UTF8.GetBytes($exec_wrapper)
++$pipe_name = "ansible-async-$jid-$([guid]::NewGuid())"
++
++# template the async process command line with the payload details
++$bootstrap_wrapper = {
++    # help with debugging errors as we loose visibility of the process output
++    # from here on
++    trap {
++        $wrapper_path = "$($env:TEMP)\ansible-async-wrapper-error-$(Get-Date -Format "yyyy-MM-ddTHH-mm-ss.ffffZ").txt"
++        $error_msg = "Error while running the async exec wrapper`r`n$($_ | Out-String)`r`n$($_.ScriptStackTrace)"
++        Set-Content -Path $wrapper_path -Value $error_msg
++        break
++    }
++
++    &chcp.com 65001 > $null
++
++    # store the pipe name and no. of bytes to read, these are populated before
++    # before the process is created - do not remove or changed
++    $pipe_name = ""
++    $bytes_length = 0
++
++    $input_bytes = New-Object -TypeName byte[] -ArgumentList $bytes_length
++    $pipe = New-Object -TypeName System.IO.Pipes.NamedPipeClientStream -ArgumentList @(
++        ".",  # localhost
++        $pipe_name,
++        [System.IO.Pipes.PipeDirection]::In,
++        [System.IO.Pipes.PipeOptions]::None,
++        [System.Security.Principal.TokenImpersonationLevel]::Anonymous
++    )
++    try {
++        $pipe.Connect()
++        $pipe.Read($input_bytes, 0, $bytes_length) > $null
++    } finally {
++        $pipe.Close()
++    }
++    $exec = [System.Text.Encoding]::UTF8.GetString($input_bytes)
++    $exec = [ScriptBlock]::Create($exec)
++    &$exec
++}
++
++$bootstrap_wrapper = $bootstrap_wrapper.ToString().Replace('$pipe_name = ""', "`$pipe_name = `"$pipe_name`"")
++$bootstrap_wrapper = $bootstrap_wrapper.Replace('$bytes_length = 0', "`$bytes_length = $($payload_bytes.Count)")
++$encoded_command = [System.Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($bootstrap_wrapper))
++$exec_args = "powershell.exe -NonInteractive -NoProfile -ExecutionPolicy Bypass -EncodedCommand $encoded_command"
++
++# create a named pipe that is set to allow only the current user read access
++$current_user = ([Security.Principal.WindowsIdentity]::GetCurrent()).User
++$pipe_sec = New-Object -TypeName System.IO.Pipes.PipeSecurity
++$pipe_ar = New-Object -TypeName System.IO.Pipes.PipeAccessRule -ArgumentList @(
++    $current_user,
++    [System.IO.Pipes.PipeAccessRights]::Read,
++    [System.Security.AccessControl.AccessControlType]::Allow
++)
++$pipe_sec.AddAccessRule($pipe_ar)
++
++Write-AnsibleLog "INFO - creating named pipe '$pipe_name'" "async_wrapper"
++$pipe = New-Object -TypeName System.IO.Pipes.NamedPipeServerStream -ArgumentList @(
++    $pipe_name,
++    [System.IO.Pipes.PipeDirection]::Out,
++    1,
++    [System.IO.Pipes.PipeTransmissionMode]::Byte,
++    [System.IO.Pipes.PipeOptions]::Asynchronous,
++    0,
++    0,
++    $pipe_sec
++)
++
++try {
++    Write-AnsibleLog "INFO - creating async process '$exec_args'" "async_wrapper"
++    $process = Invoke-CimMethod -ClassName Win32_Process -Name Create -Arguments @{CommandLine=$exec_args}
++    $rc = $process.ReturnValue
++
++    Write-AnsibleLog "INFO - return value from async process exec: $rc" "async_wrapper"
++    if ($rc -ne 0) {
++        $error_msg = switch($rc) {
++            2 { "Access denied" }
++            3 { "Insufficient privilege" }
++            8 { "Unknown failure" }
++            9 { "Path not found" }
++            21 { "Invalid parameter" }
++            default { "Other" }
++        }
++        throw "Failed to start async process: $rc ($error_msg)"
++    }
++    $watchdog_pid = $process.ProcessId
++    Write-AnsibleLog "INFO - created async process PID: $watchdog_pid" "async_wrapper"
++
++    # populate initial results before we send the async data to avoid result race
++    $result = @{
++        started = 1;
++        finished = 0;
++        results_file = $results_path;
++        ansible_job_id = $local_jid;
++        _ansible_suppress_tmpdir_delete = $true;
++        ansible_async_watchdog_pid = $watchdog_pid
++    }
++
++    Write-AnsibleLog "INFO - writing initial async results to '$results_path'" "async_wrapper"
++    $result_json = ConvertTo-Json -InputObject $result -Depth 99 -Compress
++    Set-Content $results_path -Value $result_json
++
++    Write-AnsibleLog "INFO - waiting for async process to connect to named pipe for 5 seconds" "async_wrapper"
++    $wait_async = $pipe.BeginWaitForConnection($null, $null)
++    $wait_async.AsyncWaitHandle.WaitOne(5000) > $null
++    if (-not $wait_async.IsCompleted) {
++        throw "timeout while waiting for child process to connect to named pipe"
++    }
++    $pipe.EndWaitForConnection($wait_async)
++
++    Write-AnsibleLog "INFO - writing exec_wrapper and payload to async process" "async_wrapper"
++    $pipe.Write($payload_bytes, 0, $payload_bytes.Count)
++    $pipe.Flush()
++    $pipe.WaitForPipeDrain()
++} finally {
++    $pipe.Close()
++}
++
++Write-AnsibleLog "INFO - outputting initial async result: $result_json" "async_wrapper"
++Write-Output -InputObject $result_json
++Write-AnsibleLog "INFO - ending async_wrapper" "async_wrapper"
+diff --git a/lib/ansible/executor/powershell/become_wrapper.ps1 b/lib/ansible/executor/powershell/become_wrapper.ps1
+new file mode 100644
+index 0000000000..a27ea908a6
+--- /dev/null
++++ b/lib/ansible/executor/powershell/become_wrapper.ps1
+@@ -0,0 +1,142 @@
++# (c) 2018 Ansible Project
++# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
++
++param(
++    [Parameter(Mandatory=$true)][System.Collections.IDictionary]$Payload
++)
++
++#AnsibleRequires -CSharpUtil Ansible.Become
++
++$ErrorActionPreference = "Stop"
++
++Write-AnsibleLog "INFO - starting become_wrapper" "become_wrapper"
++
++Function Get-EnumValue($enum, $flag_type, $value, $prefix) {
++    $raw_enum_value = "$prefix$($value.ToUpper())"
++    try {
++        $enum_value = [Enum]::Parse($enum, $raw_enum_value)
++    } catch [System.ArgumentException] {
++        $valid_options = [Enum]::GetNames($enum) | ForEach-Object { $_.Substring($prefix.Length).ToLower() }
++        throw "become_flags $flag_type value '$value' is not valid, valid values are: $($valid_options -join ", ")"
++    }
++    return $enum_value
++}
++
++Function Get-BecomeFlags($flags) {
++    $logon_type = [Ansible.Become.LogonType]::LOGON32_LOGON_INTERACTIVE
++    $logon_flags = [Ansible.Become.LogonFlags]::LOGON_WITH_PROFILE
++
++    if ($flags -eq $null -or $flags -eq "") {
++        $flag_split = @()
++    } elseif ($flags -is [string]) {
++        $flag_split = $flags.Split(" ")
++    } else {
++        throw "become_flags must be a string, was $($flags.GetType())"
++    }
++
++    foreach ($flag in $flag_split) {
++        $split = $flag.Split("=")
++        if ($split.Count -ne 2) {
++            throw "become_flags entry '$flag' is in an invalid format, must be a key=value pair"
++        }
++        $flag_key = $split[0]
++        $flag_value = $split[1]
++        if ($flag_key -eq "logon_type") {
++            $enum_details = @{
++                enum = [Ansible.Become.LogonType]
++                flag_type = $flag_key
++                value = $flag_value
++                prefix = "LOGON32_LOGON_"
++            }
++            $logon_type = Get-EnumValue @enum_details
++        } elseif ($flag_key -eq "logon_flags") {
++            $logon_flag_values = $flag_value.Split(",")
++            $logon_flags = 0 -as [Ansible.Become.LogonFlags]
++            foreach ($logon_flag_value in $logon_flag_values) {
++                if ($logon_flag_value -eq "") {
++                    continue
++                }
++                $enum_details = @{
++                    enum = [Ansible.Become.LogonFlags]
++                    flag_type = $flag_key
++                    value = $logon_flag_value
++                    prefix = "LOGON_"
++                }
++                $logon_flag = Get-EnumValue @enum_details
++                $logon_flags = $logon_flags -bor $logon_flag
++            }
++        } else {
++            throw "become_flags key '$flag_key' is not a valid runas flag, must be 'logon_type' or 'logon_flags'"
++        }
++    }
++
++    return $logon_type, [Ansible.Become.LogonFlags]$logon_flags
++}
++
++Write-AnsibleLog "INFO - loading C# become code" "become_wrapper"
++$become_def = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($Payload.csharp_utils["Ansible.Become"]))
++
++# set the TMP env var to _ansible_remote_tmp to ensure the tmp binaries are
++# compiled to that location
++$new_tmp = [System.Environment]::ExpandEnvironmentVariables($Payload.module_args["_ansible_remote_tmp"])
++$old_tmp = $env:TMP
++$env:TMP = $new_tmp
++Add-Type -TypeDefinition $become_def -Debug:$false
++$env:TMP = $old_tmp
++
++$username = $Payload.become_user
++$password = $Payload.become_password
++try {
++    $logon_type, $logon_flags = Get-BecomeFlags -flags $Payload.become_flags
++} catch {
++    Write-AnsibleError -Message "internal error: failed to parse become_flags '$($Payload.become_flags)'" -ErrorRecord $_
++    $host.SetShouldExit(1)
++    return
++}
++Write-AnsibleLog "INFO - parsed become input, user: '$username', type: '$logon_type', flags: '$logon_flags'" "become_wrapper"
++
++# NB: CreateProcessWithTokenW commandline maxes out at 1024 chars, must
++# bootstrap via small wrapper which contains the exec_wrapper passed through the
++# stdin pipe. Cannot use 'powershell -' as the $ErrorActionPreference is always
++# set to Stop and cannot be changed
++$bootstrap_wrapper = {
++    &chcp.com 65001 > $null
++    $exec_wrapper_str = [System.Console]::In.ReadToEnd()
++    $exec_wrapper = [ScriptBlock]::Create($exec_wrapper_str)
++    &$exec_wrapper
++}
++$exec_command = [System.Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($bootstrap_wrapper.ToString()))
++$lp_command_line = New-Object System.Text.StringBuilder @("powershell.exe -NonInteractive -NoProfile -ExecutionPolicy Bypass -EncodedCommand $exec_command")
++$lp_current_directory = $env:SystemRoot  # TODO: should this be set to the become user's profile dir?
++
++# pop the become_wrapper action so we don't get stuck in a loop
++$Payload.actions = $Payload.actions[1..99]
++# we want the output from the exec_wrapper to be base64 encoded to preserve unicode chars
++$Payload.encoded_output = $true
++
++$payload_json = ConvertTo-Json -InputObject $Payload -Depth 99 -Compress
++$exec_wrapper = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($Payload.exec_wrapper))
++$exec_wrapper = $exec_wrapper.Replace("`$json_raw = ''", "`$json_raw = @'`r`n$payload_json`r`n'@")
++
++try {
++    Write-AnsibleLog "INFO - starting become process '$lp_command_line'" "become_wrapper"
++    $result = [Ansible.Become.BecomeUtil]::RunAsUser($username, $password, $lp_command_line,
++        $lp_current_directory, $exec_wrapper, $logon_flags, $logon_type)
++    Write-AnsibleLog "INFO - become process complete with rc: $($result.ExitCode)" "become_wrapper"
++    $stdout = $result.StandardOut
++    try {
++        $stdout = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($stdout))
++    } catch [FormatException] {
++        # output wasn't Base64, ignore as it may contain an error message we want to pass to Ansible
++        Write-AnsibleLog "WARN - become process stdout was not base64 encoded as expected: $stdout"
++    }
++
++    $host.UI.WriteLine($stdout)
++    $host.UI.WriteErrorLine($result.StandardError.Trim())
++    $host.SetShouldExit($result.ExitCode)
++} catch {
++    Write-AnsibleError -Message "internal error: failed to become user '$username'" -ErrorRecord $_
++    $host.SetShouldExit(1)
++}
++
++Write-AnsibleLog "INFO - ending become_wrapper" "become_wrapper"
+diff --git a/lib/ansible/executor/powershell/exec_wrapper.ps1 b/lib/ansible/executor/powershell/exec_wrapper.ps1
+new file mode 100644
+index 0000000000..d860264ef1
+--- /dev/null
++++ b/lib/ansible/executor/powershell/exec_wrapper.ps1
+@@ -0,0 +1,228 @@
++# (c) 2018 Ansible Project
++# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
++
++begin {
++    $DebugPreference = "Continue"
++    $ProgressPreference = "SilentlyContinue"
++    $ErrorActionPreference = "Stop"
++    Set-StrictMode -Version 2
++
++    # common functions that are loaded in exec and module context, this is set
++    # as a script scoped variable so async_watchdog and module_wrapper can
++    # access the functions when creating their Runspaces
++    $script:common_functions = {
++        Function ConvertFrom-AnsibleJson {
++            <#
++            .SYNOPSIS
++            Converts a JSON string to a Hashtable/Array in the fastest way
++            possible. Unfortunately ConvertFrom-Json is still faster but outputs
++            a PSCustomObject which is combersone for module consumption.
++
++            .PARAMETER InputObject
++            [String] The JSON string to deserialize.
++            #>
++            param(
++                [Parameter(Mandatory=$true, Position=0)][String]$InputObject
++            )
++
++            # we can use -AsHashtable to get PowerShell to convert the JSON to
++            # a Hashtable and not a PSCustomObject. This was added in PowerShell
++            # 6.0, fall back to a manual conversion for older versions
++            $cmdlet = Get-Command -Name ConvertFrom-Json -CommandType Cmdlet
++            if ("AsHashtable" -in $cmdlet.Parameters.Keys) {
++                return ,(ConvertFrom-Json -InputObject $InputObject -AsHashtable)
++            } else {
++                # get the PSCustomObject and then manually convert from there
++                $raw_obj = ConvertFrom-Json -InputObject $InputObject
++
++                Function ConvertTo-Hashtable {
++                    param($InputObject)
++
++                    if ($null -eq $InputObject) {
++                        return $null
++                    }
++
++                    if ($InputObject -is [PSCustomObject]) {
++                        $new_value = @{}
++                        foreach ($prop in $InputObject.PSObject.Properties.GetEnumerator()) {
++                            $new_value.($prop.Name) = (ConvertTo-Hashtable -InputObject $prop.Value)
++                        }
++                        return ,$new_value
++                    } elseif ($InputObject -is [Array]) {
++                        $new_value = [System.Collections.ArrayList]@()
++                        foreach ($val in $InputObject) {
++                            $new_value.Add((ConvertTo-Hashtable -InputObject $val)) > $null
++                        }
++                        return ,$new_value.ToArray()
++                    } else {
++                        return ,$InputObject
++                    }
++                }
++                return ,(ConvertTo-Hashtable -InputObject $raw_obj)
++            }
++        }
++
++        Function Format-AnsibleException {
++            <#
++            .SYNOPSIS
++            Formats a PowerShell ErrorRecord to a string that's fit for human
++            consumption.
++
++            .NOTES
++            Using Out-String can give us the first part of the exception but it
++            also wraps the messages at 80 chars which is not ideal. We also
++            append the ScriptStackTrace and the .NET StackTrace if present.
++            #>
++            param([System.Management.Automation.ErrorRecord]$ErrorRecord)
++
++            $exception = @"
++$($ErrorRecord.ToString())
++$($ErrorRecord.InvocationInfo.PositionMessage)
++    + CategoryInfo          : $($ErrorRecord.CategoryInfo.ToString())
++    + FullyQualifiedErrorId : $($ErrorRecord.FullyQualifiedErrorId.ToString())
++"@
++            # module_common strip comments and empty newlines, need to manually
++            # add a preceding newline using `r`n
++            $exception += "`r`n`r`nScriptStackTrace:`r`n$($ErrorRecord.ScriptStackTrace)`r`n"
++
++            # exceptions from C# will also have a StackTrace which we
++            # append if found
++            if ($null -ne $ErrorRecord.Exception.StackTrace) {
++                $exception += "`r`n$($ErrorRecord.Exception.ToString())"
++            }
++
++            return $exception
++        }
++    }
++    .$common_functions
++
++    # common wrapper functions used in the exec wrappers, this is defined in a
++    # script scoped variable so async_watchdog can pass them into the async job
++    $script:wrapper_functions = {
++        Function Write-AnsibleError {
++            <#
++            .SYNOPSIS
++            Writes an error message to a JSON string in the format that Ansible
++            understands. Also optionally adds an exception record if the
++            ErrorRecord is passed through.
++            #>
++            param(
++                [Parameter(Mandatory=$true)][String]$Message,
++                [System.Management.Automation.ErrorRecord]$ErrorRecord = $null
++            )
++            $result = @{
++                msg = $Message
++                failed = $true
++            }
++            if ($null -ne $ErrorRecord) {
++                $result.msg += ": $($ErrorRecord.Exception.Message)"
++                $result.exception = (Format-AnsibleException -ErrorRecord $ErrorRecord)
++            }
++            Write-Output -InputObject (ConvertTo-Json -InputObject $result -Depth 99 -Compress)
++        }
++
++        Function Write-AnsibleLog {
++            <#
++            .SYNOPSIS
++            Used as a debugging tool to log events to a file as they run in the
++            exec wrappers. By default this is a noop function but the $log_path
++            can be manually set to enable it. Manually set ANSIBLE_EXEC_DEBUG as
++            an env value on the Windows host that this is run on to enable.
++            #>
++            param(
++                [Parameter(Mandatory=$true, Position=0)][String]$Message,
++                [Parameter(Position=1)][String]$Wrapper
++            )
++
++            $log_path = $env:ANSIBLE_EXEC_DEBUG
++            if ($log_path) {
++                $log_path = [System.Environment]::ExpandEnvironmentVariables($log_path)
++                $parent_path = [System.IO.Path]::GetDirectoryName($log_path)
++                if (Test-Path -LiteralPath $parent_path -PathType Container) {
++                    $msg = "{0:u} - {1} - {2} - " -f (Get-Date), $pid, ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)
++                    if ($null -ne $Wrapper) {
++                        $msg += "$Wrapper - "
++                    }
++                    $msg += $Message + "`r`n"
++                    $msg_bytes = [System.Text.Encoding]::UTF8.GetBytes($msg)
++
++                    $fs = [System.IO.File]::Open($log_path, [System.IO.FileMode]::Append,
++                        [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
++                    try {
++                        $fs.Write($msg_bytes, 0, $msg_bytes.Length)
++                    } finally {
++                        $fs.Close()
++                    }
++                }
++            }
++        }
++    }
++    .$wrapper_functions
++
++    # NB: do not adjust the following line - it is replaced when doing
++    # non-streamed input
++    $json_raw = ''
++} process {
++    $json_raw += [String]$input
++} end {
++    Write-AnsibleLog "INFO - starting exec_wrapper" "exec_wrapper"
++    if (-not $json_raw) {
++        Write-AnsibleError -Message "internal error: no input given to PowerShell exec wrapper"
++        exit 1
++    }
++
++    Write-AnsibleLog "INFO - converting json raw to a payload" "exec_wrapper"
++    $payload = ConvertFrom-AnsibleJson -InputObject $json_raw
++
++    # TODO: handle binary modules
++    # TODO: handle persistence
++
++    if ($payload.min_os_version) {
++        $min_os_version = [Version]$payload.min_os_version
++        # Environment.OSVersion.Version is deprecated and may not return the
++        # right version
++        $actual_os_version = [Version](Get-Item -Path $env:SystemRoot\System32\kernel32.dll).VersionInfo.ProductVersion
++
++        Write-AnsibleLog "INFO - checking if actual os version '$actual_os_version' is less than the min os version '$min_os_version'" "exec_wrapper"
++        if ($actual_os_version -lt $min_os_version) {
++            Write-AnsibleError -Message "internal error: This module cannot run on this OS as it requires a minimum version of $min_os_version, actual was $actual_os_version"
++            exit 1
++        }
++    }
++    if ($payload.min_ps_version) {
++        $min_ps_version = [Version]$payload.min_ps_version
++        $actual_ps_version = $PSVersionTable.PSVersion
++
++        Write-AnsibleLog "INFO - checking if actual PS version '$actual_ps_version' is less than the min PS version '$min_ps_version'" "exec_wrapper"
++        if ($actual_ps_version -lt $min_ps_version) {
++            Write-AnsibleError -Message "internal error: This module cannot run as it requires a minimum PowerShell version of $min_ps_version, actual was $actual_ps_version"
++            exit 1
++        }
++    }
++
++    # pop 0th action as entrypoint
++    $action = $payload.actions[0]
++    Write-AnsibleLog "INFO - running action $action" "exec_wrapper"
++
++    $entrypoint = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($payload.($action)))
++    $entrypoint = [ScriptBlock]::Create($entrypoint)
++    # so we preserve the formatting and don't fall prey to locale issues, some
++    # wrappers want the output to be in base64 form, we store the value here in
++    # case the wrapper changes the value when they create a payload for their
++    # own exec_wrapper
++    $encoded_output = $payload.encoded_output
++
++    try {
++        $output = &$entrypoint -Payload $payload
++        if ($encoded_output -and $null -ne $output) {
++            $b64_output = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($output))
++            Write-Output -InputObject $b64_output
++        } else {
++            Write-Output -InputObject $output
++        }
++    } catch {
++        Write-AnsibleError -Message "internal error: failed to run exec_wrapper action $action" -ErrorRecord $_
++        exit 1
++    }
++    Write-AnsibleLog "INFO - ending exec_wrapper" "exec_wrapper"
++}
+diff --git a/lib/ansible/executor/powershell/module_manifest.py b/lib/ansible/executor/powershell/module_manifest.py
+new file mode 100644
+index 0000000000..9ad8261cf7
+--- /dev/null
++++ b/lib/ansible/executor/powershell/module_manifest.py
+@@ -0,0 +1,288 @@
++# (c) 2018 Ansible Project
++# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
++
++from __future__ import (absolute_import, division, print_function)
++__metaclass__ = type
++
++import base64
++import json
++import os
++import pkgutil
++import random
++import re
++
++from distutils.version import LooseVersion
++
++from ansible import constants as C
++from ansible.errors import AnsibleError
++from ansible.module_utils._text import to_bytes, to_text
++from ansible.plugins.loader import ps_module_utils_loader
++
++
++class PSModuleDepFinder(object):
++
++    def __init__(self):
++        self.ps_modules = dict()
++        self.exec_scripts = dict()
++
++        # by defining an explicit dict of cs utils and where they are used, we
++        # can potentially save time by not adding the type multiple times if it
++        # isn't needed
++        self.cs_utils_wrapper = dict()
++        self.cs_utils_module = dict()
++
++        self.ps_version = None
++        self.os_version = None
++        self.become = False
++
++        self._re_cs_module = re.compile(to_bytes(r'(?i)^using\s(Ansible\..+);$'))
++        self._re_cs_in_ps_module = re.compile(to_bytes(r'(?i)^#\s*ansiblerequires\s+-csharputil\s+(Ansible\..+)'))
++        self._re_module = re.compile(to_bytes(r'(?i)^#\s*requires\s+\-module(?:s?)\s*(Ansible\.ModuleUtils\..+)'))
++        self._re_wrapper = re.compile(to_bytes(r'(?i)^#\s*ansiblerequires\s+-wrapper\s+(\w*)'))
++        self._re_ps_version = re.compile(to_bytes(r'(?i)^#requires\s+\-version\s+([0-9]+(\.[0-9]+){0,3})$'))
++        self._re_os_version = re.compile(to_bytes(r'(?i)^#ansiblerequires\s+\-osversion\s+([0-9]+(\.[0-9]+){0,3})$'))
++        self._re_become = re.compile(to_bytes(r'(?i)^#ansiblerequires\s+\-become$'))
++
++    def scan_module(self, module_data, wrapper=False, powershell=True):
++        lines = module_data.split(b'\n')
++        module_utils = set()
++        if wrapper:
++            cs_utils = self.cs_utils_wrapper
++        else:
++            cs_utils = self.cs_utils_module
++
++        if powershell:
++            checks = [
++                # PS module contains '#Requires -Module Ansible.ModuleUtils.*'
++                (self._re_module, self.ps_modules, ".psm1"),
++                # PS module contains '#AnsibleRequires -CSharpUtil Ansible.*'
++                (self._re_cs_in_ps_module, cs_utils, ".cs"),
++            ]
++        else:
++            checks = [
++                # CS module contains 'using Ansible.*;'
++                (self._re_cs_module, cs_utils, ".cs"),
++            ]
++
++        for line in lines:
++            for check in checks:
++                match = check[0].match(line)
++                if match:
++                    # tolerate windows line endings by stripping any remaining
++                    # newline chars
++                    module_util_name = to_text(match.group(1).rstrip())
++                    if module_util_name not in check[1].keys():
++                        module_utils.add((module_util_name, check[2]))
++
++            if powershell:
++                ps_version_match = self._re_ps_version.match(line)
++                if ps_version_match:
++                    self._parse_version_match(ps_version_match, "ps_version")
++
++                os_version_match = self._re_os_version.match(line)
++                if os_version_match:
++                    self._parse_version_match(os_version_match, "os_version")
++
++                # once become is set, no need to keep on checking recursively
++                if not self.become:
++                    become_match = self._re_become.match(line)
++                    if become_match:
++                        self.become = True
++
++            if wrapper:
++                wrapper_match = self._re_wrapper.match(line)
++                if wrapper_match:
++                    self.scan_exec_script(wrapper_match.group(1).rstrip())
++
++        # recursively drill into each Requires to see if there are any more
++        # requirements
++        for m in set(module_utils):
++            self._add_module(m, wrapper=wrapper)
++
++    def scan_exec_script(self, name):
++        # scans lib/ansible/executor/powershell for scripts used in the module
++        # exec side. It also scans these scripts for any dependencies
++        name = to_text(name)
++        if name in self.exec_scripts.keys():
++            return
++
++        data = pkgutil.get_data("ansible.executor.powershell", name + ".ps1")
++        if data is None:
++            raise AnsibleError("Could not find executor powershell script "
++                               "for '%s'" % name)
++
++        b_data = to_bytes(data)
++
++        # remove comments to reduce the payload size in the exec wrappers
++        if C.DEFAULT_DEBUG:
++            exec_script = b_data
++        else:
++            exec_script = _strip_comments(b_data)
++        self.exec_scripts[name] = to_bytes(exec_script)
++        self.scan_module(b_data, wrapper=True, powershell=True)
++
++    def _add_module(self, name, wrapper=False):
++        m, ext = name
++        m = to_text(m)
++        mu_path = ps_module_utils_loader.find_plugin(m, ext)
++        if not mu_path:
++            raise AnsibleError('Could not find imported module support code '
++                               'for \'%s\'' % m)
++
++        module_util_data = to_bytes(_slurp(mu_path))
++        if ext == ".psm1":
++            self.ps_modules[m] = module_util_data
++        else:
++            if wrapper:
++                self.cs_utils_wrapper[m] = module_util_data
++            else:
++                self.cs_utils_module[m] = module_util_data
++        self.scan_module(module_util_data, wrapper=wrapper,
++                         powershell=(ext == ".psm1"))
++
++    def _parse_version_match(self, match, attribute):
++        new_version = to_text(match.group(1)).rstrip()
++
++        # PowerShell cannot cast a string of "1" to Version, it must have at
++        # least the major.minor for it to be valid so we append 0
++        if match.group(2) is None:
++            new_version = "%s.0" % new_version
++
++        existing_version = getattr(self, attribute, None)
++        if existing_version is None:
++            setattr(self, attribute, new_version)
++        else:
++            # determine which is the latest version and set that
++            if LooseVersion(new_version) > LooseVersion(existing_version):
++                setattr(self, attribute, new_version)
++
++
++def _slurp(path):
++    if not os.path.exists(path):
++        raise AnsibleError("imported module support code does not exist at %s"
++                           % os.path.abspath(path))
++    fd = open(path, 'rb')
++    data = fd.read()
++    fd.close()
++    return data
++
++
++def _strip_comments(source):
++    # Strip comments and blank lines from the wrapper
++    buf = []
++    start_block = False
++    for line in source.splitlines():
++        l = line.strip()
++
++        if start_block and l.endswith(b'#>'):
++            start_block = False
++            continue
++        elif start_block:
++            continue
++        elif l.startswith(b'<#'):
++            start_block = True
++            continue
++        elif not l or l.startswith(b'#'):
++            continue
++
++        buf.append(line)
++    return b'\n'.join(buf)
++
++
++def _create_powershell_wrapper(b_module_data, module_args, environment,
++                               async_timeout, become, become_method,
++                               become_user, become_password, become_flags,
++                               substyle):
++    # creates the manifest/wrapper used in PowerShell/C# modules to enable
++    # things like become and async - this is also called in action/script.py
++
++    # FUTURE: add process_wrapper.ps1 to run module_wrapper in a new process
++    # if running under a persistent connection and substyle is C# so we
++    # don't have type conflicts
++    finder = PSModuleDepFinder()
++    if substyle != 'script':
++        # don't scan the module for util dependencies and other Ansible related
++        # flags if the substyle is 'script' which is set by action/script
++        finder.scan_module(b_module_data, powershell=(substyle == "powershell"))
++
++    module_wrapper = "module_%s_wrapper" % substyle
++    exec_manifest = dict(
++        module_entry=to_text(base64.b64encode(b_module_data)),
++        powershell_modules=dict(),
++        csharp_utils=dict(),
++        csharp_utils_module=list(),  # csharp_utils only required by a module
++        module_args=module_args,
++        actions=[module_wrapper],
++        environment=environment,
++        encoded_output=False
++    )
++    finder.scan_exec_script(module_wrapper)
++
++    if async_timeout > 0:
++        finder.scan_exec_script('exec_wrapper')
++        finder.scan_exec_script('async_watchdog')
++        finder.scan_exec_script('async_wrapper')
++
++        exec_manifest["actions"].insert(0, 'async_watchdog')
++        exec_manifest["actions"].insert(0, 'async_wrapper')
++        exec_manifest["async_jid"] = str(random.randint(0, 999999999999))
++        exec_manifest["async_timeout_sec"] = async_timeout
++
++    if become and become_method == 'runas':
++        finder.scan_exec_script('exec_wrapper')
++        finder.scan_exec_script('become_wrapper')
++
++        exec_manifest["actions"].insert(0, 'become_wrapper')
++        exec_manifest["become_user"] = become_user
++        exec_manifest["become_password"] = become_password
++        exec_manifest['become_flags'] = become_flags
++
++    exec_manifest['min_ps_version'] = finder.ps_version
++    exec_manifest['min_os_version'] = finder.os_version
++    if finder.become and 'become_wrapper' not in exec_manifest['actions']:
++        finder.scan_exec_script('exec_wrapper')
++        finder.scan_exec_script('become_wrapper')
++
++        exec_manifest['actions'].insert(0, 'become_wrapper')
++        exec_manifest['become_user'] = 'SYSTEM'
++        exec_manifest['become_password'] = None
++        exec_manifest['become_flags'] = None
++
++    # make sure Ansible.ModuleUtils.AddType is added if any C# utils are used
++    if len(finder.cs_utils_wrapper) > 0 or len(finder.cs_utils_module) > 0:
++        finder._add_module((b"Ansible.ModuleUtils.AddType", ".psm1"),
++                           wrapper=False)
++
++    # exec_wrapper is only required to be part of the payload if using
++    # become or async, to save on payload space we check if exec_wrapper has
++    # already been added, and remove it manually if it hasn't later
++    exec_required = "exec_wrapper" in finder.exec_scripts.keys()
++    finder.scan_exec_script("exec_wrapper")
++    # must contain an empty newline so it runs the begin/process/end block
++    finder.exec_scripts["exec_wrapper"] += b"\n\n"
++
++    exec_wrapper = finder.exec_scripts["exec_wrapper"]
++    if not exec_required:
++        finder.exec_scripts.pop("exec_wrapper")
++
++    for name, data in finder.exec_scripts.items():
++        b64_data = to_text(base64.b64encode(data))
++        exec_manifest[name] = b64_data
++
++    for name, data in finder.ps_modules.items():
++        b64_data = to_text(base64.b64encode(data))
++        exec_manifest['powershell_modules'][name] = b64_data
++
++    cs_utils = finder.cs_utils_wrapper
++    cs_utils.update(finder.cs_utils_module)
++    for name, data in cs_utils.items():
++        b64_data = to_text(base64.b64encode(data))
++        exec_manifest['csharp_utils'][name] = b64_data
++    exec_manifest['csharp_utils_module'] = list(finder.cs_utils_module.keys())
++
++    # FUTURE: smuggle this back as a dict instead of serializing here;
++    # the connection plugin may need to modify it
++    b_json = to_bytes(json.dumps(exec_manifest))
++    b_data = exec_wrapper.replace(b"$json_raw = ''",
++                                  b"$json_raw = @'\r\n%s\r\n'@" % b_json)
++    return b_data
+diff --git a/lib/ansible/executor/powershell/module_powershell_wrapper.ps1 b/lib/ansible/executor/powershell/module_powershell_wrapper.ps1
+new file mode 100644
+index 0000000000..c092f5eb00
+--- /dev/null
++++ b/lib/ansible/executor/powershell/module_powershell_wrapper.ps1
+@@ -0,0 +1,57 @@
++# (c) 2018 Ansible Project
++# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
++
++param(
++    [Parameter(Mandatory=$true)][System.Collections.IDictionary]$Payload
++)
++
++#AnsibleRequires -Wrapper module_wrapper
++
++$ErrorActionPreference = "Stop"
++
++Write-AnsibleLog "INFO - starting module_powershell_wrapper" "module_powershell_wrapper"
++
++$module_name = $Payload.module_args["_ansible_module_name"]
++Write-AnsibleLog "INFO - building module payload for '$module_name'" "module_powershell_wrapper"
++
++# compile any C# module utils passed in from the controller, Add-CSharpType is
++# automatically added to the payload manifest if any csharp util is set
++$csharp_utils = [System.Collections.ArrayList]@()
++foreach ($csharp_util in $Payload.csharp_utils_module) {
++    Write-AnsibleLog "INFO - adding $csharp_util to list of C# references to compile" "module_powershell_wrapper"
++    $util_code = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($Payload.csharp_utils[$csharp_util]))
++    $csharp_utils.Add($util_code) > $null
++}
++if ($csharp_utils.Count -gt 0) {
++    $add_type_b64 = $Payload.powershell_modules["Ansible.ModuleUtils.AddType"]
++    $add_type = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($add_type_b64))
++    New-Module -Name Ansible.ModuleUtils.AddType -ScriptBlock ([ScriptBlock]::Create($add_type)) | Import-Module > $null
++
++    # add any C# references so the module does not have to do so
++    $new_tmp = [System.Environment]::ExpandEnvironmentVariables($Payload.module_args["_ansible_remote_tmp"])
++    Add-CSharpType -References $csharp_utils -TempPath $new_tmp -IncludeDebugInfo
++}
++
++# get the common module_wrapper code and invoke that to run the module
++$variables = [System.Collections.ArrayList]@(@{ Name = "complex_args"; Value = $Payload.module_args; Scope = "Global" })
++$module = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($Payload.module_entry))
++$entrypoint = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($payload.module_wrapper))
++$entrypoint = [ScriptBlock]::Create($entrypoint)
++
++try {
++    &$entrypoint -Scripts $script:common_functions, $module -Variables $variables `
++        -Environment $Payload.environment -Modules $Payload.powershell_modules `
++        -ModuleName $module_name
++} catch {
++    # failed to invoke the PowerShell module, capture the exception and
++    # output a pretty error for Ansible to parse
++    $result = @{
++        msg = "Failed to invoke PowerShell module: $($_.Exception.Message)"
++        failed = $true
++        exception = (Format-AnsibleException -ErrorRecord $_)
++    }
++    Write-Output -InputObject (ConvertTo-Json -InputObject $result -Depth 99 -Compress)
++    $host.SetShouldExit(1)
++}
++
++Write-AnsibleLog "INFO - ending module_powershell_wrapper" "module_powershell_wrapper"
+diff --git a/lib/ansible/executor/powershell/module_script_wrapper.ps1 b/lib/ansible/executor/powershell/module_script_wrapper.ps1
+new file mode 100644
+index 0000000000..7a2e4ba418
+--- /dev/null
++++ b/lib/ansible/executor/powershell/module_script_wrapper.ps1
+@@ -0,0 +1,22 @@
++# (c) 2018 Ansible Project
++# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
++
++param(
++    [Parameter(Mandatory=$true)][System.Collections.IDictionary]$Payload
++)
++
++#AnsibleRequires -Wrapper module_wrapper
++
++$ErrorActionPreference = "Stop"
++
++Write-AnsibleLog "INFO - starting module_script_wrapper" "module_script_wrapper"
++
++$script = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($Payload.module_entry))
++
++# get the common module_wrapper code and invoke that to run the module
++$entrypoint = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($payload.module_wrapper))
++$entrypoint = [ScriptBlock]::Create($entrypoint)
++
++&$entrypoint -Scripts $script -Environment $Payload.environment -ModuleName "script"
++
++Write-AnsibleLog "INFO - ending module_script_wrapper" "module_script_wrapper"
+diff --git a/lib/ansible/executor/powershell/module_wrapper.ps1 b/lib/ansible/executor/powershell/module_wrapper.ps1
+new file mode 100644
+index 0000000000..84f30d8b18
+--- /dev/null
++++ b/lib/ansible/executor/powershell/module_wrapper.ps1
+@@ -0,0 +1,165 @@
++# (c) 2018 Ansible Project
++# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
++
++<#
++.SYNOPSIS
++Invokes an Ansible module in a new Runspace. This cmdlet will output the
++module's output and write any errors to the error stream of the current
++host.
++
++.PARAMETER Scripts
++[Object[]] String or ScriptBlocks to execute.
++
++.PARAMETER Variables
++[System.Collections.ArrayList] The variables to set in the new Pipeline.
++Each value is a hashtable that contains the parameters to use with
++Set-Variable;
++    Name: the name of the variable to set
++    Value: the value of the variable to set
++    Scope: the scope of the variable
++
++.PARAMETER Environment
++[System.Collections.IDictionary] A Dictionary of environment key/values to
++set in the new Pipeline.
++
++.PARAMETER Modules
++[System.Collections.IDictionary] A Dictionary of PowerShell modules to
++import into the new Pipeline. The key is the name of the module and the
++value is a base64 string of the module util code.
++
++.PARAMETER ModuleName
++[String] The name of the module that is being executed.
++#>
++param(
++    [Object[]]$Scripts,
++    [System.Collections.ArrayList][AllowEmptyCollection()]$Variables,
++    [System.Collections.IDictionary]$Environment,
++    [System.Collections.IDictionary]$Modules,
++    [String]$ModuleName
++)
++
++Write-AnsibleLog "INFO - creating new PowerShell pipeline for $ModuleName" "module_wrapper"
++$ps = [PowerShell]::Create()
++
++# do not set ErrorActionPreference for script
++if ($ModuleName -ne "script") {
++    $ps.Runspace.SessionStateProxy.SetVariable("ErrorActionPreference", "Stop")
++}
++
++# force input encoding to preamble-free UTF8 so PS sub-processes (eg,
++# Start-Job) don't blow up. This is only required for WinRM, a PSRP
++# runspace doesn't have a host console and this will bomb out
++if ($host.Name -eq "ConsoleHost") {
++    Write-AnsibleLog "INFO - setting console input encoding to UTF8 for $ModuleName" "module_wrapper"
++    $ps.AddScript('[Console]::InputEncoding = New-Object Text.UTF8Encoding $false').AddStatement() > $null
++}
++
++# set the variables
++foreach ($variable in $Variables) {
++    Write-AnsibleLog "INFO - setting variable '$($variable.Name)' for $ModuleName" "module_wrapper"
++    $ps.AddCommand("Set-Variable").AddParameters($variable).AddStatement() > $null
++}
++
++# set the environment vars
++if ($Environment) {
++    foreach ($env_kv in $Environment.GetEnumerator()) {
++        Write-AnsibleLog "INFO - setting environment '$($env_kv.Key)' for $ModuleName" "module_wrapper"
++        $env_key = $env_kv.Key.Replace("'", "''")
++        $env_value = $env_kv.Value.ToString().Replace("'", "''")
++        $escaped_env_set = "[System.Environment]::SetEnvironmentVariable('$env_key', '$env_value')"
++        $ps.AddScript($escaped_env_set).AddStatement() > $null
++    }
++}
++
++# import the PS modules
++if ($Modules) {
++    foreach ($module in $Modules.GetEnumerator()) {
++        Write-AnsibleLog "INFO - create module util '$($module.Key)' for $ModuleName" "module_wrapper"
++        $module_name = $module.Key
++        $module_code = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($module.Value))
++        $ps.AddCommand("New-Module").AddParameters(@{Name=$module_name; ScriptBlock=[ScriptBlock]::Create($module_code)}) > $null
++        $ps.AddCommand("Import-Module").AddParameter("WarningAction", "SilentlyContinue") > $null
++        $ps.AddCommand("Out-Null").AddStatement() > $null
++    }
++}
++
++# redefine Write-Host to dump to output instead of failing
++# lots of scripts still use it
++$ps.AddScript('Function Write-Host($msg) { Write-Output -InputObject $msg }').AddStatement() > $null
++
++# add the scripts and run
++foreach ($script in $Scripts) {
++    $ps.AddScript($script).AddStatement() > $null
++}
++
++Write-AnsibleLog "INFO - start module exec with Invoke() - $ModuleName" "module_wrapper"
++try {
++    $module_output = $ps.Invoke()
++} catch {
++    # uncaught exception while executing module, present a prettier error for
++    # Ansible to parse
++    Write-AnsibleError -Message "Unhandled exception while executing module" `
++        -ErrorRecord $_.Exception.InnerException.ErrorRecord
++    $host.SetShouldExit(1)
++    return
++}
++
++# other types of errors may not throw an exception in Invoke but rather just
++# set the pipeline state to failed
++if ($ps.InvocationStateInfo.State -eq "Failed" -and $ModuleName -ne "script") {
++    Write-AnsibleError -Message "Unhandled exception while executing module" `
++        -ErrorRecord $ps.InvocationStateInfo.Reason.ErrorRecord
++    $host.SetShouldExit(1)
++    return
++}
++
++Write-AnsibleLog "INFO - module exec ended $ModuleName" "module_wrapper"
++$ansible_output = $ps.Runspace.SessionStateProxy.GetVariable("_ansible_output")
++
++# _ansible_output is a special var used by new modules to store the
++# output JSON. If set, we consider the ExitJson and FailJson methods
++# called and assume it contains the JSON we want and the pipeline
++# output won't contain anything of note
++# TODO: should we validate it or use a random variable name?
++# TODO: should we use this behaviour for all new modules and not just
++# ones running under psrp
++if ($null -ne $ansible_output) {
++    Write-AnsibleLog "INFO - using the _ansible_output variable for module output - $ModuleName" "module_wrapper"
++    Write-Output -InputObject $ansible_output.ToString()
++} elseif ($module_output.Count -gt 0) {
++    # do not output if empty collection
++    Write-AnsibleLog "INFO - using the output stream for module output - $ModuleName" "module_wrapper"
++    Write-Output -InputObject ($module_output -join "`r`n")
++}
++
++# we attempt to get the return code from the LASTEXITCODE variable
++# this is set explicitly in newer style variables when calling
++# ExitJson and FailJson. If set we set the current hosts' exit code
++# to that same value
++$rc = $ps.Runspace.SessionStateProxy.GetVariable("LASTEXITCODE")
++if ($null -ne $rc) {
++    Write-AnsibleLog "INFO - got an rc of $rc from $ModuleName exec" "module_wrapper"
++    $host.SetShouldExit($rc)
++}
++
++# PS3 doesn't properly set HadErrors in many cases, inspect the error stream as a fallback
++# with the trap handler that's now in place, this should only write to the output if
++# $ErrorActionPreference != "Stop", that's ok because this is sent to the stderr output
++# for a user to manually debug if something went horribly wrong
++if ($ps.HadErrors -or ($PSVersionTable.PSVersion.Major -lt 4 -and $ps.Streams.Error.Count -gt 0)) {
++    Write-AnsibleLog "WARN - module had errors, outputting error info $ModuleName" "module_wrapper"
++    # if the rc wasn't explicitly set, we return an exit code of 1
++    if ($null -eq $rc) {
++        $host.SetShouldExit(1)
++    }
++
++    # output each error to the error stream of the current pipeline
++    foreach ($err in $ps.Streams.Error) {
++        $error_msg = Format-AnsibleException -ErrorRecord $err
++
++        # need to use the current hosts's UI class as we may not have
++        # a console to write the stderr to, e.g. psrp
++        Write-AnsibleLog "WARN - error msg for for $($ModuleName):`r`n$error_msg" "module_wrapper"
++        $host.UI.WriteErrorLine($error_msg)
++    }
++}
+diff --git a/lib/ansible/module_utils/csharp/Ansible.Become.cs b/lib/ansible/module_utils/csharp/Ansible.Become.cs
+new file mode 100644
+index 0000000000..3a8a852768
+--- /dev/null
++++ b/lib/ansible/module_utils/csharp/Ansible.Become.cs
+@@ -0,0 +1,721 @@
++using Microsoft.Win32.SafeHandles;
++using System;
++using System.Collections.Generic;
++using System.Diagnostics;
++using System.IO;
++using System.Linq;
++using System.Runtime.InteropServices;
++using System.Security.AccessControl;
++using System.Security.Principal;
++using System.Text;
++using System.Threading;
++
++// TODO: make some classes/structs private/internal before the next release
++
++namespace Ansible.Become
++{
++    [StructLayout(LayoutKind.Sequential)]
++    public class SECURITY_ATTRIBUTES
++    {
++        public int nLength;
++        public IntPtr lpSecurityDescriptor;
++        public bool bInheritHandle = false;
++        public SECURITY_ATTRIBUTES()
++        {
++            nLength = Marshal.SizeOf(this);
++        }
++    }
++
++    [StructLayout(LayoutKind.Sequential)]
++    public class STARTUPINFO
++    {
++        public Int32 cb;
++        public IntPtr lpReserved;
++        public IntPtr lpDesktop;
++        public IntPtr lpTitle;
++        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 28)]
++        public byte[] _data1;
++        public Int32 dwFlags;
++        public Int16 wShowWindow;
++        public Int16 cbReserved2;
++        public IntPtr lpReserved2;
++        public SafeFileHandle hStdInput;
++        public SafeFileHandle hStdOutput;
++        public SafeFileHandle hStdError;
++        public STARTUPINFO()
++        {
++            cb = Marshal.SizeOf(this);
++        }
++    }
++
++    [StructLayout(LayoutKind.Sequential)]
++    public class STARTUPINFOEX
++    {
++        public STARTUPINFO startupInfo;
++        public IntPtr lpAttributeList;
++        public STARTUPINFOEX()
++        {
++            startupInfo = new STARTUPINFO();
++            startupInfo.cb = Marshal.SizeOf(this);
++        }
++    }
++
++    [StructLayout(LayoutKind.Sequential)]
++    public struct PROCESS_INFORMATION
++    {
++        public IntPtr hProcess;
++        public IntPtr hThread;
++        public int dwProcessId;
++        public int dwThreadId;
++    }
++
++    [StructLayout(LayoutKind.Sequential)]
++    public struct SID_AND_ATTRIBUTES
++    {
++        public IntPtr Sid;
++        public int Attributes;
++    }
++
++    public struct TOKEN_USER
++    {
++        public SID_AND_ATTRIBUTES User;
++    }
++
++    [Flags]
++    public enum StartupInfoFlags : uint
++    {
++        USESTDHANDLES = 0x00000100
++    }
++
++    [Flags]
++    public enum CreationFlags : uint
++    {
++        CREATE_BREAKAWAY_FROM_JOB = 0x01000000,
++        CREATE_DEFAULT_ERROR_MODE = 0x04000000,
++        CREATE_NEW_CONSOLE = 0x00000010,
++        CREATE_SUSPENDED = 0x00000004,
++        CREATE_UNICODE_ENVIRONMENT = 0x00000400,
++        EXTENDED_STARTUPINFO_PRESENT = 0x00080000
++    }
++
++    public enum HandleFlags : uint
++    {
++        None = 0,
++        INHERIT = 1
++    }
++
++    [Flags]
++    public enum LogonFlags
++    {
++        LOGON_WITH_PROFILE = 0x00000001,
++        LOGON_NETCREDENTIALS_ONLY = 0x00000002
++    }
++
++    public enum LogonType
++    {
++        LOGON32_LOGON_INTERACTIVE = 2,
++        LOGON32_LOGON_NETWORK = 3,
++        LOGON32_LOGON_BATCH = 4,
++        LOGON32_LOGON_SERVICE = 5,
++        LOGON32_LOGON_UNLOCK = 7,
++        LOGON32_LOGON_NETWORK_CLEARTEXT = 8,
++        LOGON32_LOGON_NEW_CREDENTIALS = 9
++    }
++
++    public enum LogonProvider
++    {
++        LOGON32_PROVIDER_DEFAULT = 0,
++    }
++
++    public enum TokenInformationClass
++    {
++        TokenUser = 1,
++        TokenType = 8,
++        TokenImpersonationLevel = 9,
++        TokenElevationType = 18,
++        TokenLinkedToken = 19,
++    }
++
++    public enum TokenElevationType
++    {
++        TokenElevationTypeDefault = 1,
++        TokenElevationTypeFull,
++        TokenElevationTypeLimited
++    }
++
++    [Flags]
++    public enum ProcessAccessFlags : uint
++    {
++        PROCESS_QUERY_INFORMATION = 0x00000400,
++    }
++
++    public enum SECURITY_IMPERSONATION_LEVEL
++    {
++        SecurityImpersonation,
++    }
++
++    public enum TOKEN_TYPE
++    {
++        TokenPrimary = 1,
++        TokenImpersonation
++    }
++
++    class NativeWaitHandle : WaitHandle
++    {
++        public NativeWaitHandle(IntPtr handle)
++        {
++            this.SafeWaitHandle = new SafeWaitHandle(handle, false);
++        }
++    }
++
++    public class Win32Exception : System.ComponentModel.Win32Exception
++    {
++        private string _msg;
++        public Win32Exception(string message) : this(Marshal.GetLastWin32Error(), message) { }
++        public Win32Exception(int errorCode, string message) : base(errorCode)
++        {
++            _msg = String.Format("{0} ({1}, Win32ErrorCode {2})", message, base.Message, errorCode);
++        }
++        public override string Message { get { return _msg; } }
++        public static explicit operator Win32Exception(string message) { return new Win32Exception(message); }
++    }
++
++    public class CommandResult
++    {
++        public string StandardOut { get; internal set; }
++        public string StandardError { get; internal set; }
++        public uint ExitCode { get; internal set; }
++    }
++
++    public class BecomeUtil
++    {
++        [DllImport("advapi32.dll", SetLastError = true)]
++        private static extern bool LogonUser(
++            string lpszUsername,
++            string lpszDomain,
++            string lpszPassword,
++            LogonType dwLogonType,
++            LogonProvider dwLogonProvider,
++            out IntPtr phToken);
++
++        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
++        private static extern bool CreateProcessWithTokenW(
++            IntPtr hToken,
++            LogonFlags dwLogonFlags,
++            [MarshalAs(UnmanagedType.LPTStr)]
++            string lpApplicationName,
++            StringBuilder lpCommandLine,
++            CreationFlags dwCreationFlags,
++            IntPtr lpEnvironment,
++            [MarshalAs(UnmanagedType.LPTStr)]
++            string lpCurrentDirectory,
++            STARTUPINFOEX lpStartupInfo,
++            out PROCESS_INFORMATION lpProcessInformation);
++
++        [DllImport("kernel32.dll")]
++        private static extern bool CreatePipe(
++            out SafeFileHandle hReadPipe,
++            out SafeFileHandle hWritePipe,
++            SECURITY_ATTRIBUTES lpPipeAttributes,
++            uint nSize);
++
++        [DllImport("kernel32.dll", SetLastError = true)]
++        private static extern bool SetHandleInformation(
++            SafeFileHandle hObject,
++            HandleFlags dwMask,
++            int dwFlags);
++
++        [DllImport("kernel32.dll", SetLastError = true)]
++        private static extern bool GetExitCodeProcess(
++            IntPtr hProcess,
++            out uint lpExitCode);
++
++        [DllImport("kernel32.dll", SetLastError = true)]
++        private static extern bool CloseHandle(
++            IntPtr hObject);
++
++        [DllImport("user32.dll", SetLastError = true)]
++        private static extern IntPtr GetProcessWindowStation();
++
++        [DllImport("user32.dll", SetLastError = true)]
++        private static extern IntPtr GetThreadDesktop(
++            int dwThreadId);
++
++        [DllImport("kernel32.dll", SetLastError = true)]
++        private static extern int GetCurrentThreadId();
++
++        [DllImport("advapi32.dll", SetLastError = true)]
++        private static extern bool GetTokenInformation(
++            IntPtr TokenHandle,
++            TokenInformationClass TokenInformationClass,
++            IntPtr TokenInformation,
++            uint TokenInformationLength,
++            out uint ReturnLength);
++
++        [DllImport("psapi.dll", SetLastError = true)]
++        private static extern bool EnumProcesses(
++            [MarshalAs(UnmanagedType.LPArray, ArraySubType = UnmanagedType.U4)]
++                [In][Out] IntPtr[] processIds,
++            uint cb,
++            [MarshalAs(UnmanagedType.U4)]
++                out uint pBytesReturned);
++
++        [DllImport("kernel32.dll", SetLastError = true)]
++        private static extern IntPtr OpenProcess(
++            ProcessAccessFlags processAccess,
++            bool bInheritHandle,
++            IntPtr processId);
++
++        [DllImport("advapi32.dll", SetLastError = true)]
++        private static extern bool OpenProcessToken(
++            IntPtr ProcessHandle,
++            TokenAccessLevels DesiredAccess,
++            out IntPtr TokenHandle);
++
++        [DllImport("advapi32.dll", SetLastError = true)]
++        private static extern bool ConvertSidToStringSidW(
++            IntPtr pSID,
++            [MarshalAs(UnmanagedType.LPTStr)]
++            out string StringSid);
++
++        [DllImport("advapi32", SetLastError = true)]
++        private static extern bool DuplicateTokenEx(
++            IntPtr hExistingToken,
++            TokenAccessLevels dwDesiredAccess,
++            IntPtr lpTokenAttributes,
++            SECURITY_IMPERSONATION_LEVEL ImpersonationLevel,
++            TOKEN_TYPE TokenType,
++            out IntPtr phNewToken);
++
++        [DllImport("advapi32.dll", SetLastError = true)]
++        private static extern bool ImpersonateLoggedOnUser(
++            IntPtr hToken);
++
++        [DllImport("advapi32.dll", SetLastError = true)]
++        private static extern bool RevertToSelf();
++
++        public static CommandResult RunAsUser(string username, string password, string lpCommandLine,
++            string lpCurrentDirectory, string stdinInput, LogonFlags logonFlags, LogonType logonType)
++        {
++            SecurityIdentifier account = null;
++            if (logonType != LogonType.LOGON32_LOGON_NEW_CREDENTIALS)
++            {
++                account = GetBecomeSid(username);
++            }
++
++            STARTUPINFOEX si = new STARTUPINFOEX();
++            si.startupInfo.dwFlags = (int)StartupInfoFlags.USESTDHANDLES;
++
++            SECURITY_ATTRIBUTES pipesec = new SECURITY_ATTRIBUTES();
++            pipesec.bInheritHandle = true;
++
++            // Create the stdout, stderr and stdin pipes used in the process and add to the startupInfo
++            SafeFileHandle stdout_read, stdout_write, stderr_read, stderr_write, stdin_read, stdin_write;
++            if (!CreatePipe(out stdout_read, out stdout_write, pipesec, 0))
++                throw new Win32Exception("STDOUT pipe setup failed");
++            if (!SetHandleInformation(stdout_read, HandleFlags.INHERIT, 0))
++                throw new Win32Exception("STDOUT pipe handle setup failed");
++
++            if (!CreatePipe(out stderr_read, out stderr_write, pipesec, 0))
++                throw new Win32Exception("STDERR pipe setup failed");
++            if (!SetHandleInformation(stderr_read, HandleFlags.INHERIT, 0))
++                throw new Win32Exception("STDERR pipe handle setup failed");
++
++            if (!CreatePipe(out stdin_read, out stdin_write, pipesec, 0))
++                throw new Win32Exception("STDIN pipe setup failed");
++            if (!SetHandleInformation(stdin_write, HandleFlags.INHERIT, 0))
++                throw new Win32Exception("STDIN pipe handle setup failed");
++
++            si.startupInfo.hStdOutput = stdout_write;
++            si.startupInfo.hStdError = stderr_write;
++            si.startupInfo.hStdInput = stdin_read;
++
++            // Setup the stdin buffer
++            UTF8Encoding utf8_encoding = new UTF8Encoding(false);
++            FileStream stdin_fs = new FileStream(stdin_write, FileAccess.Write, 32768);
++            StreamWriter stdin = new StreamWriter(stdin_fs, utf8_encoding, 32768);
++
++            // Create the environment block if set
++            IntPtr lpEnvironment = IntPtr.Zero;
++
++            CreationFlags startup_flags = CreationFlags.CREATE_UNICODE_ENVIRONMENT;
++
++            PROCESS_INFORMATION pi = new PROCESS_INFORMATION();
++
++            // Get the user tokens to try running processes with
++            List<IntPtr> tokens = GetUserTokens(account, username, password, logonType);
++
++            bool launch_success = false;
++            foreach (IntPtr token in tokens)
++            {
++                if (CreateProcessWithTokenW(
++                    token,
++                    logonFlags,
++                    null,
++                    new StringBuilder(lpCommandLine),
++                    startup_flags,
++                    lpEnvironment,
++                    lpCurrentDirectory,
++                    si,
++                    out pi))
++                {
++                    launch_success = true;
++                    break;
++                }
++            }
++
++            if (!launch_success)
++                throw new Win32Exception("Failed to start become process");
++
++            CommandResult result = new CommandResult();
++            // Setup the output buffers and get stdout/stderr
++            FileStream stdout_fs = new FileStream(stdout_read, FileAccess.Read, 4096);
++            StreamReader stdout = new StreamReader(stdout_fs, utf8_encoding, true, 4096);
++            stdout_write.Close();
++
++            FileStream stderr_fs = new FileStream(stderr_read, FileAccess.Read, 4096);
++            StreamReader stderr = new StreamReader(stderr_fs, utf8_encoding, true, 4096);
++            stderr_write.Close();
++
++            stdin.WriteLine(stdinInput);
++            stdin.Close();
++
++            string stdout_str, stderr_str = null;
++            GetProcessOutput(stdout, stderr, out stdout_str, out stderr_str);
++            UInt32 rc = GetProcessExitCode(pi.hProcess);
++
++            result.StandardOut = stdout_str;
++            result.StandardError = stderr_str;
++            result.ExitCode = rc;
++
++            return result;
++        }
++
++        private static SecurityIdentifier GetBecomeSid(string username)
++        {
++            NTAccount account = new NTAccount(username);
++            try
++            {
++                SecurityIdentifier security_identifier = (SecurityIdentifier)account.Translate(typeof(SecurityIdentifier));
++                return security_identifier;
++            }
++            catch (IdentityNotMappedException ex)
++            {
++                throw new Exception(String.Format("Unable to find become user {0}: {1}", username, ex.Message));
++            }
++        }
++
++        private static List<IntPtr> GetUserTokens(SecurityIdentifier account, string username, string password, LogonType logonType)
++        {
++            List<IntPtr> tokens = new List<IntPtr>();
++            List<String> service_sids = new List<String>()
++            {
++                "S-1-5-18", // NT AUTHORITY\SYSTEM
++                "S-1-5-19", // NT AUTHORITY\LocalService
++                "S-1-5-20"  // NT AUTHORITY\NetworkService
++            };
++
++            IntPtr hSystemToken = IntPtr.Zero;
++            string account_sid = "";
++            if (logonType != LogonType.LOGON32_LOGON_NEW_CREDENTIALS)
++            {
++                GrantAccessToWindowStationAndDesktop(account);
++                // Try to get SYSTEM token handle so we can impersonate to get full admin token
++                hSystemToken = GetSystemUserHandle();
++                account_sid = account.ToString();
++            }
++            bool impersonated = false;
++
++            try
++            {
++                IntPtr hSystemTokenDup = IntPtr.Zero;
++                if (hSystemToken == IntPtr.Zero && service_sids.Contains(account_sid))
++                {
++                    // We need the SYSTEM token if we want to become one of those accounts, fail here
++                    throw new Win32Exception("Failed to get token for NT AUTHORITY\\SYSTEM");
++                }
++                else if (hSystemToken != IntPtr.Zero)
++                {
++                    // We have the token, need to duplicate and impersonate
++                    bool dupResult = DuplicateTokenEx(
++                        hSystemToken,
++                        TokenAccessLevels.MaximumAllowed,
++                        IntPtr.Zero,
++                        SECURITY_IMPERSONATION_LEVEL.SecurityImpersonation,
++                        TOKEN_TYPE.TokenPrimary,
++                        out hSystemTokenDup);
++                    int lastError = Marshal.GetLastWin32Error();
++                    CloseHandle(hSystemToken);
++
++                    if (!dupResult && service_sids.Contains(account_sid))
++                        throw new Win32Exception(lastError, "Failed to duplicate token for NT AUTHORITY\\SYSTEM");
++                    else if (dupResult && account_sid != "S-1-5-18")
++                    {
++                        if (ImpersonateLoggedOnUser(hSystemTokenDup))
++                            impersonated = true;
++                        else if (service_sids.Contains(account_sid))
++                            throw new Win32Exception("Failed to impersonate as SYSTEM account");
++                    }
++                    // If SYSTEM impersonation failed but we're trying to become a regular user, just proceed;
++                    // might get a limited token in UAC-enabled cases, but better than nothing...
++                }
++
++                string domain = null;
++
++                if (service_sids.Contains(account_sid))
++                {
++                    // We're using a well-known service account, do a service logon instead of the actual flag set
++                    logonType = LogonType.LOGON32_LOGON_SERVICE;
++                    domain = "NT AUTHORITY";
++                    password = null;
++                    switch (account_sid)
++                    {
++                        case "S-1-5-18":
++                            tokens.Add(hSystemTokenDup);
++                            return tokens;
++                        case "S-1-5-19":
++                            username = "LocalService";
++                            break;
++                        case "S-1-5-20":
++                            username = "NetworkService";
++                            break;
++                    }
++                }
++                else
++                {
++                    // We are trying to become a local or domain account
++                    if (username.Contains(@"\"))
++                    {
++                        var user_split = username.Split(Convert.ToChar(@"\"));
++                        domain = user_split[0];
++                        username = user_split[1];
++                    }
++                    else if (username.Contains("@"))
++                        domain = null;
++                    else
++                        domain = ".";
++                }
++
++                IntPtr hToken = IntPtr.Zero;
++                if (!LogonUser(
++                    username,
++                    domain,
++                    password,
++                    logonType,
++                    LogonProvider.LOGON32_PROVIDER_DEFAULT,
++                    out hToken))
++                {
++                    throw new Win32Exception("LogonUser failed");
++                }
++
++                if (!service_sids.Contains(account_sid))
++                {
++                    // Try and get the elevated token for local/domain account
++                    IntPtr hTokenElevated = GetElevatedToken(hToken);
++                    tokens.Add(hTokenElevated);
++                }
++
++                // add the original token as a fallback
++                tokens.Add(hToken);
++            }
++            finally
++            {
++                if (impersonated)
++                    RevertToSelf();
++            }
++
++            return tokens;
++        }
++
++        private static IntPtr GetSystemUserHandle()
++        {
++            uint array_byte_size = 1024 * sizeof(uint);
++            IntPtr[] pids = new IntPtr[1024];
++            uint bytes_copied;
++
++            if (!EnumProcesses(pids, array_byte_size, out bytes_copied))
++            {
++                throw new Win32Exception("Failed to enumerate processes");
++            }
++            // TODO: Handle if bytes_copied is larger than the array size and rerun EnumProcesses with larger array
++            uint num_processes = bytes_copied / sizeof(uint);
++
++            for (uint i = 0; i < num_processes; i++)
++            {
++                IntPtr hProcess = OpenProcess(ProcessAccessFlags.PROCESS_QUERY_INFORMATION, false, pids[i]);
++                if (hProcess != IntPtr.Zero)
++                {
++                    IntPtr hToken = IntPtr.Zero;
++                    // According to CreateProcessWithTokenW we require a token with
++                    //  TOKEN_QUERY, TOKEN_DUPLICATE and TOKEN_ASSIGN_PRIMARY
++                    // Also add in TOKEN_IMPERSONATE so we can get an impersontated token
++                    TokenAccessLevels desired_access = TokenAccessLevels.Query |
++                        TokenAccessLevels.Duplicate |
++                        TokenAccessLevels.AssignPrimary |
++                        TokenAccessLevels.Impersonate;
++
++                    if (OpenProcessToken(hProcess, desired_access, out hToken))
++                    {
++                        string sid = GetTokenUserSID(hToken);
++                        if (sid == "S-1-5-18")
++                        {
++                            CloseHandle(hProcess);
++                            return hToken;
++                        }
++                    }
++
++                    CloseHandle(hToken);
++                }
++                CloseHandle(hProcess);
++            }
++
++            return IntPtr.Zero;
++        }
++
++        private static string GetTokenUserSID(IntPtr hToken)
++        {
++            uint token_length;
++            string sid;
++
++            if (!GetTokenInformation(hToken, TokenInformationClass.TokenUser, IntPtr.Zero, 0, out token_length))
++            {
++                int last_err = Marshal.GetLastWin32Error();
++                if (last_err != 122) // ERROR_INSUFFICIENT_BUFFER
++                    throw new Win32Exception(last_err, "Failed to get TokenUser length");
++            }
++
++            IntPtr token_information = Marshal.AllocHGlobal((int)token_length);
++            try
++            {
++                if (!GetTokenInformation(hToken, TokenInformationClass.TokenUser, token_information, token_length, out token_length))
++                    throw new Win32Exception("Failed to get TokenUser information");
++
++                TOKEN_USER token_user = (TOKEN_USER)Marshal.PtrToStructure(token_information, typeof(TOKEN_USER));
++
++                if (!ConvertSidToStringSidW(token_user.User.Sid, out sid))
++                    throw new Win32Exception("Failed to get user SID");
++            }
++            finally
++            {
++                Marshal.FreeHGlobal(token_information);
++            }
++
++            return sid;
++        }
++
++        private static void GetProcessOutput(StreamReader stdoutStream, StreamReader stderrStream, out string stdout, out string stderr)
++        {
++            var sowait = new EventWaitHandle(false, EventResetMode.ManualReset);
++            var sewait = new EventWaitHandle(false, EventResetMode.ManualReset);
++            string so = null, se = null;
++            ThreadPool.QueueUserWorkItem((s) =>
++            {
++                so = stdoutStream.ReadToEnd();
++                sowait.Set();
++            });
++            ThreadPool.QueueUserWorkItem((s) =>
++            {
++                se = stderrStream.ReadToEnd();
++                sewait.Set();
++            });
++            foreach (var wh in new WaitHandle[] { sowait, sewait })
++                wh.WaitOne();
++            stdout = so;
++            stderr = se;
++        }
++
++        private static uint GetProcessExitCode(IntPtr processHandle)
++        {
++            new NativeWaitHandle(processHandle).WaitOne();
++            uint exitCode;
++            if (!GetExitCodeProcess(processHandle, out exitCode))
++                throw new Win32Exception("Error getting process exit code");
++            return exitCode;
++        }
++
++        private static IntPtr GetElevatedToken(IntPtr hToken)
++        {
++            uint requestedLength;
++
++            IntPtr pTokenInfo = Marshal.AllocHGlobal(sizeof(int));
++
++            try
++            {
++                if (!GetTokenInformation(hToken, TokenInformationClass.TokenElevationType, pTokenInfo, sizeof(int), out requestedLength))
++                    throw new Win32Exception("Unable to get TokenElevationType");
++
++                var tet = (TokenElevationType)Marshal.ReadInt32(pTokenInfo);
++
++                // we already have the best token we can get, just use it
++                if (tet != TokenElevationType.TokenElevationTypeLimited)
++                    return hToken;
++
++                GetTokenInformation(hToken, TokenInformationClass.TokenLinkedToken, IntPtr.Zero, 0, out requestedLength);
++
++                IntPtr pLinkedToken = Marshal.AllocHGlobal((int)requestedLength);
++
++                if (!GetTokenInformation(hToken, TokenInformationClass.TokenLinkedToken, pLinkedToken, requestedLength, out requestedLength))
++                    throw new Win32Exception("Unable to get linked token");
++
++                IntPtr linkedToken = Marshal.ReadIntPtr(pLinkedToken);
++
++                Marshal.FreeHGlobal(pLinkedToken);
++
++                return linkedToken;
++            }
++            finally
++            {
++                Marshal.FreeHGlobal(pTokenInfo);
++            }
++        }
++
++        private static void GrantAccessToWindowStationAndDesktop(SecurityIdentifier account)
++        {
++            const int WindowStationAllAccess = 0x000f037f;
++            GrantAccess(account, GetProcessWindowStation(), WindowStationAllAccess);
++            const int DesktopRightsAllAccess = 0x000f01ff;
++            GrantAccess(account, GetThreadDesktop(GetCurrentThreadId()), DesktopRightsAllAccess);
++        }
++
++        private static void GrantAccess(SecurityIdentifier account, IntPtr handle, int accessMask)
++        {
++            SafeHandle safeHandle = new NoopSafeHandle(handle);
++            GenericSecurity security =
++                new GenericSecurity(false, ResourceType.WindowObject, safeHandle, AccessControlSections.Access);
++            security.AddAccessRule(
++                new GenericAccessRule(account, accessMask, AccessControlType.Allow));
++            security.Persist(safeHandle, AccessControlSections.Access);
++        }
++
++        private class GenericSecurity : NativeObjectSecurity
++        {
++            public GenericSecurity(bool isContainer, ResourceType resType, SafeHandle objectHandle, AccessControlSections sectionsRequested)
++                : base(isContainer, resType, objectHandle, sectionsRequested) { }
++            public new void Persist(SafeHandle handle, AccessControlSections includeSections) { base.Persist(handle, includeSections); }
++            public new void AddAccessRule(AccessRule rule) { base.AddAccessRule(rule); }
++            public override Type AccessRightType { get { throw new NotImplementedException(); } }
++            public override AccessRule AccessRuleFactory(System.Security.Principal.IdentityReference identityReference, int accessMask, bool isInherited,
++                InheritanceFlags inheritanceFlags, PropagationFlags propagationFlags, AccessControlType type)
++            { throw new NotImplementedException(); }
++            public override Type AccessRuleType { get { return typeof(AccessRule); } }
++            public override AuditRule AuditRuleFactory(System.Security.Principal.IdentityReference identityReference, int accessMask, bool isInherited,
++                InheritanceFlags inheritanceFlags, PropagationFlags propagationFlags, AuditFlags flags)
++            { throw new NotImplementedException(); }
++            public override Type AuditRuleType { get { return typeof(AuditRule); } }
++        }
++
++        private class NoopSafeHandle : SafeHandle
++        {
++            public NoopSafeHandle(IntPtr handle) : base(handle, false) { }
++            public override bool IsInvalid { get { return false; } }
++            protected override bool ReleaseHandle() { return true; }
++        }
++
++        private class GenericAccessRule : AccessRule
++        {
++            public GenericAccessRule(IdentityReference identity, int accessMask, AccessControlType type) :
++                base(identity, accessMask, false, InheritanceFlags.None, PropagationFlags.None, type)
++            { }
++        }
++    }
++}
+diff --git a/lib/ansible/module_utils/csharp/__init__.py b/lib/ansible/module_utils/csharp/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/lib/ansible/module_utils/powershell/Ansible.ModuleUtils.AddType.psm1 b/lib/ansible/module_utils/powershell/Ansible.ModuleUtils.AddType.psm1
+new file mode 100644
+index 0000000000..09591583c3
+--- /dev/null
++++ b/lib/ansible/module_utils/powershell/Ansible.ModuleUtils.AddType.psm1
+@@ -0,0 +1,261 @@
++# Copyright (c) 2018 Ansible Project
++# Simplified BSD License (see licenses/simplified_bsd.txt or https://opensource.org/licenses/BSD-2-Clause)
++
++Function Add-CSharpType {
++    <#
++    .SYNOPSIS
++    Compiles one or more C# scripts similar to Add-Type. This exposes
++    more configuration options that are useable within Ansible and it
++    also allows multiple C# sources to be compiled together.
++
++    .PARAMETER References
++    [String[]] A collection of C# scripts to compile together.
++
++    .PARAMETER IgnoreWarnings
++    [Switch] Whether to compile code that contains compiler warnings, by
++    default warnings will cause a compiler error.
++
++    .PARAMETER PassThru
++    [Switch] Whether to return the loaded Assembly
++
++    .PARAMETER AnsibleModule
++    TODO - This is an AnsibleModule object that is used to derive the
++    TempPath and Debug values.
++        TempPath is set to the TmpDir property of the class
++        IncludeDebugInfo is set when the Ansible verbosity is >= 3
++
++    .PARAMETER TempPath
++    [String] The temporary directory in which the dynamic assembly is
++    compiled to. This file is deleted once compilation is complete.
++    Cannot be used when AnsibleModule is set. This is a no-op when
++    running on PSCore.
++
++    .PARAMETER IncludeDebugInfo
++    [Switch] Whether to include debug information in the compiled
++    assembly. Cannot be used when AnsibleModule is set. This is a no-op
++    when running on PSCore.
++    #>
++    param(
++        [Parameter(Mandatory=$true)][AllowEmptyCollection()][String[]]$References,
++        [Switch]$IgnoreWarnings,
++        [Switch]$PassThru,
++        [Parameter(Mandatory=$true, ParameterSetName="Module")][Object]$AnsibleModule,
++        [Parameter(ParameterSetName="Manual")][String]$TempPath = $env:TMP,
++        [Parameter(ParameterSetName="Manual")][Switch]$IncludeDebugInfo
++    )
++    if ($null -eq $References -or $References.Length -eq 0) {
++        return
++    }
++
++    # define special symbols CORECLR, WINDOWS, UNIX if required
++    # the Is* variables are defined on PSCore, if absent we assume an
++    # older version of PowerShell under .NET Framework and Windows
++    $defined_symbols = [System.Collections.ArrayList]@()
++    $is_coreclr = Get-Variable -Name IsCoreCLR -ErrorAction SilentlyContinue
++    if ($null -ne $is_coreclr) {
++        if ($is_coreclr.Value) {
++            $defined_symbols.Add("CORECLR") > $null
++        }
++    }
++    $is_windows = Get-Variable -Name IsWindows -ErrorAction SilentlyContinue
++    if ($null -ne $is_windows) {
++        if ($is_windows.Value) {
++            $defined_symbols.Add("WINDOWS") > $null
++        } else {
++            $defined_symbols.Add("UNIX") > $null
++        }
++    } else {
++        $defined_symbols.Add("WINDOWS") > $null
++    }
++
++    # pattern used to find referenced assemblies in the code
++    $assembly_pattern = "^//\s*AssemblyReference\s+-Name\s+(?<Name>[\w.]*)(\s+-CLR\s+(?<CLR>Core|Framework))?$"
++
++    # PSCore vs PSDesktop use different methods to compile the code,
++    # PSCore uses Roslyn and can compile the code purely in memory
++    # without touching the disk while PSDesktop uses CodeDom and csc.exe
++    # to compile the code. We branch out here and run each
++    # distribution's method to add our C# code.
++    if ($is_coreclr) {
++        # compile the code using Roslyn on PSCore
++
++        # Include the default assemblies using the logic in Add-Type
++        # https://github.com/PowerShell/PowerShell/blob/master/src/Microsoft.PowerShell.Commands.Utility/commands/utility/AddType.cs
++        $assemblies = [System.Collections.Generic.HashSet`1[Microsoft.CodeAnalysis.MetadataReference]]@(
++            [Microsoft.CodeAnalysis.CompilationReference]::CreateFromFile(([System.Reflection.Assembly]::GetAssembly([PSObject])).Location)
++        )
++        $netcore_app_ref_folder = [System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName([PSObject].Assembly.Location), "ref")
++        foreach ($file in [System.IO.Directory]::EnumerateFiles($netcore_app_ref_folder, "*.dll", [System.IO.SearchOption]::TopDirectoryOnly)) {
++            $assemblies.Add([Microsoft.CodeAnalysis.MetadataReference]::CreateFromFile($file)) > $null
++        }
++
++        # loop through the references, parse as a SyntaxTree and get
++        # referenced assemblies
++        $parse_options = ([Microsoft.CodeAnalysis.CSharp.CSharpParseOptions]::Default).WithPreprocessorSymbols($defined_symbols)
++        $syntax_trees = [System.Collections.Generic.List`1[Microsoft.CodeAnalysis.SyntaxTree]]@()
++        foreach ($reference in $References) {
++            # scan through code and add any assemblies that match
++            # //AssemblyReference -Name ... [-CLR Core]
++            $sr = New-Object -TypeName System.IO.StringReader -ArgumentList $reference
++            try {
++                while ($null -ne ($line = $sr.ReadLine())) {
++                    if ($line -imatch $assembly_pattern) {
++                        # verify the reference is not for .NET Framework
++                        if ($Matches.ContainsKey("CLR") -and $Matches.CLR -ne "Core") {
++                            continue
++                        }
++                        $assemblies.Add($Matches.Name) > $null
++                    }
++                }
++            } finally {
++                $sr.Close()
++            }
++            $syntax_trees.Add([Microsoft.CodeAnalysis.CSharp.CSharpSyntaxTree]::ParseText($reference, $parse_options)) > $null
++        }
++
++        # Release seems to contain the correct line numbers compared to
++        # debug,may need to keep a closer eye on this in the future
++        $compiler_options = (New-Object -TypeName Microsoft.CodeAnalysis.CSharp.CSharpCompilationOptions -ArgumentList @(
++            [Microsoft.CodeAnalysis.OutputKind]::DynamicallyLinkedLibrary
++        )).WithOptimizationLevel([Microsoft.CodeAnalysis.OptimizationLevel]::Release)
++
++        # set warnings to error out if IgnoreWarnings is not set
++        if (-not $IgnoreWarnings.IsPresent) {
++            $compiler_options = $compiler_options.WithGeneralDiagnosticOption([Microsoft.CodeAnalysis.ReportDiagnostic]::Error)
++        }
++
++        # create compilation object
++        $compilation = [Microsoft.CodeAnalysis.CSharp.CSharpCompilation]::Create(
++            [System.Guid]::NewGuid().ToString(),
++            $syntax_trees,
++            $assemblies,
++            $compiler_options
++        )
++
++        # Load the compiled code and pdb info, we do this so we can
++        # include line number in a stracktrace
++        $code_ms = New-Object -TypeName System.IO.MemoryStream
++        $pdb_ms = New-Object -TypeName System.IO.MemoryStream
++        try {
++            $emit_result = $compilation.Emit($code_ms, $pdb_ms)
++            if (-not $emit_result.Success) {
++                $errors = [System.Collections.ArrayList]@()
++
++                foreach ($e in $emit_result.Diagnostics) {
++                    # builds the error msg, based on logic in Add-Type
++                    # https://github.com/PowerShell/PowerShell/blob/master/src/Microsoft.PowerShell.Commands.Utility/commands/utility/AddType.cs#L1239
++                    if ($null -eq $e.Location.SourceTree) {
++                        $errors.Add($e.ToString()) > $null
++                        continue
++                    }
++
++                    $cancel_token = New-Object -TypeName System.Threading.CancellationToken -ArgumentList $false
++                    $text_lines = $e.Location.SourceTree.GetText($cancel_token).Lines
++                    $line_span = $e.Location.GetLineSpan()
++
++                    $diagnostic_message = $e.ToString()
++                    $error_line_string = $text_lines[$line_span.StartLinePosition.Line].ToString()
++                    $error_position = $line_span.StartLinePosition.Character
++
++                    $sb = New-Object -TypeName System.Text.StringBuilder -ArgumentList ($diagnostic_message.Length + $error_line_string.Length * 2 + 4)
++                    $sb.AppendLine($diagnostic_message)
++                    $sb.AppendLine($error_line_string)
++
++                    for ($i = 0; $i -lt $error_line_string.Length; $i++) {
++                        if ([System.Char]::IsWhiteSpace($error_line_string[$i])) {
++                            continue
++                        }
++                        $sb.Append($error_line_string, 0, $i)
++                        $sb.Append(' ', [Math]::Max(0, $error_position - $i))
++                        $sb.Append("^")
++                        break
++                    }
++
++                    $errors.Add($sb.ToString()) > $null
++                }
++
++                throw [InvalidOperationException]"Failed to compile C# code:`r`n$($errors -join "`r`n")"
++            }
++
++            $code_ms.Seek(0, [System.IO.SeekOrigin]::Begin) > $null
++            $pdb_ms.Seek(0, [System.IO.SeekOrigin]::Begin) > $null
++            $compiled_assembly = [System.Runtime.Loader.AssemblyLoadContext]::Default.LoadFromStream($code_ms, $pdb_ms)
++        } finally {
++            $code_ms.Close()
++            $pdb_ms.Close()
++        }
++    } else {
++        # compile the code using CodeDom on PSDesktop
++
++        # configure compile options based on input
++        if ($PSCmdlet.ParameterSetName -eq "Module") {
++            $temp_path = $AnsibleModule.TmpDir
++            $include_debug = $AnsibleModule.Verbosity -ge 3
++        } else {
++            $temp_path = $TempPath
++            $include_debug = $IncludeDebugInfo.IsPresent
++        }
++        $compiler_options = [System.Collections.ArrayList]@("/optimize")
++        if ($defined_symbols.Count -gt 0) {
++            $compiler_options.Add("/define:" + ([String]::Join(";", $defined_symbols.ToArray()))) > $null
++        }
++
++        $compile_parameters = New-Object -TypeName System.CodeDom.Compiler.CompilerParameters
++        $compile_parameters.CompilerOptions = [String]::Join(" ", $compiler_options.ToArray())
++        $compile_parameters.GenerateExecutable = $false
++        $compile_parameters.GenerateInMemory = $true
++        $compile_parameters.TreatWarningsAsErrors = (-not $IgnoreWarnings.IsPresent)
++        $compile_parameters.IncludeDebugInformation = $include_debug
++        $compile_parameters.TempFiles = (New-Object -TypeName System.CodeDom.Compiler.TempFileCollection -ArgumentList $temp_path, $false)
++
++        # Add-Type automatically references System.dll, System.Core.dll,
++        # and System.Management.Automation.dll which we replicate here
++        $assemblies = [System.Collections.Generic.HashSet`1[String]]@(
++            "System.dll",
++            "System.Core.dll",
++            ([System.Reflection.Assembly]::GetAssembly([PSObject])).Location
++        )
++
++        # create a code snippet for each reference and check if we need
++        # to reference any extra assemblies
++        # //AssemblyReference -Name ... [-CLR Framework]
++        $compile_units = [System.Collections.Generic.List`1[System.CodeDom.CodeSnippetCompileUnit]]@()
++        foreach ($reference in $References) {
++            $sr = New-Object -TypeName System.IO.StringReader -ArgumentList $reference
++            try {
++                while ($null -ne ($line = $sr.ReadLine())) {
++                    if ($line -imatch $assembly_pattern) {
++                        # verify the reference is not for .NET Core
++                        if ($Matches.ContainsKey("CLR") -and $Matches.CLR -ne "Framework") {
++                            continue
++                        }
++                        $assemblies.Add($Matches.Name) > $null
++                    }
++                }
++            } finally {
++                $sr.Close()
++            }
++            $compile_units.Add((New-Object -TypeName System.CodeDom.CodeSnippetCompileUnit -ArgumentList $reference)) > $null
++        }
++        $compile_parameters.ReferencedAssemblies.AddRange($assemblies)
++
++        # compile the code together and check for errors
++        $provider = New-Object -TypeName Microsoft.CSharp.CSharpCodeProvider
++        $compile = $provider.CompileAssemblyFromDom($compile_parameters, $compile_units.ToArray())
++        if ($compile.Errors.HasErrors) {
++            $msg = "Failed to compile C# code: "
++            foreach ($e in $compile.Errors) {
++                $msg += "`r`n" + $e.ToString()
++            }
++            throw [InvalidOperationException]$msg
++        }
++        $compiled_assembly = $compile.CompiledAssembly
++    }
++
++    # return the compiled assembly if PassThru is set.
++    if ($PassThru) {
++        return $compiled_assembly
++    }
++}
++
++Export-ModuleMember -Function Add-CSharpType
+diff --git a/lib/ansible/modules/windows/win_dsc.ps1 b/lib/ansible/modules/windows/win_dsc.ps1
+index d80fe640a4..4903ebcf21 100644
+--- a/lib/ansible/modules/windows/win_dsc.ps1
++++ b/lib/ansible/modules/windows/win_dsc.ps1
+@@ -14,29 +14,9 @@ $result = @{
+     changed = $false
+ }
+ 
+-Function ConvertTo-HashtableFromPsCustomObject($psObject)
+-{
+-    $hashtable = @{}
+-    $psObject | Get-Member -MemberType *Property | ForEach-Object {
+-        $value = $psObject.($_.Name)
+-        if ($value -is [PSObject])
+-        {
+-            $value = ConvertTo-HashtableFromPsCustomObject -myPsObject $value
+-        }
+-        $hashtable.($_.Name) = $value
+-    }
+-
+-    return ,$hashtable
+-}
+-
+ Function Cast-ToCimInstance($name, $value, $className)
+ {
+     # this converts a hashtable to a CimInstance
+-    if ($value -is [PSObject])
+-    {
+-        # convert to hashtable
+-        $value = ConvertTo-HashtableFromPsCustomObject -psObject $value
+-    }
+ 
+     $valueType = $value.GetType()
+     if ($valueType -ne [hashtable])
+diff --git a/lib/ansible/modules/windows/win_scheduled_task.ps1 b/lib/ansible/modules/windows/win_scheduled_task.ps1
+index ba5d36a419..2fda495526 100644
+--- a/lib/ansible/modules/windows/win_scheduled_task.ps1
++++ b/lib/ansible/modules/windows/win_scheduled_task.ps1
+@@ -10,49 +10,7 @@
+ 
+ $ErrorActionPreference = "Stop"
+ 
+-Function ConvertTo-Hashtable {
+-    param([Object]$Value)
+-
+-    if ($null -eq $Value) {
+-        return $null
+-    }
+-    $value_type = $Value.GetType()
+-    if ($value_type.IsGenericType) {
+-        $value_type = $value_type.GetGenericTypeDefinition()
+-    }
+-    if ($value_type -eq [System.Collections.Generic.Dictionary`2]) {
+-        $new_value = @{}
+-        foreach ($kv in $Value.GetEnumerator()) {
+-            $new_value.Add($kv.Key, (ConvertTo-Hashtable -Value $kv.Value))
+-        }
+-        return ,$new_value
+-    } elseif ($value_type -eq [System.Collections.ArrayList]) {
+-        for ($i = 0; $i -lt $Value.Count; $i++) {
+-            $Value[$i] = ConvertTo-Hashtable -Value $Value[$i]
+-        }
+-        return ,$Value.ToArray()
+-    } else {
+-        return ,$Value
+-    }
+-}
+-
+ $params = Parse-Args -arguments $args -supports_check_mode $true
+-
+-# FUTURE: remove this once exec_wrapper has this behaviour inbuilt with the new
+-# json changes in the exec_wrapper.
+-# Currently ConvertFrom-Json creates a PSObject for the deserialized JSON and the
+-# exec_wrapper converts all dicts as Hashtable. Unfortunately it doesn't
+-# convert any dict in lists leaving to some confusing behaviour. We manually
+-# use JavaScriptSerializer to ensure we have the type of objects to simply the
+-# code in the module when it comes to type checking
+-$params_json = ConvertTo-Json -InputObject $params -Depth 99 -Compress
+-
+-Add-Type -AssemblyName System.Web.Extensions
+-$json = New-Object -TypeName System.Web.Script.Serialization.JavaScriptSerializer
+-$json.MaxJsonLength = [Int32]::MaxValue
+-$json.RecursionLimit = [Int32]::MaxValue
+-$params = ConvertTo-Hashtable -Value ($json.Deserialize($params_json, [System.Collections.Generic.Dictionary`2[[String], [Object]]]))
+-
+ $check_mode = Get-AnsibleParam -obj $params -name "_ansible_check_mode" -type "bool" -default $false
+ $diff_mode = Get-AnsibleParam -obj $params -name "_ansible_diff" -type "bool" -default $false
+ $_remote_tmp = Get-AnsibleParam $params "_ansible_remote_tmp" -type "path" -default $env:TMP
+diff --git a/lib/ansible/modules/windows/win_wait_for_process.ps1 b/lib/ansible/modules/windows/win_wait_for_process.ps1
+index 5ddd1837bb..5b18e30eaa 100644
+--- a/lib/ansible/modules/windows/win_wait_for_process.ps1
++++ b/lib/ansible/modules/windows/win_wait_for_process.ps1
+@@ -9,13 +9,6 @@
+ 
+ $ErrorActionPreference = "Stop"
+ 
+-# NOTE: Ensure we get proper debug information when things fall over
+-trap {
+-    if ($null -eq $result) { $result = @{} }
+-    $result.exception = "$($_ | Out-String)`r`n$($_.ScriptStackTrace)"
+-    Fail-Json -obj $result -message "Uncaught exception: $($_.Exception.Message)"
+-}
+-
+ $params = Parse-Args -arguments $args -supports_check_mode $true
+ 
+ $process_name_exact = Get-AnsibleParam -obj $params -name "process_name_exact" -type "list"
+diff --git a/lib/ansible/plugins/action/script.py b/lib/ansible/plugins/action/script.py
+index dc8655f958..a7a338e5b2 100644
+--- a/lib/ansible/plugins/action/script.py
++++ b/lib/ansible/plugins/action/script.py
+@@ -22,7 +22,7 @@ import re
+ import shlex
+ 
+ from ansible.errors import AnsibleError, AnsibleAction, _AnsibleActionDone, AnsibleActionFail, AnsibleActionSkip
+-from ansible.executor.module_common import _create_powershell_wrapper
++from ansible.executor.powershell import module_manifest as ps_manifest
+ from ansible.module_utils._text import to_bytes, to_native, to_text
+ from ansible.plugins.action import ActionBase
+ 
+@@ -129,10 +129,10 @@ class ActionModule(ActionBase):
+             if self._connection._shell.SHELL_FAMILY == "powershell":
+                 # FIXME: use a more public method to get the exec payload
+                 pc = self._play_context
+-                exec_data = _create_powershell_wrapper(
++                exec_data = ps_manifest._create_powershell_wrapper(
+                     to_bytes(script_cmd), {}, env_dict, self._task.async_val,
+                     pc.become, pc.become_method, pc.become_user,
+-                    pc.become_pass, pc.become_flags, scan_dependencies=False
++                    pc.become_pass, pc.become_flags, substyle="script"
+                 )
+                 script_cmd = "-"
+ 
+diff --git a/lib/ansible/plugins/shell/powershell.py b/lib/ansible/plugins/shell/powershell.py
+index 48ef5531f6..551a9e2db5 100644
+--- a/lib/ansible/plugins/shell/powershell.py
++++ b/lib/ansible/plugins/shell/powershell.py
+@@ -69,1397 +69,6 @@ _powershell_version = os.environ.get('POWERSHELL_VERSION', None)
+ if _powershell_version:
+     _common_args = ['PowerShell', '-Version', _powershell_version] + _common_args[1:]
+ 
+-exec_wrapper = br'''
+-begin {
+-    $DebugPreference = "Continue"
+-    $ErrorActionPreference = "Stop"
+-    Set-StrictMode -Version 2
+-
+-    function ConvertTo-HashtableFromPsCustomObject ($myPsObject){
+-        $output = @{};
+-        $myPsObject | Get-Member -MemberType *Property | % {
+-            $val = $myPsObject.($_.name);
+-            If ($val -is [psobject]) {
+-                $val = ConvertTo-HashtableFromPsCustomObject $val
+-            }
+-            $output.($_.name) = $val
+-        }
+-        return $output;
+-    }
+-    # stream JSON including become_pw, ps_module_payload, bin_module_payload, become_payload, write_payload_path, preserve directives
+-    # exec runspace, capture output, cleanup, return module output
+-
+-    # NB: do not adjust the following line- it is replaced when doing non-streamed module output
+-    $json_raw = ''
+-}
+-process {
+-    $input_as_string = [string]$input
+-
+-    $json_raw += $input_as_string
+-}
+-end {
+-    If (-not $json_raw) {
+-        Write-Error "no input given" -Category InvalidArgument
+-    }
+-    $payload = ConvertTo-HashtableFromPsCustomObject (ConvertFrom-Json $json_raw)
+-
+-    # TODO: handle binary modules
+-    # TODO: handle persistence
+-
+-    $min_os_version = [version]$payload.min_os_version
+-    if ($min_os_version -ne $null) {
+-        $actual_os_version = [System.Environment]::OSVersion.Version
+-        if ($actual_os_version -lt $min_os_version) {
+-            $msg = "This module cannot run on this OS as it requires a minimum version of $min_os_version, actual was $actual_os_version"
+-            Write-Output (ConvertTo-Json @{failed=$true;msg=$msg})
+-            exit 1
+-        }
+-    }
+-
+-    $min_ps_version = [version]$payload.min_ps_version
+-    if ($min_ps_version -ne $null) {
+-        $actual_ps_version = $PSVersionTable.PSVersion
+-        if ($actual_ps_version -lt $min_ps_version) {
+-            $msg = "This module cannot run as it requires a minimum PowerShell version of $min_ps_version, actual was $actual_ps_version"
+-            Write-Output (ConvertTo-Json @{failed=$true;msg=$msg})
+-            exit 1
+-        }
+-    }
+-
+-    $actions = $payload.actions
+-
+-    # pop 0th action as entrypoint
+-    $entrypoint = $payload.($actions[0])
+-    $payload.actions = $payload.actions[1..99]
+-
+-    $entrypoint = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($entrypoint))
+-
+-    # load the current action entrypoint as a module custom object with a Run method
+-    $entrypoint = New-Module -ScriptBlock ([scriptblock]::Create($entrypoint)) -AsCustomObject
+-
+-    Set-Variable -Scope global -Name complex_args -Value $payload["module_args"] | Out-Null
+-
+-    # dynamically create/load modules
+-    ForEach ($mod in $payload.powershell_modules.GetEnumerator()) {
+-        $decoded_module = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($mod.Value))
+-        New-Module -ScriptBlock ([scriptblock]::Create($decoded_module)) -Name $mod.Key | Import-Module -WarningAction SilentlyContinue | Out-Null
+-    }
+-
+-    $output = $entrypoint.Run($payload)
+-
+-    Write-Output $output
+-}
+-
+-'''  # end exec_wrapper
+-
+-leaf_exec = br'''
+-Function Run($payload) {
+-    $entrypoint = $payload.module_entry
+-
+-    $entrypoint = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($entrypoint))
+-
+-    $ps = [powershell]::Create()
+-
+-    $ps.AddStatement().AddCommand("Set-Variable").AddParameters(@{Scope="global";Name="complex_args";Value=$payload.module_args}) | Out-Null
+-    $ps.AddCommand("Out-Null") | Out-Null
+-
+-    # redefine Write-Host to dump to output instead of failing- lots of scripts use it
+-    $ps.AddStatement().AddScript("Function Write-Host(`$msg){ Write-Output `$msg }") | Out-Null
+-
+-    ForEach ($env_kv in $payload.environment.GetEnumerator()) {
+-        # need to escape ' in both the key and value
+-        $env_key = $env_kv.Key.ToString().Replace("'", "''")
+-        $env_value = $env_kv.Value.ToString().Replace("'", "''")
+-        $escaped_env_set = "[System.Environment]::SetEnvironmentVariable('{0}', '{1}')" -f $env_key, $env_value
+-        $ps.AddStatement().AddScript($escaped_env_set) | Out-Null
+-    }
+-
+-    # dynamically create/load modules
+-    ForEach ($mod in $payload.powershell_modules.GetEnumerator()) {
+-        $decoded_module = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($mod.Value))
+-        $ps.AddStatement().AddCommand("New-Module").AddParameters(@{ScriptBlock=([scriptblock]::Create($decoded_module));Name=$mod.Key}) | Out-Null
+-        $ps.AddCommand("Import-Module").AddParameters(@{WarningAction="SilentlyContinue"}) | Out-Null
+-        $ps.AddCommand("Out-Null") | Out-Null
+-    }
+-
+-    # force input encoding to preamble-free UTF8 so PS sub-processes (eg,
+-    # Start-Job) don't blow up. This is only required for WinRM, a PSRP
+-    # runspace doesn't have a host console and this will bomb out
+-    if ($host.Name -eq "ConsoleHost") {
+-        $ps.AddStatement().AddScript("[Console]::InputEncoding = New-Object Text.UTF8Encoding `$false") | Out-Null
+-    }
+-
+-    $ps.AddStatement().AddScript($entrypoint) | Out-Null
+-
+-    $output = $ps.Invoke()
+-
+-    $output
+-
+-    # PS3 doesn't properly set HadErrors in many cases, inspect the error stream as a fallback
+-    If ($ps.HadErrors -or ($PSVersionTable.PSVersion.Major -lt 4 -and $ps.Streams.Error.Count -gt 0)) {
+-        $host.UI.WriteErrorLine($($ps.Streams.Error | Out-String))
+-        $exit_code = $ps.Runspace.SessionStateProxy.GetVariable("LASTEXITCODE")
+-        If(-not $exit_code) {
+-            $exit_code = 1
+-        }
+-        # need to use this instead of Exit keyword to prevent runspace from crashing with dynamic modules
+-        $host.SetShouldExit($exit_code)
+-    }
+-}
+-'''  # end leaf_exec
+-
+-become_wrapper = br'''
+-Set-StrictMode -Version 2
+-$ErrorActionPreference = "Stop"
+-
+-$helper_def = @"
+-using Microsoft.Win32.SafeHandles;
+-using System;
+-using System.Collections.Generic;
+-using System.Diagnostics;
+-using System.IO;
+-using System.Linq;
+-using System.Runtime.InteropServices;
+-using System.Security.AccessControl;
+-using System.Security.Principal;
+-using System.Text;
+-using System.Threading;
+-
+-namespace AnsibleBecome
+-{
+-    [StructLayout(LayoutKind.Sequential)]
+-    public class SECURITY_ATTRIBUTES
+-    {
+-        public int nLength;
+-        public IntPtr lpSecurityDescriptor;
+-        public bool bInheritHandle = false;
+-        public SECURITY_ATTRIBUTES()
+-        {
+-            nLength = Marshal.SizeOf(this);
+-        }
+-    }
+-
+-    [StructLayout(LayoutKind.Sequential)]
+-    public class STARTUPINFO
+-    {
+-        public Int32 cb;
+-        public IntPtr lpReserved;
+-        public IntPtr lpDesktop;
+-        public IntPtr lpTitle;
+-        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 28)]
+-        public byte[] _data1;
+-        public Int32 dwFlags;
+-        public Int16 wShowWindow;
+-        public Int16 cbReserved2;
+-        public IntPtr lpReserved2;
+-        public SafeFileHandle hStdInput;
+-        public SafeFileHandle hStdOutput;
+-        public SafeFileHandle hStdError;
+-        public STARTUPINFO()
+-        {
+-            cb = Marshal.SizeOf(this);
+-        }
+-    }
+-
+-    [StructLayout(LayoutKind.Sequential)]
+-    public class STARTUPINFOEX
+-    {
+-        public STARTUPINFO startupInfo;
+-        public IntPtr lpAttributeList;
+-        public STARTUPINFOEX()
+-        {
+-            startupInfo = new STARTUPINFO();
+-            startupInfo.cb = Marshal.SizeOf(this);
+-        }
+-    }
+-
+-    [StructLayout(LayoutKind.Sequential)]
+-    public struct PROCESS_INFORMATION
+-    {
+-        public IntPtr hProcess;
+-        public IntPtr hThread;
+-        public int dwProcessId;
+-        public int dwThreadId;
+-    }
+-
+-    [StructLayout(LayoutKind.Sequential)]
+-    public struct SID_AND_ATTRIBUTES
+-    {
+-        public IntPtr Sid;
+-        public int Attributes;
+-    }
+-
+-    public struct TOKEN_USER
+-    {
+-        public SID_AND_ATTRIBUTES User;
+-    }
+-
+-    [Flags]
+-    public enum StartupInfoFlags : uint
+-    {
+-        USESTDHANDLES = 0x00000100
+-    }
+-
+-    [Flags]
+-    public enum CreationFlags : uint
+-    {
+-        CREATE_BREAKAWAY_FROM_JOB = 0x01000000,
+-        CREATE_DEFAULT_ERROR_MODE = 0x04000000,
+-        CREATE_NEW_CONSOLE = 0x00000010,
+-        CREATE_SUSPENDED = 0x00000004,
+-        CREATE_UNICODE_ENVIRONMENT = 0x00000400,
+-        EXTENDED_STARTUPINFO_PRESENT = 0x00080000
+-    }
+-
+-    public enum HandleFlags : uint
+-    {
+-        None = 0,
+-        INHERIT = 1
+-    }
+-
+-    [Flags]
+-    public enum LogonFlags
+-    {
+-        LOGON_WITH_PROFILE = 0x00000001,
+-        LOGON_NETCREDENTIALS_ONLY = 0x00000002
+-    }
+-
+-    public enum LogonType
+-    {
+-        LOGON32_LOGON_INTERACTIVE = 2,
+-        LOGON32_LOGON_NETWORK = 3,
+-        LOGON32_LOGON_BATCH = 4,
+-        LOGON32_LOGON_SERVICE = 5,
+-        LOGON32_LOGON_UNLOCK = 7,
+-        LOGON32_LOGON_NETWORK_CLEARTEXT = 8,
+-        LOGON32_LOGON_NEW_CREDENTIALS = 9
+-    }
+-
+-    public enum LogonProvider
+-    {
+-        LOGON32_PROVIDER_DEFAULT = 0,
+-    }
+-
+-    public enum TokenInformationClass
+-    {
+-        TokenUser = 1,
+-        TokenType = 8,
+-        TokenImpersonationLevel = 9,
+-        TokenElevationType = 18,
+-        TokenLinkedToken = 19,
+-    }
+-
+-    public enum TokenElevationType
+-    {
+-        TokenElevationTypeDefault = 1,
+-        TokenElevationTypeFull,
+-        TokenElevationTypeLimited
+-    }
+-
+-    [Flags]
+-    public enum ProcessAccessFlags : uint
+-    {
+-        PROCESS_QUERY_INFORMATION = 0x00000400,
+-    }
+-
+-    public enum SECURITY_IMPERSONATION_LEVEL
+-    {
+-        SecurityImpersonation,
+-    }
+-
+-    public enum TOKEN_TYPE
+-    {
+-        TokenPrimary = 1,
+-        TokenImpersonation
+-    }
+-
+-    class NativeWaitHandle : WaitHandle
+-    {
+-        public NativeWaitHandle(IntPtr handle)
+-        {
+-            this.SafeWaitHandle = new SafeWaitHandle(handle, false);
+-        }
+-    }
+-
+-    public class Win32Exception : System.ComponentModel.Win32Exception
+-    {
+-        private string _msg;
+-        public Win32Exception(string message) : this(Marshal.GetLastWin32Error(), message) { }
+-        public Win32Exception(int errorCode, string message) : base(errorCode)
+-        {
+-            _msg = String.Format("{0} ({1}, Win32ErrorCode {2})", message, base.Message, errorCode);
+-        }
+-        public override string Message { get { return _msg; } }
+-        public static explicit operator Win32Exception(string message) { return new Win32Exception(message); }
+-    }
+-
+-    public class CommandResult
+-    {
+-        public string StandardOut { get; internal set; }
+-        public string StandardError { get; internal set; }
+-        public uint ExitCode { get; internal set; }
+-    }
+-
+-    public class BecomeUtil
+-    {
+-        [DllImport("advapi32.dll", SetLastError = true)]
+-        private static extern bool LogonUser(
+-            string lpszUsername,
+-            string lpszDomain,
+-            string lpszPassword,
+-            LogonType dwLogonType,
+-            LogonProvider dwLogonProvider,
+-            out IntPtr phToken);
+-
+-        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+-        private static extern bool CreateProcessWithTokenW(
+-            IntPtr hToken,
+-            LogonFlags dwLogonFlags,
+-            [MarshalAs(UnmanagedType.LPTStr)]
+-            string lpApplicationName,
+-            StringBuilder lpCommandLine,
+-            CreationFlags dwCreationFlags,
+-            IntPtr lpEnvironment,
+-            [MarshalAs(UnmanagedType.LPTStr)]
+-            string lpCurrentDirectory,
+-            STARTUPINFOEX lpStartupInfo,
+-            out PROCESS_INFORMATION lpProcessInformation);
+-
+-        [DllImport("kernel32.dll")]
+-        private static extern bool CreatePipe(
+-            out SafeFileHandle hReadPipe,
+-            out SafeFileHandle hWritePipe,
+-            SECURITY_ATTRIBUTES lpPipeAttributes,
+-            uint nSize);
+-
+-        [DllImport("kernel32.dll", SetLastError = true)]
+-        private static extern bool SetHandleInformation(
+-            SafeFileHandle hObject,
+-            HandleFlags dwMask,
+-            int dwFlags);
+-
+-        [DllImport("kernel32.dll", SetLastError = true)]
+-        private static extern bool GetExitCodeProcess(
+-            IntPtr hProcess,
+-            out uint lpExitCode);
+-
+-        [DllImport("kernel32.dll", SetLastError = true)]
+-        private static extern bool CloseHandle(
+-            IntPtr hObject);
+-
+-        [DllImport("user32.dll", SetLastError = true)]
+-        private static extern IntPtr GetProcessWindowStation();
+-
+-        [DllImport("user32.dll", SetLastError = true)]
+-        private static extern IntPtr GetThreadDesktop(
+-            int dwThreadId);
+-
+-        [DllImport("kernel32.dll", SetLastError = true)]
+-        private static extern int GetCurrentThreadId();
+-
+-        [DllImport("advapi32.dll", SetLastError = true)]
+-        private static extern bool GetTokenInformation(
+-            IntPtr TokenHandle,
+-            TokenInformationClass TokenInformationClass,
+-            IntPtr TokenInformation,
+-            uint TokenInformationLength,
+-            out uint ReturnLength);
+-
+-        [DllImport("psapi.dll", SetLastError = true)]
+-        private static extern bool EnumProcesses(
+-            [MarshalAs(UnmanagedType.LPArray, ArraySubType = UnmanagedType.U4)]
+-                [In][Out] IntPtr[] processIds,
+-            uint cb,
+-            [MarshalAs(UnmanagedType.U4)]
+-                out uint pBytesReturned);
+-
+-        [DllImport("kernel32.dll", SetLastError = true)]
+-        private static extern IntPtr OpenProcess(
+-            ProcessAccessFlags processAccess,
+-            bool bInheritHandle,
+-            IntPtr processId);
+-
+-        [DllImport("advapi32.dll", SetLastError = true)]
+-        private static extern bool OpenProcessToken(
+-            IntPtr ProcessHandle,
+-            TokenAccessLevels DesiredAccess,
+-            out IntPtr TokenHandle);
+-
+-        [DllImport("advapi32.dll", SetLastError = true)]
+-        private static extern bool ConvertSidToStringSidW(
+-            IntPtr pSID,
+-            [MarshalAs(UnmanagedType.LPTStr)]
+-            out string StringSid);
+-
+-        [DllImport("advapi32", SetLastError = true)]
+-        private static extern bool DuplicateTokenEx(
+-            IntPtr hExistingToken,
+-            TokenAccessLevels dwDesiredAccess,
+-            IntPtr lpTokenAttributes,
+-            SECURITY_IMPERSONATION_LEVEL ImpersonationLevel,
+-            TOKEN_TYPE TokenType,
+-            out IntPtr phNewToken);
+-
+-        [DllImport("advapi32.dll", SetLastError = true)]
+-        private static extern bool ImpersonateLoggedOnUser(
+-            IntPtr hToken);
+-
+-        [DllImport("advapi32.dll", SetLastError = true)]
+-        private static extern bool RevertToSelf();
+-
+-        public static CommandResult RunAsUser(string username, string password, string lpCommandLine,
+-            string lpCurrentDirectory, string stdinInput, LogonFlags logonFlags, LogonType logonType)
+-        {
+-            SecurityIdentifier account = null;
+-            if (logonType != LogonType.LOGON32_LOGON_NEW_CREDENTIALS)
+-            {
+-                account = GetBecomeSid(username);
+-            }
+-
+-            STARTUPINFOEX si = new STARTUPINFOEX();
+-            si.startupInfo.dwFlags = (int)StartupInfoFlags.USESTDHANDLES;
+-
+-            SECURITY_ATTRIBUTES pipesec = new SECURITY_ATTRIBUTES();
+-            pipesec.bInheritHandle = true;
+-
+-            // Create the stdout, stderr and stdin pipes used in the process and add to the startupInfo
+-            SafeFileHandle stdout_read, stdout_write, stderr_read, stderr_write, stdin_read, stdin_write;
+-            if (!CreatePipe(out stdout_read, out stdout_write, pipesec, 0))
+-                throw new Win32Exception("STDOUT pipe setup failed");
+-            if (!SetHandleInformation(stdout_read, HandleFlags.INHERIT, 0))
+-                throw new Win32Exception("STDOUT pipe handle setup failed");
+-
+-            if (!CreatePipe(out stderr_read, out stderr_write, pipesec, 0))
+-                throw new Win32Exception("STDERR pipe setup failed");
+-            if (!SetHandleInformation(stderr_read, HandleFlags.INHERIT, 0))
+-                throw new Win32Exception("STDERR pipe handle setup failed");
+-
+-            if (!CreatePipe(out stdin_read, out stdin_write, pipesec, 0))
+-                throw new Win32Exception("STDIN pipe setup failed");
+-            if (!SetHandleInformation(stdin_write, HandleFlags.INHERIT, 0))
+-                throw new Win32Exception("STDIN pipe handle setup failed");
+-
+-            si.startupInfo.hStdOutput = stdout_write;
+-            si.startupInfo.hStdError = stderr_write;
+-            si.startupInfo.hStdInput = stdin_read;
+-
+-            // Setup the stdin buffer
+-            UTF8Encoding utf8_encoding = new UTF8Encoding(false);
+-            FileStream stdin_fs = new FileStream(stdin_write, FileAccess.Write, 32768);
+-            StreamWriter stdin = new StreamWriter(stdin_fs, utf8_encoding, 32768);
+-
+-            // Create the environment block if set
+-            IntPtr lpEnvironment = IntPtr.Zero;
+-
+-            CreationFlags startup_flags = CreationFlags.CREATE_UNICODE_ENVIRONMENT;
+-
+-            PROCESS_INFORMATION pi = new PROCESS_INFORMATION();
+-
+-            // Get the user tokens to try running processes with
+-            List<IntPtr> tokens = GetUserTokens(account, username, password, logonType);
+-
+-            bool launch_success = false;
+-            foreach (IntPtr token in tokens)
+-            {
+-                if (CreateProcessWithTokenW(
+-                    token,
+-                    logonFlags,
+-                    null,
+-                    new StringBuilder(lpCommandLine),
+-                    startup_flags,
+-                    lpEnvironment,
+-                    lpCurrentDirectory,
+-                    si,
+-                    out pi))
+-                {
+-                    launch_success = true;
+-                    break;
+-                }
+-            }
+-
+-            if (!launch_success)
+-                throw new Win32Exception("Failed to start become process");
+-
+-            CommandResult result = new CommandResult();
+-            // Setup the output buffers and get stdout/stderr
+-            FileStream stdout_fs = new FileStream(stdout_read, FileAccess.Read, 4096);
+-            StreamReader stdout = new StreamReader(stdout_fs, utf8_encoding, true, 4096);
+-            stdout_write.Close();
+-
+-            FileStream stderr_fs = new FileStream(stderr_read, FileAccess.Read, 4096);
+-            StreamReader stderr = new StreamReader(stderr_fs, utf8_encoding, true, 4096);
+-            stderr_write.Close();
+-
+-            stdin.WriteLine(stdinInput);
+-            stdin.Close();
+-
+-            string stdout_str, stderr_str = null;
+-            GetProcessOutput(stdout, stderr, out stdout_str, out stderr_str);
+-            UInt32 rc = GetProcessExitCode(pi.hProcess);
+-
+-            result.StandardOut = stdout_str;
+-            result.StandardError = stderr_str;
+-            result.ExitCode = rc;
+-
+-            return result;
+-        }
+-
+-        private static SecurityIdentifier GetBecomeSid(string username)
+-        {
+-            NTAccount account = new NTAccount(username);
+-            try
+-            {
+-                SecurityIdentifier security_identifier = (SecurityIdentifier)account.Translate(typeof(SecurityIdentifier));
+-                return security_identifier;
+-            }
+-            catch (IdentityNotMappedException ex)
+-            {
+-                throw new Exception(String.Format("Unable to find become user {0}: {1}", username, ex.Message));
+-            }
+-        }
+-
+-        private static List<IntPtr> GetUserTokens(SecurityIdentifier account, string username, string password, LogonType logonType)
+-        {
+-            List<IntPtr> tokens = new List<IntPtr>();
+-            List<String> service_sids = new List<String>()
+-            {
+-                "S-1-5-18", // NT AUTHORITY\SYSTEM
+-                "S-1-5-19", // NT AUTHORITY\LocalService
+-                "S-1-5-20"  // NT AUTHORITY\NetworkService
+-            };
+-
+-            IntPtr hSystemToken = IntPtr.Zero;
+-            string account_sid = "";
+-            if (logonType != LogonType.LOGON32_LOGON_NEW_CREDENTIALS)
+-            {
+-                GrantAccessToWindowStationAndDesktop(account);
+-                // Try to get SYSTEM token handle so we can impersonate to get full admin token
+-                hSystemToken = GetSystemUserHandle();
+-                account_sid = account.ToString();
+-            }
+-            bool impersonated = false;
+-
+-            try
+-            {
+-                IntPtr hSystemTokenDup = IntPtr.Zero;
+-                if (hSystemToken == IntPtr.Zero && service_sids.Contains(account_sid))
+-                {
+-                    // We need the SYSTEM token if we want to become one of those accounts, fail here
+-                    throw new Win32Exception("Failed to get token for NT AUTHORITY\\SYSTEM");
+-                }
+-                else if (hSystemToken != IntPtr.Zero)
+-                {
+-                    // We have the token, need to duplicate and impersonate
+-                    bool dupResult = DuplicateTokenEx(
+-                        hSystemToken,
+-                        TokenAccessLevels.MaximumAllowed,
+-                        IntPtr.Zero,
+-                        SECURITY_IMPERSONATION_LEVEL.SecurityImpersonation,
+-                        TOKEN_TYPE.TokenPrimary,
+-                        out hSystemTokenDup);
+-                    int lastError = Marshal.GetLastWin32Error();
+-                    CloseHandle(hSystemToken);
+-
+-                    if (!dupResult && service_sids.Contains(account_sid))
+-                        throw new Win32Exception(lastError, "Failed to duplicate token for NT AUTHORITY\\SYSTEM");
+-                    else if (dupResult && account_sid != "S-1-5-18")
+-                    {
+-                        if (ImpersonateLoggedOnUser(hSystemTokenDup))
+-                            impersonated = true;
+-                        else if (service_sids.Contains(account_sid))
+-                            throw new Win32Exception("Failed to impersonate as SYSTEM account");
+-                    }
+-                    // If SYSTEM impersonation failed but we're trying to become a regular user, just proceed;
+-                    // might get a limited token in UAC-enabled cases, but better than nothing...
+-                }
+-
+-                string domain = null;
+-
+-                if (service_sids.Contains(account_sid))
+-                {
+-                    // We're using a well-known service account, do a service logon instead of the actual flag set
+-                    logonType = LogonType.LOGON32_LOGON_SERVICE;
+-                    domain = "NT AUTHORITY";
+-                    password = null;
+-                    switch (account_sid)
+-                    {
+-                        case "S-1-5-18":
+-                            tokens.Add(hSystemTokenDup);
+-                            return tokens;
+-                        case "S-1-5-19":
+-                            username = "LocalService";
+-                            break;
+-                        case "S-1-5-20":
+-                            username = "NetworkService";
+-                            break;
+-                    }
+-                }
+-                else
+-                {
+-                    // We are trying to become a local or domain account
+-                    if (username.Contains(@"\"))
+-                    {
+-                        var user_split = username.Split(Convert.ToChar(@"\"));
+-                        domain = user_split[0];
+-                        username = user_split[1];
+-                    }
+-                    else if (username.Contains("@"))
+-                        domain = null;
+-                    else
+-                        domain = ".";
+-                }
+-
+-                IntPtr hToken = IntPtr.Zero;
+-                if (!LogonUser(
+-                    username,
+-                    domain,
+-                    password,
+-                    logonType,
+-                    LogonProvider.LOGON32_PROVIDER_DEFAULT,
+-                    out hToken))
+-                {
+-                    throw new Win32Exception("LogonUser failed");
+-                }
+-
+-                if (!service_sids.Contains(account_sid))
+-                {
+-                    // Try and get the elevated token for local/domain account
+-                    IntPtr hTokenElevated = GetElevatedToken(hToken);
+-                    tokens.Add(hTokenElevated);
+-                }
+-
+-                // add the original token as a fallback
+-                tokens.Add(hToken);
+-            }
+-            finally
+-            {
+-                if (impersonated)
+-                    RevertToSelf();
+-            }
+-
+-            return tokens;
+-        }
+-
+-        private static IntPtr GetSystemUserHandle()
+-        {
+-            uint array_byte_size = 1024 * sizeof(uint);
+-            IntPtr[] pids = new IntPtr[1024];
+-            uint bytes_copied;
+-
+-            if (!EnumProcesses(pids, array_byte_size, out bytes_copied))
+-            {
+-                throw new Win32Exception("Failed to enumerate processes");
+-            }
+-            // TODO: Handle if bytes_copied is larger than the array size and rerun EnumProcesses with larger array
+-            uint num_processes = bytes_copied / sizeof(uint);
+-
+-            for (uint i = 0; i < num_processes; i++)
+-            {
+-                IntPtr hProcess = OpenProcess(ProcessAccessFlags.PROCESS_QUERY_INFORMATION, false, pids[i]);
+-                if (hProcess != IntPtr.Zero)
+-                {
+-                    IntPtr hToken = IntPtr.Zero;
+-                    // According to CreateProcessWithTokenW we require a token with
+-                    //  TOKEN_QUERY, TOKEN_DUPLICATE and TOKEN_ASSIGN_PRIMARY
+-                    // Also add in TOKEN_IMPERSONATE so we can get an impersontated token
+-                    TokenAccessLevels desired_access = TokenAccessLevels.Query |
+-                        TokenAccessLevels.Duplicate |
+-                        TokenAccessLevels.AssignPrimary |
+-                        TokenAccessLevels.Impersonate;
+-
+-                    if (OpenProcessToken(hProcess, desired_access, out hToken))
+-                    {
+-                        string sid = GetTokenUserSID(hToken);
+-                        if (sid == "S-1-5-18")
+-                        {
+-                            CloseHandle(hProcess);
+-                            return hToken;
+-                        }
+-                    }
+-
+-                    CloseHandle(hToken);
+-                }
+-                CloseHandle(hProcess);
+-            }
+-
+-            return IntPtr.Zero;
+-        }
+-
+-        private static string GetTokenUserSID(IntPtr hToken)
+-        {
+-            uint token_length;
+-            string sid;
+-
+-            if (!GetTokenInformation(hToken, TokenInformationClass.TokenUser, IntPtr.Zero, 0, out token_length))
+-            {
+-                int last_err = Marshal.GetLastWin32Error();
+-                if (last_err != 122) // ERROR_INSUFFICIENT_BUFFER
+-                    throw new Win32Exception(last_err, "Failed to get TokenUser length");
+-            }
+-
+-            IntPtr token_information = Marshal.AllocHGlobal((int)token_length);
+-            try
+-            {
+-                if (!GetTokenInformation(hToken, TokenInformationClass.TokenUser, token_information, token_length, out token_length))
+-                    throw new Win32Exception("Failed to get TokenUser information");
+-
+-                TOKEN_USER token_user = (TOKEN_USER)Marshal.PtrToStructure(token_information, typeof(TOKEN_USER));
+-
+-                if (!ConvertSidToStringSidW(token_user.User.Sid, out sid))
+-                    throw new Win32Exception("Failed to get user SID");
+-            }
+-            finally
+-            {
+-                Marshal.FreeHGlobal(token_information);
+-            }
+-
+-            return sid;
+-        }
+-
+-        private static void GetProcessOutput(StreamReader stdoutStream, StreamReader stderrStream, out string stdout, out string stderr)
+-        {
+-            var sowait = new EventWaitHandle(false, EventResetMode.ManualReset);
+-            var sewait = new EventWaitHandle(false, EventResetMode.ManualReset);
+-            string so = null, se = null;
+-            ThreadPool.QueueUserWorkItem((s) =>
+-            {
+-                so = stdoutStream.ReadToEnd();
+-                sowait.Set();
+-            });
+-            ThreadPool.QueueUserWorkItem((s) =>
+-            {
+-                se = stderrStream.ReadToEnd();
+-                sewait.Set();
+-            });
+-            foreach (var wh in new WaitHandle[] { sowait, sewait })
+-                wh.WaitOne();
+-            stdout = so;
+-            stderr = se;
+-        }
+-
+-        private static uint GetProcessExitCode(IntPtr processHandle)
+-        {
+-            new NativeWaitHandle(processHandle).WaitOne();
+-            uint exitCode;
+-            if (!GetExitCodeProcess(processHandle, out exitCode))
+-                throw new Win32Exception("Error getting process exit code");
+-            return exitCode;
+-        }
+-
+-        private static IntPtr GetElevatedToken(IntPtr hToken)
+-        {
+-            uint requestedLength;
+-
+-            IntPtr pTokenInfo = Marshal.AllocHGlobal(sizeof(int));
+-
+-            try
+-            {
+-                if (!GetTokenInformation(hToken, TokenInformationClass.TokenElevationType, pTokenInfo, sizeof(int), out requestedLength))
+-                    throw new Win32Exception("Unable to get TokenElevationType");
+-
+-                var tet = (TokenElevationType)Marshal.ReadInt32(pTokenInfo);
+-
+-                // we already have the best token we can get, just use it
+-                if (tet != TokenElevationType.TokenElevationTypeLimited)
+-                    return hToken;
+-
+-                GetTokenInformation(hToken, TokenInformationClass.TokenLinkedToken, IntPtr.Zero, 0, out requestedLength);
+-
+-                IntPtr pLinkedToken = Marshal.AllocHGlobal((int)requestedLength);
+-
+-                if (!GetTokenInformation(hToken, TokenInformationClass.TokenLinkedToken, pLinkedToken, requestedLength, out requestedLength))
+-                    throw new Win32Exception("Unable to get linked token");
+-
+-                IntPtr linkedToken = Marshal.ReadIntPtr(pLinkedToken);
+-
+-                Marshal.FreeHGlobal(pLinkedToken);
+-
+-                return linkedToken;
+-            }
+-            finally
+-            {
+-                Marshal.FreeHGlobal(pTokenInfo);
+-            }
+-        }
+-
+-        private static void GrantAccessToWindowStationAndDesktop(SecurityIdentifier account)
+-        {
+-            const int WindowStationAllAccess = 0x000f037f;
+-            GrantAccess(account, GetProcessWindowStation(), WindowStationAllAccess);
+-            const int DesktopRightsAllAccess = 0x000f01ff;
+-            GrantAccess(account, GetThreadDesktop(GetCurrentThreadId()), DesktopRightsAllAccess);
+-        }
+-
+-        private static void GrantAccess(SecurityIdentifier account, IntPtr handle, int accessMask)
+-        {
+-            SafeHandle safeHandle = new NoopSafeHandle(handle);
+-            GenericSecurity security =
+-                new GenericSecurity(false, ResourceType.WindowObject, safeHandle, AccessControlSections.Access);
+-            security.AddAccessRule(
+-                new GenericAccessRule(account, accessMask, AccessControlType.Allow));
+-            security.Persist(safeHandle, AccessControlSections.Access);
+-        }
+-
+-        private class GenericSecurity : NativeObjectSecurity
+-        {
+-            public GenericSecurity(bool isContainer, ResourceType resType, SafeHandle objectHandle, AccessControlSections sectionsRequested)
+-                : base(isContainer, resType, objectHandle, sectionsRequested) { }
+-            public new void Persist(SafeHandle handle, AccessControlSections includeSections) { base.Persist(handle, includeSections); }
+-            public new void AddAccessRule(AccessRule rule) { base.AddAccessRule(rule); }
+-            public override Type AccessRightType { get { throw new NotImplementedException(); } }
+-            public override AccessRule AccessRuleFactory(System.Security.Principal.IdentityReference identityReference, int accessMask, bool isInherited,
+-                InheritanceFlags inheritanceFlags, PropagationFlags propagationFlags, AccessControlType type)
+-            { throw new NotImplementedException(); }
+-            public override Type AccessRuleType { get { return typeof(AccessRule); } }
+-            public override AuditRule AuditRuleFactory(System.Security.Principal.IdentityReference identityReference, int accessMask, bool isInherited,
+-                InheritanceFlags inheritanceFlags, PropagationFlags propagationFlags, AuditFlags flags)
+-            { throw new NotImplementedException(); }
+-            public override Type AuditRuleType { get { return typeof(AuditRule); } }
+-        }
+-
+-        private class NoopSafeHandle : SafeHandle
+-        {
+-            public NoopSafeHandle(IntPtr handle) : base(handle, false) { }
+-            public override bool IsInvalid { get { return false; } }
+-            protected override bool ReleaseHandle() { return true; }
+-        }
+-
+-        private class GenericAccessRule : AccessRule
+-        {
+-            public GenericAccessRule(IdentityReference identity, int accessMask, AccessControlType type) :
+-                base(identity, accessMask, false, InheritanceFlags.None, PropagationFlags.None, type)
+-            { }
+-        }
+-    }
+-}
+-"@
+-
+-# due to the command line size limitations of CreateProcessWithTokenW, we
+-# execute a simple PS script that executes our full exec_wrapper so no files
+-# touch the disk
+-$become_exec_wrapper = {
+-    chcp.com 65001 > $null
+-    $ProgressPreference = "SilentlyContinue"
+-    $exec_wrapper_str = [System.Console]::In.ReadToEnd()
+-    $exec_wrapper = [ScriptBlock]::Create($exec_wrapper_str)
+-    &$exec_wrapper
+-}
+-
+-$exec_wrapper = {
+-    &chcp.com 65001 > $null
+-    Set-StrictMode -Version 2
+-    $DebugPreference = "Continue"
+-    $ErrorActionPreference = "Stop"
+-
+-    Function ConvertTo-HashtableFromPsCustomObject($myPsObject) {
+-        $output = @{}
+-        $myPsObject | Get-Member -MemberType *Property | % {
+-            $val = $myPsObject.($_.name)
+-            if ($val -is [psobject]) {
+-                $val = ConvertTo-HashtableFromPsCustomObject -myPsObject $val
+-            }
+-            $output.($_.name) = $val
+-        }
+-        return $output
+-    }
+-
+-    # stream JSON including become_pw, ps_module_payload, bin_module_payload, become_payload, write_payload_path, preserve directives
+-    # exec runspace, capture output, cleanup, return module output. Do not change this as it is set become before being passed to the
+-    # become process.
+-    $json_raw = ""
+-
+-    If (-not $json_raw) {
+-        Write-Error "no input given" -Category InvalidArgument
+-    }
+-
+-    $payload = ConvertTo-HashtableFromPsCustomObject -myPsObject (ConvertFrom-Json $json_raw)
+-
+-    # TODO: handle binary modules
+-    # TODO: handle persistence
+-
+-    $actions = $payload.actions
+-
+-    # pop 0th action as entrypoint
+-    $entrypoint = $payload.($actions[0])
+-    $payload.actions = $payload.actions[1..99]
+-
+-    $entrypoint = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($entrypoint))
+-
+-    # load the current action entrypoint as a module custom object with a Run method
+-    $entrypoint = New-Module -ScriptBlock ([scriptblock]::Create($entrypoint)) -AsCustomObject
+-
+-    Set-Variable -Scope global -Name complex_args -Value $payload["module_args"] | Out-Null
+-
+-    # dynamically create/load modules
+-    ForEach ($mod in $payload.powershell_modules.GetEnumerator()) {
+-        $decoded_module = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($mod.Value))
+-        New-Module -ScriptBlock ([scriptblock]::Create($decoded_module)) -Name $mod.Key | Import-Module -WarningAction SilentlyContinue | Out-Null
+-    }
+-
+-    $output = $entrypoint.Run($payload)
+-    # base64 encode the output so the non-ascii characters are preserved
+-    Write-Output ([System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes((Write-Output ($output | Out-String)))))
+-} # end exec_wrapper
+-
+-Function Dump-Error ($excep, $msg=$null) {
+-    $eo = @{failed=$true}
+-
+-    $exception_message = $excep.Exception.Message
+-    if ($null -ne $msg) {
+-        $exception_message = "$($msg): $exception_message"
+-    }
+-    $eo.msg = $exception_message
+-    $eo.exception = $excep | Out-String
+-    $host.SetShouldExit(1)
+-
+-    $eo | ConvertTo-Json -Depth 10 -Compress
+-}
+-
+-Function Parse-EnumValue($enum, $flag_type, $value, $prefix) {
+-    $raw_enum_value = "$prefix$($value.ToUpper())"
+-    try {
+-        $enum_value = [Enum]::Parse($enum, $raw_enum_value)
+-    } catch [System.ArgumentException] {
+-        $valid_options = [Enum]::GetNames($enum) | ForEach-Object { $_.Substring($prefix.Length).ToLower() }
+-        throw "become_flags $flag_type value '$value' is not valid, valid values are: $($valid_options -join ", ")"
+-    }
+-    return $enum_value
+-}
+-
+-Function Parse-BecomeFlags($flags) {
+-    $logon_type = [AnsibleBecome.LogonType]::LOGON32_LOGON_INTERACTIVE
+-    $logon_flags = [AnsibleBecome.LogonFlags]::LOGON_WITH_PROFILE
+-
+-    if ($flags -eq $null -or $flags -eq "") {
+-        $flag_split = @()
+-    } elseif ($flags -is [string]) {
+-        $flag_split = $flags.Split(" ")
+-    } else {
+-        throw "become_flags must be a string, was $($flags.GetType())"
+-    }
+-
+-    foreach ($flag in $flag_split) {
+-        $split = $flag.Split("=")
+-        if ($split.Count -ne 2) {
+-            throw "become_flags entry '$flag' is in an invalid format, must be a key=value pair"
+-        }
+-        $flag_key = $split[0]
+-        $flag_value = $split[1]
+-        if ($flag_key -eq "logon_type") {
+-            $enum_details = @{
+-                enum = [AnsibleBecome.LogonType]
+-                flag_type = $flag_key
+-                value = $flag_value
+-                prefix = "LOGON32_LOGON_"
+-            }
+-            $logon_type = Parse-EnumValue @enum_details
+-        } elseif ($flag_key -eq "logon_flags") {
+-            $logon_flag_values = $flag_value.Split(",")
+-            $logon_flags = 0 -as [AnsibleBecome.LogonFlags]
+-            foreach ($logon_flag_value in $logon_flag_values) {
+-                if ($logon_flag_value -eq "") {
+-                    continue
+-                }
+-                $enum_details = @{
+-                    enum = [AnsibleBecome.LogonFlags]
+-                    flag_type = $flag_key
+-                    value = $logon_flag_value
+-                    prefix = "LOGON_"
+-                }
+-                $logon_flag = Parse-EnumValue @enum_details
+-                $logon_flags = $logon_flags -bor $logon_flag
+-            }
+-        } else {
+-            throw "become_flags key '$flag_key' is not a valid runas flag, must be 'logon_type' or 'logon_flags'"
+-        }
+-    }
+-
+-    return $logon_type, [AnsibleBecome.LogonFlags]$logon_flags
+-}
+-
+-Function Run($payload) {
+-    # NB: action popping handled inside subprocess wrapper
+-
+-    $original_tmp = $env:TMP
+-    $remote_tmp = $payload["module_args"]["_ansible_remote_tmp"]
+-    $remote_tmp = [System.Environment]::ExpandEnvironmentVariables($remote_tmp)
+-    if ($null -eq $remote_tmp) {
+-        $remote_tmp = $original_tmp
+-    }
+-
+-    # become process is run under a different console to the WinRM one so we
+-    # need to set the UTF-8 codepage again
+-    $env:TMP = $remote_tmp
+-    Add-Type -TypeDefinition $helper_def -Debug:$false
+-    $env:TMP = $original_tmp
+-
+-    $username = $payload.become_user
+-    $password = $payload.become_password
+-    try {
+-        $logon_type, $logon_flags = Parse-BecomeFlags -flags $payload.become_flags
+-    } catch {
+-        Dump-Error -excep $_ -msg "Failed to parse become_flags '$($payload.become_flags)'"
+-        return $null
+-    }
+-
+-    # NB: CreateProcessWithTokenW commandline maxes out at 1024 chars, must bootstrap via small
+-    # wrapper which calls our read wrapper passed through stdin. Cannot use 'powershell -' as
+-    # the $ErrorActionPreference is always set to Stop and cannot be changed
+-    $payload_string = $payload | ConvertTo-Json -Depth 99 -Compress
+-    $exec_wrapper = $exec_wrapper.ToString().Replace('$json_raw = ""', "`$json_raw = '$payload_string'")
+-    $rc = 0
+-
+-    $exec_command = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($become_exec_wrapper.ToString()))
+-    $lp_command_line = New-Object System.Text.StringBuilder @("powershell.exe -NonInteractive -NoProfile -ExecutionPolicy Bypass -EncodedCommand $exec_command")
+-    $lp_current_directory = "$env:SystemRoot"
+-
+-    Try {
+-        $result = [AnsibleBecome.BecomeUtil]::RunAsUser($username, $password, $lp_command_line, $lp_current_directory, $exec_wrapper, $logon_flags, $logon_type)
+-        $stdout = $result.StandardOut
+-        $stdout = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($stdout.Trim()))
+-        $stderr = $result.StandardError
+-        $rc = $result.ExitCode
+-
+-        $host.UI.WriteLine($stdout)
+-        $host.UI.WriteErrorLine($stderr.Trim())
+-    } Catch {
+-        $excep = $_
+-        Dump-Error -excep $excep -msg "Failed to become user $username"
+-    }
+-    $host.SetShouldExit($rc)
+-}
+-'''
+-
+-async_wrapper = br'''
+-Set-StrictMode -Version 2
+-$ErrorActionPreference = "Stop"
+-
+-# build exec_wrapper encoded command
+-# start powershell with breakaway running exec_wrapper encodedcommand
+-# stream payload to powershell with normal exec, but normal exec writes results to resultfile instead of stdout/stderr
+-# return asyncresult to controller
+-
+-$exec_wrapper = {
+-    # help to debug any errors in the exec_wrapper or async_watchdog by generating
+-    # an error log in case of a terminating error
+-    trap {
+-        $log_path = "$($env:TEMP)\async-exec-wrapper-$(Get-Date -Format "yyyy-MM-ddTHH-mm-ss.ffffZ")-error.txt"
+-        $error_msg = "Error while running the async exec wrapper`r`n$_`r`n$($_.ScriptStackTrace)"
+-        Set-Content -Path $log_path -Value $error_msg
+-        throw $_
+-    }
+-
+-    &chcp.com 65001 > $null
+-    $DebugPreference = "Continue"
+-    $ErrorActionPreference = "Stop"
+-    Set-StrictMode -Version 2
+-
+-    function ConvertTo-HashtableFromPsCustomObject ($myPsObject){
+-        $output = @{};
+-        $myPsObject | Get-Member -MemberType *Property | % {
+-            $val = $myPsObject.($_.name);
+-            If ($val -is [psobject]) {
+-                $val = ConvertTo-HashtableFromPsCustomObject $val
+-            }
+-            $output.($_.name) = $val
+-        }
+-        return $output;
+-    }
+-
+-    # store the pipe name and no. of bytes to read, these are populated by the
+-    # Run function before being run - do not remove or change
+-    $pipe_name = ""
+-    $bytes_length = 0
+-
+-    # stream JSON including become_pw, ps_module_payload, bin_module_payload, become_payload, write_payload_path, preserve directives
+-    # exec runspace, capture output, cleanup, return module output
+-    $input_bytes = New-Object -TypeName byte[] -ArgumentList $bytes_length
+-    $pipe = New-Object -TypeName System.IO.Pipes.NamedPipeClientStream -ArgumentList @(
+-        ".",  # localhost
+-        $pipe_name,
+-        [System.IO.Pipes.PipeDirection]::In,
+-        [System.IO.Pipes.PipeOptions]::None,
+-        [System.Security.Principal.TokenImpersonationLevel]::Anonymous
+-    )
+-    try {
+-        $pipe.Connect()
+-        $pipe.Read($input_bytes, 0, $bytes_length) > $null
+-    } finally {
+-        $pipe.Close()
+-    }
+-    $json_raw = [System.Text.Encoding]::UTF8.GetString($input_bytes)
+-
+-    If (-not $json_raw) {
+-        Write-Error "no input given" -Category InvalidArgument
+-    }
+-
+-    $payload = ConvertTo-HashtableFromPsCustomObject (ConvertFrom-Json $json_raw)
+-
+-    # TODO: handle binary modules
+-    # TODO: handle persistence
+-
+-    $actions = $payload.actions
+-
+-    # pop 0th action as entrypoint
+-    $entrypoint = $payload.($actions[0])
+-    $payload.actions = $payload.actions[1..99]
+-
+-    $entrypoint = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($entrypoint))
+-
+-    # load the current action entrypoint as a module custom object with a Run method
+-    $entrypoint = New-Module -ScriptBlock ([scriptblock]::Create($entrypoint)) -AsCustomObject
+-
+-    Set-Variable -Scope global -Name complex_args -Value $payload["module_args"] | Out-Null
+-
+-    # dynamically create/load modules
+-    ForEach ($mod in $payload.powershell_modules.GetEnumerator()) {
+-        $decoded_module = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($mod.Value))
+-        New-Module -ScriptBlock ([scriptblock]::Create($decoded_module)) -Name $mod.Key | Import-Module -WarningAction SilentlyContinue | Out-Null
+-    }
+-
+-    $output = $entrypoint.Run($payload)
+-
+-    Write-Output $output
+-} # end exec_wrapper
+-
+-
+-Function Run($payload) {
+-    if ($payload.environment.ContainsKey("ANSIBLE_ASYNC_DIR")) {
+-        $async_dir = $payload.environment.ANSIBLE_ASYNC_DIR
+-    } else {
+-        $async_dir = "%USERPROFILE%\.ansible_async"
+-    }
+-    $async_dir = [System.Environment]::ExpandEnvironmentVariables($async_dir)
+-
+-    # calculate the result path so we can include it in the worker payload
+-    $jid = $payload.async_jid
+-    $local_jid = $jid + "." + $pid
+-
+-    $results_path = [System.IO.Path]::Combine($async_dir, $local_jid)
+-
+-    $payload.async_results_path = $results_path
+-
+-    [System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($results_path)) | Out-Null
+-
+-    # can't use anonymous pipes as the spawned process will not be a child due to
+-    # the way WMI works, use a named pipe with a random name instead and set to
+-    # only allow current user to read from the pipe
+-    $pipe_name = "ansible-async-$jid-$([guid]::NewGuid())"
+-    $current_user = ([Security.Principal.WindowsIdentity]::GetCurrent()).User
+-    $payload_string = $payload | ConvertTo-Json -Depth 99 -Compress
+-    $payload_bytes = [System.Text.Encoding]::UTF8.GetBytes($payload_string)
+-
+-    $pipe_sec = New-Object -TypeName System.IO.Pipes.PipeSecurity
+-    $pipe_ar = New-Object -TypeName System.IO.Pipes.PipeAccessRule -ArgumentList @(
+-        $current_user,
+-        [System.IO.Pipes.PipeAccessRights]::Read,
+-        [System.Security.AccessControl.AccessControlType]::Allow
+-    )
+-    $pipe_sec.AddAccessRule($pipe_ar)
+-    $pipe = New-Object -TypeName System.IO.Pipes.NamedPipeServerStream -ArgumentList @(
+-        $pipe_name,
+-        [System.IO.Pipes.PipeDirection]::Out,
+-        1,
+-        [System.IO.Pipes.PipeTransmissionMode]::Byte,
+-        [System.IO.Pipes.PipeOptions]::Asynchronous,
+-        0,
+-        0,
+-        $pipe_sec
+-    )
+-
+-    try {
+-        $exec_wrapper_str = $exec_wrapper.ToString()
+-        $exec_wrapper_str = $exec_wrapper_str.Replace('$pipe_name = ""', "`$pipe_name = `"$pipe_name`"")
+-        $exec_wrapper_str = $exec_wrapper_str.Replace('$bytes_length = 0', "`$bytes_length = $($payload_bytes.Count)")
+-
+-        $encoded_command = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($exec_wrapper_str))
+-        $exec_args = "powershell.exe -NonInteractive -NoProfile -ExecutionPolicy Bypass -EncodedCommand $encoded_command"
+-
+-        # not all connection plugins support breakaway from job that is required
+-        # for async, Win32_Process.Create() is still able to escape so we use
+-        # that here
+-        $process = Invoke-CimMethod -ClassName Win32_Process -Name Create -Arguments @{CommandLine=$exec_args}
+-        $rc = $process.ReturnValue
+-        if ($rc -ne 0) {
+-            $error_msg = switch($rc) {
+-                2 { "Access denied" }
+-                3 { "Insufficient privilege" }
+-                8 { "Unknown failure" }
+-                9 { "Path not found" }
+-                21 { "Invalid parameter" }
+-                default { "Other" }
+-            }
+-            throw "Failed to start async process: $rc ($error_msg)"
+-        }
+-        $watchdog_pid = $process.ProcessId
+-
+-        # populate initial results before we send the async data to avoid result race
+-        $result = @{
+-            started = 1;
+-            finished = 0;
+-            results_file = $results_path;
+-            ansible_job_id = $local_jid;
+-            _ansible_suppress_tmpdir_delete = $true;
+-            ansible_async_watchdog_pid = $watchdog_pid
+-        }
+-
+-        $result_json = ConvertTo-Json $result
+-        Set-Content $results_path -Value $result_json
+-
+-        # wait until the client connects, throw an error if the timeout is reached
+-        $wait_async = $pipe.BeginWaitForConnection($null, $null)
+-        $wait_async.AsyncWaitHandle.WaitOne(5000) > $null
+-        if (-not $wait_async.IsCompleted) {
+-            throw "timeout while waiting for child process to connect to named pipe"
+-        }
+-        $pipe.EndWaitForConnection($wait_async)
+-
+-        # write the exec manifest to the child process
+-        $pipe.Write($payload_bytes, 0, $payload_bytes.Count)
+-        $pipe.Flush()
+-        $pipe.WaitForPipeDrain()
+-    } finally {
+-        $pipe.Close()
+-    }
+-
+-    return $result_json
+-}
+-
+-'''  # end async_wrapper
+-
+-async_watchdog = br'''
+-Set-StrictMode -Version 2
+-$ErrorActionPreference = "Stop"
+-
+-Add-Type -AssemblyName System.Web.Extensions
+-
+-Function Log {
+-    Param(
+-        [string]$msg
+-    )
+-
+-    If(Get-Variable -Name log_path -ErrorAction SilentlyContinue) {
+-        Add-Content $log_path $msg
+-    }
+-}
+-
+-Function Deserialize-Json {
+-    Param(
+-        [Parameter(ValueFromPipeline=$true)]
+-        [string]$json
+-    )
+-
+-    # FUTURE: move this into module_utils/powershell.ps1 and use for everything (sidestep PSCustomObject issues)
+-    # FUTURE: won't work w/ Nano Server/.NET Core- fallback to DataContractJsonSerializer (which can't handle dicts on .NET 4.0)
+-
+-    Log "Deserializing:`n$json"
+-
+-    $jss = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+-    return $jss.DeserializeObject($json)
+-}
+-
+-Function Write-Result {
+-    Param(
+-        [hashtable]$result,
+-        [string]$resultfile_path
+-    )
+-
+-    $result | ConvertTo-Json | Set-Content -Path $resultfile_path
+-}
+-
+-Function Run($payload) {
+-    $actions = $payload.actions
+-
+-    # pop 0th action as entrypoint
+-    $entrypoint = $payload.($actions[0])
+-    $entrypoint = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($entrypoint))
+-
+-    $payload.actions = $payload.actions[1..99]
+-
+-    $resultfile_path = $payload.async_results_path
+-    $max_exec_time_sec = $payload.async_timeout_sec
+-
+-    Log "deserializing existing resultfile args"
+-    # read in existing resultsfile to merge w/ module output (it should be written by the time we're unsuspended and running)
+-    $result = Get-Content $resultfile_path -Raw | Deserialize-Json
+-
+-    Log "deserialized result is $($result | Out-String)"
+-
+-    Log "creating runspace"
+-
+-    $rs = [runspacefactory]::CreateRunspace()
+-    $rs.Open()
+-
+-    Log "creating Powershell object"
+-
+-    $job = [powershell]::Create()
+-    $job.Runspace = $rs
+-
+-    $job.AddScript($entrypoint) | Out-Null
+-    $job.AddStatement().AddCommand("Run").AddArgument($payload) | Out-Null
+-
+-    Log "job BeginInvoke()"
+-
+-    $job_asyncresult = $job.BeginInvoke()
+-
+-    Log "waiting $max_exec_time_sec seconds for job to complete"
+-
+-    $signaled = $job_asyncresult.AsyncWaitHandle.WaitOne($max_exec_time_sec * 1000)
+-
+-    $result["finished"] = 1
+-
+-    If($job_asyncresult.IsCompleted) {
+-        Log "job completed, calling EndInvoke()"
+-
+-        $job_output = $job.EndInvoke($job_asyncresult)
+-        $job_error = $job.Streams.Error
+-
+-        Log "raw module stdout: \r\n$job_output"
+-        If($job_error) {
+-            Log "raw module stderr: \r\n$job_error"
+-        }
+-
+-        # write success/output/error to result object
+-
+-        # TODO: cleanse leading/trailing junk
+-        Try {
+-            $module_result = Deserialize-Json $job_output
+-            # TODO: check for conflicting keys
+-            $result = $result + $module_result
+-        }
+-        Catch {
+-            $excep = $_
+-
+-            $result.failed = $true
+-            $result.msg = "failed to parse module output: $excep"
+-            # return the output back to Ansible to help with debugging errors
+-            $result.stdout = $job_output | Out-String
+-            $result.stderr = $job_error | Out-String
+-        }
+-
+-        # TODO: determine success/fail, or always include stderr if nonempty?
+-        Write-Result $result $resultfile_path
+-
+-        Log "wrote output to $resultfile_path"
+-    }
+-    Else {
+-        $job.BeginStop($null, $null) | Out-Null # best effort stop
+-        # write timeout to result object
+-        $result.failed = $true
+-        $result.msg = "timed out waiting for module completion"
+-        Write-Result $result $resultfile_path
+-
+-        Log "wrote timeout to $resultfile_path"
+-    }
+-
+-    # in the case of a hung pipeline, this will cause the process to stay alive until it's un-hung...
+-    #$rs.Close() | Out-Null
+-}
+-
+-'''  # end async_watchdog
+-
+-from ansible.plugins import AnsiblePlugin
+-
+ 
+ class ShellModule(ShellBase):
+ 
+@@ -1691,7 +300,7 @@ class ShellModule(ShellBase):
+         script = to_text(script)
+ 
+         if script == u'-':
+-            cmd_parts = _common_args + ['-']
++            cmd_parts = _common_args + ['-Command', '-']
+ 
+         else:
+             if strict_mode:
+diff --git a/setup.py b/setup.py
+index da788c285e..b100f7ebd3 100644
+--- a/setup.py
++++ b/setup.py
+@@ -249,6 +249,9 @@ static_setup_params = dict(
+     packages=find_packages('lib'),
+     package_data={
+         '': [
++            'executor/powershell/*.ps1',
++            'module_utils/csharp/*.cs',
++            'module_utils/csharp/*/*.cs',
+             'module_utils/powershell/*.psm1',
+             'module_utils/powershell/*/*.psm1',
+             'modules/windows/*.ps1',
+diff --git a/test/integration/targets/win_async_wrapper/tasks/main.yml b/test/integration/targets/win_async_wrapper/tasks/main.yml
+index 756e3ee780..91b45846ed 100644
+--- a/test/integration/targets/win_async_wrapper/tasks/main.yml
++++ b/test/integration/targets/win_async_wrapper/tasks/main.yml
+@@ -148,8 +148,7 @@
+     - asyncresult is finished
+     - asyncresult is not changed
+     - asyncresult is failed
+-# TODO: re-enable after catastrophic failure behavior is cleaned up
+-#    - asyncresult.msg is search('failing via exception')
++    - 'asyncresult.msg == "Unhandled exception while executing module: failing via exception"'
+ 
+ - name: echo some non ascii characters
+   win_command: cmd.exe /c echo über den Fußgängerübergang gehen
+diff --git a/test/integration/targets/win_become/tasks/main.yml b/test/integration/targets/win_become/tasks/main.yml
+index 1f2f241884..0aab437471 100644
+--- a/test/integration/targets/win_become/tasks/main.yml
++++ b/test/integration/targets/win_become/tasks/main.yml
+@@ -136,7 +136,8 @@
+     register: become_invalid_pass
+     failed_when:
+     - '"Failed to become user " + become_test_username not in become_invalid_pass.msg'
+-    - '"LogonUser failed (The user name or password is incorrect, Win32ErrorCode 1326)" not in become_invalid_pass.msg'
++    - '"LogonUser failed" not in become_invalid_pass.msg'
++    - '"Win32ErrorCode 1326)" not in become_invalid_pass.msg'
+     
+   - name: test become with SYSTEM account
+     win_whoami:
+@@ -206,21 +207,21 @@
+     become_flags: logon_type=batch invalid_flags=a
+     become_method: runas
+     register: failed_flags_invalid_key
+-    failed_when: "failed_flags_invalid_key.msg != \"Failed to parse become_flags 'logon_type=batch invalid_flags=a': become_flags key 'invalid_flags' is not a valid runas flag, must be 'logon_type' or 'logon_flags'\""
++    failed_when: "failed_flags_invalid_key.msg != \"internal error: failed to parse become_flags 'logon_type=batch invalid_flags=a': become_flags key 'invalid_flags' is not a valid runas flag, must be 'logon_type' or 'logon_flags'\""
+ 
+   - name: test failure with invalid logon_type
+     vars: *become_vars
+     win_whoami:
+     become_flags: logon_type=invalid
+     register: failed_flags_invalid_type
+-    failed_when: "failed_flags_invalid_type.msg != \"Failed to parse become_flags 'logon_type=invalid': become_flags logon_type value 'invalid' is not valid, valid values are: interactive, network, batch, service, unlock, network_cleartext, new_credentials\""
++    failed_when: "failed_flags_invalid_type.msg != \"internal error: failed to parse become_flags 'logon_type=invalid': become_flags logon_type value 'invalid' is not valid, valid values are: interactive, network, batch, service, unlock, network_cleartext, new_credentials\""
+ 
+   - name: test failure with invalid logon_flag
+     vars: *become_vars
+     win_whoami:
+     become_flags: logon_flags=with_profile,invalid
+     register: failed_flags_invalid_flag
+-    failed_when: "failed_flags_invalid_flag.msg != \"Failed to parse become_flags 'logon_flags=with_profile,invalid': become_flags logon_flags value 'invalid' is not valid, valid values are: with_profile, netcredentials_only\""
++    failed_when: "failed_flags_invalid_flag.msg != \"internal error: failed to parse become_flags 'logon_flags=with_profile,invalid': become_flags logon_flags value 'invalid' is not valid, valid values are: with_profile, netcredentials_only\""
+ 
+   # Server 2008 doesn't work with network and network_cleartext, there isn't really a reason why you would want this anyway
+   - name: check if we are running on a dinosaur, neanderthal or an OS of the modern age
+diff --git a/test/integration/targets/win_exec_wrapper/library/test_common_functions.ps1 b/test/integration/targets/win_exec_wrapper/library/test_common_functions.ps1
+new file mode 100644
+index 0000000000..9a5918f943
+--- /dev/null
++++ b/test/integration/targets/win_exec_wrapper/library/test_common_functions.ps1
+@@ -0,0 +1,40 @@
++#!powershell
++
++#Requires -Module Ansible.ModuleUtils.Legacy
++
++$ErrorActionPreference = "Stop"
++
++Function Assert-Equals($actual, $expected) {
++    if ($actual -cne $expected) {
++        $call_stack = (Get-PSCallStack)[1]
++        $error_msg = "AssertionError:`r`nActual: `"$actual`" != Expected: `"$expected`"`r`nLine: $($call_stack.ScriptLineNumber), Method: $($call_stack.Position.Text)"
++        Fail-Json -obj $result -message $error_msg
++    }
++}
++
++$result = @{
++    changed = $false
++}
++
++#ConvertFrom-AnsibleJso
++$input_json  = '{"string":"string","float":3.1415926,"dict":{"string":"string","int":1},"list":["entry 1","entry 2"],"null":null,"int":1}'
++$actual = ConvertFrom-AnsibleJson -InputObject $input_json
++Assert-Equals -actual $actual.GetType() -expected ([Hashtable])
++Assert-Equals -actual $actual.string.GetType() -expected ([String])
++Assert-Equals -actual $actual.string -expected "string"
++Assert-Equals -actual $actual.int.GetType() -expected ([Int32])
++Assert-Equals -actual $actual.int -expected 1
++Assert-Equals -actual $actual.null -expected $null
++Assert-Equals -actual $actual.float.GetType() -expected ([Decimal])
++Assert-Equals -actual $actual.float -expected 3.1415926
++Assert-Equals -actual $actual.list.GetType() -expected ([Object[]])
++Assert-Equals -actual $actual.list.Count -expected 2
++Assert-Equals -actual $actual.list[0] -expected "entry 1"
++Assert-Equals -actual $actual.list[1] -expected "entry 2"
++Assert-Equals -actual $actual.GetType() -expected ([Hashtable])
++Assert-Equals -actual $actual.dict.string -expected "string"
++Assert-Equals -actual $actual.dict.int -expected 1
++
++$result.msg = "good"
++Exit-Json -obj $result
++
+diff --git a/test/integration/targets/win_exec_wrapper/library/test_fail.ps1 b/test/integration/targets/win_exec_wrapper/library/test_fail.ps1
+new file mode 100644
+index 0000000000..06c63f72c4
+--- /dev/null
++++ b/test/integration/targets/win_exec_wrapper/library/test_fail.ps1
+@@ -0,0 +1,58 @@
++#!powershell
++
++#Requires -Module Ansible.ModuleUtils.Legacy
++
++$params = Parse-Args $args -supports_check_mode $true
++
++$data = Get-AnsibleParam -obj $params -name "data" -type "str" -default "normal"
++$result = @{
++    changed = $false
++}
++
++<#
++This module tests various error events in PowerShell to verify our hidden trap
++catches them all and outputs a pretty error message with a traceback to help
++users debug the actual issue
++
++normal - normal execution, no errors
++fail - Calls Fail-Json like normal
++throw - throws an exception
++error - Write-Error with ErrorActionPreferenceStop
++cmdlet_error - Calls a Cmdlet with an invalid error
++dotnet_exception - Calls a .NET function that will throw an error
++function_throw - Throws an exception in a function
++proc_exit_fine - calls an executable with a non-zero exit code with Exit-Json
++proc_exit_fail - calls an executable with a non-zero exit code with Fail-Json
++#>
++
++Function Test-ThrowException {
++    throw "exception in function"
++}
++
++if ($data -eq "normal") {
++    Exit-Json -obj $result
++} elseif ($data -eq "fail") {
++    Fail-Json -obj $result -message "fail message"
++} elseif ($data -eq "throw") {
++    throw [ArgumentException]"module is thrown"
++} elseif ($data -eq "error") {
++    Write-Error -Message $data
++} elseif ($data -eq "cmdlet_error") {
++    Get-Item -Path "fake:\path"
++} elseif ($data -eq "dotnet_exception") {
++    [System.IO.Path]::GetFullPath($null)
++} elseif ($data -eq "function_throw") {
++    Test-ThrowException
++} elseif ($data -eq "proc_exit_fine") {
++    # verifies that if no error was actually fired and we have an output, we
++    # don't use the RC to validate if the module failed
++    &cmd.exe /c exit 2
++    Exit-Json -obj $result
++} elseif ($data -eq "proc_exit_fail") {
++    &cmd.exe /c exit 2
++    Fail-Json -obj $result -message "proc_exit_fail"
++}
++
++# verify no exception were silently caught during our tests
++Fail-Json -obj $result -message "end of module"
++
+diff --git a/test/integration/targets/win_exec_wrapper/tasks/main.yml b/test/integration/targets/win_exec_wrapper/tasks/main.yml
+index 0ab4fe1d55..b067168b80 100644
+--- a/test/integration/targets/win_exec_wrapper/tasks/main.yml
++++ b/test/integration/targets/win_exec_wrapper/tasks/main.yml
+@@ -1,4 +1,115 @@
+ ---
++- name: test normal module execution
++  test_fail:
++  register: normal
++
++- name: assert test normal module execution
++  assert:
++    that:
++    - not normal is failed
++
++- name: test fail module execution
++  test_fail:
++    data: fail
++  register: fail_module
++  ignore_errors: yes
++
++- name: assert test fail module execution
++  assert:
++    that:
++    - fail_module is failed
++    - fail_module.msg == "fail message"
++    - not fail_module.exception is defined
++
++- name: test module with exception thrown
++  test_fail:
++    data: throw
++  register: throw_module
++  ignore_errors: yes
++
++- name: assert test module with exception thrown
++  assert:
++    that:
++    - throw_module is failed
++    - 'throw_module.msg == "Unhandled exception while executing module: module is thrown"'
++    - '"throw [ArgumentException]\"module is thrown\"" in throw_module.exception'
++
++- name: test module with error msg
++  test_fail:
++    data: error
++  register: error_module
++  ignore_errors: yes
++
++- name: assert test module with error msg
++  assert:
++    that:
++    - error_module is failed
++    - 'error_module.msg == "Unhandled exception while executing module: error"'
++    - '"Write-Error -Message $data" in error_module.exception'
++
++- name: test module with cmdlet error
++  test_fail:
++    data: cmdlet_error
++  register: cmdlet_error
++  ignore_errors: yes
++
++- name: assert test module with cmdlet error
++  assert:
++    that:
++    - cmdlet_error is failed
++    - 'cmdlet_error.msg == "Unhandled exception while executing module: Cannot find drive. A drive with the name ''fake'' does not exist."'
++    - '"Get-Item -Path \"fake:\\path\"" in cmdlet_error.exception'
++
++- name: test module with .NET exception
++  test_fail:
++    data: dotnet_exception
++  register: dotnet_exception
++  ignore_errors: yes
++
++- name: assert test module with .NET exception
++  assert:
++    that:
++    - dotnet_exception is failed
++    - 'dotnet_exception.msg == "Unhandled exception while executing module: Exception calling \"GetFullPath\" with \"1\" argument(s): \"The path is not of a legal form.\""'
++    - '"[System.IO.Path]::GetFullPath($null)" in dotnet_exception.exception'
++
++- name: test module with function exception
++  test_fail:
++    data: function_throw
++  register: function_exception
++  ignore_errors: yes
++
++- name: assert test module with function exception
++  assert:
++    that:
++    - function_exception is failed
++    - 'function_exception.msg == "Unhandled exception while executing module: exception in function"'
++    - '"throw \"exception in function\"" in function_exception.exception'
++    - '"at Test-ThrowException, <No file>: line" in function_exception.exception'
++
++- name: test module with fail process but Exit-Json
++  test_fail:
++    data: proc_exit_fine
++  register: proc_exit_fine
++
++- name: assert test module with fail process but Exit-Json
++  assert:
++    that:
++    - not proc_exit_fine is failed
++
++- name: test module with fail process but Fail-Json
++  test_fail:
++    data: proc_exit_fail
++  register: proc_exit_fail
++  ignore_errors: yes
++
++- name: assert test module with fail process but Fail-Json
++  assert:
++    that:
++    - proc_exit_fail is failed
++    - proc_exit_fail.msg == "proc_exit_fail"
++    - not proc_exit_fail.exception is defined
++
+ - name: test out invalid options
+   test_invalid_requires:
+   register: invalid_options
+@@ -127,3 +238,13 @@
+     args:
+       executable: cmd.exe
+     when: become_test_username in profile_dir_out.stdout_lines[0]
++
++- name: test common functions in exec
++  test_common_functions:
++  register: common_functions_res
++
++- name: assert test common functions in exec
++  assert:
++    that:
++    - not common_functions_res is failed
++    - common_functions_res.msg == "good"
+diff --git a/test/integration/targets/win_module_utils/library/add_type_test.ps1 b/test/integration/targets/win_module_utils/library/add_type_test.ps1
+new file mode 100644
+index 0000000000..f27a1d9c58
+--- /dev/null
++++ b/test/integration/targets/win_module_utils/library/add_type_test.ps1
+@@ -0,0 +1,187 @@
++#!powershell
++
++#Requires -Module Ansible.ModuleUtils.Legacy
++#Requires -Module Ansible.ModuleUtils.AddType
++
++$ErrorActionPreference = "Stop"
++
++$result = @{
++    changed = $false
++}
++
++Function Assert-Equals($actual, $expected) {
++    if ($actual -cne $expected) {
++        $call_stack = (Get-PSCallStack)[1]
++        $error_msg = "AssertionError:`r`nActual: `"$actual`" != Expected: `"$expected`"`r`nLine: $($call_stack.ScriptLineNumber), Method: $($call_stack.Position.Text)"
++        Fail-Json -obj $result -message $error_msg
++    }
++}
++
++$code = @'
++using System;
++
++namespace Namespace1
++{
++    public class Class1
++    {
++        public static string GetString(bool error)
++        {
++            if (error)
++                throw new Exception("error");
++            return "Hello World";
++        }
++    }
++}
++'@
++$res = Add-CSharpType -References $code
++Assert-Equals -actual $res -expected $null
++
++$actual = [Namespace1.Class1]::GetString($false)
++Assert-Equals $actual -expected "Hello World"
++
++try {
++    [Namespace1.Class1]::GetString($true)
++} catch {
++    Assert-Equals ($_.Exception.ToString().Contains("at Namespace1.Class1.GetString(Boolean error)`r`n")) -expected $true
++}
++
++$code_debug = @'
++using System;
++
++namespace Namespace2
++{
++    public class Class2
++    {
++        public static string GetString(bool error)
++        {
++            if (error)
++                throw new Exception("error");
++            return "Hello World";
++        }
++    }
++}
++'@
++$res = Add-CSharpType -References $code_debug -IncludeDebugInfo
++Assert-Equals -actual $res -expected $null
++
++$actual = [Namespace2.Class2]::GetString($false)
++Assert-Equals $actual -expected "Hello World"
++
++try {
++    [Namespace2.Class2]::GetString($true)
++} catch {
++    $tmp_path = [System.IO.Path]::GetFullPath($env:TMP).ToLower()
++    Assert-Equals ($_.Exception.ToString().ToLower().Contains("at namespace2.class2.getstring(boolean error) in $tmp_path")) -expected $true
++    Assert-Equals ($_.Exception.ToString().Contains(".cs:line 10")) -expected $true
++}
++
++$code_tmp = @'
++using System;
++
++namespace Namespace3
++{
++    public class Class3
++    {
++        public static string GetString(bool error)
++        {
++            if (error)
++                throw new Exception("error");
++            return "Hello World";
++        }
++    }
++}
++'@
++$tmp_path = $env:USERPROFILE
++$res = Add-CSharpType -References $code_tmp -IncludeDebugInfo -TempPath $tmp_path -PassThru
++Assert-Equals -actual $res.GetType().Name -expected "RuntimeAssembly"
++Assert-Equals -actual $res.Location -expected ""
++Assert-Equals -actual $res.GetTypes().Length -expected 1
++Assert-Equals -actual $res.GetTypes()[0].Name -expected "Class3"
++
++$actual = [Namespace3.Class3]::GetString($false)
++Assert-Equals $actual -expected "Hello World"
++
++try {
++    [Namespace3.Class3]::GetString($true)
++} catch {
++    Assert-Equals ($_.Exception.ToString().ToLower().Contains("at namespace3.class3.getstring(boolean error) in $($tmp_path.ToLower())")) -expected $true
++    Assert-Equals ($_.Exception.ToString().Contains(".cs:line 10")) -expected $true
++}
++
++$warning_code = @'
++using System;
++
++namespace Namespace4
++{
++    public class Class4
++    {
++        public static string GetString(bool test)
++        {
++            if (test)
++            {
++                string a = "";
++            }
++
++            return "Hello World";
++        }
++    }
++}
++'@
++$failed = $false
++try {
++    Add-CSharpType -References $warning_code
++} catch {
++    $failed = $true
++    Assert-Equals -actual ($_.Exception.Message.Contains("error CS0219: Warning as Error: The variable 'a' is assigned but its value is never used")) -expected $true
++}
++Assert-Equals -actual $failed -expected $true
++
++Add-CSharpType -References $warning_code -IgnoreWarnings
++$actual = [Namespace4.Class4]::GetString($true)
++Assert-Equals -actual $actual -expected "Hello World"
++
++$reference_1 = @'
++using System;
++using System.Web.Script.Serialization;
++
++//AssemblyReference -Name System.Web.Extensions.dll
++
++namespace Namespace5
++{
++    public class Class5
++    {
++        public static string GetString()
++        {
++            return "Hello World";
++        }
++    }
++}
++'@
++
++$reference_2 = @'
++using System;
++using Namespace5;
++using System.Management.Automation;
++using System.Collections;
++using System.Collections.Generic;
++
++namespace Namespace6
++{
++    public class Class6
++    {
++        public static string GetString()
++        {
++            Hashtable hash = new Hashtable();
++            hash["test"] = "abc";
++            return Class5.GetString();
++        }
++    }
++}
++'@
++
++Add-CSharpType -References $reference_1, $reference_2
++$actual = [Namespace6.Class6]::GetString()
++Assert-Equals -actual $actual -expected "Hello World"
++
++$result.res = "success"
++Exit-Json -obj $result
+diff --git a/test/integration/targets/win_module_utils/library/csharp_util.ps1 b/test/integration/targets/win_module_utils/library/csharp_util.ps1
+new file mode 100644
+index 0000000000..cf2dc45202
+--- /dev/null
++++ b/test/integration/targets/win_module_utils/library/csharp_util.ps1
+@@ -0,0 +1,12 @@
++#1powershell
++
++#Requires -Module Ansible.ModuleUtils.Legacy
++#AnsibleRequires -CSharpUtil Ansible.Test
++
++$result = @{
++    res = [Ansible.Test.OutputTest]::GetString()
++    changed = $false
++}
++
++Exit-Json -obj $result
++
+diff --git a/test/integration/targets/win_module_utils/module_utils/Ansible.Test.cs b/test/integration/targets/win_module_utils/module_utils/Ansible.Test.cs
+new file mode 100644
+index 0000000000..9556d9af49
+--- /dev/null
++++ b/test/integration/targets/win_module_utils/module_utils/Ansible.Test.cs
+@@ -0,0 +1,26 @@
++//AssemblyReference -Name System.Web.Extensions.dll
++
++using System;
++using System.Collections.Generic;
++using System.Web.Script.Serialization;
++
++namespace Ansible.Test
++{
++    public class OutputTest
++    {
++        public static string GetString()
++        {
++            Dictionary<string, object> obj = new Dictionary<string, object>();
++            obj["a"] = "a";
++            obj["b"] = 1;
++            return ToJson(obj);
++        }
++
++        private static string ToJson(object obj)
++        {
++            JavaScriptSerializer jss = new JavaScriptSerializer();
++            return jss.Serialize(obj);
++        }
++    }
++}
++
+diff --git a/test/integration/targets/win_module_utils/tasks/main.yml b/test/integration/targets/win_module_utils/tasks/main.yml
+index 05f2dffab3..18fca76ccd 100644
+--- a/test/integration/targets/win_module_utils/tasks/main.yml
++++ b/test/integration/targets/win_module_utils/tasks/main.yml
+@@ -143,3 +143,23 @@
+ - assert:
+     that:
+     - privilege_util_test.data == 'success'
++
++- name: call module with C# reference
++  csharp_util:
++  register: csharp_res
++
++- name: assert call module with C# reference
++  assert:
++    that:
++    - not csharp_res is failed
++    - csharp_res.res == '{"a":"a","b":1}'
++
++- name: call module with AddType tests
++  add_type_test:
++  register: add_type_test
++
++- name: assert call module with AddType tests
++  assert:
++    that:
++    - not add_type_test is failed
++    - add_type_test.res == 'success'
+diff --git a/test/integration/targets/win_ping/tasks/main.yml b/test/integration/targets/win_ping/tasks/main.yml
+index a1b4c1a15e..4ed8cd9af7 100644
+--- a/test/integration/targets/win_ping/tasks/main.yml
++++ b/test/integration/targets/win_ping/tasks/main.yml
+@@ -51,6 +51,7 @@
+       - win_ping_ps1_result is not changed
+       - win_ping_ps1_result.ping == 'bleep'
+ 
++# TODO: this will have to be removed once PS basic is implemented
+ - name: test win_ping with extra args to verify that v2 module replacer escaping works as expected
+   win_ping:
+     data: bloop
+@@ -92,71 +93,5 @@
+     that:
+       - win_ping_crash_result is failed
+       - win_ping_crash_result is not changed
+-      - "'FullyQualifiedErrorId : boom' in win_ping_crash_result.module_stderr"
+-
+-# TODO: fix code or tests? discrete error returns from PS are strange...
+-
+-#- name: test modified win_ping that throws an exception
+-#  action: win_ping_throw
+-#  register: win_ping_throw_result
+-#  ignore_errors: true
+-#
+-#- name: check win_ping_throw result
+-#  assert:
+-#    that:
+-#      - win_ping_throw_result is failed
+-#      - win_ping_throw_result is not changed
+-#      - win_ping_throw_result.msg == 'MODULE FAILURE'
+-#      - win_ping_throw_result.exception
+-#      - win_ping_throw_result.error_record
+-#
+-#- name: test modified win_ping that throws a string exception
+-#  action: win_ping_throw_string
+-#  register: win_ping_throw_string_result
+-#  ignore_errors: true
+-#
+-#- name: check win_ping_throw_string result
+-#  assert:
+-#    that:
+-#      - win_ping_throw_string_result is failed
+-#      - win_ping_throw_string_result is not changed
+-#      - win_ping_throw_string_result.msg == 'no ping for you'
+-#      - win_ping_throw_string_result.exception
+-#      - win_ping_throw_string_result.error_record
+-#
+-#- name: test modified win_ping that has a syntax error
+-#  action: win_ping_syntax_error
+-#  register: win_ping_syntax_error_result
+-#  ignore_errors: true
+-#
+-#- name: check win_ping_syntax_error result
+-#  assert:
+-#    that:
+-#      - win_ping_syntax_error_result is failed
+-#      - win_ping_syntax_error_result is not changed
+-#      - win_ping_syntax_error_result.msg
+-#      - win_ping_syntax_error_result.exception
+-#
+-#- name: test modified win_ping that has an error that only surfaces when strict mode is on
+-#  action: win_ping_strict_mode_error
+-#  register: win_ping_strict_mode_error_result
+-#  ignore_errors: true
+-#
+-#- name: check win_ping_strict_mode_error result
+-#  assert:
+-#    that:
+-#      - win_ping_strict_mode_error_result is failed
+-#      - win_ping_strict_mode_error_result is not changed
+-#      - win_ping_strict_mode_error_result.msg
+-#      - win_ping_strict_mode_error_result.exception
+-#
+-#- name: test modified win_ping to verify a Set-Attr fix
+-#  action: win_ping_set_attr data="fixed"
+-#  register: win_ping_set_attr_result
+-#
+-#- name: check win_ping_set_attr_result result
+-#  assert:
+-#    that:
+-#      - win_ping_set_attr_result is not failed
+-#      - win_ping_set_attr_result is not changed
+-#      - win_ping_set_attr_result.ping == 'fixed'
++      - 'win_ping_crash_result.msg == "Unhandled exception while executing module: boom"'
++      - '"throw \"boom\"" in win_ping_crash_result.exception'
+diff --git a/test/runner/lib/classification.py b/test/runner/lib/classification.py
+index 37ec6f1eb2..77fc06f673 100644
+--- a/test/runner/lib/classification.py
++++ b/test/runner/lib/classification.py
+@@ -25,6 +25,10 @@ from lib.import_analysis import (
+     get_python_module_utils_imports,
+ )
+ 
++from lib.csharp_import_analysis import (
++    get_csharp_module_utils_imports,
++)
++
+ from lib.powershell_import_analysis import (
+     get_powershell_module_utils_imports,
+ )
+@@ -168,6 +172,7 @@ class PathMapper(object):
+         self.units_targets = list(walk_units_targets())
+         self.sanity_targets = list(walk_sanity_targets())
+         self.powershell_targets = [t for t in self.sanity_targets if os.path.splitext(t.path)[1] == '.ps1']
++        self.csharp_targets = [t for t in self.sanity_targets if os.path.splitext(t.path)[1] == '.cs']
+ 
+         self.units_modules = set(t.module for t in self.units_targets if t.module)
+         self.units_paths = set(a for t in self.units_targets for a in t.aliases)
+@@ -189,6 +194,7 @@ class PathMapper(object):
+ 
+         self.python_module_utils_imports = {}  # populated on first use to reduce overhead when not needed
+         self.powershell_module_utils_imports = {}  # populated on first use to reduce overhead when not needed
++        self.csharp_module_utils_imports = {}  # populated on first use to reduce overhead when not needed
+ 
+     def get_dependent_paths(self, path):
+         """
+@@ -204,6 +210,9 @@ class PathMapper(object):
+             if ext == '.psm1':
+                 return self.get_powershell_module_utils_usage(path)
+ 
++            if ext == '.cs':
++                return self.get_csharp_module_utils_usage(path)
++
+         if path.startswith('test/integration/targets/'):
+             return self.get_integration_target_usage(path)
+ 
+@@ -247,6 +256,22 @@ class PathMapper(object):
+ 
+         return sorted(self.powershell_module_utils_imports[name])
+ 
++    def get_csharp_module_utils_usage(self, path):
++        """
++        :type path: str
++        :rtype: list[str]
++        """
++        if not self.csharp_module_utils_imports:
++            display.info('Analyzing C# module_utils imports...')
++            before = time.time()
++            self.csharp_module_utils_imports = get_csharp_module_utils_imports(self.powershell_targets, self.csharp_targets)
++            after = time.time()
++            display.info('Processed %d C# module_utils in %d second(s).' % (len(self.csharp_module_utils_imports), after - before))
++
++        name = os.path.splitext(os.path.basename(path))[0]
++
++        return sorted(self.csharp_module_utils_imports[name])
++
+     def get_integration_target_usage(self, path):
+         """
+         :type path: str
+@@ -320,7 +345,7 @@ class PathMapper(object):
+                 return {
+                     'units': module_name if module_name in self.units_modules else None,
+                     'integration': self.posix_integration_by_module.get(module_name) if ext == '.py' else None,
+-                    'windows-integration': self.windows_integration_by_module.get(module_name) if ext == '.ps1' else None,
++                    'windows-integration': self.windows_integration_by_module.get(module_name) if ext in ['.cs', '.ps1'] else None,
+                     'network-integration': self.network_integration_by_module.get(module_name),
+                     FOCUSED_TARGET: True,
+                 }
+@@ -328,6 +353,9 @@ class PathMapper(object):
+             return minimal
+ 
+         if path.startswith('lib/ansible/module_utils/'):
++            if ext == '.cs':
++                return minimal  # already expanded using get_dependent_paths
++
+             if ext == '.psm1':
+                 return minimal  # already expanded using get_dependent_paths
+ 
+diff --git a/test/runner/lib/csharp_import_analysis.py b/test/runner/lib/csharp_import_analysis.py
+new file mode 100644
+index 0000000000..64e80b4378
+--- /dev/null
++++ b/test/runner/lib/csharp_import_analysis.py
+@@ -0,0 +1,76 @@
++"""Analyze C# import statements."""
++
++from __future__ import absolute_import, print_function
++
++import os
++import re
++
++from lib.util import (
++    display,
++)
++
++
++def get_csharp_module_utils_imports(powershell_targets, csharp_targets):
++    """Return a dictionary of module_utils names mapped to sets of powershell file paths.
++    :type powershell_targets: list[TestTarget] - C# files
++    :type csharp_targets: list[TestTarget] - PS files
++    :rtype: dict[str, set[str]]
++    """
++
++    module_utils = enumerate_module_utils()
++
++    imports_by_target_path = {}
++
++    for target in powershell_targets:
++        imports_by_target_path[target.path] = extract_csharp_module_utils_imports(target.path, module_utils, False)
++
++    for target in csharp_targets:
++        imports_by_target_path[target.path] = extract_csharp_module_utils_imports(target.path, module_utils, True)
++
++    imports = dict([(module_util, set()) for module_util in module_utils])
++
++    for target_path in imports_by_target_path:
++        for module_util in imports_by_target_path[target_path]:
++            imports[module_util].add(target_path)
++
++    for module_util in sorted(imports):
++        if not imports[module_util]:
++            display.warning('No imports found which use the "%s" module_util.' % module_util)
++
++    return imports
++
++
++def enumerate_module_utils():
++    """Return a list of available module_utils imports.
++    :rtype: set[str]
++    """
++    return set(os.path.splitext(p)[0] for p in os.listdir('lib/ansible/module_utils/csharp') if os.path.splitext(p)[1] == '.cs')
++
++
++def extract_csharp_module_utils_imports(path, module_utils, is_pure_csharp):
++    """Return a list of module_utils imports found in the specified source file.
++    :type path: str
++    :type module_utils: set[str]
++    :rtype: set[str]
++    """
++    imports = set()
++    if is_pure_csharp:
++        pattern = re.compile(r'(?i)^using\s(Ansible\..+);$')
++    else:
++        pattern = re.compile(r'(?i)^#\s*ansiblerequires\s+-csharputil\s+(Ansible\..+)')
++
++    with open(path, 'r') as module_file:
++        for line_number, line in enumerate(module_file, 1):
++            match = re.search(pattern, line)
++
++            if not match:
++                continue
++
++            import_name = match.group(1)
++            if import_name not in module_utils:
++                display.warning('%s:%d Invalid module_utils import: %s' % (path, line_number, import_name))
++                continue
++
++            imports.add(import_name)
++
++    return imports
+diff --git a/test/runner/lib/util.py b/test/runner/lib/util.py
+index 5780ad9642..72f2da3977 100644
+--- a/test/runner/lib/util.py
++++ b/test/runner/lib/util.py
+@@ -489,6 +489,7 @@ def is_binary_file(path):
+         '.cfg',
+         '.conf',
+         '.crt',
++        '.cs',
+         '.css',
+         '.html',
+         '.ini',

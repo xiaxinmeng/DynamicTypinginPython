@@ -1,0 +1,460 @@
+commit 28e95df9e842fbef65762ed35b67c16911ade4eb
+Author: Ryan Skonnord <ryan.skonnord@sentry.io>
+Date:   Fri May 15 13:44:31 2020 -0700
+
+    perf(features): Support batched feature handlers (#18808)
+    
+    Introduce BatchFeatureHandler, an abstract FeatureHandler subclass for
+    cases where the feature flag check needs only an organization. In cases
+    where multiple projects are guaranteed to have the same result from the
+    same handler, this allows us to optimize by making only one check for a
+    batch of projects.
+    
+    Introduce FeatureManager.has_for_batch, a method that behaves
+    equivalently to FeatureManager.has on a batch of objects but dispatches
+    to BatchFeatureHandler as an optimization. Instrument the cost of
+    applying each handler.
+    
+    Modify ProjectSerializer to call FeatureManager.has_for_batch and unpack
+    its results into the individual projects' feature lists.
+    
+    These changes target a measured performance problem in situations where
+    we iterate over a large number (~1000) of projects and apply at least
+    one handler with a substantial time cost per project.
+
+diff --git a/src/sentry/api/serializers/models/project.py b/src/sentry/api/serializers/models/project.py
+index c6adcd323c..a970d267f9 100644
+--- a/src/sentry/api/serializers/models/project.py
++++ b/src/sentry/api/serializers/models/project.py
+@@ -158,13 +158,9 @@ class ProjectSerializer(Serializer):
+             result = self.get_access_by_project(item_list, user)
+ 
+         with measure_span("features"):
+-            project_features = [
+-                feature_name
+-                for feature_name in features.all(feature_type=ProjectFeature).keys()
+-                if feature_name.startswith(_PROJECT_SCOPE_PREFIX)
+-            ]
++            features_by_project = self._get_features_for_projects(item_list, user)
+             for project, serialized in result.items():
+-                serialized["features"] = self._get_feature_list(project, user, project_features)
++                serialized["features"] = features_by_project[project]
+ 
+         with measure_span("other"):
+             for project, serialized in result.items():
+@@ -183,17 +179,29 @@ class ProjectSerializer(Serializer):
+         return result
+ 
+     @staticmethod
+-    def _get_feature_list(obj, user, project_features):
+-        feature_list = set(
+-            feature_name[len(_PROJECT_SCOPE_PREFIX) :]  # Remove the project scope prefix
+-            for feature_name in project_features
+-            if features.has(feature_name, obj, actor=user)
+-        )
+-
+-        if obj.flags.has_releases:
+-            feature_list.add("releases")
+-
+-        return feature_list
++    def _get_features_for_projects(all_projects, user):
++        # Arrange to call features.has_for_batch rather than features.has
++        # for performance's sake
++        projects_by_org = defaultdict(list)
++        for project in all_projects:
++            projects_by_org[project.organization].append(project)
++
++        features_by_project = defaultdict(list)
++        for feature_name in features.all(feature_type=ProjectFeature).keys():
++            if not feature_name.startswith(_PROJECT_SCOPE_PREFIX):
++                continue
++            abbreviated_feature = feature_name[len(_PROJECT_SCOPE_PREFIX) :]
++            for (organization, projects) in projects_by_org.items():
++                result = features.has_for_batch(feature_name, organization, projects, user)
++                for (project, flag) in result.items():
++                    if flag:
++                        features_by_project[project].append(abbreviated_feature)
++
++        for project in all_projects:
++            if project.flags.has_releases:
++                features_by_project[project].append("releases")
++
++        return features_by_project
+ 
+     def serialize(self, obj, attrs, user):
+         status_label = STATUS_LABELS.get(obj.status, "unknown")
+diff --git a/src/sentry/features/__init__.py b/src/sentry/features/__init__.py
+index e637ddf795..2c9a45e34c 100644
+--- a/src/sentry/features/__init__.py
++++ b/src/sentry/features/__init__.py
+@@ -132,3 +132,4 @@ get = default_manager.get
+ has = default_manager.has
+ all = default_manager.all
+ add_handler = default_manager.add_handler
++has_for_batch = default_manager.has_for_batch
+diff --git a/src/sentry/features/handler.py b/src/sentry/features/handler.py
+index acf32052b3..07a729d8fa 100644
+--- a/src/sentry/features/handler.py
++++ b/src/sentry/features/handler.py
+@@ -1,6 +1,6 @@
+ from __future__ import absolute_import
+ 
+-__all__ = ["FeatureHandler"]
++__all__ = ["FeatureHandler", "BatchFeatureHandler"]
+ 
+ 
+ class FeatureHandler(object):
+@@ -14,3 +14,29 @@ class FeatureHandler(object):
+ 
+     def has(self, feature, actor):
+         raise NotImplementedError
++
++    def has_for_batch(self, batch):
++        # If not overridden, iterate over objects in the batch individually.
++        return {
++            obj: self.has(feature, batch.actor)
++            for (obj, feature) in batch.get_feature_objects().items()
++        }
++
++
++# It is generally better to extend BatchFeatureHandler if it is possible to do
++# the check with no more than the feature name, organization, and actor. If it
++# needs to unpack the Feature object and examine the flagged entity, extend
++# FeatureHandler directly.
++
++
++class BatchFeatureHandler(FeatureHandler):
++    def _check_for_batch(self, feature_name, organization, actor):
++        raise NotImplementedError
++
++    def has(self, feature, actor):
++        organization = getattr(feature, "organization", None) or feature.project.organization
++        return self._check_for_batch(feature.name, organization, actor)
++
++    def has_for_batch(self, batch):
++        flag = self._check_for_batch(batch.feature_name, batch.organization, batch.actor)
++        return {obj: flag for obj in batch.objects}
+diff --git a/src/sentry/features/manager.py b/src/sentry/features/manager.py
+index a40606e005..9e800ef6ef 100644
+--- a/src/sentry/features/manager.py
++++ b/src/sentry/features/manager.py
+@@ -5,6 +5,8 @@ __all__ = ["FeatureManager"]
+ from collections import defaultdict
+ from django.conf import settings
+ 
++import sentry_sdk
++
+ from .base import Feature
+ from .exceptions import FeatureNotRegistered
+ 
+@@ -32,16 +34,19 @@ class FeatureManager(object):
+         """
+         self._feature_registry[name] = cls
+ 
++    def _get_feature_class(self, name):
++        try:
++            return self._feature_registry[name]
++        except KeyError:
++            raise FeatureNotRegistered(name)
++
+     def get(self, name, *args, **kwargs):
+         """
+         Lookup a registered feature handler given the feature name.
+ 
+         >>> FeatureManager.get('my:feature', actor=request.user)
+         """
+-        try:
+-            cls = self._feature_registry[name]
+-        except KeyError:
+-            raise FeatureNotRegistered(name)
++        cls = self._get_feature_class(name)
+         return cls(name, *args, **kwargs)
+ 
+     def add_handler(self, handler):
+@@ -98,3 +103,78 @@ class FeatureManager(object):
+             if rv is not None:
+                 return rv
+         return None
++
++    def has_for_batch(self, name, organization, objects, actor=None):
++        """
++        Determine in a batch if a feature is enabled.
++
++        This applies the same procedure as ``FeatureManager.has``, but with a
++        performance benefit where the objects being checked all belong to the
++        same organization. The objects are entities (e.g., projects) with the
++        common parent organization, as would be passed individually to ``has``.
++
++        Feature handlers that depend only on organization attributes, and not
++        on attributes of the individual objects being checked, will generally
++        perform faster if this method is used in preference to ``has``.
++
++        The return value is a dictionary with the objects as keys. Each value
++        is what would be returned if the key were passed to ``has``.
++
++        >>> FeatureManager.has_for_batch('projects:feature', organization, [project1, project2], actor=request.user)
++        """
++
++        result = dict()
++        remaining = set(objects)
++
++        handlers = self._handler_registry[name]
++        for handler in handlers:
++            if not remaining:
++                break
++
++            with sentry_sdk.start_span(op="feature.has_for_batch.handler") as span:
++                batch_size = len(remaining)
++                span.set_data("Batch Size", batch_size)
++                span.set_data("Feature Name", name)
++                span.set_data("Handler Type", type(handler).__name__)
++
++                batch = FeatureCheckBatch(self, name, organization, remaining, actor)
++                handler_result = handler.has_for_batch(batch)
++                for (obj, flag) in handler_result.items():
++                    if flag is not None:
++                        remaining.remove(obj)
++                        result[obj] = flag
++                span.set_data("Flags Found", batch_size - len(remaining))
++
++        default_flag = settings.SENTRY_FEATURES.get(name, False)
++        for obj in remaining:
++            result[obj] = default_flag
++
++        return result
++
++
++class FeatureCheckBatch(object):
++    """
++    A batch of objects to be checked for a feature flag.
++
++    An instance of this class encapsulates a call to
++    ``FeatureManager.has_for_batch``. The objects (such as projects) have a
++    common parent organization.
++    """
++
++    def __init__(self, manager, name, organization, objects, actor):
++        self._manager = manager
++        self.feature_name = name
++        self.organization = organization
++        self.objects = objects
++        self.actor = actor
++
++    def get_feature_objects(self):
++        """
++        Iterate over individual Feature objects.
++
++        This is a fallback mode for applying a FeatureHandler that doesn't
++        support checking the entire batch at once.
++        """
++
++        cls = self._manager._get_feature_class(self.feature_name)
++        return {obj: cls(self.feature_name, obj) for obj in self.objects}
+diff --git a/tests/sentry/api/serializers/test_project.py b/tests/sentry/api/serializers/test_project.py
+index 44d88fcf70..9a35e2bf4a 100644
+--- a/tests/sentry/api/serializers/test_project.py
++++ b/tests/sentry/api/serializers/test_project.py
+@@ -9,6 +9,7 @@ import datetime
+ from django.utils import timezone
+ from exam import fixture
+ 
++from sentry import features
+ from sentry.api.serializers import serialize
+ from sentry.api.serializers.models.project import (
+     bulk_fetch_project_latest_releases,
+@@ -141,6 +142,57 @@ class ProjectSerializerTest(TestCase):
+         assert result["hasAccess"] is True
+         assert result["isMember"] is True
+ 
++    def test_project_features(self):
++        early_flag = "projects:TEST_early"
++        red_flag = "projects:TEST_red"
++        blue_flag = "projects:TEST_blue"
++
++        early_adopter = self.create_organization()
++        early_red = self.create_project(organization=early_adopter)
++        early_blue = self.create_project(organization=early_adopter)
++
++        late_adopter = self.create_organization()
++        late_red = self.create_project(organization=late_adopter)
++        late_blue = self.create_project(organization=late_adopter)
++
++        class EarlyAdopterFeatureHandler(features.BatchFeatureHandler):
++            features = {early_flag}
++
++            def _check_for_batch(self, feature_name, organization, actor):
++                return organization == early_adopter
++
++        def create_color_handler(color_flag, included_projects):
++            class ProjectColorFeatureHandler(features.FeatureHandler):
++                features = {color_flag}
++
++                def has(self, feature, actor):
++                    return feature.project in included_projects
++
++            return ProjectColorFeatureHandler()
++
++        features.add(early_flag, features.ProjectFeature)
++        features.add(red_flag, features.ProjectFeature)
++        features.add(blue_flag, features.ProjectFeature)
++        red_handler = create_color_handler(red_flag, [early_red, late_red])
++        blue_handler = create_color_handler(blue_flag, [early_blue, late_blue])
++        for handler in (EarlyAdopterFeatureHandler(), red_handler, blue_handler):
++            features.add_handler(handler)
++
++        def api_form(flag):
++            return flag[len("projects:") :]
++
++        flags_to_find = set(api_form(f) for f in [early_flag, red_flag, blue_flag])
++
++        def assert_has_features(project, expected_features):
++            serialized = serialize(project)
++            actual_features = set(f for f in serialized["features"] if f in flags_to_find)
++            assert actual_features == set(api_form(f) for f in expected_features)
++
++        assert_has_features(early_red, [early_flag, red_flag])
++        assert_has_features(early_blue, [early_flag, blue_flag])
++        assert_has_features(late_red, [red_flag])
++        assert_has_features(late_blue, [blue_flag])
++
+ 
+ class ProjectWithTeamSerializerTest(TestCase):
+     def test_simple(self):
+diff --git a/tests/sentry/features/__init__.py b/tests/sentry/features/__init__.py
+new file mode 100644
+index 0000000000..c3961685ab
+--- /dev/null
++++ b/tests/sentry/features/__init__.py
+@@ -0,0 +1 @@
++from __future__ import absolute_import
+diff --git a/tests/sentry/features/test_manager.py b/tests/sentry/features/test_manager.py
+new file mode 100644
+index 0000000000..8660bda84b
+--- /dev/null
++++ b/tests/sentry/features/test_manager.py
+@@ -0,0 +1,118 @@
++from __future__ import absolute_import
++
++from sentry import features
++from sentry.testutils import TestCase
++
++
++class FeatureManagerTest(TestCase):
++    def test_feature_registry(self):
++        manager = features.FeatureManager()
++        assert manager.all() == {}
++
++        manager.add("organizations:feature1", features.OrganizationFeature)
++        manager.add("projects:feature2", features.ProjectFeature)
++        manager.add("projects:feature3", features.ProjectFeature)
++        assert set(manager.all(features.OrganizationFeature).keys()) == {"organizations:feature1"}
++        assert set(manager.all(features.ProjectFeature).keys()) == {
++            "projects:feature2",
++            "projects:feature3",
++        }
++
++    def test_handlers(self):
++        project_flag = "projects:test_handlers"
++        test_user = self.create_user()
++
++        class TestProjectHandler(features.FeatureHandler):
++            features = {project_flag}
++
++            def __init__(self, true_set, false_set):
++                self.true_set = frozenset(true_set)
++                self.false_set = frozenset(false_set)
++
++            def has(self, feature, actor):
++                assert actor == test_user
++
++                if feature.project in self.true_set:
++                    return True
++                if feature.project in self.false_set:
++                    return False
++                return None
++
++        p1 = self.create_project()
++        p2 = self.create_project()
++        p3 = self.create_project()
++        p4 = self.create_project()
++
++        handlers = [
++            TestProjectHandler([], []),
++            TestProjectHandler([p1, p3], []),
++            TestProjectHandler([], [p2, p3]),
++        ]
++
++        manager = features.FeatureManager()
++        manager.add(project_flag, features.ProjectFeature)
++        for handler in handlers:
++            manager.add_handler(handler)
++
++        assert manager.has(project_flag, p1, actor=test_user) is True
++        assert manager.has(project_flag, p2, actor=test_user) is False
++        assert manager.has(project_flag, p3, actor=test_user) is True
++        assert manager.has(project_flag, p4, actor=test_user) is False
++
++        organization = None  # Doesn't matter because no BatchFeatureHandlers
++        assert manager.has_for_batch(
++            project_flag, organization, [p1, p2, p3, p4], actor=test_user
++        ) == {p1: True, p2: False, p3: True, p4: False}
++
++    def test_has_for_batch(self):
++        test_user = self.create_user()
++        test_org = self.create_organization()
++
++        projects = [self.create_project(organization=test_org) for i in range(5)]
++
++        def create_handler(flags, result):
++            class OrganizationTestHandler(features.BatchFeatureHandler):
++                features = frozenset(flags)
++
++                def __init__(self):
++                    self.hit_counter = 0
++
++                def _check_for_batch(self, feature_name, organization, actor):
++                    assert feature_name in self.features
++                    assert organization == test_org
++                    assert actor == test_user
++
++                    self.hit_counter += 1
++                    return result
++
++            return OrganizationTestHandler()
++
++        yes_flag = "organizations:yes"
++        no_flag = "organizations:no"
++
++        null_handler = create_handler([yes_flag, no_flag], None)
++        yes_handler = create_handler([yes_flag], True)
++        after_yes_handler = create_handler([yes_flag], False)
++        no_handler = create_handler([no_flag], False)
++        after_no_handler = create_handler([no_flag], True)
++
++        manager = features.FeatureManager()
++        for flag in (yes_flag, no_flag):
++            manager.add(flag, features.OrganizationFeature)
++
++        for handler in (null_handler, yes_handler, after_yes_handler, no_handler, after_no_handler):
++            manager.add_handler(handler)
++
++        assert manager.has_for_batch(yes_flag, test_org, projects, actor=test_user) == {
++            p: True for p in projects
++        }
++        assert yes_handler.hit_counter == 1  # as opposed to len(projects)
++        assert after_yes_handler.hit_counter == 0
++
++        assert manager.has_for_batch(no_flag, test_org, projects, actor=test_user) == {
++            p: False for p in projects
++        }
++        assert no_handler.hit_counter == 1
++        assert after_no_handler.hit_counter == 0
++
++        assert null_handler.hit_counter == 2
+diff --git a/tests/sentry/options/__init__.py b/tests/sentry/options/__init__.py
+new file mode 100644
+index 0000000000..c3961685ab
+--- /dev/null
++++ b/tests/sentry/options/__init__.py
+@@ -0,0 +1 @@
++from __future__ import absolute_import

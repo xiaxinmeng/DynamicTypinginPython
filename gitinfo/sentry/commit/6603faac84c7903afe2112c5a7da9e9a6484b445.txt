@@ -1,0 +1,186 @@
+commit 6603faac84c7903afe2112c5a7da9e9a6484b445
+Author: Tony <Zylphrex@users.noreply.github.com>
+Date:   Thu Jun 11 15:30:55 2020 -0400
+
+    feat(async-csv): Load up to 8Mb of data per batch (#19250)
+
+diff --git a/src/sentry/data_export/base.py b/src/sentry/data_export/base.py
+index 61383d7cd3..b88f4b79d6 100644
+--- a/src/sentry/data_export/base.py
++++ b/src/sentry/data_export/base.py
+@@ -4,6 +4,7 @@ import six
+ from datetime import timedelta
+ from enum import Enum
+ 
++MAX_BATCH_SIZE = 8 * 1024 * 1024
+ EXPORTED_ROWS_LIMIT = 10000000
+ SNUBA_MAX_RESULTS = 10000
+ DEFAULT_EXPIRATION = timedelta(weeks=4)
+diff --git a/src/sentry/data_export/tasks.py b/src/sentry/data_export/tasks.py
+index f9311e3e25..7b2dcecc39 100644
+--- a/src/sentry/data_export/tasks.py
++++ b/src/sentry/data_export/tasks.py
+@@ -24,7 +24,13 @@ from sentry.tasks.base import instrumented_task
+ from sentry.utils import metrics
+ from sentry.utils.sdk import capture_exception
+ 
+-from .base import ExportError, ExportQueryType, EXPORTED_ROWS_LIMIT, SNUBA_MAX_RESULTS
++from .base import (
++    ExportError,
++    ExportQueryType,
++    EXPORTED_ROWS_LIMIT,
++    SNUBA_MAX_RESULTS,
++    MAX_BATCH_SIZE,
++)
+ from .models import ExportedData, ExportedDataBlob
+ from .utils import convert_to_utf8, handle_snuba_errors
+ from .processors.discover import DiscoverProcessor
+@@ -65,15 +71,12 @@ def assemble_download(
+         return
+ 
+     try:
++        # ensure that the export limit is set and capped at EXPORTED_ROWS_LIMIT
+         if export_limit is None:
+             export_limit = EXPORTED_ROWS_LIMIT
+         else:
+             export_limit = min(export_limit, EXPORTED_ROWS_LIMIT)
+ 
+-        # if there is an export limit, the last batch should only return up to the export limit
+-        if export_limit is not None:
+-            batch_size = min(batch_size, max(export_limit - offset, 0))
+-
+         processor = get_processor(data_export, environment_id)
+ 
+         with tempfile.TemporaryFile() as tf:
+@@ -81,10 +84,33 @@ def assemble_download(
+             if first_page:
+                 writer.writeheader()
+ 
+-            rows = process_rows(processor, data_export, batch_size, offset)
+-            writer.writerows(rows)
++            # the position in the file at the end of the headers
++            starting_pos = tf.tell()
++
++            # the row offset relative to the start of the current task
++            # this offset tells you the number of rows written during this batch fragment
++            fragment_offset = 0
++
++            # the absolute row offset from the beginning of the export
++            next_offset = offset + fragment_offset
++
++            while True:
++                # the number of rows to export in the next batch fragment
++                fragment_row_count = min(batch_size, max(export_limit - next_offset, 1))
++
++                rows = process_rows(processor, data_export, fragment_row_count, next_offset)
++                writer.writerows(rows)
++
++                fragment_offset += len(rows)
++                next_offset = offset + fragment_offset
+ 
+-            next_offset = offset + len(rows)
++                if (
++                    not rows
++                    or len(rows) < batch_size
++                    # the batch may exceed MAX_BATCH_SIZE but immediately stops
++                    or tf.tell() - starting_pos >= MAX_BATCH_SIZE
++                ):
++                    break
+ 
+             tf.seek(0)
+             new_bytes_written = store_export_chunk_as_blob(data_export, bytes_written, tf)
+@@ -105,12 +131,7 @@ def assemble_download(
+         except MaxRetriesExceededError:
+             return data_export.email_failure(message="Internal processing failure")
+     else:
+-        if (
+-            rows
+-            and len(rows) >= batch_size
+-            and new_bytes_written
+-            and (export_limit is None or next_offset < export_limit)
+-        ):
++        if rows and len(rows) >= batch_size and new_bytes_written and next_offset < export_limit:
+             assemble_download.delay(
+                 data_export_id,
+                 export_limit=export_limit,
+diff --git a/tests/sentry/data_export/test_tasks.py b/tests/sentry/data_export/test_tasks.py
+index 08de92c5c3..56d655bf9d 100644
+--- a/tests/sentry/data_export/test_tasks.py
++++ b/tests/sentry/data_export/test_tasks.py
+@@ -9,6 +9,7 @@ from sentry.snuba.discover import InvalidSearchQuery
+ from sentry.testutils import TestCase, SnubaTestCase
+ from sentry.testutils.helpers.datetime import iso_format, before_now
+ from sentry.utils.compat.mock import patch
++from sentry.utils.samples import load_data
+ from sentry.utils.snuba import (
+     QueryOutsideRetentionError,
+     QueryIllegalTypeOfArgument,
+@@ -126,7 +127,7 @@ class AssembleDownloadTest(TestCase, SnubaTestCase):
+     @patch("sentry.tagstore.get_tag_key")
+     @patch("sentry.utils.snuba.raw_query")
+     @patch("sentry.data_export.models.ExportedData.email_failure")
+-    def test_issues_by_tag_outside_retention(self, emailer, mock_query, mock_get_tag_key):
++    def test_issue_by_tag_outside_retention(self, emailer, mock_query, mock_get_tag_key):
+         """
+         When an issues by tag query goes outside the retention range, it returns 0 results.
+         This gives us an empty CSV with just the headers.
+@@ -194,6 +195,7 @@ class AssembleDownloadTest(TestCase, SnubaTestCase):
+         error = emailer.call_args[1]["message"]
+         assert error == "Requested project does not exist"
+ 
++    @patch("sentry.data_export.tasks.MAX_BATCH_SIZE", 35)
+     @patch("sentry.data_export.tasks.MAX_FILE_SIZE", 55)
+     @patch("sentry.data_export.models.ExportedData.email_success")
+     def test_discover_export_file_too_large(self, emailer):
+@@ -398,6 +400,51 @@ class AssembleDownloadTest(TestCase, SnubaTestCase):
+         assert error == "Failed to save the assembled file."
+ 
+ 
++class AssembleDownloadLargeTest(TestCase, SnubaTestCase):
++    def setUp(self):
++        super(AssembleDownloadLargeTest, self).setUp()
++        self.user = self.create_user()
++        self.org = self.create_organization()
++        self.project = self.create_project()
++        data = load_data("transaction")
++        for i in range(50):
++            event = data.copy()
++            event.update(
++                {
++                    "transaction": "/event/{0:03d}/".format(i),
++                    "timestamp": iso_format(before_now(minutes=1, seconds=i)),
++                    "start_timestamp": iso_format(before_now(minutes=1, seconds=i + 1)),
++                }
++            )
++            self.store_event(event, project_id=self.project.id)
++
++    @patch("sentry.data_export.tasks.MAX_BATCH_SIZE", 200)
++    @patch("sentry.data_export.models.ExportedData.email_success")
++    def test_discover_large_batch(self, emailer):
++        """
++        Each row in this export requires exactly 13 bytes, with batch_size=3 and
++        MAX_BATCH_SIZE=200, this means that each batch can export 6 batch fragments,
++        each containing 3 rows for a total of 3 * 6 * 13 = 234 bytes per batch before
++        it stops the current batch and starts another. This runs for 2 batches and
++        during the 3rd batch, it will finish exporting all 50 rows.
++        """
++        de = ExportedData.objects.create(
++            user=self.user,
++            organization=self.org,
++            query_type=ExportQueryType.DISCOVER,
++            query_info={"project": [self.project.id], "field": ["title"], "query": ""},
++        )
++        with self.tasks():
++            assemble_download(de.id, batch_size=3)
++        de = ExportedData.objects.get(id=de.id)
++        assert de.date_finished is not None
++        assert de.date_expired is not None
++        assert de.file is not None
++        assert isinstance(de.file, File)
++
++        assert emailer.called
++
++
+ class MergeExportBlobsTest(TestCase, SnubaTestCase):
+     def test_task_persistent_name(self):
+         assert merge_export_blobs.name == "sentry.data_export.tasks.merge_blobs"

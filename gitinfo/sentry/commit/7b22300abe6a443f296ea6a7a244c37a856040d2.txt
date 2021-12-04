@@ -1,0 +1,382 @@
+commit 7b22300abe6a443f296ea6a7a244c37a856040d2
+Author: Chris Fuller <cfuller@sentry.io>
+Date:   Thu Apr 30 18:49:00 2020 -0400
+
+    feat(workflow): Delay Alert Snapshot Creation (#18480)
+    
+    * Adding buffer to end of graph to show incident end marker
+    
+    * Adding snapshot task
+
+diff --git a/src/sentry/conf/server.py b/src/sentry/conf/server.py
+index 6b35f4c208..b32d47dd4c 100644
+--- a/src/sentry/conf/server.py
++++ b/src/sentry/conf/server.py
+@@ -681,6 +681,11 @@ CELERYBEAT_SCHEDULE = {
+         "schedule": timedelta(hours=6),
+         "options": {"expires": 60 * 25},
+     },
++    "process_pending_incident_snapshots": {
++        "task": "sentry.incidents.tasks.process_pending_incident_snapshots",
++        "schedule": timedelta(hours=1),
++        "options": {"expires": 3600, "queue": "incidents"},
++    },
+ }
+ 
+ BGTASKS = {
+diff --git a/src/sentry/incidents/logic.py b/src/sentry/incidents/logic.py
+index c2e7f7a4ac..2665be5f84 100644
+--- a/src/sentry/incidents/logic.py
++++ b/src/sentry/incidents/logic.py
+@@ -27,6 +27,7 @@ from sentry.incidents.models import (
+     IncidentGroup,
+     IncidentProject,
+     IncidentSnapshot,
++    PendingIncidentSnapshot,
+     IncidentSeen,
+     IncidentStatus,
+     IncidentStatusMethod,
+@@ -159,11 +160,12 @@ def update_incident_status(
+             # Remove the snapshot since it's only used after the incident is
+             # closed.
+             IncidentSnapshot.objects.filter(incident=incident).delete()
++            PendingIncidentSnapshot.objects.filter(incident=incident).delete()
+ 
+         incident.update(**kwargs)
+ 
+         if status == IncidentStatus.CLOSED:
+-            create_incident_snapshot(incident, windowed_stats=True)
++            create_pending_incident_snapshot(incident)
+ 
+         analytics.record(
+             "incident.status_change",
+@@ -269,16 +271,29 @@ def delete_comment(activity):
+     return activity.delete()
+ 
+ 
++def create_pending_incident_snapshot(incident):
++    if PendingIncidentSnapshot.objects.filter(incident=incident).exists():
++        PendingIncidentSnapshot.objects.filter(incident=incident).delete()
++
++    time_window = incident.alert_rule.time_window if incident.alert_rule is not None else 1
++    target_run_date = incident.current_end_date + min(
++        timedelta(minutes=time_window * 10), timedelta(days=10)
++    )
++    return PendingIncidentSnapshot.objects.create(
++        incident=incident, target_run_date=target_run_date,
++    )
++
++
+ def create_incident_snapshot(incident, windowed_stats=False):
+     """
+     Creates a snapshot of an incident. This includes the count of unique users
+     and total events, plus a time series snapshot of the entire incident.
+     """
+-
+     assert incident.status == IncidentStatus.CLOSED.value
+ 
+     event_stats_snapshot = create_event_stat_snapshot(incident, windowed_stats=windowed_stats)
+     aggregates = get_incident_aggregates(incident)
++
+     return IncidentSnapshot.objects.create(
+         incident=incident,
+         event_stats_snapshot=event_stats_snapshot,
+@@ -360,14 +375,25 @@ def calculate_incident_time_range(incident, start=None, end=None, windowed_stats
+     time_window = incident.alert_rule.time_window if incident.alert_rule is not None else 1
+     time_window_delta = timedelta(minutes=time_window)
+     start = incident.date_started - time_window_delta if start is None else start
+-    end = incident.current_end_date if end is None else end
++    end = incident.current_end_date + time_window_delta if end is None else end
+     if windowed_stats:
+         now = timezone.now()
+         end = start + timedelta(minutes=time_window * (WINDOWED_STATS_DATA_POINTS / 2))
+         start = start - timedelta(minutes=time_window * (WINDOWED_STATS_DATA_POINTS / 2))
+         if end > now:
+             end = now
+-            start = now - timedelta(minutes=time_window * WINDOWED_STATS_DATA_POINTS)
++
++            # If the incident ended already, 'now' could be greater than we'd like
++            # which would result in showing too many data points after an incident ended.
++            # This depends on when the task to process snapshots runs.
++            # To resolve that, we ensure that the end is never greater than the date
++            # an incident ended + the smaller of time_window*10 or 10 days.
++            latest_end_date = incident.current_end_date + min(
++                timedelta(minutes=time_window * 10), timedelta(days=10)
++            )
++            end = min(end, latest_end_date)
++
++            start = end - timedelta(minutes=time_window * WINDOWED_STATS_DATA_POINTS)
+ 
+     return start, end
+ 
+diff --git a/src/sentry/incidents/tasks.py b/src/sentry/incidents/tasks.py
+index 25ccbd5f65..9721b9c566 100644
+--- a/src/sentry/incidents/tasks.py
++++ b/src/sentry/incidents/tasks.py
+@@ -1,6 +1,8 @@
+ from __future__ import absolute_import
+ 
++from django.db import transaction
+ from django.core.urlresolvers import reverse
++from django.utils import timezone
+ from six.moves.urllib.parse import urlencode
+ 
+ from sentry.auth.access import from_user
+@@ -8,6 +10,8 @@ from sentry.incidents.models import (
+     AlertRuleTriggerAction,
+     AlertRuleStatus,
+     Incident,
++    PendingIncidentSnapshot,
++    IncidentSnapshot,
+     IncidentActivity,
+     IncidentActivityType,
+     IncidentStatus,
+@@ -181,3 +185,38 @@ def auto_resolve_snapshot_incidents(alert_rule_id, **kwargs):
+         auto_resolve_snapshot_incidents.apply_async(
+             kwargs={"alert_rule_id": alert_rule_id}, countdown=1
+         )
++
++
++@instrumented_task(
++    name="sentry.incidents.tasks.process_pending_incident_snapshots", queue="incident_snapshots"
++)
++def process_pending_incident_snapshots():
++    """
++    Processes PendingIncidentSnapshots and creates a snapshot for any snapshot that
++    has passed it's target_run_date.
++    """
++    from sentry.incidents.logic import create_incident_snapshot
++
++    batch_size = 50
++
++    now = timezone.now()
++    pending_snapshots = PendingIncidentSnapshot.objects.filter(
++        target_run_date__lte=now
++    ).select_related("incident")
++
++    if not pending_snapshots:
++        return
++
++    for processed, pending_snapshot in enumerate(pending_snapshots):
++        incident = pending_snapshot.incident
++        if processed > batch_size:
++            process_pending_incident_snapshots.apply_async(countdown=1)
++            break
++        else:
++            with transaction.atomic():
++                if (
++                    incident.status == IncidentStatus.CLOSED.value
++                    and not IncidentSnapshot.objects.filter(incident=incident).exists()
++                ):
++                    create_incident_snapshot(incident, windowed_stats=True)
++                pending_snapshot.delete()
+diff --git a/tests/sentry/incidents/test_logic.py b/tests/sentry/incidents/test_logic.py
+index c39bc6066f..06927875b1 100644
+--- a/tests/sentry/incidents/test_logic.py
++++ b/tests/sentry/incidents/test_logic.py
+@@ -64,7 +64,7 @@ from sentry.incidents.models import (
+     IncidentActivityType,
+     IncidentGroup,
+     IncidentProject,
+-    IncidentSnapshot,
++    PendingIncidentSnapshot,
+     IncidentStatus,
+     IncidentStatusMethod,
+     IncidentSubscription,
+@@ -206,12 +206,29 @@ class UpdateIncidentStatus(TestCase):
+             projects=[self.project],
+         )
+         with self.assertChanges(
+-            lambda: IncidentSnapshot.objects.filter(incident=incident).exists(),
++            lambda: PendingIncidentSnapshot.objects.filter(incident=incident).exists(),
+             before=False,
+             after=True,
+         ):
+             self.run_test(incident, IncidentStatus.CLOSED, timezone.now())
+ 
++    def test_pending_snapshot_management(self):
++        # Test to verify PendingIncidentSnapshot's are created on close, and deleted on open
++        incident = create_incident(
++            self.organization,
++            IncidentType.ALERT_TRIGGERED,
++            "Test",
++            "",
++            QueryAggregations.TOTAL,
++            timezone.now(),
++            projects=[self.project],
++        )
++        assert PendingIncidentSnapshot.objects.all().count() == 0
++        update_incident_status(incident, IncidentStatus.CLOSED)
++        assert PendingIncidentSnapshot.objects.filter(incident=incident).count() == 1
++        update_incident_status(incident, IncidentStatus.OPEN)
++        assert PendingIncidentSnapshot.objects.filter(incident=incident).count() == 0
++
+     def test_all_params(self):
+         incident = self.create_incident()
+         self.run_test(
+@@ -268,7 +285,7 @@ class BaseIncidentEventStatsTest(BaseIncidentsTest):
+         time_window = incident.alert_rule.time_window if incident.alert_rule else 1
+         assert result.rollup == time_window * 60
+         expected_start = start if start else incident.date_started - timedelta(minutes=1)
+-        expected_end = end if end else incident.current_end_date
++        expected_end = end if end else incident.current_end_date + timedelta(minutes=1)
+ 
+         if windowed_stats:
+             now = timezone.now()
+@@ -461,7 +478,7 @@ class CreateEventStatTest(TestCase, BaseIncidentsTest):
+         )
+         snapshot = create_event_stat_snapshot(incident, windowed_stats=False)
+         assert snapshot.start == incident.date_started - timedelta(minutes=1)
+-        assert snapshot.end == incident.current_end_date
++        assert snapshot.end == incident.current_end_date + timedelta(minutes=1)
+         assert [row[1] for row in snapshot.values] == [2, 1]
+ 
+         snapshot = create_event_stat_snapshot(incident, windowed_stats=True)
+@@ -612,6 +629,33 @@ class CreateIncidentSnapshotTest(TestCase, BaseIncidentsTest):
+         assert snapshot.unique_users == aggregates["unique_users"]
+         assert snapshot.total_events == aggregates["count"]
+ 
++    def test_windowed_capped_end(self):
++        # When processing PendingIncidentSnapshots, the task could run later than we'd like the
++        # end to actually be, so we have logic to cap it to 10 datapoints, or 10 days, whichever is less. This tests that logic.
++
++        time_window = 1500  # more than 24 hours, so gets capped at 10 days
++        alert_rule = create_alert_rule(
++            self.organization,
++            [self.project],
++            "hello",
++            "level:error",
++            QueryAggregations.TOTAL,
++            time_window,
++            1,
++        )
++
++        incident = self.create_incident(self.organization)
++        incident.update(status=IncidentStatus.CLOSED.value, alert_rule=alert_rule)
++        incident.date_closed = timezone.now() - timedelta(days=11)
++
++        start, end = calculate_incident_time_range(incident, windowed_stats=True)
++        assert end == incident.current_end_date + timedelta(days=10)
++
++        alert_rule.update(time_window=10)
++
++        start, end = calculate_incident_time_range(incident, windowed_stats=True)
++        assert end == incident.current_end_date + timedelta(minutes=100)
++
+ 
+ @freeze_time()
+ class BulkGetIncidentStatsTest(TestCase, BaseIncidentsTest):
+diff --git a/tests/sentry/incidents/test_tasks.py b/tests/sentry/incidents/test_tasks.py
+index c18221e1ab..8d3877c425 100644
+--- a/tests/sentry/incidents/test_tasks.py
++++ b/tests/sentry/incidents/test_tasks.py
+@@ -1,7 +1,10 @@
+ from __future__ import absolute_import
+ 
+ import six
++
++from datetime import timedelta
+ from django.core.urlresolvers import reverse
++from django.utils import timezone
+ from exam import fixture, patcher
+ from freezegun import freeze_time
+ from sentry.utils.compat.mock import Mock, patch
+@@ -19,12 +22,15 @@ from sentry.incidents.models import (
+     IncidentStatus,
+     INCIDENT_STATUS,
+     IncidentSubscription,
++    PendingIncidentSnapshot,
++    IncidentSnapshot,
+ )
+ from sentry.incidents.tasks import (
+     build_activity_context,
+     generate_incident_activity_email,
+     handle_trigger_action,
+     send_subscriber_notifications,
++    process_pending_incident_snapshots,
+ )
+ from sentry.testutils import TestCase
+ from sentry.utils.http import absolute_uri
+@@ -190,3 +196,82 @@ class HandleTriggerActionTest(TestCase):
+                 handle_trigger_action.delay(self.action.id, incident.id, self.project.id, "fire")
+             mock_handler.assert_called_once_with(self.action, incident, self.project)
+             mock_handler.return_value.fire.assert_called_once_with()
++
++
++class ProcessPendingIncidentSnapshots(TestCase):
++    def test_simple(self):
++        incident = self.create_incident(title="incident", status=IncidentStatus.CLOSED.value)
++        pending = PendingIncidentSnapshot.objects.create(
++            incident=incident, target_run_date=timezone.now()
++        )
++
++        assert IncidentSnapshot.objects.all().count() == 0
++
++        with self.tasks():
++            process_pending_incident_snapshots()
++
++        assert not PendingIncidentSnapshot.objects.filter(id=pending.id).exists()
++        assert IncidentSnapshot.objects.filter(incident=incident).exists()
++
++    def test_skip_open_incident(self):
++        incident = self.create_incident(title="incident", status=IncidentStatus.OPEN.value)
++        pending = PendingIncidentSnapshot.objects.create(
++            incident=incident, target_run_date=timezone.now()
++        )
++        assert IncidentSnapshot.objects.all().count() == 0
++
++        with self.tasks():
++            process_pending_incident_snapshots()
++
++        # The PendingSnapshot should be deleted, and a Snapshot should not be created because the incident is open.
++        assert not PendingIncidentSnapshot.objects.filter(id=pending.id).exists()
++        assert not IncidentSnapshot.objects.filter(incident=incident).exists()
++
++    def test_skip_future_run_date(self):
++        incident_1 = self.create_incident(title="incident1", status=IncidentStatus.CLOSED.value)
++        incident_2 = self.create_incident(title="incident2", status=IncidentStatus.CLOSED.value)
++        pending_1 = PendingIncidentSnapshot.objects.create(
++            incident=incident_1, target_run_date=timezone.now()
++        )
++        pending_2 = PendingIncidentSnapshot.objects.create(
++            incident=incident_2, target_run_date=timezone.now() + timedelta(minutes=5)
++        )
++
++        assert IncidentSnapshot.objects.all().count() == 0
++
++        with self.tasks():
++            process_pending_incident_snapshots()
++
++        # Should only process the one with target_run_date <= timezone.now()
++        assert not PendingIncidentSnapshot.objects.filter(id=pending_1.id).exists()
++        assert PendingIncidentSnapshot.objects.filter(id=pending_2.id).exists()
++
++        assert IncidentSnapshot.objects.filter(incident=incident_1).exists()
++        assert not IncidentSnapshot.objects.filter(incident=incident_2).exists()
++
++    def test_skip_because_existing_snapshot(self):
++        incident = self.create_incident(title="incident1", status=IncidentStatus.CLOSED.value)
++        pending_1 = PendingIncidentSnapshot.objects.create(
++            incident=incident, target_run_date=timezone.now()
++        )
++
++        assert IncidentSnapshot.objects.all().count() == 0
++
++        with self.tasks():
++            process_pending_incident_snapshots()
++
++        assert not PendingIncidentSnapshot.objects.filter(id=pending_1.id).exists()
++        assert IncidentSnapshot.objects.filter(incident=incident).exists()
++        assert IncidentSnapshot.objects.all().count() == 1
++
++        # Have to create it here otherwise the unique constraint will cause this to fail:
++        pending_2 = PendingIncidentSnapshot.objects.create(
++            incident=incident, target_run_date=timezone.now()
++        )
++        with self.tasks():
++            process_pending_incident_snapshots()
++
++        assert not PendingIncidentSnapshot.objects.filter(id=pending_2.id).exists()
++        assert IncidentSnapshot.objects.filter(incident=incident).exists()
++        assert IncidentSnapshot.objects.filter(incident=incident).count() == 1
++        assert IncidentSnapshot.objects.all().count() == 1

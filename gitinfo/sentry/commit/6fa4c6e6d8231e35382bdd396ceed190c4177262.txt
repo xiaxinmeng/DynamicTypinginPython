@@ -1,0 +1,1714 @@
+commit 6fa4c6e6d8231e35382bdd396ceed190c4177262
+Author: ted kaemming <ted@kaemming.com>
+Date:   Tue Nov 27 14:31:17 2018 -0800
+
+    feat(eventstream): Add post-processing relay based on Snuba writer progress (#9159)
+    
+    This enables the dispatch of post-processing tasks to be synchronized with the progress of an external Kafka consumer — in our case, the Snuba consumer/writer.
+    
+    This effectively puts those external resources on the critical path of the application, at least for any functionality that relies on post-processing (e.g. alerts, plugins, etc.) This is necessary in our case because post-processing functionality may, and often does, depend on the result of TSDB or tagstore results, which otherwise would be incorrect if their execution is not delayed until after that data has been persisted to ClickHouse.
+    
+    This adds:
+    
+    - A `relay` function to the `EventStream` service interface. Implementation of this method is optional, and depends on the specific service needs. (The base implementation doesn't require this, for example, since post-processing still happens in this backend without the need for any sychronization.) This method does not return. It can be interrupted with `SIGINT` to exit cleanly.
+    - A `relay` command to the Sentry runner that invokes the `relay` method on the backend, if its implemented/required.
+
+diff --git a/.travis.yml b/.travis.yml
+index 7dff9881d1..404ce46ec9 100644
+--- a/.travis.yml
++++ b/.travis.yml
+@@ -202,19 +202,22 @@ matrix:
+ 
+     # snuba in testing - allowed to fail
+     - python: 2.7
+-      env: TEST_SUITE=snuba SENTRY_TAGSTORE=sentry.tagstore.snuba.SnubaTagStorage
++      env: TEST_SUITE=snuba SENTRY_TAGSTORE=sentry.tagstore.snuba.SnubaTagStorage SENTRY_ZOOKEEPER_HOSTS=localhost:2181 SENTRY_KAFKA_HOSTS=localhost:9092
+       services:
+         - docker
+         - memcached
+         - redis-server
+         - postgresql
+       before_install:
++        - docker run -d --network host --name zookeeper -e ZOOKEEPER_CLIENT_PORT=2181 confluentinc/cp-zookeeper:4.1.0
++        - docker run -d --network host --name kafka -e KAFKA_ZOOKEEPER_CONNECT=localhost:2181 -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://localhost:9092 -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 confluentinc/cp-kafka:4.1.0
+         - docker run -d --network host --name clickhouse-server --ulimit nofile=262144:262144 yandex/clickhouse-server:18.14.9
+         - docker run -d --network host --name snuba --env SNUBA_SETTINGS=test --env CLICKHOUSE_SERVER=localhost:9000 getsentry/snuba
+         - docker ps -a
+       install:
+         - python setup.py install_egg_info
+         - pip install -e ".[dev,tests,optional]"
++        - pip install confluent-kafka
+       before_script:
+         - psql -c 'create database sentry;' -U postgres
+ 
+diff --git a/Makefile b/Makefile
+index 3039844814..a581dc9028 100644
+--- a/Makefile
++++ b/Makefile
+@@ -128,7 +128,7 @@ test-python: build-platform-assets
+ 
+ test-snuba:
+ 	@echo "--> Running snuba tests"
+-	py.test tests/snuba -vv --cov . --cov-report="xml:.artifacts/snuba.coverage.xml" --junit-xml=".artifacts/snuba.junit.xml"
++	py.test tests/snuba tests/sentry/eventstream/kafka -vv --cov . --cov-report="xml:.artifacts/snuba.coverage.xml" --junit-xml=".artifacts/snuba.junit.xml"
+ 	@echo ""
+ 
+ test-acceptance: build-platform-assets node-version-check
+diff --git a/src/sentry/eventstream/base.py b/src/sentry/eventstream/base.py
+index 8d6de5e856..a39ecba9df 100644
+--- a/src/sentry/eventstream/base.py
++++ b/src/sentry/eventstream/base.py
+@@ -9,6 +9,13 @@ from sentry.tasks.post_process import post_process_group
+ logger = logging.getLogger(__name__)
+ 
+ 
++class RelayNotRequired(NotImplementedError):
++    """
++    Exception raised if this backend does not require a relay process to
++    enqueue post-processing tasks.
++    """
++
++
+ class EventStream(Service):
+     __all__ = (
+         'insert',
+@@ -18,6 +25,7 @@ class EventStream(Service):
+         'end_merge',
+         'start_unmerge',
+         'end_unmerge',
++        'relay',
+     )
+ 
+     def insert(self, group, event, is_new, is_sample, is_regression,
+@@ -52,3 +60,7 @@ class EventStream(Service):
+ 
+     def end_unmerge(self, state):
+         pass
++
++    def relay(self, consumer_group, commit_log_topic,
++              synchronize_commit_group, commit_batch_size=100, initial_offset_reset='latest'):
++        raise RelayNotRequired
+diff --git a/src/sentry/eventstream/kafka/__init__.py b/src/sentry/eventstream/kafka/__init__.py
+new file mode 100644
+index 0000000000..38ebfc054f
+--- /dev/null
++++ b/src/sentry/eventstream/kafka/__init__.py
+@@ -0,0 +1,3 @@
++from __future__ import absolute_import
++
++from .backend import KafkaEventStream  # noqa
+diff --git a/src/sentry/eventstream/kafka.py b/src/sentry/eventstream/kafka/backend.py
+similarity index 78%
+rename from src/sentry/eventstream/kafka.py
+rename to src/sentry/eventstream/kafka/backend.py
+index 19c87e3974..322821e6d3 100644
+--- a/src/sentry/eventstream/kafka.py
++++ b/src/sentry/eventstream/kafka/backend.py
+@@ -6,19 +6,23 @@ import pytz
+ import six
+ from uuid import uuid4
+ 
+-from confluent_kafka import Producer
++from confluent_kafka import Producer, TopicPartition
+ from django.utils.functional import cached_property
+ 
+ from sentry import options, quotas
+ from sentry.models import Organization
+ from sentry.eventstream.base import EventStream
++from sentry.eventstream.kafka.consumer import SynchronizedConsumer
++from sentry.eventstream.kafka.protocol import parse_event_message
++from sentry.tasks.post_process import post_process_group
+ from sentry.utils import json
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+-# Beware! Changing this, or the message format/fields themselves requires
+-# consideration of all downstream consumers.
++# Beware! Changing this protocol (introducing a new version, or the message
++# format/fields themselves) requires consideration of all downstream consumers.
++# This includes the post-processing relay code!
+ EVENT_PROTOCOL_VERSION = 2
+ 
+ # Version 1 format: (1, TYPE, [...REST...])
+@@ -237,3 +241,52 @@ class KafkaEventStream(EventStream):
+             extra_data=(state,),
+             asynchronous=False
+         )
++
++    def relay(self, consumer_group, commit_log_topic,
++              synchronize_commit_group, commit_batch_size=100, initial_offset_reset='latest'):
++        consumer = SynchronizedConsumer(
++            bootstrap_servers=self.producer_configuration['bootstrap.servers'],
++            consumer_group=consumer_group,
++            commit_log_topic=commit_log_topic,
++            synchronize_commit_group=synchronize_commit_group,
++            initial_offset_reset=initial_offset_reset,
++        )
++
++        consumer.subscribe([self.publish_topic])
++
++        offsets = {}
++
++        def commit_offsets():
++            consumer.commit(offsets=[
++                TopicPartition(topic, partition, offset) for (topic, partition), offset in offsets.items()
++            ], asynchronous=False)
++
++        try:
++            i = 0
++            while True:
++                message = consumer.poll(0.1)
++                if message is None:
++                    continue
++
++                error = message.error()
++                if error is not None:
++                    raise Exception(error)
++
++                i = i + 1
++                offsets[(message.topic(), message.partition())] = message.offset() + 1
++
++                payload = parse_event_message(message.value())
++                if payload is not None:
++                    post_process_group.delay(**payload)
++
++                if i % commit_batch_size == 0:
++                    commit_offsets()
++        except KeyboardInterrupt:
++            pass
++
++        logger.info('Committing offsets and closing consumer...')
++
++        if offsets:
++            commit_offsets()
++
++        consumer.close()
+diff --git a/src/sentry/eventstream/kafka/consumer.py b/src/sentry/eventstream/kafka/consumer.py
+new file mode 100644
+index 0000000000..6356aa8616
+--- /dev/null
++++ b/src/sentry/eventstream/kafka/consumer.py
+@@ -0,0 +1,295 @@
++from __future__ import absolute_import
++
++import functools
++import logging
++import threading
++import uuid
++
++from concurrent.futures import TimeoutError
++from confluent_kafka import Consumer, OFFSET_BEGINNING, TopicPartition
++
++from sentry.eventstream.kafka.state import SynchronizedPartitionState, SynchronizedPartitionStateManager
++from sentry.utils.concurrent import execute
++
++
++logger = logging.getLogger(__name__)
++
++
++def get_commit_data(message):
++    topic, partition, group = message.key().decode('utf-8').split(':', 3)
++    partition = int(partition)
++    offset = int(message.value().decode('utf-8'))
++    return group, topic, partition, offset
++
++
++def run_commit_log_consumer(bootstrap_servers, consumer_group, commit_log_topic,
++                            partition_state_manager, synchronize_commit_group, start_event, stop_request_event):
++    start_event.set()
++
++    logging.debug('Starting commit log consumer...')
++
++    positions = {}
++
++    # NOTE: The commit log consumer group should not be persisted into the
++    # ``__consumer_offsets`` topic since no offsets are committed by this
++    # consumer. The group membership metadata messages will be published
++    # initially but as long as this group remains a single consumer it will
++    # be deleted after the consumer is closed.
++    # It is very important to note that the ``group.id`` **MUST** be unique to
++    # this consumer process!!! This ensures that it is able to consume from all
++    # partitions of the commit log topic and get a comprehensive view of the
++    # state of the consumer groups it is tracking.
++    consumer = Consumer({
++        'bootstrap.servers': bootstrap_servers,
++        'group.id': consumer_group,
++        'enable.auto.commit': 'false',
++        'enable.auto.offset.store': 'true',
++        'enable.partition.eof': 'false',
++        'default.topic.config': {
++            'auto.offset.reset': 'error',
++        },
++    })
++
++    def rewind_partitions_on_assignment(consumer, assignment):
++        # The commit log consumer must start consuming from the beginning of
++        # the commit log topic to ensure that it has a comprehensive view of
++        # all active partitions.
++        consumer.assign([
++            TopicPartition(
++                i.topic,
++                i.partition,
++                positions.get((i.topic, i.partition), OFFSET_BEGINNING),
++            ) for i in assignment
++        ])
++
++    consumer.subscribe(
++        [commit_log_topic],
++        on_assign=rewind_partitions_on_assignment,
++    )
++
++    while not stop_request_event.is_set():
++        message = consumer.poll(1)
++        if message is None:
++            continue
++
++        error = message.error()
++        if error is not None:
++            raise Exception(error)
++
++        positions[(message.topic(), message.partition())] = message.offset() + 1
++
++        group, topic, partition, offset = get_commit_data(message)
++        if group != synchronize_commit_group:
++            logger.debug('Received consumer offsets update from %r, ignoring...', group)
++            continue
++
++        partition_state_manager.set_remote_offset(topic, partition, offset)
++
++
++def get_earliest_offset(consumer, topic, partition):
++    low, high = consumer.get_watermark_offsets(TopicPartition(topic, partition))
++    return low
++
++
++def get_latest_offset(consumer, topic, partition):
++    low, high = consumer.get_watermark_offsets(TopicPartition(topic, partition))
++    return high
++
++
++class SynchronizedConsumer(object):
++    """
++    This class implements the framework for a consumer that is intended to only
++    consume messages that have already been consumed and committed by members
++    of another consumer group.
++
++    This works similarly to the Kafka built-in ``__consumer_offsets`` topic.
++    The consumer group that is being "followed" (the one that must make
++    progress for our consumer here to make progress, identified by the
++    ``synchronize_commit_group`` constructor parameter/instance attribute) must
++    report its offsets to a topic (identified by the ``commit_log_topic``
++    constructor parameter/instance attribute). This consumer subscribes to both
++    commit log topic, as well as the topic(s) that we are actually interested
++    in consuming messages from. The messages received from the commit log topic
++    control whether or not consumption from partitions belonging to the main
++    topic is paused, resumed, or allowed to continue in its current state
++    without changes.
++
++    The furthest point in any partition that this consumer should ever consume
++    to is the maximum offset that has been recorded to the commit log topic for
++    that partition. If the offsets recorded to that topic move
++    non-monotonically (due to an intentional offset rollback, for instance)
++    this consumer *may* consume up to the highest watermark point. (The
++    implementation here tries to pause consuming from the partition as soon as
++    possible, but this makes no explicit guarantees about that behavior.)
++    """
++    initial_offset_reset_strategies = {
++        'earliest': get_earliest_offset,
++        'latest': get_latest_offset,
++    }
++
++    def __init__(self, bootstrap_servers, consumer_group, commit_log_topic,
++                 synchronize_commit_group, initial_offset_reset='latest', on_commit=None):
++        self.bootstrap_servers = bootstrap_servers
++        self.consumer_group = consumer_group
++        self.commit_log_topic = commit_log_topic
++        self.synchronize_commit_group = synchronize_commit_group
++        self.initial_offset_reset = self.initial_offset_reset_strategies[initial_offset_reset]
++
++        self.__partition_state_manager = SynchronizedPartitionStateManager(
++            self.__on_partition_state_change)
++        self.__commit_log_consumer, self.__commit_log_consumer_stop_request = self.__start_commit_log_consumer()
++
++        self.__positions = {}
++
++        def commit_callback(error, partitions):
++            if on_commit is not None:
++                return on_commit(error, partitions)
++
++        consumer_configuration = {
++            'bootstrap.servers': self.bootstrap_servers,
++            'group.id': self.consumer_group,
++            'enable.auto.commit': 'false',
++            'enable.auto.offset.store': 'true',
++            'enable.partition.eof': 'false',
++            'default.topic.config': {
++                'auto.offset.reset': 'error',
++            },
++            'on_commit': commit_callback,
++        }
++
++        self.__consumer = Consumer(consumer_configuration)
++
++    def __start_commit_log_consumer(self, timeout=None):
++        """
++        Starts running the commit log consumer.
++        """
++        stop_request_event = threading.Event()
++        start_event = threading.Event()
++        result = execute(
++            functools.partial(
++                run_commit_log_consumer,
++                bootstrap_servers=self.bootstrap_servers,
++                consumer_group='{}:sync:{}'.format(self.consumer_group, uuid.uuid1().hex),
++                commit_log_topic=self.commit_log_topic,
++                synchronize_commit_group=self.synchronize_commit_group,
++                partition_state_manager=self.__partition_state_manager,
++                start_event=start_event,
++                stop_request_event=stop_request_event,
++            ),
++        )
++        start_event.wait(timeout)
++        return result, stop_request_event
++
++    def __check_commit_log_consumer_running(self):
++        if not self.__commit_log_consumer.running():
++            try:
++                result = self.__commit_log_consumer.result(timeout=0)  # noqa
++            except TimeoutError:
++                pass  # not helpful
++
++            raise Exception('Commit log consumer unexpectedly exit!')
++
++    def __on_partition_state_change(
++            self, topic, partition, previous_state_and_offsets, current_state_and_offsets):
++        """
++        Callback that is invoked when a partition state changes.
++        """
++        logger.debug('State change for %r: %r to %r', (topic, partition),
++                     previous_state_and_offsets, current_state_and_offsets)
++
++        current_state, current_offsets = current_state_and_offsets
++        if current_offsets.local is None:
++            # It only makes sense to manipulate the consumer if we've got an
++            # assignment. (This block should only be entered at startup if the
++            # remote offsets are retrieved from the commit log before the local
++            # consumer has received its assignment.)
++            return
++
++        # TODO: This will be called from the commit log consumer thread, so need
++        # to verify that calling the ``consumer.{pause,resume}`` methods is
++        # thread safe!
++        if current_state in (SynchronizedPartitionState.UNKNOWN, SynchronizedPartitionState.SYNCHRONIZED,
++                             SynchronizedPartitionState.REMOTE_BEHIND):
++            self.__consumer.pause([TopicPartition(topic, partition, current_offsets.local)])
++        elif current_state is SynchronizedPartitionState.LOCAL_BEHIND:
++            self.__consumer.resume([TopicPartition(topic, partition, current_offsets.local)])
++        else:
++            raise NotImplementedError('Unexpected partition state: %s' % (current_state,))
++
++    def subscribe(self, topics, on_assign=None, on_revoke=None):
++        """
++        Subscribe to a topic.
++        """
++        self.__check_commit_log_consumer_running()
++
++        def assignment_callback(consumer, assignment):
++            # Since ``auto.offset.reset`` is set to ``error`` to force human
++            # interaction on an offset reset, we have to explicitly specify the
++            # starting offset if no offset has been committed for this topic during
++            # the ``__consumer_offsets`` topic retention period.
++            assignment = {
++                (i.topic, i.partition): self.__positions.get((i.topic, i.partition)) for i in assignment
++            }
++
++            for i in self.__consumer.committed([TopicPartition(topic, partition) for (
++                    topic, partition), offset in assignment.items() if offset is None]):
++                k = (i.topic, i.partition)
++                if i.offset > -1:
++                    assignment[k] = i.offset
++                else:
++                    assignment[k] = self.initial_offset_reset(consumer, i.topic, i.partition)
++
++            self.__consumer.assign([TopicPartition(topic, partition, offset)
++                                    for (topic, partition), offset in assignment.items()])
++
++            for (topic, partition), offset in assignment.items():
++                # Setting the local offsets will either cause the partition to be
++                # paused (if the remote offset is unknown or the local offset is
++                # not trailing the remote offset) or resumed.
++                self.__partition_state_manager.set_local_offset(topic, partition, offset)
++                self.__positions[(topic, partition)] = offset
++
++            if on_assign is not None:
++                on_assign(self, [TopicPartition(topic, partition)
++                                 for topic, partition in assignment.keys()])
++
++        def revocation_callback(consumer, assignment):
++            if on_revoke is not None:
++                on_revoke(self, assignment)
++
++        self.__consumer.subscribe(
++            topics,
++            on_assign=assignment_callback,
++            on_revoke=revocation_callback)
++
++    def poll(self, timeout):
++        self.__check_commit_log_consumer_running()
++
++        message = self.__consumer.poll(timeout)
++        if message is None:
++            return
++
++        if message.error() is not None:
++            return message
++
++        self.__partition_state_manager.validate_local_message(
++            message.topic(), message.partition(), message.offset())
++        self.__partition_state_manager.set_local_offset(
++            message.topic(), message.partition(), message.offset() + 1)
++        self.__positions[(message.topic(), message.partition())] = message.offset() + 1
++
++        return message
++
++    def commit(self, *args, **kwargs):
++        self.__check_commit_log_consumer_running()
++
++        return self.__consumer.commit(*args, **kwargs)
++
++    def close(self):
++        self.__check_commit_log_consumer_running()
++
++        self.__commit_log_consumer_stop_request.set()
++        try:
++            self.__consumer.close()
++        finally:
++            self.__commit_log_consumer.result()
+diff --git a/src/sentry/eventstream/kafka/protocol.py b/src/sentry/eventstream/kafka/protocol.py
+new file mode 100644
+index 0000000000..33aa7046ae
+--- /dev/null
++++ b/src/sentry/eventstream/kafka/protocol.py
+@@ -0,0 +1,105 @@
++from __future__ import absolute_import
++
++import pytz
++import logging
++from datetime import datetime
++
++from sentry.models import Event
++from sentry.utils import json
++
++
++logger = logging.getLogger(__name__)
++
++
++class UnexpectedOperation(Exception):
++    pass
++
++
++def basic_protocol_handler(unsupported_operations):
++    # The insert message formats for Version 1 and 2 are essentially unchanged,
++    # so this function builds a handler function that can deal with both.
++
++    def get_task_kwargs_for_insert(operation, event_data, task_state=None):
++        event_data['datetime'] = datetime.strptime(
++            event_data['datetime'],
++            "%Y-%m-%dT%H:%M:%S.%fZ",
++        ).replace(tzinfo=pytz.utc)
++
++        kwargs = {
++            'event': Event(**{
++                name: event_data[name] for name in [
++                    'group_id',
++                    'event_id',
++                    'project_id',
++                    'message',
++                    'platform',
++                    'datetime',
++                    'data',
++                ]
++            }),
++            'primary_hash': event_data['primary_hash'],
++        }
++
++        for name in ('is_new', 'is_sample', 'is_regression', 'is_new_group_environment'):
++            kwargs[name] = task_state[name]
++
++        return kwargs
++
++    def handle_message(operation, *data):
++        if operation == 'insert':
++            return get_task_kwargs_for_insert(operation, *data)
++        elif operation in unsupported_operations:
++            logger.debug('Skipping unsupported operation: %s', operation)
++            return None
++        else:
++            raise UnexpectedOperation(u'Received unexpected operation type: {!r}'.format(operation))
++
++    return handle_message
++
++
++version_handlers = {
++    1: basic_protocol_handler(unsupported_operations=frozenset([
++        'delete',
++        'delete_groups',
++        'merge',
++        'unmerge',
++    ])),
++    2: basic_protocol_handler(unsupported_operations=frozenset([
++        'start_delete_groups',
++        'end_delete_groups',
++        'start_merge',
++        'end_merge',
++        'start_unmerge',
++        'end_unmerge',
++    ])),
++}
++
++
++class InvalidPayload(Exception):
++    pass
++
++
++class InvalidVersion(Exception):
++    pass
++
++
++def parse_event_message(value):
++    """
++    Decodes a message body, returning a dictionary of keyword arguments that
++    can be applied to a post-processing task, or ``None`` if no task should be
++    dispatched.
++    """
++    payload = json.loads(value)
++
++    try:
++        version = payload[0]
++    except Exception:
++        raise InvalidPayload('Received event payload with unexpected structure')
++
++    try:
++        handler = version_handlers[int(version)]
++    except (ValueError, KeyError):
++        raise InvalidVersion(
++            'Received event payload with unexpected version identifier: {}'.format(version))
++
++    return handler(*payload[1:])
+diff --git a/src/sentry/eventstream/kafka/state.py b/src/sentry/eventstream/kafka/state.py
+new file mode 100644
+index 0000000000..10dcfacaae
+--- /dev/null
++++ b/src/sentry/eventstream/kafka/state.py
+@@ -0,0 +1,178 @@
++from __future__ import absolute_import
++
++import logging
++import threading
++from collections import defaultdict, namedtuple
++
++
++logger = logging.getLogger(__name__)
++
++
++Offsets = namedtuple('Offsets', 'local remote')
++
++
++class InvalidState(Exception):
++    pass
++
++
++class InvalidStateTransition(Exception):
++    pass
++
++
++class MessageNotReady(Exception):
++    pass
++
++
++class SynchronizedPartitionState:
++    # The ``SYNCHRONIZED`` state represents that the local offset is equal to
++    # the remote offset. The local consumer should be paused to avoid advancing
++    # further beyond the remote consumer.
++    SYNCHRONIZED = 'SYNCHRONIZED'
++
++    # The ``LOCAL_BEHIND`` state represents that the remote offset is greater
++    # than the local offset. The local consumer should be unpaused to avoid
++    # falling behind the remote consumer.
++    LOCAL_BEHIND = 'LOCAL_BEHIND'
++
++    # The ``REMOTE_BEHIND`` state represents that the local offset is greater
++    # than the remote offset. The local consumer should be paused to avoid
++    # advancing further beyond the remote consumer.
++    REMOTE_BEHIND = 'REMOTE_BEHIND'
++
++    # The ``UNKNOWN`` state represents that we haven't received enough data to
++    # know the current offset state.
++    UNKNOWN = 'UNKNOWN'
++
++
++class SynchronizedPartitionStateManager(object):
++    """
++    This class implements a state machine that can be used to track the
++    consumption progress of a Kafka partition (the "local" consumer) relative
++    to a the progress of another consumer (the "remote" consumer.)
++
++    This is intended to be paired with the ``SynchronizedConsumer``.
++    """
++
++    transitions = {  # from state -> set(to states)
++        None: frozenset([
++            SynchronizedPartitionState.UNKNOWN,
++        ]),
++        SynchronizedPartitionState.UNKNOWN: frozenset([
++            SynchronizedPartitionState.LOCAL_BEHIND,
++            SynchronizedPartitionState.REMOTE_BEHIND,
++            SynchronizedPartitionState.SYNCHRONIZED,
++        ]),
++        SynchronizedPartitionState.REMOTE_BEHIND: frozenset([
++            SynchronizedPartitionState.LOCAL_BEHIND,
++            SynchronizedPartitionState.SYNCHRONIZED,
++        ]),
++        SynchronizedPartitionState.LOCAL_BEHIND: frozenset([
++            SynchronizedPartitionState.SYNCHRONIZED,
++            SynchronizedPartitionState.REMOTE_BEHIND,
++        ]),
++        SynchronizedPartitionState.SYNCHRONIZED: frozenset([
++            SynchronizedPartitionState.LOCAL_BEHIND,
++            SynchronizedPartitionState.REMOTE_BEHIND,
++        ]),
++    }
++
++    def __init__(self, callback):
++        self.partitions = defaultdict(lambda: (None, Offsets(None, None)))
++        self.callback = callback
++        self.__lock = threading.RLock()
++
++    def get_state_from_offsets(self, offsets):
++        """
++        Derive the partition state by comparing local and remote offsets.
++        """
++        if offsets.local is None or offsets.remote is None:
++            return SynchronizedPartitionState.UNKNOWN
++        else:
++            if offsets.local < offsets.remote:
++                return SynchronizedPartitionState.LOCAL_BEHIND
++            elif offsets.remote < offsets.local:
++                return SynchronizedPartitionState.REMOTE_BEHIND
++            else:  # local == remote
++                return SynchronizedPartitionState.SYNCHRONIZED
++
++    def set_local_offset(self, topic, partition, local_offset):
++        """
++        Update the local offset for a topic and partition.
++
++        If this update operation results in a state change, the callback
++        function will be invoked.
++        """
++        with self.__lock:
++            previous_state, previous_offsets = self.partitions[(topic, partition)]
++            if local_offset < previous_offsets.local:
++                logger.info(
++                    'Local offset has moved backwards (current: %s, previous: %s)',
++                    local_offset,
++                    previous_offsets.local)
++            updated_offsets = Offsets(local_offset, previous_offsets.remote)
++            updated_state = self.get_state_from_offsets(updated_offsets)
++            if previous_state is not updated_state and updated_state not in self.transitions[previous_state]:
++                raise InvalidStateTransition(
++                    'Unexpected state transition from {} to {}'.format(
++                        previous_state, updated_state))
++            self.partitions[(topic, partition)] = (updated_state, updated_offsets)
++            if previous_state is not updated_state:
++                if updated_state == SynchronizedPartitionState.REMOTE_BEHIND:
++                    logger.warning(
++                        'Current local offset (%s) exceeds remote offset (%s)!',
++                        updated_offsets.local,
++                        updated_offsets.remote)
++                self.callback(
++                    topic,
++                    partition,
++                    (previous_state, previous_offsets),
++                    (updated_state, updated_offsets),
++                )
++
++    def set_remote_offset(self, topic, partition, remote_offset):
++        """
++        Update the remote offset for a topic and partition.
++
++        If this update operation results in a state change, the callback
++        function will be invoked.
++        """
++        with self.__lock:
++            previous_state, previous_offsets = self.partitions[(topic, partition)]
++            if remote_offset < previous_offsets.remote:
++                logger.info(
++                    'Remote offset has moved backwards (current: %s, previous: %s)',
++                    remote_offset,
++                    previous_offsets.remote)
++            updated_offsets = Offsets(previous_offsets.local, remote_offset)
++            updated_state = self.get_state_from_offsets(updated_offsets)
++            if previous_state is not updated_state and updated_state not in self.transitions[previous_state]:
++                raise InvalidStateTransition(
++                    'Unexpected state transition from {} to {}'.format(
++                        previous_state, updated_state))
++            self.partitions[(topic, partition)] = (updated_state, updated_offsets)
++            if previous_state is not updated_state:
++                self.callback(
++                    topic,
++                    partition,
++                    (previous_state, previous_offsets),
++                    (updated_state, updated_offsets),
++                )
++
++    def validate_local_message(self, topic, partition, offset):
++        """
++        Check if a message should be consumed by the local consumer.
++
++        The local consumer should be prevented from consuming messages that
++        have yet to have been committed by the remote consumer.
++        """
++        with self.__lock:
++            state, offsets = self.partitions[(topic, partition)]
++            if state is not SynchronizedPartitionState.LOCAL_BEHIND:
++                raise InvalidState(
++                    'Received a message while consumer is not in LOCAL_BEHIND state!')
++            if offset >= offsets.remote:
++                raise MessageNotReady(
++                    'Received a message that has not been committed by remote consumer')
++            if offset < offsets.local:
++                logger.warning(
++                    'Received a message prior to local offset (local consumer offset rewound without update?)')
+diff --git a/src/sentry/runner/commands/run.py b/src/sentry/runner/commands/run.py
+index 023cd3b6d1..c9328375bb 100644
+--- a/src/sentry/runner/commands/run.py
++++ b/src/sentry/runner/commands/run.py
+@@ -251,3 +251,34 @@ def cron(**options):
+             # without_heartbeat=True,
+             **options
+         ).run()
++
++
++@run.command()
++@click.option('--consumer-group', default='snuba-post-processor',
++              help='Consumer group used to track event offsets that have been enqueued for post-processing.')
++@click.option('--commit-log-topic', default='snuba-commit-log',
++              help='Topic that the Snuba writer is publishing its committed offsets to.')
++@click.option('--synchronize-commit-group', default='snuba-consumers',
++              help='Consumer group that the Snuba writer is committing its offset as.')
++@click.option('--commit-batch-size', default=1000, type=int,
++              help='How many messages to process (may or may not result in an enqueued task) before committing offsets.')
++@click.option('--initial-offset-reset', default='latest', type=click.Choice(['earliest', 'latest']),
++              help='Position in the commit log topic to begin reading from when no prior offset has been recorded.')
++@log_options()
++@configuration
++def relay(**options):
++    from sentry import eventstream
++    from sentry.eventstream.base import RelayNotRequired
++    try:
++        eventstream.relay(
++            consumer_group=options['consumer_group'],
++            commit_log_topic=options['commit_log_topic'],
++            synchronize_commit_group=options['synchronize_commit_group'],
++            commit_batch_size=options['commit_batch_size'],
++            initial_offset_reset=options['initial_offset_reset'],
++        )
++    except RelayNotRequired:
++        sys.stdout.write(
++            'The configured event stream backend does not need a relay '
++            'process to enqueue post-processing tasks. Exiting...\n')
++        return
+diff --git a/src/sentry/utils/concurrent.py b/src/sentry/utils/concurrent.py
+index 1553972288..36d8e350e8 100644
+--- a/src/sentry/utils/concurrent.py
++++ b/src/sentry/utils/concurrent.py
+@@ -14,6 +14,27 @@ from six.moves import xrange
+ logger = logging.getLogger(__name__)
+ 
+ 
++def execute(function, daemon=True):
++    future = Future()
++
++    def run():
++        if not future.set_running_or_notify_cancel():
++            return
++
++        try:
++            result = function()
++        except Exception:
++            future.set_exception_info(*sys.exc_info()[1:])
++        else:
++            future.set_result(result)
++
++    t = threading.Thread(target=run)
++    t.daemon = daemon
++    t.start()
++
++    return future
++
++
+ class TimedFuture(Future):
+     def __init__(self, *args, **kwargs):
+         self.__timing = [None, None]  # [started, finished/cancelled]
+diff --git a/tests/sentry/eventstream/__init__.py b/tests/sentry/eventstream/__init__.py
+new file mode 100644
+index 0000000000..c3961685ab
+--- /dev/null
++++ b/tests/sentry/eventstream/__init__.py
+@@ -0,0 +1 @@
++from __future__ import absolute_import
+diff --git a/tests/sentry/eventstream/kafka/__init__.py b/tests/sentry/eventstream/kafka/__init__.py
+new file mode 100644
+index 0000000000..c3961685ab
+--- /dev/null
++++ b/tests/sentry/eventstream/kafka/__init__.py
+@@ -0,0 +1 @@
++from __future__ import absolute_import
+diff --git a/tests/sentry/eventstream/kafka/test_consumer.py b/tests/sentry/eventstream/kafka/test_consumer.py
+new file mode 100644
+index 0000000000..7392f58958
+--- /dev/null
++++ b/tests/sentry/eventstream/kafka/test_consumer.py
+@@ -0,0 +1,634 @@
++from __future__ import absolute_import
++
++import functools
++import os
++import subprocess
++import uuid
++from collections import defaultdict
++from contextlib import contextmanager
++
++import pytest
++
++try:
++    from confluent_kafka import Consumer, KafkaError, Producer, TopicPartition
++    from sentry.eventstream.kafka.consumer import SynchronizedConsumer
++    has_kafka_client = True
++except ImportError:
++    has_kafka_client = False
++
++
++@contextmanager
++def create_topic(partitions=1, replication_factor=1):
++    command = ['docker', 'exec', 'kafka', 'kafka-topics'] + \
++        ['--zookeeper', os.environ['SENTRY_ZOOKEEPER_HOSTS']]
++    topic = 'test-{}'.format(uuid.uuid1().hex)
++    subprocess.check_call(command + [
++        '--create',
++        '--topic', topic,
++        '--partitions', '{}'.format(partitions),
++        '--replication-factor', '{}'.format(replication_factor),
++    ])
++    try:
++        yield topic
++    finally:
++        subprocess.check_call(command + [
++            '--delete',
++            '--topic', topic,
++        ])
++
++
++def requires_kafka(function):
++    @functools.wraps(function)
++    def wrapper(*args, **kwargs):
++        if not has_kafka_client:
++            return pytest.xfail('test requires confluent_kafka which is not installed')
++        if 'SENTRY_KAFKA_HOSTS' not in os.environ:
++            return pytest.xfail('test requires SENTRY_KAFKA_HOSTS environment variable which is not set')
++        return function(*args, **kwargs)
++
++    return wrapper
++
++
++@requires_kafka
++def test_consumer_start_from_partition_start():
++    synchronize_commit_group = 'consumer-{}'.format(uuid.uuid1().hex)
++
++    messages_delivered = defaultdict(list)
++
++    def record_message_delivered(error, message):
++        assert error is None
++        messages_delivered[message.topic()].append(message)
++
++    producer = Producer({
++        'bootstrap.servers': os.environ['SENTRY_KAFKA_HOSTS'],
++        'on_delivery': record_message_delivered,
++    })
++
++    with create_topic() as topic, create_topic() as commit_log_topic:
++
++        # Produce some messages into the topic.
++        for i in range(3):
++            producer.produce(topic, '{}'.format(i).encode('utf8'))
++
++        assert producer.flush(5) == 0, 'producer did not successfully flush queue'
++
++        # Create the synchronized consumer.
++        consumer = SynchronizedConsumer(
++            bootstrap_servers=os.environ['SENTRY_KAFKA_HOSTS'],
++            consumer_group='consumer-{}'.format(uuid.uuid1().hex),
++            commit_log_topic=commit_log_topic,
++            synchronize_commit_group=synchronize_commit_group,
++            initial_offset_reset='earliest',
++        )
++
++        assignments_received = []
++
++        def on_assign(c, assignment):
++            assert c is consumer
++            assignments_received.append(assignment)
++
++        consumer.subscribe([topic], on_assign=on_assign)
++
++        # Wait until we have received our assignments.
++        for i in xrange(10):  # this takes a while
++            assert consumer.poll(1) is None
++            if assignments_received:
++                break
++
++        assert len(assignments_received) == 1, 'expected to receive partition assignment'
++        assert set((i.topic, i.partition) for i in assignments_received[0]) == set([(topic, 0)])
++
++        # TODO: Make sure that all partitions remain paused.
++
++        # Make sure that there are no messages ready to consume.
++        assert consumer.poll(1) is None
++
++        # Move the committed offset forward for our synchronizing group.
++        message = messages_delivered[topic][0]
++        producer.produce(
++            commit_log_topic,
++            key='{}:{}:{}'.format(
++                message.topic(),
++                message.partition(),
++                synchronize_commit_group,
++            ).encode('utf8'),
++            value='{}'.format(
++                message.offset() + 1,
++            ).encode('utf8'),
++        )
++
++        assert producer.flush(5) == 0, 'producer did not successfully flush queue'
++
++        # We should have received a single message.
++        # TODO: Can we also assert that the position is unpaused?)
++        for i in xrange(5):
++            message = consumer.poll(1)
++            if message is not None:
++                break
++
++        assert message is not None, 'no message received'
++
++        expected_message = messages_delivered[topic][0]
++        assert message.topic() == expected_message.topic()
++        assert message.partition() == expected_message.partition()
++        assert message.offset() == expected_message.offset()
++
++        # We should not be able to continue reading into the topic.
++        # TODO: Can we assert that the position is paused?
++        assert consumer.poll(1) is None
++
++
++@requires_kafka
++def test_consumer_start_from_committed_offset():
++    consumer_group = 'consumer-{}'.format(uuid.uuid1().hex)
++    synchronize_commit_group = 'consumer-{}'.format(uuid.uuid1().hex)
++
++    messages_delivered = defaultdict(list)
++
++    def record_message_delivered(error, message):
++        assert error is None
++        messages_delivered[message.topic()].append(message)
++
++    producer = Producer({
++        'bootstrap.servers': os.environ['SENTRY_KAFKA_HOSTS'],
++        'on_delivery': record_message_delivered,
++    })
++
++    with create_topic() as topic, create_topic() as commit_log_topic:
++
++        # Produce some messages into the topic.
++        for i in range(3):
++            producer.produce(topic, '{}'.format(i).encode('utf8'))
++
++        assert producer.flush(5) == 0, 'producer did not successfully flush queue'
++
++        Consumer({
++            'bootstrap.servers': os.environ['SENTRY_KAFKA_HOSTS'],
++            'group.id': consumer_group,
++        }).commit(
++            message=messages_delivered[topic][0],
++            asynchronous=False,
++        )
++
++        # Create the synchronized consumer.
++        consumer = SynchronizedConsumer(
++            bootstrap_servers=os.environ['SENTRY_KAFKA_HOSTS'],
++            consumer_group=consumer_group,
++            commit_log_topic=commit_log_topic,
++            synchronize_commit_group=synchronize_commit_group,
++            initial_offset_reset='earliest',
++        )
++
++        assignments_received = []
++
++        def on_assign(c, assignment):
++            assert c is consumer
++            assignments_received.append(assignment)
++
++        consumer.subscribe([topic], on_assign=on_assign)
++
++        # Wait until we have received our assignments.
++        for i in xrange(10):  # this takes a while
++            assert consumer.poll(1) is None
++            if assignments_received:
++                break
++
++        assert len(assignments_received) == 1, 'expected to receive partition assignment'
++        assert set((i.topic, i.partition) for i in assignments_received[0]) == set([(topic, 0)])
++
++        # TODO: Make sure that all partitions are paused on assignment.
++
++        # Move the committed offset forward for our synchronizing group.
++        message = messages_delivered[topic][0]
++        producer.produce(
++            commit_log_topic,
++            key='{}:{}:{}'.format(
++                message.topic(),
++                message.partition(),
++                synchronize_commit_group,
++            ).encode('utf8'),
++            value='{}'.format(
++                message.offset() + 1,
++            ).encode('utf8'),
++        )
++
++        # Make sure that there are no messages ready to consume.
++        assert consumer.poll(1) is None
++
++        # Move the committed offset forward for our synchronizing group.
++        message = messages_delivered[topic][0 + 1]  # second message
++        producer.produce(
++            commit_log_topic,
++            key='{}:{}:{}'.format(
++                message.topic(),
++                message.partition(),
++                synchronize_commit_group,
++            ).encode('utf8'),
++            value='{}'.format(
++                message.offset() + 1,
++            ).encode('utf8'),
++        )
++
++        assert producer.flush(5) == 0, 'producer did not successfully flush queue'
++
++        # We should have received a single message.
++        # TODO: Can we also assert that the position is unpaused?)
++        for i in xrange(5):
++            message = consumer.poll(1)
++            if message is not None:
++                break
++
++        assert message is not None, 'no message received'
++
++        expected_message = messages_delivered[topic][0 + 1]  # second message
++        assert message.topic() == expected_message.topic()
++        assert message.partition() == expected_message.partition()
++        assert message.offset() == expected_message.offset()
++
++        # We should not be able to continue reading into the topic.
++        # TODO: Can we assert that the position is paused?
++        assert consumer.poll(1) is None
++
++
++@requires_kafka
++def test_consumer_rebalance_from_partition_start():
++    consumer_group = 'consumer-{}'.format(uuid.uuid1().hex)
++    synchronize_commit_group = 'consumer-{}'.format(uuid.uuid1().hex)
++
++    messages_delivered = defaultdict(list)
++
++    def record_message_delivered(error, message):
++        assert error is None
++        messages_delivered[message.topic()].append(message)
++
++    producer = Producer({
++        'bootstrap.servers': os.environ['SENTRY_KAFKA_HOSTS'],
++        'on_delivery': record_message_delivered,
++    })
++
++    with create_topic(partitions=2) as topic, create_topic() as commit_log_topic:
++
++        # Produce some messages into the topic.
++        for i in range(4):
++            producer.produce(topic, '{}'.format(i).encode('utf8'), partition=i % 2)
++
++        assert producer.flush(5) == 0, 'producer did not successfully flush queue'
++
++        consumer_a = SynchronizedConsumer(
++            bootstrap_servers=os.environ['SENTRY_KAFKA_HOSTS'],
++            consumer_group=consumer_group,
++            commit_log_topic=commit_log_topic,
++            synchronize_commit_group=synchronize_commit_group,
++            initial_offset_reset='earliest',
++        )
++
++        assignments_received = defaultdict(list)
++
++        def on_assign(consumer, assignment):
++            assignments_received[consumer].append(assignment)
++
++        consumer_a.subscribe([topic], on_assign=on_assign)
++
++        # Wait until the first consumer has received its assignments.
++        for i in xrange(10):  # this takes a while
++            assert consumer_a.poll(1) is None
++            if assignments_received[consumer_a]:
++                break
++
++        assert len(assignments_received[consumer_a]
++                   ) == 1, 'expected to receive partition assignment'
++        assert set((i.topic, i.partition)
++                   for i in assignments_received[consumer_a][0]) == set([(topic, 0), (topic, 1)])
++
++        assignments_received[consumer_a].pop()
++
++        consumer_b = SynchronizedConsumer(
++            bootstrap_servers=os.environ['SENTRY_KAFKA_HOSTS'],
++            consumer_group=consumer_group,
++            commit_log_topic=commit_log_topic,
++            synchronize_commit_group=synchronize_commit_group,
++            initial_offset_reset='earliest',
++        )
++
++        consumer_b.subscribe([topic], on_assign=on_assign)
++
++        assignments = {}
++
++        # Wait until *both* consumers have received updated assignments.
++        for consumer in [consumer_a, consumer_b]:
++            for i in xrange(10):  # this takes a while
++                assert consumer.poll(1) is None
++                if assignments_received[consumer]:
++                    break
++
++            assert len(assignments_received[consumer]
++                       ) == 1, 'expected to receive partition assignment'
++            assert len(assignments_received[consumer][0]
++                       ) == 1, 'expected to have a single partition assignment'
++
++            i = assignments_received[consumer][0][0]
++            assignments[(i.topic, i.partition)] = consumer
++
++        assert set(assignments.keys()) == set([(topic, 0), (topic, 1)])
++
++        for expected_message in messages_delivered[topic]:
++            consumer = assignments[(expected_message.topic(), expected_message.partition())]
++
++            # Make sure that there are no messages ready to consume.
++            assert consumer.poll(1) is None
++
++            # Move the committed offset forward for our synchronizing group.
++            producer.produce(
++                commit_log_topic,
++                key='{}:{}:{}'.format(
++                    expected_message.topic(),
++                    expected_message.partition(),
++                    synchronize_commit_group,
++                ).encode('utf8'),
++                value='{}'.format(
++                    expected_message.offset() + 1,
++                ).encode('utf8'),
++            )
++
++            assert producer.flush(5) == 0, 'producer did not successfully flush queue'
++
++            # We should have received a single message.
++            # TODO: Can we also assert that the position is unpaused?)
++            for i in xrange(5):
++                received_message = consumer.poll(1)
++                if received_message is not None:
++                    break
++
++            assert received_message is not None, 'no message received'
++
++            assert received_message.topic() == expected_message.topic()
++            assert received_message.partition() == expected_message.partition()
++            assert received_message.offset() == expected_message.offset()
++
++            # We should not be able to continue reading into the topic.
++            # TODO: Can we assert that the position is paused?
++            assert consumer.poll(1) is None
++
++
++@requires_kafka
++def test_consumer_rebalance_from_committed_offset():
++    consumer_group = 'consumer-{}'.format(uuid.uuid1().hex)
++    synchronize_commit_group = 'consumer-{}'.format(uuid.uuid1().hex)
++
++    messages_delivered = defaultdict(list)
++
++    def record_message_delivered(error, message):
++        assert error is None
++        messages_delivered[message.topic()].append(message)
++
++    producer = Producer({
++        'bootstrap.servers': os.environ['SENTRY_KAFKA_HOSTS'],
++        'on_delivery': record_message_delivered,
++    })
++
++    with create_topic(partitions=2) as topic, create_topic() as commit_log_topic:
++
++        # Produce some messages into the topic.
++        for i in range(4):
++            producer.produce(topic, '{}'.format(i).encode('utf8'), partition=i % 2)
++
++        assert producer.flush(5) == 0, 'producer did not successfully flush queue'
++
++        Consumer({
++            'bootstrap.servers': os.environ['SENTRY_KAFKA_HOSTS'],
++            'group.id': consumer_group,
++        }).commit(
++            offsets=[
++                TopicPartition(
++                    message.topic(),
++                    message.partition(),
++                    message.offset() + 1,
++                ) for message in messages_delivered[topic][:2]
++            ],
++            asynchronous=False,
++        )
++
++        consumer_a = SynchronizedConsumer(
++            bootstrap_servers=os.environ['SENTRY_KAFKA_HOSTS'],
++            consumer_group=consumer_group,
++            commit_log_topic=commit_log_topic,
++            synchronize_commit_group=synchronize_commit_group,
++            initial_offset_reset='earliest',
++        )
++
++        assignments_received = defaultdict(list)
++
++        def on_assign(consumer, assignment):
++            assignments_received[consumer].append(assignment)
++
++        consumer_a.subscribe([topic], on_assign=on_assign)
++
++        # Wait until the first consumer has received its assignments.
++        for i in xrange(10):  # this takes a while
++            assert consumer_a.poll(1) is None
++            if assignments_received[consumer_a]:
++                break
++
++        assert len(assignments_received[consumer_a]
++                   ) == 1, 'expected to receive partition assignment'
++        assert set((i.topic, i.partition)
++                   for i in assignments_received[consumer_a][0]) == set([(topic, 0), (topic, 1)])
++
++        assignments_received[consumer_a].pop()
++
++        consumer_b = SynchronizedConsumer(
++            bootstrap_servers=os.environ['SENTRY_KAFKA_HOSTS'],
++            consumer_group=consumer_group,
++            commit_log_topic=commit_log_topic,
++            synchronize_commit_group=synchronize_commit_group,
++            initial_offset_reset='earliest',
++        )
++
++        consumer_b.subscribe([topic], on_assign=on_assign)
++
++        assignments = {}
++
++        # Wait until *both* consumers have received updated assignments.
++        for consumer in [consumer_a, consumer_b]:
++            for i in xrange(10):  # this takes a while
++                assert consumer.poll(1) is None
++                if assignments_received[consumer]:
++                    break
++
++            assert len(assignments_received[consumer]
++                       ) == 1, 'expected to receive partition assignment'
++            assert len(assignments_received[consumer][0]
++                       ) == 1, 'expected to have a single partition assignment'
++
++            i = assignments_received[consumer][0][0]
++            assignments[(i.topic, i.partition)] = consumer
++
++        assert set(assignments.keys()) == set([(topic, 0), (topic, 1)])
++
++        for expected_message in messages_delivered[topic][2:]:
++            consumer = assignments[(expected_message.topic(), expected_message.partition())]
++
++            # Make sure that there are no messages ready to consume.
++            assert consumer.poll(1) is None
++
++            # Move the committed offset forward for our synchronizing group.
++            producer.produce(
++                commit_log_topic,
++                key='{}:{}:{}'.format(
++                    expected_message.topic(),
++                    expected_message.partition(),
++                    synchronize_commit_group,
++                ).encode('utf8'),
++                value='{}'.format(
++                    expected_message.offset() + 1,
++                ).encode('utf8'),
++            )
++
++            assert producer.flush(5) == 0, 'producer did not successfully flush queue'
++
++            # We should have received a single message.
++            # TODO: Can we also assert that the position is unpaused?)
++            for i in xrange(5):
++                received_message = consumer.poll(1)
++                if received_message is not None:
++                    break
++
++            assert received_message is not None, 'no message received'
++
++            assert received_message.topic() == expected_message.topic()
++            assert received_message.partition() == expected_message.partition()
++            assert received_message.offset() == expected_message.offset()
++
++            # We should not be able to continue reading into the topic.
++            # TODO: Can we assert that the position is paused?
++            assert consumer.poll(1) is None
++
++
++def consume_until_constraints_met(consumer, constraints, iterations, timeout=1):
++    constraints = set(constraints)
++
++    for i in xrange(iterations):
++        message = consumer.poll(timeout)
++        for constraint in list(constraints):
++            if constraint(message):
++                constraints.remove(constraint)
++
++        if not constraints:
++            break
++
++    if constraints:
++        raise AssertionError(
++            'Completed {} iterations with {} unmet constraints: {!r}'.format(
++                iterations, len(constraints), constraints))
++
++
++def collect_messages_recieved(count):
++    messages = []
++
++    def messages_recieved_constraint(message):
++        if message is not None:
++            messages.append(message)
++            if len(messages) == count:
++                return True
++    return messages_recieved_constraint
++
++
++@requires_kafka
++def test_consumer_rebalance_from_uncommitted_offset():
++    consumer_group = 'consumer-{}'.format(uuid.uuid1().hex)
++    synchronize_commit_group = 'consumer-{}'.format(uuid.uuid1().hex)
++
++    messages_delivered = defaultdict(list)
++
++    def record_message_delivered(error, message):
++        assert error is None
++        messages_delivered[message.topic()].append(message)
++
++    producer = Producer({
++        'bootstrap.servers': os.environ['SENTRY_KAFKA_HOSTS'],
++        'on_delivery': record_message_delivered,
++    })
++
++    with create_topic(partitions=2) as topic, create_topic() as commit_log_topic:
++
++        # Produce some messages into the topic.
++        for i in range(4):
++            producer.produce(topic, '{}'.format(i).encode('utf8'), partition=i % 2)
++
++        assert producer.flush(5) == 0, 'producer did not successfully flush queue'
++
++        for (topic, partition), offset in {(message.topic(), message.partition(
++        )): message.offset() for message in messages_delivered[topic]}.items():
++            producer.produce(
++                commit_log_topic,
++                key='{}:{}:{}'.format(
++                    topic,
++                    partition,
++                    synchronize_commit_group,
++                ).encode('utf8'),
++                value='{}'.format(
++                    offset + 1,
++                ).encode('utf8'),
++            )
++
++        assert producer.flush(5) == 0, 'producer did not successfully flush queue'
++
++        consumer_a = SynchronizedConsumer(
++            bootstrap_servers=os.environ['SENTRY_KAFKA_HOSTS'],
++            consumer_group=consumer_group,
++            commit_log_topic=commit_log_topic,
++            synchronize_commit_group=synchronize_commit_group,
++            initial_offset_reset='earliest',
++        )
++
++        assignments_received = defaultdict(list)
++
++        def on_assign(consumer, assignment):
++            assignments_received[consumer].append(assignment)
++
++        consumer_a.subscribe([topic], on_assign=on_assign)
++
++        consume_until_constraints_met(consumer_a, [
++            lambda message: assignments_received[consumer_a],
++            collect_messages_recieved(4),
++        ], 10)
++
++        assert len(assignments_received[consumer_a]
++                   ) == 1, 'expected to receive partition assignment'
++        assert set((i.topic, i.partition)
++                   for i in assignments_received[consumer_a][0]) == set([(topic, 0), (topic, 1)])
++        assignments_received[consumer_a].pop()
++
++        message = consumer_a.poll(1)
++        assert message is None or message.error(
++        ) is KafkaError._PARTITION_EOF, 'there should be no more messages to recieve'
++
++        consumer_b = SynchronizedConsumer(
++            bootstrap_servers=os.environ['SENTRY_KAFKA_HOSTS'],
++            consumer_group=consumer_group,
++            commit_log_topic=commit_log_topic,
++            synchronize_commit_group=synchronize_commit_group,
++            initial_offset_reset='earliest',
++        )
++
++        consumer_b.subscribe([topic], on_assign=on_assign)
++
++        consume_until_constraints_met(consumer_a, [
++            lambda message: assignments_received[consumer_a],
++        ], 10)
++
++        consume_until_constraints_met(consumer_b, [
++            lambda message: assignments_received[consumer_b],
++            collect_messages_recieved(2),
++        ], 10)
++
++        for consumer in [consumer_a, consumer_b]:
++            assert len(assignments_received[consumer][0]) == 1
++
++        message = consumer_a.poll(1)
++        assert message is None or message.error(
++        ) is KafkaError._PARTITION_EOF, 'there should be no more messages to recieve'
++
++        message = consumer_b.poll(1)
++        assert message is None or message.error(
++        ) is KafkaError._PARTITION_EOF, 'there should be no more messages to recieve'
+diff --git a/tests/sentry/eventstream/kafka/test_protocol.py b/tests/sentry/eventstream/kafka/test_protocol.py
+new file mode 100644
+index 0000000000..d8e8abc7a0
+--- /dev/null
++++ b/tests/sentry/eventstream/kafka/test_protocol.py
+@@ -0,0 +1,72 @@
++from __future__ import absolute_import
++
++import pytest
++import pytz
++from datetime import datetime
++
++from sentry.eventstream.kafka.protocol import (
++    InvalidPayload,
++    InvalidVersion,
++    UnexpectedOperation,
++    parse_event_message,
++)
++from sentry.utils import json
++
++
++def test_parse_event_message_invalid_payload():
++    with pytest.raises(InvalidPayload):
++        parse_event_message('{"format": "invalid"}')
++
++
++def test_parse_event_message_invalid_version():
++    with pytest.raises(InvalidVersion):
++        parse_event_message(json.dumps([0, 'insert', {}]))
++
++
++def test_parse_event_message_version_1():
++    event_data = {
++        'project_id': 1,
++        'group_id': 2,
++        'event_id': '00000000000010008080808080808080',
++        'message': 'message',
++        'platform': 'python',
++        'datetime': '2018-07-20T21:04:27.600640Z',
++        'data': {},
++        'extra': {},
++        'primary_hash': '49f68a5c8493ec2c0bf489821c21fc3b',
++    }
++
++    task_state = {
++        'is_new': True,
++        'is_sample': False,
++        'is_regression': False,
++        'is_new_group_environment': True,
++    }
++
++    kwargs = parse_event_message(json.dumps([1, 'insert', event_data, task_state]))
++    event = kwargs.pop('event')
++    assert event.project_id == 1
++    assert event.group_id == 2
++    assert event.event_id == '00000000000010008080808080808080'
++    assert event.message == 'message'
++    assert event.platform == 'python'
++    assert event.datetime == datetime(2018, 7, 20, 21, 4, 27, 600640, tzinfo=pytz.utc)
++    assert dict(event.data) == {}
++
++    assert kwargs.pop('primary_hash') == '49f68a5c8493ec2c0bf489821c21fc3b'
++
++    assert kwargs.pop('is_new') is True
++    assert kwargs.pop('is_sample') is False
++    assert kwargs.pop('is_regression') is False
++    assert kwargs.pop('is_new_group_environment') is True
++
++    assert not kwargs, 'unexpected values remaining: {!r}'.format(kwargs)
++
++
++def test_parse_event_message_version_1_unsupported_operation():
++    assert parse_event_message(json.dumps([1, 'delete', {}])) is None
++
++
++def test_parse_event_message_version_1_unexpected_operation():
++    with pytest.raises(UnexpectedOperation):
++        parse_event_message(json.dumps([1, 'invalid', {}, {}]))
+diff --git a/tests/sentry/eventstream/kafka/test_state.py b/tests/sentry/eventstream/kafka/test_state.py
+new file mode 100644
+index 0000000000..293f1450ea
+--- /dev/null
++++ b/tests/sentry/eventstream/kafka/test_state.py
+@@ -0,0 +1,97 @@
++from __future__ import absolute_import
++
++import pytest
++import mock
++from sentry.eventstream.kafka.state import (
++    InvalidState,
++    InvalidStateTransition,
++    MessageNotReady,
++    Offsets,
++    SynchronizedPartitionState,
++    SynchronizedPartitionStateManager,
++)
++
++
++def test_transitions():
++    callback = mock.MagicMock()
++    state = SynchronizedPartitionStateManager(callback)
++
++    with pytest.raises(InvalidState):
++        state.validate_local_message('topic', 0, 0)
++
++    state.set_local_offset('topic', 0, 1)
++    assert callback.mock_calls[-1] == mock.call(
++        'topic', 0,
++        (None, Offsets(None, None)),
++        (SynchronizedPartitionState.UNKNOWN, Offsets(1, None)),
++    )
++
++    with pytest.raises(InvalidState):
++        state.validate_local_message('topic', 0, 0)
++
++    state.set_remote_offset('topic', 0, 1)
++    assert callback.mock_calls[-1] == mock.call(
++        'topic', 0,
++        (SynchronizedPartitionState.UNKNOWN, Offsets(1, None)),
++        (SynchronizedPartitionState.SYNCHRONIZED, Offsets(1, 1)),
++    )
++
++    with pytest.raises(InvalidStateTransition):
++        state.set_local_offset('topic', 0, None)
++
++    with pytest.raises(InvalidStateTransition):
++        state.set_remote_offset('topic', 0, None)
++
++    state.set_remote_offset('topic', 0, 2)
++    assert callback.mock_calls[-1] == mock.call(
++        'topic', 0,
++        (SynchronizedPartitionState.SYNCHRONIZED, Offsets(1, 1)),
++        (SynchronizedPartitionState.LOCAL_BEHIND, Offsets(1, 2)),
++    )
++
++    state.validate_local_message('topic', 0, 1)
++
++    with pytest.raises(MessageNotReady):
++        state.validate_local_message('topic', 0, 2)
++
++    state.set_local_offset('topic', 0, 2)
++    assert callback.mock_calls[-1] == mock.call(
++        'topic', 0,
++        (SynchronizedPartitionState.LOCAL_BEHIND, Offsets(1, 2)),
++        (SynchronizedPartitionState.SYNCHRONIZED, Offsets(2, 2)),
++    )
++
++    state.set_remote_offset('topic', 1, 5)
++    assert callback.mock_calls[-1] == mock.call(
++        'topic', 1,
++        (None, Offsets(None, None)),
++        (SynchronizedPartitionState.UNKNOWN, Offsets(None, 5)),
++    )
++
++    state.set_local_offset('topic', 1, 0)
++    assert callback.mock_calls[-1] == mock.call(
++        'topic', 1,
++        (SynchronizedPartitionState.UNKNOWN, Offsets(None, 5)),
++        (SynchronizedPartitionState.LOCAL_BEHIND, Offsets(0, 5)),
++    )
++
++    before_calls = len(callback.mock_calls)
++    state.set_local_offset('topic', 1, 1)
++    state.set_local_offset('topic', 1, 2)
++    state.set_local_offset('topic', 1, 3)
++    state.set_local_offset('topic', 1, 4)
++    assert len(callback.mock_calls) == before_calls
++
++    state.set_local_offset('topic', 1, 5)
++    assert callback.mock_calls[-1] == mock.call(
++        'topic', 1,
++        (SynchronizedPartitionState.LOCAL_BEHIND, Offsets(4, 5)),
++        (SynchronizedPartitionState.SYNCHRONIZED, Offsets(5, 5)),
++    )
++
++    state.set_local_offset('topic', 1, 6)
++    assert callback.mock_calls[-1] == mock.call(
++        'topic', 1,
++        (SynchronizedPartitionState.SYNCHRONIZED, Offsets(5, 5)),
++        (SynchronizedPartitionState.REMOTE_BEHIND, Offsets(6, 5)),
++    )
+diff --git a/tests/sentry/utils/test_concurrent.py b/tests/sentry/utils/test_concurrent.py
+index 10e83d7536..4a944988f4 100644
+--- a/tests/sentry/utils/test_concurrent.py
++++ b/tests/sentry/utils/test_concurrent.py
+@@ -2,12 +2,20 @@ from __future__ import absolute_import
+ 
+ import mock
+ import pytest
++import thread
+ from Queue import Full
+ from concurrent.futures import CancelledError, Future
+ from contextlib import contextmanager
+ from threading import Event
+ 
+-from sentry.utils.concurrent import FutureSet, SynchronousExecutor, ThreadedExecutor, TimedFuture
++from sentry.utils.concurrent import FutureSet, SynchronousExecutor, ThreadedExecutor, TimedFuture, execute
++
++
++def test_execute():
++    assert execute(thread.get_ident).result() != thread.get_ident()
++
++    with pytest.raises(Exception):
++        assert execute(mock.Mock(side_effect=Exception('Boom!'))).result()
+ 
+ 
+ def test_future_set_callback_success():

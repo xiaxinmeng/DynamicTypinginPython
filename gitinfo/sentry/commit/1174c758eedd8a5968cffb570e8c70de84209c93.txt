@@ -1,0 +1,463 @@
+commit 1174c758eedd8a5968cffb570e8c70de84209c93
+Author: David Cramer <dcramer@gmail.com>
+Date:   Mon Sep 25 17:16:30 2017 -0700
+
+    feat(slack): Add support for unfurling URLs
+
+diff --git a/src/sentry/integrations/helper.py b/src/sentry/integrations/helper.py
+index 54da474e34..5e2ac470aa 100644
+--- a/src/sentry/integrations/helper.py
++++ b/src/sentry/integrations/helper.py
+@@ -188,14 +188,17 @@ class PipelineHelper(object):
+                 name=data.get('name', self.provider.name),
+             )
+         else:
+-            self.integration, _ = Integration.objects.get_or_create(
++            defaults = {
++                'metadata': data.get('metadata', {}),
++                'name': data.get('name', data['external_id']),
++            }
++            self.integration, created = Integration.objects.get_or_create(
+                 provider=self.provider.id,
+                 external_id=data['external_id'],
+-                defaults={
+-                    'metadata': data.get('metadata', {}),
+-                    'name': data.get('name', data['external_id']),
+-                }
++                defaults=defaults
+             )
++            if not created:
++                self.integration.update(**defaults)
+             self.integration.add_organization(self.organization.id)
+ 
+         id_config = data.get('identity')
+diff --git a/src/sentry/integrations/slack/event_endpoint.py b/src/sentry/integrations/slack/event_endpoint.py
+new file mode 100644
+index 0000000000..aa1e1d8ae2
+--- /dev/null
++++ b/src/sentry/integrations/slack/event_endpoint.py
+@@ -0,0 +1,170 @@
++from __future__ import absolute_import
++
++import logging
++import json
++import re
++import six
++
++from six.moves.urllib.parse import parse_qs, urlencode, urlparse, urlunparse
++
++from sentry import http, options
++from sentry.api.base import Endpoint
++from sentry.models import Group, Integration, Project
++
++logger = logging.getLogger('sentry.integrations.cloudflare')
++
++_link_regexp = re.compile(r'^https?\://[^/]+/[^/]+/[^/]+/issues/(\d+)/')
++
++LEVEL_TO_COLOR = {
++    'debug': 'cfd3da',
++    'info': '2788ce',
++    'warning': 'f18500',
++    'error': 'f43f20',
++    'fatal': 'd20f2a',
++}
++
++
++# XXX(dcramer): a lot of this is copied from sentry-plugins right now, and will
++# need refactored
++class SlackEventEndpoint(Endpoint):
++    authentication_classes = ()
++    permission_classes = ()
++
++    def _parse_issue_id_from_url(self, link):
++        match = _link_regexp.match(link)
++        if not match:
++            return
++        try:
++            return int(match.group(1))
++        except (TypeError, ValueError):
++            return
++
++    def _attachment_for(self, group):
++        return {
++            'fallback': '[{}] {}'.format(group.project.slug, group.title),
++            'title': group.title,
++            'title_link': self._add_notification_referrer_param(group.get_absolute_url()),
++        }
++
++    def _add_notification_referrer_param(self, url):
++        parsed_url = urlparse(url)
++        query = parse_qs(parsed_url.query)
++        query['referrer'] = 'slack'
++
++        url_list = list(parsed_url)
++        url_list[4] = urlencode(query, doseq=True)
++        return urlunparse(url_list)
++
++    def on_url_verification(self, request, integration, data):
++        return self.respond({
++            'challenge': data['challenge'],
++        })
++
++    def on_link_shared(self, request, integration, token, data):
++        issue_map = {}
++        for item in data['links']:
++            issue_id = self._parse_issue_id_from_url(item['url'])
++            if not issue_id:
++                continue
++            issue_map[issue_id] = item['url']
++
++        if not issue_map:
++            return
++
++        results = {
++            g.id: g for g in Group.objects.filter(
++                id__in=set(issue_map.keys()),
++                project__in=Project.objects.filter(
++                    organization__in=integration.organizations.all(),
++                )
++            )
++        }
++        if not results:
++            return
++
++        payload = {
++            'token': integration.metadata['access_token'],
++            'channel': data['channel'],
++            'ts': data['message_ts'],
++            'unfurls': json.dumps({
++                v: self._attachment_for(results[k])
++                for k, v in six.iteritems(issue_map)
++                if k in results
++            }),
++            # 'user_auth_required': False,
++            # 'user_auth_message': 'You can enable automatic unfurling of Sentry URLs by having a Sentry admin configure the Slack integration.',
++            # we dont have a generic URL that this will work for your
++            # 'user_auth_url': '...',
++        }
++
++        session = http.build_session()
++        req = session.post('https://slack.com/api/chat.unfurl', data=payload)
++        req.raise_for_status()
++        resp = req.json()
++        if not resp.get('ok'):
++            logger.error('slack.event.unfurl-error', extra={
++                'error': resp.get('error'),
++            })
++        return self.respond()
++
++    # TODO(dcramer): implement app_uninstalled and tokens_revoked
++    def post(self, request):
++        logging_data = {}
++
++        try:
++            data = request.DATA
++        except (ValueError, TypeError):
++            logger.error('slack.event.invalid-json', extra=logging_data)
++            return self.respond(status=400)
++
++        event_id = data.get('event_id')
++        team_id = data.get('team_id')
++        api_app_id = data.get('api_app_id')
++        # TODO(dcramer): should we verify this here?
++        # authed_users = data.get('authed_users')
++
++        logging_data.update({
++            'team_id': team_id,
++            'api_app_id': api_app_id,
++            'event_id': event_id,
++        })
++
++        token = data.get('token')
++        if token != options.get('slack.verification-token'):
++            logger.error('slack.event.invalid-token', extra=logging_data)
++            return self.respond(status=400)
++
++        try:
++            integration = Integration.objects.get(
++                provider='slack',
++                external_id=team_id,
++            )
++        except Integration.DoesNotExist:
++            logger.error('slack.event.unknown-team-id', extra=logging_data)
++            return self.respond(status=400)
++
++        logging_data['integration_id'] = integration.id
++
++        payload_type = data.get('type')
++        logger.info('slack.event.{}'.format(payload_type), extra=logging_data)
++        if payload_type == 'url_verification':
++            return self.on_url_verification(request, integration, data)
++
++        event_data = data.get('event')
++        if not event_data:
++            logger.error('slack.event.invalid-event-data', extra=logging_data)
++            return self.respond(status=400)
++
++        event_type = event_data.get('type')
++        if not event_data:
++            logger.error('slack.event.invalid-event-type', extra=logging_data)
++            return self.respond(status=400)
++
++        logging_data['event_type'] = event_type
++        if event_type == 'link_shared':
++            resp = self.on_link_shared(request, integration, token, event_data)
++        else:
++            resp = None
++        if resp:
++            return resp
++        return self.respond()
+diff --git a/src/sentry/integrations/slack/integration.py b/src/sentry/integrations/slack/integration.py
+index d8ae587835..a92d7d86fd 100644
+--- a/src/sentry/integrations/slack/integration.py
++++ b/src/sentry/integrations/slack/integration.py
+@@ -16,12 +16,22 @@ class SlackIntegration(OAuth2Integration):
+     oauth_authorize_url = 'https://slack.com/oauth/authorize'
+     oauth_client_id = options.get('slack.client-id')
+     oauth_client_secret = options.get('slack.client-secret')
+-    oauth_scopes = (
++    oauth_scopes = tuple(sorted((
+         'bot',
+         'chat:write:bot',
+         'commands',
++        'links:read',
++        'links:write',
+         'team:read',
+-    )
++    )))
++
++    def get_config(self):
++        return [{
++            'name': 'unfurl_urls',
++            'label': 'Unfurl URLs',
++            'type': 'bool',
++            'help': 'Unfurl any URLs which reference a Sentry issue.',
++        }]
+ 
+     def build_integration(self, state):
+         data = state['data']
+@@ -34,6 +44,9 @@ class SlackIntegration(OAuth2Integration):
+             'metadata': {
+                 'bot_access_token': data['bot']['bot_access_token'],
+                 'bot_user_id': data['bot']['bot_user_id'],
++                # XXX: should this be stored with OrganizationIntegration?
++                # is there any concern of access?
++                'access_token': data['access_token'],
+                 'scopes': sorted(data['scope'].split(',')),
+             },
+             'identity': self.build_identity(state)
+diff --git a/src/sentry/integrations/slack/urls.py b/src/sentry/integrations/slack/urls.py
+new file mode 100644
+index 0000000000..4f4a37105e
+--- /dev/null
++++ b/src/sentry/integrations/slack/urls.py
+@@ -0,0 +1,11 @@
++from __future__ import absolute_import, print_function
++
++from django.conf.urls import patterns, url
++
++from .event_endpoint import SlackEventEndpoint
++
++
++urlpatterns = patterns(
++    '',
++    url(r'^event/$', SlackEventEndpoint.as_view()),
++)
+diff --git a/src/sentry/web/urls.py b/src/sentry/web/urls.py
+index 7d2038eb6f..2c905ab59a 100644
+--- a/src/sentry/web/urls.py
++++ b/src/sentry/web/urls.py
+@@ -455,8 +455,9 @@ urlpatterns += patterns(
+     # XXX(dcramer): preferably we'd be able to use 'integrations' as the URL
+     # prefix here, but unfortunately sentry.io has that mapped to marketing
+     # assets for the time being
+-    url(r'^extensions/cloudflare/', include('sentry.integrations.cloudflare.urls')),
+     url(r'^extensions/(?P<provider_id>[\w_-]+)/setup/$', IntegrationSetupView.as_view()),
++    url(r'^extensions/cloudflare/', include('sentry.integrations.cloudflare.urls')),
++    url(r'^extensions/slack/', include('sentry.integrations.slack.urls')),
+ 
+     url(r'^plugins/', include('sentry.plugins.base.urls')),
+ 
+diff --git a/tests/sentry/integrations/slack/test_event_endpoint.py b/tests/sentry/integrations/slack/test_event_endpoint.py
+new file mode 100644
+index 0000000000..5f32be241c
+--- /dev/null
++++ b/tests/sentry/integrations/slack/test_event_endpoint.py
+@@ -0,0 +1,117 @@
++from __future__ import absolute_import
++
++import json
++import responses
++
++from sentry import options
++from sentry.models import Integration, OrganizationIntegration
++from sentry.testutils import APITestCase
++
++UNSET = object()
++
++LINK_SHARED_EVENT = """{
++    "type": "link_shared",
++    "channel": "Cxxxxxx",
++    "user": "Uxxxxxxx",
++    "message_ts": "123456789.9875",
++    "links": [
++        {
++            "domain": "example.com",
++            "url": "http://testserver/fizz/buzz"
++        },
++        {
++            "domain": "example.com",
++            "url": "http://testserver/sentry/sentry/issues/%(group1)s/"
++        },
++        {
++            "domain": "example.com",
++            "url": "http://testserver/sentry/sentry/issues/%(group2)s/bar/"
++        },
++        {
++            "domain": "example.com",
++            "url": "http://testserver/sentry/sentry/issues/%(group1)s/bar/"
++        },
++        {
++            "domain": "another-example.com",
++            "url": "https://yet.another-example.com/v/abcde"
++        }
++    ]
++}"""
++
++
++class BaseEventTest(APITestCase):
++    def setUp(self):
++        super(BaseEventTest, self).setUp()
++        self.user = self.create_user(is_superuser=False)
++        self.org = self.create_organization(owner=None)
++        self.integration = Integration.objects.create(
++            provider='slack',
++            external_id='TXXXXXXX1',
++            metadata={
++                'access_token': 'xoxp-xxxxxxxxx-xxxxxxxxxx-xxxxxxxxxxxx',
++                'bot_access_token': 'xoxb-xxxxxxxxx-xxxxxxxxxx-xxxxxxxxxxxx',
++            }
++        )
++        OrganizationIntegration.objects.create(
++            organization=self.org,
++            integration=self.integration,
++        )
++
++    def post_webhook(self, event_data=None, type='event_callback', data=None,
++                     token=UNSET, team_id='TXXXXXXX1'):
++        if token is UNSET:
++            token = options.get('slack.verification-token')
++        payload = {
++            'token': token,
++            'team_id': team_id,
++            'api_app_id': 'AXXXXXXXX1',
++            'type': type,
++            'authed_users': [],
++            'event_id': 'Ev08MFMKH6',
++            'event_time': 123456789,
++        }
++        if data:
++            payload.update(data)
++        if event_data:
++            payload.setdefault('event', {}).update(event_data)
++        return self.client.post(
++            '/extensions/slack/event/',
++            payload,
++        )
++
++
++class UrlVerificationEventTest(BaseEventTest):
++    challenge = '3eZbrw1aBm2rZgRNFdxV2595E9CY3gmdALWMmHkvFXO7tYXAYM8P'
++
++    def test_valid_token(self):
++        resp = self.post_webhook(
++            type='url_verification',
++            data={'challenge': self.challenge},
++        )
++        assert resp.status_code == 200, resp.content
++        assert resp.data['challenge'] == self.challenge
++
++    def test_invalid_token(self):
++        resp = self.post_webhook(
++            type='url_verification',
++            data={'challenge': self.challenge},
++            token='fizzbuzz',
++        )
++        assert resp.status_code == 400, resp.content
++
++
++class LinkSharedEventTest(BaseEventTest):
++    @responses.activate
++    def test_valid_token(self):
++        responses.add(responses.POST, 'https://slack.com/api/chat.unfurl',
++                      json={'ok': True})
++        org2 = self.create_organization(name='biz')
++        project1 = self.create_project(organization=self.org)
++        project2 = self.create_project(organization=org2)
++        group1 = self.create_group(project=project1)
++        group2 = self.create_group(project=project2)
++        resp = self.post_webhook(event_data=json.loads(LINK_SHARED_EVENT % {
++            'group1': group1.id,
++            'group2': group2.id,
++        }))
++        assert resp.status_code == 200, resp.content
+diff --git a/tests/sentry/integrations/slack/test_integration.py b/tests/sentry/integrations/slack/test_integration.py
+index 78495c6208..a2a11ff3dd 100644
+--- a/tests/sentry/integrations/slack/test_integration.py
++++ b/tests/sentry/integrations/slack/test_integration.py
+@@ -25,7 +25,7 @@ class SlackIntegrationTest(IntegrationTestCase):
+         assert redirect.netloc == 'slack.com'
+         assert redirect.path == '/oauth/authorize'
+         params = parse_qs(redirect.query)
+-        assert params['scope'] == ['bot chat:write:bot commands team:read']
++        assert params['scope'] == [' '.join(self.provider.oauth_scopes)]
+         assert params['state']
+         assert params['redirect_uri'] == ['http://testserver/extensions/slack/setup/']
+         assert params['response_type'] == ['code']
+@@ -38,13 +38,13 @@ class SlackIntegrationTest(IntegrationTestCase):
+             responses.POST, 'https://slack.com/api/oauth.access',
+             json={
+                 'ok': True,
+-                'user_id': 'UXXXXXXX0',
++                'user_id': 'UXXXXXXX1',
+                 'access_token': 'xoxp-xxxxxxxxx-xxxxxxxxxx-xxxxxxxxxxxx',
+-                'team_id': 'TXXXXXXX0',
++                'team_id': 'TXXXXXXX1',
+                 'team_name': 'Example',
+                 'bot': {
+                     'bot_access_token': 'xoxb-xxxxxxxxx-xxxxxxxxxx-xxxxxxxxxxxx',
+-                    'bot_user_id': 'UXXXXXXX1',
++                    'bot_user_id': 'UXXXXXXX2',
+                 },
+                 'scope': ','.join(authorize_params['scope'].split(' ')),
+             })
+@@ -69,12 +69,13 @@ class SlackIntegrationTest(IntegrationTestCase):
+         self.assertDialogSuccess(resp)
+ 
+         integration = Integration.objects.get(provider=self.provider.id)
+-        assert integration.external_id == 'TXXXXXXX0'
++        assert integration.external_id == 'TXXXXXXX1'
+         assert integration.name == 'Example'
+         assert integration.metadata == {
++            'access_token': 'xoxp-xxxxxxxxx-xxxxxxxxxx-xxxxxxxxxxxx',
+             'bot_access_token': 'xoxb-xxxxxxxxx-xxxxxxxxxx-xxxxxxxxxxxx',
+-            'bot_user_id': 'UXXXXXXX1',
+-            'scopes': ['bot', 'chat:write:bot', 'commands', 'team:read'],
++            'bot_user_id': 'UXXXXXXX2',
++            'scopes': list(self.provider.oauth_scopes),
+         }
+         oi = OrganizationIntegration.objects.get(
+             integration=integration,
+@@ -88,10 +89,10 @@ class SlackIntegrationTest(IntegrationTestCase):
+         )
+         identity = Identity.objects.get(
+             idp=idp,
+-            external_id='UXXXXXXX0',
++            external_id='UXXXXXXX1',
+         )
+         assert identity.status == IdentityStatus.VALID
+-        assert identity.scopes == ['bot', 'chat:write:bot', 'commands', 'team:read']
++        assert identity.scopes == list(self.provider.oauth_scopes)
+         assert identity.data == {
+             'access_token': 'xoxp-xxxxxxxxx-xxxxxxxxxx-xxxxxxxxxxxx',
+         }

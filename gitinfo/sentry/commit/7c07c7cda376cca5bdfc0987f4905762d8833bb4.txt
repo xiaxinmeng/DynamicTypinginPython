@@ -1,0 +1,874 @@
+commit 7c07c7cda376cca5bdfc0987f4905762d8833bb4
+Author: Matte Noble <me@mattenoble.com>
+Date:   Tue Dec 18 09:13:16 2018 -0800
+
+    feat(app-platform): Refresh Token exchange (#10896)
+    
+    Augments the Installation authorization endpoint to allow refreshing of
+    tokens. If the token isn't already expired, this process expires it and
+    returns a new one.
+
+diff --git a/src/sentry/api/endpoints/sentry_app_authorizations.py b/src/sentry/api/endpoints/sentry_app_authorizations.py
+index 37cdabb129..76399c4dc7 100644
+--- a/src/sentry/api/endpoints/sentry_app_authorizations.py
++++ b/src/sentry/api/endpoints/sentry_app_authorizations.py
+@@ -4,31 +4,41 @@ from rest_framework.response import Response
+ 
+ from sentry.api.bases import SentryAppAuthorizationsBaseEndpoint
+ from sentry.coreapi import APIUnauthorized
+-from sentry.mediators.sentry_app_installations import Authorizer
++from sentry.mediators.token_exchange import (
++    GrantExchanger,
++    Refresher,
++    GrantTypes,
++)
+ from sentry.api.serializers.models.apitoken import ApiTokenSerializer
+ 
+ 
+ class SentryAppAuthorizationsEndpoint(SentryAppAuthorizationsBaseEndpoint):
+     def post(self, request, installation):
+         try:
+-            token = Authorizer.run(
+-                grant_type=request.json_body.get('grant_type'),
+-                code=request.json_body.get('code'),
+-                client_id=request.json_body.get('client_id'),
+-                user=request.user,
+-                install=installation,
+-            )
+-        except APIUnauthorized:
+-            return Response({'error': 'Unauthorized'}, status=403)
++            if request.json_body.get('grant_type') == GrantTypes.AUTHORIZATION:
++                token = GrantExchanger.run(
++                    install=installation,
++                    code=request.json_body.get('code'),
++                    client_id=request.json_body.get('client_id'),
++                    user=request.user,
++                )
++            elif request.json_body.get('grant_type') == GrantTypes.REFRESH:
++                token = Refresher.run(
++                    install=installation,
++                    refresh_token=request.json_body.get('refresh_token'),
++                    client_id=request.json_body.get('client_id'),
++                    user=request.user,
++                )
++            else:
++                return Response({'error': 'Invalid grant_type'}, status=403)
++        except APIUnauthorized as e:
++            return Response({'error': e.msg or 'Unauthorized'}, status=403)
+ 
+-        return Response(
+-            ApiTokenSerializer().serialize(
+-                token,
+-                {
+-                    'state': request.json_body.get('state'),
+-                    'application': None,
+-                },
+-                request.user,
+-            ),
+-            status=201
+-        )
++        attrs = {
++            'state': request.json_body.get('state'),
++            'application': None,
++        }
++
++        body = ApiTokenSerializer().serialize(token, attrs, request.user)
++
++        return Response(body, status=201)
+diff --git a/src/sentry/mediators/__init__.py b/src/sentry/mediators/__init__.py
+index 0aefc67725..02baf488b7 100644
+--- a/src/sentry/mediators/__init__.py
++++ b/src/sentry/mediators/__init__.py
+@@ -4,3 +4,10 @@ from .mediator import Mediator  # NOQA
+ from .param import Param  # NOQA
+ from .sentry_apps import *  # NOQA
+ from .sentry_app_installations import *  # NOQA
++from .token_exchange import (  # NOQA
++    AUTHORIZATION,
++    REFRESH,
++    GrantTypes,
++    GrantExchanger,
++    Refresher,
++)
+diff --git a/src/sentry/mediators/sentry_app_installations/__init__.py b/src/sentry/mediators/sentry_app_installations/__init__.py
+index ff31386c2a..cd76833604 100644
+--- a/src/sentry/mediators/sentry_app_installations/__init__.py
++++ b/src/sentry/mediators/sentry_app_installations/__init__.py
+@@ -2,5 +2,4 @@ from __future__ import absolute_import
+ 
+ from .creator import Creator  # NOQA
+ from .destroyer import Destroyer  # NOQA
+-from .authorizer import Authorizer  # NOQA
+ from .installation_notifier import InstallationNotifier  # NOQA
+diff --git a/src/sentry/mediators/token_exchange/__init__.py b/src/sentry/mediators/token_exchange/__init__.py
+new file mode 100644
+index 0000000000..1c3748bdc3
+--- /dev/null
++++ b/src/sentry/mediators/token_exchange/__init__.py
+@@ -0,0 +1,6 @@
++from __future__ import absolute_import
++
++from .grant_exchanger import GrantExchanger  # NOQA
++from .refresher import Refresher  # NOQA
++from .validator import Validator  # NOQA
++from .util import AUTHORIZATION, REFRESH, GrantTypes, token_expiration  # NOQA
+diff --git a/src/sentry/mediators/sentry_app_installations/authorizer.py b/src/sentry/mediators/token_exchange/grant_exchanger.py
+similarity index 50%
+rename from src/sentry/mediators/sentry_app_installations/authorizer.py
+rename to src/sentry/mediators/token_exchange/grant_exchanger.py
+index 93dd546a90..0bd3c61c09 100644
+--- a/src/sentry/mediators/sentry_app_installations/authorizer.py
++++ b/src/sentry/mediators/token_exchange/grant_exchanger.py
+@@ -1,97 +1,83 @@
+ from __future__ import absolute_import
+ 
+ import six
++import pytz
+ 
+-from datetime import datetime, timedelta
+-from django.utils.crypto import constant_time_compare
++from datetime import datetime
+ 
+ from sentry.coreapi import APIUnauthorized
+ from sentry.mediators import Mediator, Param
+-from sentry.models import ApiGrant, ApiApplication, ApiToken, SentryApp
++from sentry.mediators.token_exchange.validator import Validator
++from sentry.mediators.token_exchange.util import token_expiration
++from sentry.models import ApiApplication, ApiToken, ApiGrant, SentryApp
+ from sentry.utils.cache import memoize
+ 
+ 
+-TOKEN_LIFE_IN_HOURS = 8
+-
+-
+-class Authorizer(Mediator):
++class GrantExchanger(Mediator):
++    """
++    Exchanges a Grant Code for an Access Token
++    """
+     install = Param('sentry.models.SentryAppInstallation')
+-    grant_type = Param(six.string_types)
+     code = Param(six.string_types)
+     client_id = Param(six.string_types)
+     user = Param('sentry.models.User')
+ 
+     def call(self):
+-        self._validate_grant_type()
+-        self._validate_install()
+-        self._validate_sentry_app()
+-        self._validate_grant()
+-        return self.exchange()
++        self._validate()
+ 
+-    def exchange(self):
+         return ApiToken.objects.create(
+             user=self.user,
+             application=self.application,
+             scope_list=self.sentry_app.scope_list,
+-            expires_at=(datetime.now() + timedelta(hours=TOKEN_LIFE_IN_HOURS)),
++            expires_at=token_expiration()
+         )
+ 
+-    def _validate_grant_type(self):
+-        if not self.grant_type == 'authorization_code':
+-            raise APIUnauthorized
+-
+-    def _validate_install(self):
+-        if not self.install.sentry_app.proxy_user == self.user:
+-            raise APIUnauthorized
+-
+-    def _validate_sentry_app(self):
+-        if not self.user.is_sentry_app:
+-            raise APIUnauthorized
++    def _validate(self):
++        Validator.run(
++            install=self.install,
++            client_id=self.client_id,
++            user=self.user,
++        )
+ 
+-    def _validate_grant(self):
+         if (
+-            not self.grant_belongs_to_install() or
+-            not self.application_owned_by_user() or
+-            not self.client_id_matches()
++            not self._grant_belongs_to_install() or
++            not self._sentry_app_user_owns_grant()
+         ):
+             raise APIUnauthorized
+ 
+-        if self.grant.is_expired():
+-            raise APIUnauthorized
++        if not self._grant_is_active():
++            raise APIUnauthorized('Grant has already expired.')
+ 
+-    def grant_belongs_to_install(self):
++    def _grant_belongs_to_install(self):
+         return self.grant.sentry_app_installation == self.install
+ 
+-    def application_owned_by_user(self):
++    def _sentry_app_user_owns_grant(self):
+         return self.grant.application.owner == self.user
+ 
+-    def client_id_matches(self):
+-        return constant_time_compare(
+-            self.grant.application.client_id,
+-            self.client_id,
+-        )
++    def _grant_is_active(self):
++        return self.grant.expires_at > datetime.now(pytz.UTC)
+ 
+     @memoize
+-    def sentry_app(self):
++    def grant(self):
+         try:
+-            return self.application.sentry_app
+-        except SentryApp.DoesNotExist:
++            return ApiGrant.objects \
++                .select_related('sentry_app_installation') \
++                .select_related('application') \
++                .select_related('application__sentry_app') \
++                .get(code=self.code)
++        except ApiGrant.DoesNotExist:
+             raise APIUnauthorized
+ 
+-    @memoize
++    @property
+     def application(self):
+         try:
+             return self.grant.application
+         except ApiApplication.DoesNotExist:
+             raise APIUnauthorized
+ 
+-    @memoize
+-    def grant(self):
++    @property
++    def sentry_app(self):
+         try:
+-            return ApiGrant.objects \
+-                .select_related('sentry_app_installation') \
+-                .select_related('application') \
+-                .select_related('application__sentry_app') \
+-                .get(code=self.code)
+-        except ApiGrant.DoesNotExist:
++            return self.application.sentry_app
++        except SentryApp.DoesNotExist:
+             raise APIUnauthorized
+diff --git a/src/sentry/mediators/token_exchange/refresher.py b/src/sentry/mediators/token_exchange/refresher.py
+new file mode 100644
+index 0000000000..d000394c7c
+--- /dev/null
++++ b/src/sentry/mediators/token_exchange/refresher.py
+@@ -0,0 +1,77 @@
++from __future__ import absolute_import
++
++import six
++import pytz
++
++from datetime import datetime
++
++from sentry.coreapi import APIUnauthorized
++from sentry.mediators import Mediator, Param
++from sentry.mediators.token_exchange.validator import Validator
++from sentry.mediators.token_exchange.util import token_expiration
++from sentry.models import ApiApplication, ApiToken, SentryApp
++from sentry.utils.cache import memoize
++
++
++class Refresher(Mediator):
++    """
++    Exchanges a Refresh Token for a new Access Token
++    """
++
++    install = Param('sentry.models.SentryAppInstallation')
++    refresh_token = Param(six.string_types)
++    client_id = Param(six.string_types)
++    user = Param('sentry.models.User')
++
++    def call(self):
++        self._validate()
++        self._expire_token()
++
++        return ApiToken.objects.create(
++            user=self.user,
++            application=self.application,
++            scope_list=self.sentry_app.scope_list,
++            expires_at=token_expiration(),
++        )
++
++    def _validate(self):
++        Validator.run(
++            install=self.install,
++            client_id=self.client_id,
++            user=self.user,
++        )
++
++        self._validate_token_belongs_to_app()
++        self._validate_token_is_active()
++
++    def _validate_token_belongs_to_app(self):
++        if self.token.application != self.application:
++            raise APIUnauthorized
++
++    def _validate_token_is_active(self):
++        if self.token.expires_at < datetime.utcnow().replace(tzinfo=pytz.UTC):
++            raise APIUnauthorized
++
++    def _expire_token(self):
++        self.token.update(expires_at=datetime.utcnow())
++
++    @memoize
++    def token(self):
++        try:
++            return ApiToken.objects.get(refresh_token=self.refresh_token)
++        except ApiToken.DoesNotExist:
++            raise APIUnauthorized
++
++    @memoize
++    def application(self):
++        try:
++            return ApiApplication.objects.get(client_id=self.client_id)
++        except ApiApplication.DoesNotExist:
++            raise APIUnauthorized
++
++    @property
++    def sentry_app(self):
++        try:
++            return self.application.sentry_app
++        except SentryApp.DoesNotExist:
++            raise APIUnauthorized
+diff --git a/src/sentry/mediators/token_exchange/util.py b/src/sentry/mediators/token_exchange/util.py
+new file mode 100644
+index 0000000000..f4023847e0
+--- /dev/null
++++ b/src/sentry/mediators/token_exchange/util.py
+@@ -0,0 +1,18 @@
++from __future__ import absolute_import
++
++from datetime import datetime, timedelta
++
++
++TOKEN_LIFE_IN_HOURS = 8
++
++AUTHORIZATION = 'authorization_code'
++REFRESH = 'refresh_token'
++
++
++class GrantTypes(object):
++    AUTHORIZATION = AUTHORIZATION
++    REFRESH = REFRESH
++
++
++def token_expiration():
++    return (datetime.utcnow() + timedelta(hours=TOKEN_LIFE_IN_HOURS))
+diff --git a/src/sentry/mediators/token_exchange/validator.py b/src/sentry/mediators/token_exchange/validator.py
+new file mode 100644
+index 0000000000..5d7ae617d1
+--- /dev/null
++++ b/src/sentry/mediators/token_exchange/validator.py
+@@ -0,0 +1,49 @@
++from __future__ import absolute_import
++
++import six
++
++from sentry.coreapi import APIUnauthorized
++from sentry.mediators import Mediator, Param
++from sentry.models import ApiApplication, SentryApp
++from sentry.utils.cache import memoize
++
++
++class Validator(Mediator):
++    """
++    Validates general authorization params for all types of token exchanges.
++    """
++    install = Param('sentry.models.SentryAppInstallation')
++    client_id = Param(six.string_types)
++    user = Param('sentry.models.User')
++
++    def call(self):
++        self._validate_is_sentry_app_making_request()
++        self._validate_app_is_owned_by_user()
++        self._validate_installation()
++        return True
++
++    def _validate_is_sentry_app_making_request(self):
++        if not self.user.is_sentry_app:
++            raise APIUnauthorized
++
++    def _validate_app_is_owned_by_user(self):
++        if self.sentry_app.proxy_user != self.user:
++            raise APIUnauthorized
++
++    def _validate_installation(self):
++        if self.install.sentry_app != self.sentry_app:
++            raise APIUnauthorized
++
++    @memoize
++    def sentry_app(self):
++        try:
++            return self.application.sentry_app
++        except SentryApp.DoesNotExist:
++            raise APIUnauthorized
++
++    @memoize
++    def application(self):
++        try:
++            return ApiApplication.objects.get(client_id=self.client_id)
++        except ApiApplication.DoesNotExist:
++            raise APIUnauthorized
+diff --git a/src/sentry/testutils/fixtures.py b/src/sentry/testutils/fixtures.py
+index 79fe2bff92..4f92ae4912 100644
+--- a/src/sentry/testutils/fixtures.py
++++ b/src/sentry/testutils/fixtures.py
+@@ -714,7 +714,7 @@ class Fixtures(object):
+     def create_sentry_app(self, name=None, organization=None, published=False, scopes=(),
+                           webhook_url=None, **kwargs):
+         if not name:
+-            name = 'Test App'
++            name = petname.Generate(2, ' ', letters=10).title()
+         if not organization:
+             organization = self.create_organization()
+         if not webhook_url:
+diff --git a/tests/sentry/api/bases/test_sentryapps.py b/tests/sentry/api/bases/test_sentryapps.py
+index 57e7e0c55c..9340b47447 100644
+--- a/tests/sentry/api/bases/test_sentryapps.py
++++ b/tests/sentry/api/bases/test_sentryapps.py
+@@ -9,7 +9,7 @@ from sentry.api.bases.sentryapps import (
+     SentryAppInstallationPermission,
+     SentryAppInstallationBaseEndpoint,
+ )
+-from sentry.mediators.sentry_app_installations import Creator as SentryAppInstallationCreator
++from sentry.mediators import sentry_app_installations
+ 
+ 
+ class SentryAppPermissionTest(TestCase):
+@@ -71,7 +71,7 @@ class SentryAppInstallationPermissionTest(TestCase):
+             organization=self.org,
+         )
+ 
+-        self.installation = SentryAppInstallationCreator.run(
++        self.installation = sentry_app_installations.Creator.run(
+             slug=self.sentry_app.slug,
+             organization=self.org,
+             user=self.user,
+@@ -120,7 +120,7 @@ class SentryAppInstallationBaseEndpointTest(TestCase):
+             organization=self.org,
+         )
+ 
+-        self.installation = SentryAppInstallationCreator.run(
++        self.installation = sentry_app_installations.Creator.run(
+             slug=self.sentry_app.slug,
+             organization=self.org,
+             user=self.user,
+diff --git a/tests/sentry/api/endpoints/test_sentry_app_authorizations.py b/tests/sentry/api/endpoints/test_sentry_app_authorizations.py
+index b3110c2451..3604a1154a 100644
+--- a/tests/sentry/api/endpoints/test_sentry_app_authorizations.py
++++ b/tests/sentry/api/endpoints/test_sentry_app_authorizations.py
+@@ -1,14 +1,13 @@
+ from __future__ import absolute_import
+ 
+ import six
++import pytz
+ 
+ from datetime import datetime, timedelta
+ from django.core.urlresolvers import reverse
+ from django.utils import timezone
+ 
+-from sentry.mediators.sentry_apps import Creator as SentryAppCreator
+-from sentry.mediators.sentry_app_installations import Creator as \
+-    SentryAppInstallationCreator
++from sentry.mediators import sentry_apps, sentry_app_installations
+ from sentry.models import ApiApplication, ApiToken
+ from sentry.testutils import APITestCase
+ 
+@@ -18,21 +17,21 @@ class TestSentryAppAuthorizations(APITestCase):
+         self.user = self.create_user()
+         self.org = self.create_organization()
+ 
+-        self.sentry_app = SentryAppCreator.run(
++        self.sentry_app = sentry_apps.Creator.run(
+             name='nulldb',
+             organization=self.create_organization(),
+             scopes=('org:read', ),
+             webhook_url='http://example.com',
+         )
+ 
+-        self.other_sentry_app = SentryAppCreator.run(
++        self.other_sentry_app = sentry_apps.Creator.run(
+             name='slowdb',
+             organization=self.create_organization(),
+             scopes=(),
+             webhook_url='http://example.com',
+         )
+ 
+-        self.install = SentryAppInstallationCreator.run(
++        self.install = sentry_app_installations.Creator.run(
+             organization=self.org,
+             slug='nulldb',
+             user=self.user,
+@@ -84,7 +83,7 @@ class TestSentryAppAuthorizations(APITestCase):
+         assert response.status_code == 403
+ 
+     def test_invalid_installation(self):
+-        self.install = SentryAppInstallationCreator.run(
++        self.install = sentry_app_installations.Creator.run(
+             organization=self.org,
+             slug='slowdb',
+             user=self.user,
+@@ -117,6 +116,7 @@ class TestSentryAppAuthorizations(APITestCase):
+         self.install.api_grant.update(expires_at=timezone.now() - timedelta(minutes=2))
+         response = self._run_request()
+         assert response.status_code == 403
++        assert response.data['error'] == 'Grant has already expired.'
+ 
+     def test_request_with_exchanged_access_token(self):
+         response = self._run_request()
+@@ -138,3 +138,23 @@ class TestSentryAppAuthorizations(APITestCase):
+     def test_state(self):
+         response = self._run_request(state='abc123')
+         assert response.data['state'] == 'abc123'
++
++    def test_refresh_token_exchange(self):
++        response = self._run_request()
++
++        token_id = response.data['id']
++        token = response.data['token']
++        refresh_token = response.data['refreshToken']
++
++        response = self._run_request(
++            code=None,
++            refresh_token=refresh_token,
++            grant_type='refresh_token',
++        )
++
++        assert response.data['token'] != token
++        assert response.data['refreshToken'] != refresh_token
++        assert response.data['expiresAt'] > datetime.utcnow()
++
++        old_token = ApiToken.objects.get(id=token_id)
++        assert old_token.expires_at < datetime.now(pytz.UTC)
+diff --git a/tests/sentry/auth/test_access.py b/tests/sentry/auth/test_access.py
+index f0fc453b04..7e69d25572 100644
+--- a/tests/sentry/auth/test_access.py
++++ b/tests/sentry/auth/test_access.py
+@@ -5,8 +5,7 @@ from mock import Mock
+ 
+ from sentry.auth import access
+ from sentry.models import AuthProvider, AuthIdentity, Organization
+-from sentry.mediators.sentry_app_installations import Creator as \
+-    SentryAppInstallationCreator
++from sentry.mediators import sentry_app_installations
+ from sentry.testutils import TestCase
+ 
+ 
+@@ -178,7 +177,7 @@ class FromSentryAppTest(TestCase):
+ 
+         self.proxy_user = self.sentry_app.proxy_user
+ 
+-        self.install = SentryAppInstallationCreator.run(
++        self.install = sentry_app_installations.Creator.run(
+             organization=self.org,
+             slug=self.sentry_app.slug,
+             user=self.user,
+diff --git a/tests/sentry/mediators/sentry_app_installations/test_authorizer.py b/tests/sentry/mediators/sentry_app_installations/test_authorizer.py
+deleted file mode 100644
+index 1f03c2b216..0000000000
+--- a/tests/sentry/mediators/sentry_app_installations/test_authorizer.py
++++ /dev/null
+@@ -1,70 +0,0 @@
+-from __future__ import absolute_import
+-
+-from datetime import datetime, timedelta
+-
+-from sentry.coreapi import APIUnauthorized
+-from sentry.mediators.sentry_app_installations import Authorizer, Creator
+-from sentry.testutils import TestCase
+-
+-
+-class TestAuthorizer(TestCase):
+-    def setUp(self):
+-        self.user = self.create_user()
+-        self.org = self.create_organization()
+-
+-        self.sentry_app = self.create_sentry_app(
+-            name='nulldb',
+-            organization=self.org,
+-        )
+-
+-        self.install = Creator.run(
+-            organization=self.org,
+-            slug='nulldb',
+-            user=self.user,
+-        )
+-
+-        self.authorizer = Authorizer(
+-            install=self.install,
+-            grant_type='authorization_code',
+-            code=self.install.api_grant.code,
+-            client_id=self.sentry_app.application.client_id,
+-            user=self.sentry_app.proxy_user,
+-        )
+-
+-    def test_simple(self):
+-        token = self.authorizer.call()
+-        assert token is not None
+-
+-    def test_token_expires_in_eight_hours(self):
+-        token = self.authorizer.call()
+-        assert token.expires_at.hour == (datetime.now() + timedelta(hours=8)).hour
+-
+-    def test_invalid_grant_type(self):
+-        self.authorizer.grant_type = 'stuff'
+-
+-        with self.assertRaises(APIUnauthorized):
+-            self.authorizer.call()
+-
+-    def test_non_owner(self):
+-        self.authorizer.user = self.create_user(is_sentry_app=True)
+-
+-        with self.assertRaises(APIUnauthorized):
+-            self.authorizer.call()
+-
+-    def test_non_sentry_app(self):
+-        self.authorizer.user = self.create_user()
+-
+-        with self.assertRaises(APIUnauthorized):
+-            self.authorizer.call()
+-
+-    def test_missing_grant(self):
+-        self.authorizer.code = '123'
+-
+-        with self.assertRaises(APIUnauthorized):
+-            self.authorizer.call()
+-
+-    def test_mismatching_client_id(self):
+-        self.authorizer.client_id = '123'
+-
+-        with self.assertRaises(APIUnauthorized):
+-            self.authorizer.call()
+diff --git a/tests/sentry/mediators/token_exchange/test_grant_exchanger.py b/tests/sentry/mediators/token_exchange/test_grant_exchanger.py
+new file mode 100644
+index 0000000000..d1510ee552
+--- /dev/null
++++ b/tests/sentry/mediators/token_exchange/test_grant_exchanger.py
+@@ -0,0 +1,72 @@
++from __future__ import absolute_import
++
++from mock import patch
++from datetime import datetime, timedelta
++
++from sentry.coreapi import APIUnauthorized
++from sentry.models import ApiApplication, SentryApp
++from sentry.mediators.token_exchange import GrantExchanger
++from sentry.testutils import TestCase
++
++
++class TestGrantExchanger(TestCase):
++    def setUp(self):
++        self.install = self.create_sentry_app_installation()
++        self.code = self.install.api_grant.code
++        self.client_id = self.install.sentry_app.application.client_id
++        self.user = self.install.sentry_app.proxy_user
++
++        self.grant_exchanger = GrantExchanger(
++            install=self.install,
++            client_id=self.client_id,
++            code=self.code,
++            user=self.user,
++        )
++
++    def test_happy_path(self):
++        assert self.grant_exchanger.call()
++
++    @patch('sentry.mediators.token_exchange.Validator.run')
++    def test_validate_generic_token_exchange_requirements(self, validator):
++        self.grant_exchanger.call()
++
++        validator.assert_called_once_with(
++            install=self.install,
++            client_id=self.client_id,
++            user=self.user,
++        )
++
++    def test_grant_must_belong_to_installations(self):
++        other_install = self.create_sentry_app_installation()
++        self.grant_exchanger.code = other_install.api_grant.code
++
++        with self.assertRaises(APIUnauthorized):
++            self.grant_exchanger.call()
++
++    def test_request_user_owns_api_grant(self):
++        self.grant_exchanger.user = self.create_user()
++
++        with self.assertRaises(APIUnauthorized):
++            self.grant_exchanger.call()
++
++    def test_grant_must_be_active(self):
++        self.install.api_grant.update(expires_at=(datetime.utcnow() - timedelta(hours=1)))
++
++        with self.assertRaises(APIUnauthorized):
++            self.grant_exchanger.call()
++
++    def test_grant_must_exist(self):
++        self.grant_exchanger.code = '123'
++
++        with self.assertRaises(APIUnauthorized):
++            self.grant_exchanger.call()
++
++    @patch('sentry.models.ApiGrant.application', side_effect=ApiApplication.DoesNotExist)
++    def test_application_must_exist(self, _):
++        with self.assertRaises(APIUnauthorized):
++            self.grant_exchanger.call()
++
++    @patch('sentry.models.ApiApplication.sentry_app', side_effect=SentryApp.DoesNotExist)
++    def test_sentry_app_must_exist(self, _):
++        with self.assertRaises(APIUnauthorized):
++            self.grant_exchanger.call()
+diff --git a/tests/sentry/mediators/token_exchange/test_refresher.py b/tests/sentry/mediators/token_exchange/test_refresher.py
+new file mode 100644
+index 0000000000..8caaa17ffa
+--- /dev/null
++++ b/tests/sentry/mediators/token_exchange/test_refresher.py
+@@ -0,0 +1,81 @@
++from __future__ import absolute_import
++
++import pytz
++
++from mock import patch
++from datetime import datetime, timedelta
++
++from sentry.coreapi import APIUnauthorized
++from sentry.models import ApiApplication, ApiToken, SentryApp
++from sentry.mediators.token_exchange import GrantExchanger, Refresher
++from sentry.testutils import TestCase
++
++
++class TestRefresher(TestCase):
++    def setUp(self):
++        self.install = self.create_sentry_app_installation()
++        self.client_id = self.install.sentry_app.application.client_id
++        self.user = self.install.sentry_app.proxy_user
++
++        self.token = GrantExchanger.run(
++            install=self.install,
++            code=self.install.api_grant.code,
++            client_id=self.client_id,
++            user=self.user,
++        )
++
++        self.refresher = Refresher(
++            install=self.install,
++            client_id=self.client_id,
++            refresh_token=self.token.refresh_token,
++            user=self.user,
++        )
++
++    def test_happy_path(self):
++        assert self.refresher.call()
++
++    def test_expires_active_token(self):
++        self.refresher.call()
++        assert ApiToken.objects.get(id=self.token.id).expires_at < datetime.now(pytz.UTC)
++
++    @patch('sentry.mediators.token_exchange.Validator.run')
++    def test_validates_generic_token_exchange_requirements(self, validator):
++        self.refresher.call()
++
++        validator.assert_called_once_with(
++            install=self.install,
++            client_id=self.client_id,
++            user=self.user,
++        )
++
++    def test_validates_token_belongs_to_sentry_app(self):
++        self.refresher.refresh_token = ApiToken.objects.create(
++            user=self.user,
++            application=ApiApplication.objects.create(
++                owner_id=self.create_user().id,
++            ),
++        ).refresh_token
++
++        with self.assertRaises(APIUnauthorized):
++            self.refresher.call()
++
++    def test_cannot_exchange_expired_token(self):
++        self.token.update(expires_at=(datetime.utcnow() - timedelta(hours=1)))
++
++        with self.assertRaises(APIUnauthorized):
++            self.refresher.call()
++
++    @patch('sentry.models.ApiToken.objects.get', side_effect=ApiToken.DoesNotExist)
++    def test_token_must_exist(self, _):
++        with self.assertRaises(APIUnauthorized):
++            self.refresher.call()
++
++    @patch('sentry.models.ApiApplication.objects.get', side_effect=ApiApplication.DoesNotExist)
++    def test_api_application_must_exist(self, _):
++        with self.assertRaises(APIUnauthorized):
++            self.refresher.call()
++
++    @patch('sentry.models.ApiApplication.sentry_app', side_effect=SentryApp.DoesNotExist)
++    def test_sentry_app_must_exist(self, _):
++        with self.assertRaises(APIUnauthorized):
++            self.refresher.call()
+diff --git a/tests/sentry/mediators/token_exchange/test_validator.py b/tests/sentry/mediators/token_exchange/test_validator.py
+new file mode 100644
+index 0000000000..529c4d82b4
+--- /dev/null
++++ b/tests/sentry/mediators/token_exchange/test_validator.py
+@@ -0,0 +1,55 @@
++from __future__ import absolute_import
++
++from mock import patch
++
++from sentry.coreapi import APIUnauthorized
++from sentry.mediators.token_exchange import Validator
++from sentry.models import SentryApp
++from sentry.testutils import TestCase
++
++
++class TestValidator(TestCase):
++    def setUp(self):
++        self.install = self.create_sentry_app_installation()
++        self.client_id = self.install.sentry_app.application.client_id
++        self.user = self.install.sentry_app.proxy_user
++
++        self.validator = Validator(
++            install=self.install,
++            client_id=self.client_id,
++            user=self.user,
++        )
++
++    def test_happy_path(self):
++        assert self.validator.call()
++
++    def test_request_must_be_made_by_sentry_app(self):
++        self.validator.user = self.create_user()
++
++        with self.assertRaises(APIUnauthorized):
++            self.validator.call()
++
++    def test_request_user_must_own_sentry_app(self):
++        self.validator.user = self.create_user(is_sentry_app=True)
++
++        with self.assertRaises(APIUnauthorized):
++            self.validator.call()
++
++    def test_installation_belongs_to_sentry_app_with_client_id(self):
++        self.validator.install = self.create_sentry_app_installation()
++
++        with self.assertRaises(APIUnauthorized):
++            self.validator.call()
++
++    @patch('sentry.models.ApiApplication.sentry_app')
++    def test_raises_when_sentry_app_cannot_be_found(self, sentry_app):
++        sentry_app.side_effect = SentryApp.DoesNotExist()
++
++        with self.assertRaises(APIUnauthorized):
++            self.validator.call()
++
++    def test_raises_with_invalid_client_id(self):
++        self.validator.client_id = '123'
++
++        with self.assertRaises(APIUnauthorized):
++            self.validator.call()

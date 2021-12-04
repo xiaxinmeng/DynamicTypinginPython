@@ -1,0 +1,365 @@
+commit 57b427e2de796e09e13ea571ad57c8744b4f1773
+Author: Matt Robenolt <matt@ydekproductions.com>
+Date:   Sun Oct 11 01:30:27 2015 -0700
+
+    CSP reporting
+    
+    Fixes GH-729
+
+diff --git a/src/sentry/conf/server.py b/src/sentry/conf/server.py
+index b6deef9ef8..fc727fcd97 100644
+--- a/src/sentry/conf/server.py
++++ b/src/sentry/conf/server.py
+@@ -656,6 +656,7 @@ SENTRY_INTERFACES = {
+     'template': 'sentry.interfaces.template.Template',
+     'query': 'sentry.interfaces.query.Query',
+     'user': 'sentry.interfaces.user.User',
++    'csp': 'sentry.interfaces.csp.Csp',
+ 
+     'sentry.interfaces.Exception': 'sentry.interfaces.exception.Exception',
+     'sentry.interfaces.Message': 'sentry.interfaces.message.Message',
+@@ -664,6 +665,7 @@ SENTRY_INTERFACES = {
+     'sentry.interfaces.Query': 'sentry.interfaces.query.Query',
+     'sentry.interfaces.Http': 'sentry.interfaces.http.Http',
+     'sentry.interfaces.User': 'sentry.interfaces.user.User',
++    'sentry.interfaces.Csp': 'sentry.interfaces.csp.Csp',
+ }
+ 
+ # Should users without superuser permissions be allowed to
+diff --git a/src/sentry/coreapi.py b/src/sentry/coreapi.py
+index 412f0cc780..c940124fb8 100644
+--- a/src/sentry/coreapi.py
++++ b/src/sentry/coreapi.py
+@@ -29,6 +29,7 @@ from sentry.constants import (
+     MAX_TAG_KEY_LENGTH
+ )
+ from sentry.interfaces.base import get_interface, InterfaceValidationError
++from sentry.interfaces.csp import Csp
+ from sentry.models import EventError, Project, ProjectKey
+ from sentry.tasks.store import preprocess_event
+ from sentry.utils import is_float, json
+@@ -569,3 +570,35 @@ class ClientApiHelper(object):
+         cache_key = 'e:{1}:{0}'.format(data['project'], data['event_id'])
+         default_cache.set(cache_key, data, timeout=3600)
+         preprocess_event.delay(cache_key=cache_key, start_time=time())
++
++
++class CspApiHelper(ClientApiHelper):
++    def validate_data(self, project, data):
++        report = data.get('csp-report')
++        if not report:
++            raise APIForbidden('Missing csp-report')
++
++        report = dict(map(lambda v: (v[0].replace('-', '_'), v[1]), report.iteritems()))
++        inst = Csp.to_python(report)
++        headers = {}
++        if self.context.agent:
++            headers['User-Agent'] = self.context.agent
++        if inst.referrer:
++            headers['Referer'] = inst.referrer
++        return {
++            'project': project.id,
++            inst.get_path(): inst.to_json(),
++            'message': inst.get_message(),
++            'culprit': inst.get_culprit(),
++            # This is a bit weird, since we don't have nearly enough
++            # information to create an Http interface, but
++            # this automatically will pick up tags for the User-Agent
++            # which is actually important here for CSP
++            'sentry.interfaces.Http': {
++                'url': inst.document_uri,
++                'headers': headers,
++            },
++            'sentry.interfaces.User': {
++                'ip_address': self.context.ip_address,
++            }
++        }
+diff --git a/src/sentry/interfaces/csp.py b/src/sentry/interfaces/csp.py
+new file mode 100644
+index 0000000000..cab1a6c6de
+--- /dev/null
++++ b/src/sentry/interfaces/csp.py
+@@ -0,0 +1,88 @@
++"""
++sentry.interfaces.csp
++~~~~~~~~~~~~~~~~~~~~~
++
++:copyright: (c) 2010-2015 by the Sentry Team, see AUTHORS for more details.
++:license: BSD, see LICENSE for more details.
++"""
++
++from __future__ import absolute_import
++
++__all__ = ('Csp',)
++
++from urlparse import urlsplit
++from sentry.interfaces.base import Interface
++from sentry.utils.safe import trim
++
++REPORT_KEYS = frozenset((
++    'blocked_uri', 'document_uri', 'effective_directive', 'original_policy',
++    'referrer', 'status_code', 'violated_directive', 'source_file',
++    'line_number', 'column_number',
++))
++
++KEYWORDS = frozenset((
++    "'none'", "'self'", "'unsafe-inline'", "'unsafe-eval'",
++))
++
++ALL_SCHEMES = (
++    'data:', 'mediastream:', 'blob:', 'filesystem:',
++    'http:', 'https:', 'file:',
++)
++
++
++class Csp(Interface):
++    """
++    A CSP violation report.
++
++    >>> {
++    >>>     "document_uri": "http://example.com/",
++    >>>     "violated_directive": "style-src cdn.example.com",
++    >>>     "blocked_uri": "http://example.com/style.css",
++    >>> }
++    """
++    @classmethod
++    def to_python(cls, data):
++        kwargs = {k: trim(data.get(k, None), 1024) for k in REPORT_KEYS}
++        return cls(**kwargs)
++
++    def get_hash(self):
++        # this may or may not be great, not sure until we see it in the wild
++        bits = filter(None, self.violated_directive.split(' '))
++        return [bits[0]] + map(self._normalize_value, bits[1:])
++
++    def get_path(self):
++        return 'sentry.interfaces.Csp'
++
++    def get_message(self):
++        return 'CSP Violation: %r' % ' '.join(self.get_hash())
++
++    def get_culprit(self):
++        return self.blocked_uri or self.effective_directive or self.violated_directive
++
++    def _normalize_value(self, value):
++        # > If no scheme is specified, the same scheme as the one used to
++        # > access the protected document is assumed.
++        # Source: https://developer.mozilla.org/en-US/docs/Web/Security/CSP/CSP_policy_directives
++        if value in KEYWORDS:
++            return value
++
++        # normalize a value down to 'self' if it matches the origin of document-uri
++        # FireFox transforms a 'self' value into the spelled out origin, so we
++        # want to reverse this and bring it back
++        if value.startswith(ALL_SCHEMES):
++            if _get_origin(self.document_uri) == value:
++                return "'self'"
++            return value
++        scheme = self.document_uri.split(':', 1)[0]
++        # These schemes need to have an additional '//' to be a url
++        if scheme in ('http', 'https', 'file'):
++            return '%s://%s' % (scheme, value)
++        # The others do not
++        return '%s:%s' % (scheme, value)
++
++
++def _get_origin(value):
++    scheme, hostname = urlsplit(value)[:2]
++    if scheme in ('http', 'https', 'file'):
++        return '%s://%s' % (scheme, hostname)
++    return '%s:%s' % (scheme, hostname)
+diff --git a/src/sentry/static/sentry/app/components/events/eventEntries.jsx b/src/sentry/static/sentry/app/components/events/eventEntries.jsx
+index e5f4915b05..df66839172 100644
+--- a/src/sentry/static/sentry/app/components/events/eventEntries.jsx
++++ b/src/sentry/static/sentry/app/components/events/eventEntries.jsx
+@@ -31,7 +31,8 @@ var EventEntries = React.createClass({
+     exception: require("./interfaces/exception"),
+     request: require("./interfaces/request"),
+     stacktrace: require("./interfaces/stacktrace"),
+-    template: require("./interfaces/template")
++    template: require("./interfaces/template"),
++    csp: require("./interfaces/csp"),
+   },
+ 
+   shouldComponentUpdate(nextProps, nextState) {
+diff --git a/src/sentry/static/sentry/app/components/events/interfaces/csp.jsx b/src/sentry/static/sentry/app/components/events/interfaces/csp.jsx
+new file mode 100644
+index 0000000000..c0d8187989
+--- /dev/null
++++ b/src/sentry/static/sentry/app/components/events/interfaces/csp.jsx
+@@ -0,0 +1,35 @@
++import React from "react";
++import _ from "underscore";
++import PropTypes from "../../../proptypes";
++
++import EventDataSection from "../eventDataSection";
++import DefinitionList from "./definitionList";
++
++var CSPInterface = React.createClass({
++  propTypes: {
++    group: PropTypes.Group.isRequired,
++    event: PropTypes.Event.isRequired,
++    type: React.PropTypes.string.isRequired,
++    data: React.PropTypes.object.isRequired,
++  },
++
++  render() {
++    let {group, event, data} = this.props;
++
++    let extraDataArray = _.chain(data)
++      .map((val, key) => [key.replace(/_/g, '-'), val])
++      .value();
++
++    return (
++      <EventDataSection
++          group={group}
++          event={event}
++          type="csp"
++          title="CSP Report">
++          <DefinitionList data={extraDataArray} isContextData={true}/>
++      </EventDataSection>
++    );
++  }
++});
++
++export default CSPInterface;
+diff --git a/src/sentry/web/api.py b/src/sentry/web/api.py
+index 52e7699118..289e5bbd97 100644
+--- a/src/sentry/web/api.py
++++ b/src/sentry/web/api.py
+@@ -15,7 +15,7 @@ from django.conf import settings
+ from django.core.cache import cache
+ from django.core.urlresolvers import reverse
+ from django.db.models import Sum, Q
+-from django.http import HttpResponse, HttpResponseRedirect
++from django.http import HttpResponse, HttpResponseRedirect, HttpResponseNotAllowed
+ from django.utils import timezone
+ from django.utils.encoding import force_bytes
+ from django.views.decorators.cache import never_cache, cache_control
+@@ -27,7 +27,7 @@ from raven.contrib.django.models import client as Raven
+ from sentry import app
+ from sentry.app import tsdb
+ from sentry.coreapi import (
+-    APIError, APIForbidden, APIRateLimited, ClientApiHelper
++    APIError, APIForbidden, APIRateLimited, ClientApiHelper, CspApiHelper,
+ )
+ from sentry.event_manager import EventManager
+ from sentry.models import (
+@@ -71,6 +71,8 @@ def api(func):
+ 
+ 
+ class APIView(BaseView):
++    helper_cls = ClientApiHelper
++
+     def _get_project_from_id(self, project_id):
+         if not project_id:
+             return
+@@ -95,7 +97,7 @@ class APIView(BaseView):
+     @csrf_exempt
+     @never_cache
+     def dispatch(self, request, project_id=None, *args, **kwargs):
+-        helper = ClientApiHelper(
++        helper = self.helper_cls(
+             agent=request.META.get('HTTP_USER_AGENT'),
+             project_id=project_id,
+             ip_address=request.META['REMOTE_ADDR'],
+@@ -329,16 +331,17 @@ class StoreView(APIView):
+ 
+         content_encoding = request.META.get('HTTP_CONTENT_ENCODING', '')
+ 
+-        if content_encoding == 'gzip':
+-            data = helper.decompress_gzip(data)
+-        elif content_encoding == 'deflate':
+-            data = helper.decompress_deflate(data)
+-        elif not data.startswith('{'):
+-            data = helper.decode_and_decompress_data(data)
+-        data = helper.safely_load_json_string(data)
++        if isinstance(data, basestring):
++            if content_encoding == 'gzip':
++                data = helper.decompress_gzip(data)
++            elif content_encoding == 'deflate':
++                data = helper.decompress_deflate(data)
++            elif not data.startswith('{'):
++                data = helper.decode_and_decompress_data(data)
++            data = helper.safely_load_json_string(data)
+ 
+         # mutates data
+-        helper.validate_data(project, data)
++        data = helper.validate_data(project, data)
+ 
+         # mutates data
+         manager = EventManager(data, version=auth.version)
+@@ -378,6 +381,60 @@ class StoreView(APIView):
+         return event_id
+ 
+ 
++class CspReportView(StoreView):
++    helper_cls = CspApiHelper
++    content_types = ('application/csp-report', 'application/json')
++
++    def _dispatch(self, request, helper, project_id=None, origin=None,
++                  *args, **kwargs):
++        if request.method != 'POST':
++            return HttpResponseNotAllowed(['POST'])
++
++        if request.META.get('CONTENT_TYPE') not in self.content_types:
++            raise APIError('Invalid Content-Type')
++
++        request.user = AnonymousUser()
++
++        project = self._get_project_from_id(project_id)
++        helper.context.bind_project(project)
++        Raven.tags_context(helper.context.get_tags_context())
++
++        auth = self._parse_header(request, helper, project)
++
++        project_ = helper.project_from_auth(auth)
++        if project_ != project:
++            raise APIError('Two different project were specified')
++
++        helper.context.bind_auth(auth)
++        Raven.tags_context(helper.context.get_tags_context())
++
++        return super(APIView, self).dispatch(
++            request=request,
++            project=project,
++            auth=auth,
++            helper=helper,
++            **kwargs
++        )
++
++    def post(self, request, project, auth, helper, **kwargs):
++        data = helper.safely_load_json_string(request.body)
++        origin = data['csp-report'].get('document-uri')
++        if not is_valid_origin(origin, project):
++            raise APIForbidden('Invalid document-uri')
++
++        response_or_event_id = self.process(
++            request,
++            project=project,
++            auth=auth,
++            helper=helper,
++            data=data,
++            **kwargs
++        )
++        if isinstance(response_or_event_id, HttpResponse):
++            return response_or_event_id
++        return HttpResponse(status=201)
++
++
+ @never_cache
+ @csrf_exempt
+ @has_access
+diff --git a/src/sentry/web/urls.py b/src/sentry/web/urls.py
+index f626f15adb..1b82f2d9f5 100644
+--- a/src/sentry/web/urls.py
++++ b/src/sentry/web/urls.py
+@@ -105,6 +105,8 @@ urlpatterns += patterns(
+         name='sentry-api-store'),
+     url(r'^api/(?P<project_id>[\w_-]+)/store/$', api.StoreView.as_view(),
+         name='sentry-api-store'),
++    url(r'^api/(?P<project_id>\d+)/csp-report/$', api.CspReportView.as_view(),
++        name='sentry-api-csp-report'),
+ 
+     url(r'^_static/(?P<module>[^/]+)/(?P<path>.*)$', generic.static_media,
+         name='sentry-media'),

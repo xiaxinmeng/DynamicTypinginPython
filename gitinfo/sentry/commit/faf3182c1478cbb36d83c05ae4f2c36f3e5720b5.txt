@@ -1,0 +1,1026 @@
+commit faf3182c1478cbb36d83c05ae4f2c36f3e5720b5
+Author: Dan Fuller <dfuller@sentry.io>
+Date:   Fri Sep 6 12:42:46 2019 -0700
+
+    feat(api): Move query subscription creation and other subscription related things to `snuba` app
+    
+    This pr moves query subscriptions and other things related to them into the `snuba` app. These
+    things aren't the responsibility of incidents, so it makes sense to have this separation.
+    
+    We also change the way we handle transactions and rolling back. Previously we'd try to handle
+    rolling back the transaction and removing any created subscriptions from Snuba in the `incidents`
+    project. This was starting to get complicated, so we'll now handle this in `snuba` instead. In a
+    follow up PR I'll move the actual calls to snuba into tasks, so that we can handle the creation of
+    everything in Postgres, and then once we're committed we can then fire off the creations to Snuba
+    if everything looks good. This simplifies how we handle transactions a lot, and we can perform
+    checks inside the tasks to make sure that the subscription is in the correct state.
+    
+    We'll also handle multiple subscriptions per alert rule in a later pr.
+
+diff --git a/src/sentry/incidents/endpoints/serializers.py b/src/sentry/incidents/endpoints/serializers.py
+index 019e6ec635..6540c29b53 100644
+--- a/src/sentry/incidents/endpoints/serializers.py
++++ b/src/sentry/incidents/endpoints/serializers.py
+@@ -7,7 +7,8 @@ from enum import Enum
+ from rest_framework import serializers
+ 
+ from sentry.api.serializers.rest_framework.base import CamelSnakeModelSerializer
+-from sentry.incidents.models import AlertRule, AlertRuleAggregations, AlertRuleThresholdType
++from sentry.incidents.models import AlertRule, AlertRuleThresholdType
++from sentry.snuba.models import QueryAggregations
+ from sentry.incidents.logic import (
+     AlertRuleNameAlreadyUsedError,
+     create_alert_rule,
+@@ -57,21 +58,21 @@ class AlertRuleSerializer(CamelSnakeModelSerializer):
+ 
+     def validate_aggregation(self, aggregation):
+         try:
+-            return AlertRuleAggregations(aggregation)
++            return QueryAggregations(aggregation)
+         except ValueError:
+             raise serializers.ValidationError(
+                 "Invalid aggregation, valid values are %s"
+-                % [item.value for item in AlertRuleAggregations]
++                % [item.value for item in QueryAggregations]
+             )
+ 
+     def validate_aggregations(self, aggregations):
+         # TODO: Remove this once FE transitions
+         try:
+-            return [AlertRuleAggregations(agg) for agg in aggregations]
++            return [QueryAggregations(agg) for agg in aggregations]
+         except ValueError:
+             raise serializers.ValidationError(
+                 "Invalid aggregation, valid values are %s"
+-                % [item.value for item in AlertRuleAggregations]
++                % [item.value for item in QueryAggregations]
+             )
+ 
+     def validate(self, attrs):
+diff --git a/src/sentry/incidents/logic.py b/src/sentry/incidents/logic.py
+index 026e5ed26f..59cddce53a 100644
+--- a/src/sentry/incidents/logic.py
++++ b/src/sentry/incidents/logic.py
+@@ -1,7 +1,5 @@
+ from __future__ import absolute_import
+ 
+-import json
+-import uuid
+ from collections import defaultdict
+ from datetime import timedelta
+ from uuid import uuid4
+@@ -16,7 +14,7 @@ from sentry import analytics
+ from sentry.api.event_search import get_snuba_query_args
+ from sentry.incidents.models import (
+     AlertRule,
+-    AlertRuleAggregations,
++    AlertRuleQuerySubscription,
+     AlertRuleStatus,
+     Incident,
+     IncidentActivity,
+@@ -28,27 +26,20 @@ from sentry.incidents.models import (
+     IncidentStatus,
+     IncidentSubscription,
+     IncidentType,
+-    SnubaDatasets,
+     TimeSeriesSnapshot,
+ )
++from sentry.snuba.models import QueryAggregations, QueryDatasets
+ from sentry.models import Commit, Release
+ from sentry.incidents import tasks
+-from sentry.utils.committers import get_event_file_committers
+-from sentry.utils.snuba import (
+-    _snuba_pool,
+-    bulk_raw_query,
+-    raw_query,
+-    SnubaError,
+-    SnubaQueryParams,
+-    SnubaTSResult,
+-    zerofill,
++from sentry.snuba.subscriptions import (
++    create_snuba_subscription,
++    delete_snuba_subscription,
++    update_snuba_subscription,
+ )
++from sentry.utils.committers import get_event_file_committers
++from sentry.utils.snuba import bulk_raw_query, raw_query, SnubaQueryParams, SnubaTSResult, zerofill
+ 
+ MAX_INITIAL_INCIDENT_PERIOD = timedelta(days=7)
+-alert_aggregation_to_snuba = {
+-    AlertRuleAggregations.TOTAL: ("count()", "", "count"),
+-    AlertRuleAggregations.UNIQUE_USERS: ("uniq", "tags[sentry:user]", "unique_users"),
+-}
+ 
+ 
+ class StatusAlreadyChangedError(Exception):
+@@ -589,8 +580,7 @@ def create_alert_rule(
+     incident name, and must be unique per project.
+     :param threshold_type: An AlertRuleThresholdType
+     :param query: An event search query to subscribe to and monitor for alerts
+-    :param aggregations: A list of AlertRuleAggregations that we want to fetch
+-    for this alert rule
++    :param aggregation: A QueryAggregation to fetch for this alert rule
+     :param time_window: Time period to aggregate over, in minutes.
+     :param alert_threshold: Value that the subscription needs to reach to
+     trigger the alert
+@@ -600,22 +590,26 @@ def create_alert_rule(
+     subscription needs to exceed the threshold before triggering
+     :return: The created `AlertRule`
+     """
+-    subscription_id = None
+-    dataset = SnubaDatasets.EVENTS
++    dataset = QueryDatasets.EVENTS
+     resolution = DEFAULT_ALERT_RULE_RESOLUTION
+     validate_alert_rule_query(query)
+     if AlertRule.objects.filter(project=project, name=name).exists():
+         raise AlertRuleNameAlreadyUsedError()
+-    try:
+-        subscription_id = create_snuba_subscription(
+-            project, dataset, query, aggregation, time_window, resolution
++    with transaction.atomic():
++        query_subscription = create_snuba_subscription(
++            project,
++            tasks.INCIDENTS_SNUBA_SUBSCRIPTION_TYPE,
++            dataset,
++            query,
++            aggregation,
++            time_window,
++            resolution,
+         )
+         alert_rule = AlertRule.objects.create(
+             project=project,
+             name=name,
+-            subscription_id=subscription_id,
+             threshold_type=threshold_type.value,
+-            dataset=SnubaDatasets.EVENTS.value,
++            dataset=dataset.value,
+             query=query,
+             aggregation=aggregation.value,
+             time_window=time_window,
+@@ -624,12 +618,9 @@ def create_alert_rule(
+             resolve_threshold=resolve_threshold,
+             threshold_period=threshold_period,
+         )
+-    except Exception:
+-        # If we error for some reason and have a valid subscription_id then
+-        # attempt to delete from snuba to avoid orphaned subscriptions.
+-        if subscription_id:
+-            delete_snuba_subscription(subscription_id)
+-        raise
++        AlertRuleQuerySubscription.objects.create(
++            query_subscription=query_subscription, alert_rule=alert_rule
++        )
+     return alert_rule
+ 
+ 
+@@ -669,8 +660,6 @@ def update_alert_rule(
+     ):
+         raise AlertRuleNameAlreadyUsedError()
+ 
+-    old_subscription_id = None
+-    subscription_id = None
+     updated_fields = {}
+     if name:
+         updated_fields["name"] = name
+@@ -683,38 +672,32 @@ def update_alert_rule(
+         updated_fields["aggregation"] = aggregation.value
+     if time_window:
+         updated_fields["time_window"] = time_window
+-    if alert_threshold:
++    if alert_threshold is not None:
+         updated_fields["alert_threshold"] = alert_threshold
+-    if resolve_threshold:
++    if resolve_threshold is not None:
+         updated_fields["resolve_threshold"] = resolve_threshold
+     if threshold_period:
+         updated_fields["threshold_period"] = threshold_period
+ 
+-    if query is not None or aggregation is not None or time_window is not None:
+-        old_subscription_id = alert_rule.subscription_id
+-        # If updating any details of the query, create a new subscription
+-        subscription_id = create_snuba_subscription(
+-            alert_rule.project,
+-            SnubaDatasets(alert_rule.dataset),
+-            query if query is not None else alert_rule.query,
+-            aggregation if aggregation else AlertRuleAggregations(alert_rule.aggregation),
+-            time_window if time_window else alert_rule.time_window,
+-            DEFAULT_ALERT_RULE_RESOLUTION,
+-        )
+-        updated_fields["subscription_id"] = subscription_id
+-
+-    try:
++    with transaction.atomic():
++        if query is not None or aggregation is not None or time_window is not None:
++            # TODO: We're assuming only one subscription for the moment
++            subscription = (
++                AlertRuleQuerySubscription.objects.select_related("query_subscription")
++                .get(alert_rule=alert_rule)
++                .query_subscription
++            )
++            # If updating any details of the query, update the Snuba subscription
++            update_snuba_subscription(
++                subscription,
++                query if query is not None else alert_rule.query,
++                aggregation
++                if aggregation is not None
++                else QueryAggregations(alert_rule.aggregation),
++                time_window if time_window else alert_rule.time_window,
++                DEFAULT_ALERT_RULE_RESOLUTION,
++            )
+         alert_rule.update(**updated_fields)
+-    except Exception:
+-        # If we error for some reason and have a valid subscription_id then
+-        # attempt to delete from snuba to avoid orphaned subscriptions.
+-        if subscription_id:
+-            delete_snuba_subscription(subscription_id)
+-        raise
+-
+-    if old_subscription_id:
+-        # Once we're set up correctly, remove the previous subscription id.
+-        delete_snuba_subscription(old_subscription_id)
+ 
+     return alert_rule
+ 
+@@ -729,6 +712,12 @@ def delete_alert_rule(alert_rule):
+         AlertRuleStatus.DELETION_IN_PROGRESS.value,
+     ):
+         raise AlreadyDeletedError()
++    # TODO: We're assuming only one subscription for the moment
++    subscription = (
++        AlertRuleQuerySubscription.objects.select_related("query_subscription")
++        .get(alert_rule=alert_rule)
++        .query_subscription
++    )
+ 
+     alert_rule.update(
+         # Randomize the name here so that we don't get unique constraint issues
+@@ -737,7 +726,7 @@ def delete_alert_rule(alert_rule):
+         status=AlertRuleStatus.PENDING_DELETION.value,
+     )
+     tasks.delete_alert_rule.apply_async(kwargs={"alert_rule_id": alert_rule.id})
+-    delete_snuba_subscription(alert_rule.subscription_id)
++    delete_snuba_subscription(subscription)
+ 
+ 
+ def validate_alert_rule_query(query):
+@@ -745,54 +734,3 @@ def validate_alert_rule_query(query):
+     # fields that are invalid in alert rules. For now this will just make sure
+     # the query parses correctly.
+     get_snuba_query_args(query)
+-
+-
+-def create_snuba_subscription(project, dataset, query, aggregation, time_window, resolution):
+-    """
+-    Creates a subscription to a snuba query.
+-
+-    :param project: The project we're applying the query to
+-    :param dataset: The snuba dataset to query and aggregate over
+-    :param query: An event search query that we can parse and convert into a
+-    set of Snuba conditions
+-    :param aggregations: A list of aggregations to calculate over the time
+-    window
+-    :param time_window: The time window to aggregate over
+-    :param resolution: How often to receive updates/bucket size
+-    :return: A uuid representing the subscription id.
+-    """
+-    # TODO: Might make sense to move this into snuba if we have wider use for
+-    # it.
+-    response = _snuba_pool.urlopen(
+-        "POST",
+-        "/subscriptions",
+-        body=json.dumps(
+-            {
+-                "project_id": project.id,
+-                "dataset": dataset.value,
+-                # We only care about conditions here. Filter keys only matter for
+-                # filtering to project and groups. Projects are handled with an
+-                # explicit param, and groups can't be queried here.
+-                "conditions": get_snuba_query_args(query)["conditions"],
+-                "aggregates": alert_aggregation_to_snuba[aggregation],
+-                "time_window": time_window,
+-                "resolution": resolution,
+-            }
+-        ),
+-        retries=False,
+-    )
+-    if response.status != 202:
+-        raise SnubaError("HTTP %s response from Snuba!" % response.status)
+-
+-    return uuid.UUID(json.loads(response.data)["subscription_id"])
+-
+-
+-def delete_snuba_subscription(subscription_id):
+-    """
+-    Deletes a subscription to a snuba query.
+-    :param subscription_id: The uuid of the subscription to delete
+-    :return:
+-    """
+-    response = _snuba_pool.urlopen("DELETE", "/subscriptions/%s" % subscription_id, retries=False)
+-    if response.status != 202:
+-        raise SnubaError("HTTP %s response from Snuba!" % response.status)
+diff --git a/src/sentry/incidents/models.py b/src/sentry/incidents/models.py
+index 114d0d6f6b..16e4e69169 100644
+--- a/src/sentry/incidents/models.py
++++ b/src/sentry/incidents/models.py
+@@ -8,6 +8,7 @@ from enum import Enum
+ from sentry.db.models import FlexibleForeignKey, Model, UUIDField
+ from sentry.db.models import ArrayField, sane_repr
+ from sentry.db.models.manager import BaseManager
++from sentry.snuba.models import QueryAggregations
+ from sentry.utils.retries import TimedRetryPolicy
+ 
+ 
+@@ -232,16 +233,6 @@ class AlertRuleThresholdType(Enum):
+     BELOW = 1
+ 
+ 
+-class AlertRuleAggregations(Enum):
+-    TOTAL = 0
+-    UNIQUE_USERS = 1
+-
+-
+-# TODO: This should probably live in the snuba app.
+-class SnubaDatasets(Enum):
+-    EVENTS = "events"
+-
+-
+ class AlertRuleManager(BaseManager):
+     """
+     A manager that excludes all rows that are pending deletion.
+@@ -291,7 +282,7 @@ class AlertRule(Model):
+     dataset = models.TextField()
+     query = models.TextField()
+     # TODO: Remove this default after we migrate
+-    aggregation = models.IntegerField(default=AlertRuleAggregations.TOTAL.value)
++    aggregation = models.IntegerField(default=QueryAggregations.TOTAL.value)
+     time_window = models.IntegerField()
+     resolution = models.IntegerField()
+     threshold_type = models.SmallIntegerField()
+diff --git a/src/sentry/incidents/subscription_processor.py b/src/sentry/incidents/subscription_processor.py
+index 45e0d814b9..5a44f7fb34 100644
+--- a/src/sentry/incidents/subscription_processor.py
++++ b/src/sentry/incidents/subscription_processor.py
+@@ -7,19 +7,16 @@ from datetime import timedelta
+ from django.conf import settings
+ from django.db import transaction
+ 
+-from sentry.incidents.logic import (
+-    alert_aggregation_to_snuba,
+-    create_incident,
+-    update_incident_status,
+-)
++from sentry.incidents.logic import create_incident, update_incident_status
++from sentry.snuba.subscriptions import query_aggregation_to_snuba
+ from sentry.incidents.models import (
+     AlertRule,
+-    AlertRuleAggregations,
+     AlertRuleThresholdType,
+     Incident,
+     IncidentStatus,
+     IncidentType,
+ )
++from sentry.snuba.models import QueryAggregations
+ from sentry.utils import metrics, redis
+ from sentry.utils.dates import to_datetime
+ 
+@@ -94,10 +91,8 @@ class SubscriptionProcessor(object):
+ 
+         self.last_update = subscription_update["timestamp"]
+ 
+-        # TODO: At the moment we only have individual aggregations. Handle multiple
+-        # later
+-        aggregation = AlertRuleAggregations(self.alert_rule.aggregation)
+-        aggregation_name = alert_aggregation_to_snuba[aggregation][2]
++        aggregation = QueryAggregations(self.alert_rule.aggregation)
++        aggregation_name = query_aggregation_to_snuba[aggregation][2]
+         aggregation_value = subscription_update["values"][aggregation_name]
+ 
+         alert_operator, resolve_operator = self.THRESHOLD_TYPE_OPERATORS[
+diff --git a/src/sentry/snuba/models.py b/src/sentry/snuba/models.py
+index 547ff446aa..f61cefa5f6 100644
+--- a/src/sentry/snuba/models.py
++++ b/src/sentry/snuba/models.py
+@@ -1,11 +1,22 @@
+ from __future__ import absolute_import
+ 
++from enum import Enum
++
+ from django.db import models
+ from django.utils import timezone
+ 
+ from sentry.db.models import ArrayField, FlexibleForeignKey, Model
+ 
+ 
++class QueryAggregations(Enum):
++    TOTAL = 0
++    UNIQUE_USERS = 1
++
++
++class QueryDatasets(Enum):
++    EVENTS = "events"
++
++
+ class QuerySubscription(Model):
+     __core__ = True
+ 
+diff --git a/src/sentry/snuba/subscriptions.py b/src/sentry/snuba/subscriptions.py
+new file mode 100644
+index 0000000000..e1b6527c63
+--- /dev/null
++++ b/src/sentry/snuba/subscriptions.py
+@@ -0,0 +1,129 @@
++from __future__ import absolute_import
++
++import json
++
++from django.db import transaction
++
++from sentry.api.event_search import get_snuba_query_args
++from sentry.snuba.models import QueryAggregations, QueryDatasets, QuerySubscription
++from sentry.utils.snuba import _snuba_pool, SnubaError
++
++query_aggregation_to_snuba = {
++    QueryAggregations.TOTAL: ("count()", "", "count"),
++    QueryAggregations.UNIQUE_USERS: ("uniq", "tags[sentry:user]", "unique_users"),
++}
++
++
++def create_snuba_subscription(
++    project, subscription_type, dataset, query, aggregation, time_window, resolution
++):
++    """
++    Creates a subscription to a snuba query.
++
++    :param project: The project we're applying the query to
++    :param subscription_type: Text identifier for the subscription type this is. Used
++    to identify the registered callback associated with this subscription.
++    :param dataset: The snuba dataset to query and aggregate over
++    :param query: An event search query that we can parse and convert into a
++    set of Snuba conditions
++    :param aggregation: An aggregation to calculate over the time window
++    :param time_window: The time window to aggregate over
++    :param resolution: How often to receive updates/bucket size
++    :return: The QuerySubscription representing the subscription
++    """
++    # TODO: Move this call to snuba into a task. This lets us successfully create a
++    # subscription in postgres and rollback as needed without having to create/delete
++    # from Snuba
++    subscription_id = _create_in_snuba(
++        project, dataset, query, aggregation, time_window, resolution
++    )
++
++    return QuerySubscription.objects.create(
++        project=project,
++        type=subscription_type,
++        subscription_id=subscription_id,
++        dataset=dataset.value,
++        query=query,
++        aggregation=aggregation.value,
++        time_window=time_window,
++        resolution=resolution,
++    )
++
++
++def update_snuba_subscription(subscription, query, aggregation, time_window, resolution):
++    """
++    Updates a subscription to a snuba query.
++
++    :param query: An event search query that we can parse and convert into a
++    set of Snuba conditions
++    :param aggregation: An aggregation to calculate over the time window
++    :param time_window: The time window to aggregate over
++    :param resolution: How often to receive updates/bucket size
++    :return: The QuerySubscription representing the subscription
++    """
++    # TODO: Move this call to snuba into a task. This lets us successfully update a
++    # subscription in postgres and rollback as needed without having to create/delete
++    # from snuba
++    _delete_from_snuba(subscription)
++    subscription_id = _create_in_snuba(
++        subscription.project,
++        QueryDatasets(subscription.dataset),
++        query,
++        aggregation,
++        time_window,
++        resolution,
++    )
++    subscription.update(
++        subscription_id=subscription_id,
++        query=query,
++        aggregation=aggregation.value,
++        time_window=time_window,
++        resolution=resolution,
++    )
++    return subscription
++
++
++def delete_snuba_subscription(subscription):
++    """
++    Deletes a subscription to a snuba query.
++    :param subscription_id: The uuid of the subscription to delete
++    :return:
++    """
++    with transaction.atomic():
++        subscription.delete()
++        # TODO: Move this call to snuba into a task. This lets us successfully delete a
++        # subscription in postgres and rollback as needed without having to create/delete
++        # from snuba
++        _delete_from_snuba(subscription)
++
++
++def _create_in_snuba(project, dataset, query, aggregation, time_window, resolution):
++    response = _snuba_pool.urlopen(
++        "POST",
++        "/subscriptions",
++        body=json.dumps(
++            {
++                "project_id": project.id,
++                "dataset": dataset.value,
++                # We only care about conditions here. Filter keys only matter for
++                # filtering to project and groups. Projects are handled with an
++                # explicit param, and groups can't be queried here.
++                "conditions": get_snuba_query_args(query)["conditions"],
++                "aggregates": [query_aggregation_to_snuba[aggregation]],
++                "time_window": time_window,
++                "resolution": resolution,
++            }
++        ),
++        retries=False,
++    )
++    if response.status != 202:
++        raise SnubaError("HTTP %s response from Snuba!" % response.status)
++    return json.loads(response.data)["subscription_id"]
++
++
++def _delete_from_snuba(subscription):
++    response = _snuba_pool.urlopen(
++        "DELETE", "/subscriptions/%s" % subscription.subscription_id, retries=False
++    )
++    if response.status != 202:
++        raise SnubaError("HTTP %s response from Snuba!" % response.status)
+diff --git a/tests/sentry/api/serializers/test_alert_rule.py b/tests/sentry/api/serializers/test_alert_rule.py
+index 2291193996..ff3d453c02 100644
+--- a/tests/sentry/api/serializers/test_alert_rule.py
++++ b/tests/sentry/api/serializers/test_alert_rule.py
+@@ -6,7 +6,8 @@ import six
+ 
+ from sentry.api.serializers import serialize
+ from sentry.incidents.logic import create_alert_rule
+-from sentry.incidents.models import AlertRuleAggregations, AlertRuleThresholdType
++from sentry.incidents.models import AlertRuleThresholdType
++from sentry.snuba.models import QueryAggregations
+ from sentry.testutils import TestCase
+ 
+ 
+@@ -17,7 +18,7 @@ class IncidentSerializerTest(TestCase):
+             "hello",
+             AlertRuleThresholdType.ABOVE,
+             "level:error",
+-            AlertRuleAggregations.TOTAL,
++            QueryAggregations.TOTAL,
+             10,
+             1000,
+             400,
+diff --git a/tests/sentry/api/serializers/test_incident.py b/tests/sentry/api/serializers/test_incident.py
+index 601bdf5f39..07f8187fc5 100644
+--- a/tests/sentry/api/serializers/test_incident.py
++++ b/tests/sentry/api/serializers/test_incident.py
+@@ -11,7 +11,8 @@ from freezegun import freeze_time
+ from sentry.api.serializers import serialize
+ from sentry.api.serializers.models.incident import DetailedIncidentSerializer
+ from sentry.incidents.logic import create_alert_rule, subscribe_to_incident
+-from sentry.incidents.models import AlertRuleAggregations, AlertRuleThresholdType, IncidentGroup
++from sentry.incidents.models import AlertRuleThresholdType, IncidentGroup
++from sentry.snuba.models import QueryAggregations
+ from sentry.testutils import TestCase
+ 
+ 
+@@ -71,7 +72,7 @@ class DetailedIncidentSerializerTest(TestCase):
+             "hi",
+             AlertRuleThresholdType.ABOVE,
+             "test query",
+-            AlertRuleAggregations.TOTAL,
++            QueryAggregations.TOTAL,
+             10,
+             1000,
+             400,
+diff --git a/tests/sentry/incidents/endpoints/test_project_alert_rule_details.py b/tests/sentry/incidents/endpoints/test_project_alert_rule_details.py
+index 618ea006ca..136456d9d7 100644
+--- a/tests/sentry/incidents/endpoints/test_project_alert_rule_details.py
++++ b/tests/sentry/incidents/endpoints/test_project_alert_rule_details.py
+@@ -4,7 +4,8 @@ from exam import fixture
+ 
+ from sentry.api.serializers import serialize
+ from sentry.incidents.logic import create_alert_rule
+-from sentry.incidents.models import AlertRule, AlertRuleAggregations, AlertRuleThresholdType
++from sentry.incidents.models import AlertRule, AlertRuleThresholdType
++from sentry.snuba.models import QueryAggregations
+ from sentry.testutils import APITestCase
+ 
+ 
+@@ -30,7 +31,7 @@ class AlertRuleDetailsBase(object):
+             "hello",
+             AlertRuleThresholdType.ABOVE,
+             "level:error",
+-            AlertRuleAggregations.TOTAL,
++            QueryAggregations.TOTAL,
+             10,
+             1000,
+             400,
+diff --git a/tests/sentry/incidents/endpoints/test_project_alert_rule_index.py b/tests/sentry/incidents/endpoints/test_project_alert_rule_index.py
+index e41e5ff2a3..28798767c6 100644
+--- a/tests/sentry/incidents/endpoints/test_project_alert_rule_index.py
++++ b/tests/sentry/incidents/endpoints/test_project_alert_rule_index.py
+@@ -5,7 +5,8 @@ from freezegun import freeze_time
+ 
+ from sentry.api.serializers import serialize
+ from sentry.incidents.logic import create_alert_rule
+-from sentry.incidents.models import AlertRule, AlertRuleAggregations, AlertRuleThresholdType
++from sentry.incidents.models import AlertRule, AlertRuleThresholdType
++from sentry.snuba.models import QueryAggregations
+ from sentry.testutils import APITestCase
+ 
+ 
+@@ -34,7 +35,7 @@ class AlertRuleListEndpointTest(APITestCase):
+             "hello",
+             AlertRuleThresholdType.ABOVE,
+             "level:error",
+-            AlertRuleAggregations.TOTAL,
++            QueryAggregations.TOTAL,
+             10,
+             1000,
+             400,
+diff --git a/tests/sentry/incidents/endpoints/test_serializers.py b/tests/sentry/incidents/endpoints/test_serializers.py
+index b96cb9af6f..6064254524 100644
+--- a/tests/sentry/incidents/endpoints/test_serializers.py
++++ b/tests/sentry/incidents/endpoints/test_serializers.py
+@@ -3,7 +3,8 @@ from __future__ import absolute_import
+ from exam import fixture
+ 
+ from sentry.incidents.endpoints.serializers import AlertRuleSerializer
+-from sentry.incidents.models import AlertRule, AlertRuleAggregations, AlertRuleThresholdType
++from sentry.incidents.models import AlertRule, AlertRuleThresholdType
++from sentry.snuba.models import QueryAggregations
+ from sentry.testutils import TestCase
+ 
+ 
+@@ -65,8 +66,7 @@ class TestAlertRuleSerializer(TestCase):
+ 
+     def test_aggregation(self):
+         invalid_values = [
+-            "Invalid aggregation, valid values are %s"
+-            % [item.value for item in AlertRuleAggregations]
++            "Invalid aggregation, valid values are %s" % [item.value for item in QueryAggregations]
+         ]
+         self.run_fail_validation_test(
+             {"aggregation": "a"}, {"aggregation": ["A valid integer is required."]}
+@@ -88,7 +88,7 @@ class TestAlertRuleSerializer(TestCase):
+         self._run_changed_fields_test(alert_rule, {"name": "a name"}, {"name": "a name"})
+         self._run_changed_fields_test(alert_rule, {"aggregation": 0}, {})
+         self._run_changed_fields_test(
+-            alert_rule, {"aggregation": 1}, {"aggregation": AlertRuleAggregations.UNIQUE_USERS}
++            alert_rule, {"aggregation": 1}, {"aggregation": QueryAggregations.UNIQUE_USERS}
+         )
+         self._run_changed_fields_test(alert_rule, {"threshold_type": 0}, {})
+         self._run_changed_fields_test(
+diff --git a/tests/sentry/incidents/test_logic.py b/tests/sentry/incidents/test_logic.py
+index 2b6267efeb..d1a365e610 100644
+--- a/tests/sentry/incidents/test_logic.py
++++ b/tests/sentry/incidents/test_logic.py
+@@ -44,7 +44,6 @@ from sentry.incidents.logic import (
+ )
+ from sentry.incidents.models import (
+     AlertRule,
+-    AlertRuleAggregations,
+     AlertRuleStatus,
+     AlertRuleThresholdType,
+     Incident,
+@@ -57,8 +56,8 @@ from sentry.incidents.models import (
+     IncidentSubscription,
+     IncidentSuspectCommit,
+     IncidentType,
+-    SnubaDatasets,
+ )
++from sentry.snuba.models import QueryAggregations, QueryDatasets
+ from sentry.models.commit import Commit
+ from sentry.models.repository import Repository
+ from sentry.testutils import TestCase, SnubaTestCase
+@@ -82,7 +81,7 @@ class CreateIncidentTest(TestCase):
+             "hello",
+             AlertRuleThresholdType.ABOVE,
+             "level:error",
+-            AlertRuleAggregations.TOTAL,
++            QueryAggregations.TOTAL,
+             10,
+             1000,
+             400,
+@@ -755,7 +754,7 @@ class CreateAlertRuleTest(TestCase, BaseIncidentsTest):
+         name = "hello"
+         threshold_type = AlertRuleThresholdType.ABOVE
+         query = "level:error"
+-        aggregation = AlertRuleAggregations.TOTAL
++        aggregation = QueryAggregations.TOTAL
+         time_window = 10
+         alert_threshold = 1000
+         resolve_threshold = 400
+@@ -774,9 +773,9 @@ class CreateAlertRuleTest(TestCase, BaseIncidentsTest):
+         assert alert_rule.project == self.project
+         assert alert_rule.name == name
+         assert alert_rule.status == AlertRuleStatus.PENDING.value
+-        assert alert_rule.subscription_id is not None
++        assert alert_rule.query_subscriptions.all().count() == 1
+         assert alert_rule.threshold_type == threshold_type.value
+-        assert alert_rule.dataset == SnubaDatasets.EVENTS.value
++        assert alert_rule.dataset == QueryDatasets.EVENTS.value
+         assert alert_rule.query == query
+         assert alert_rule.aggregation == aggregation.value
+         assert alert_rule.time_window == time_window
+@@ -792,7 +791,7 @@ class CreateAlertRuleTest(TestCase, BaseIncidentsTest):
+                 "hi",
+                 AlertRuleThresholdType.ABOVE,
+                 "has:",
+-                AlertRuleAggregations.TOTAL,
++                QueryAggregations.TOTAL,
+                 1,
+                 1,
+                 1,
+@@ -806,7 +805,7 @@ class CreateAlertRuleTest(TestCase, BaseIncidentsTest):
+             name,
+             AlertRuleThresholdType.ABOVE,
+             "level:error",
+-            AlertRuleAggregations.TOTAL,
++            QueryAggregations.TOTAL,
+             1,
+             1,
+             1,
+@@ -818,7 +817,7 @@ class CreateAlertRuleTest(TestCase, BaseIncidentsTest):
+                 name,
+                 AlertRuleThresholdType.ABOVE,
+                 "level:error",
+-                AlertRuleAggregations.TOTAL,
++                QueryAggregations.TOTAL,
+                 1,
+                 1,
+                 1,
+@@ -834,7 +833,7 @@ class UpdateAlertRuleTest(TestCase, BaseIncidentsTest):
+             "hello",
+             AlertRuleThresholdType.ABOVE,
+             "level:error",
+-            AlertRuleAggregations.TOTAL,
++            QueryAggregations.TOTAL,
+             10,
+             1000,
+             400,
+@@ -845,7 +844,7 @@ class UpdateAlertRuleTest(TestCase, BaseIncidentsTest):
+         name = "uh oh"
+         threshold_type = AlertRuleThresholdType.BELOW
+         query = "level:warning"
+-        aggregation = AlertRuleAggregations.UNIQUE_USERS
++        aggregation = QueryAggregations.UNIQUE_USERS
+         time_window = 50
+         alert_threshold = 2000
+         resolve_threshold = 800
+@@ -872,9 +871,9 @@ class UpdateAlertRuleTest(TestCase, BaseIncidentsTest):
+         assert self.alert_rule.threshold_period == threshold_period
+ 
+     def test_update_subscription(self):
+-        old_subscription_id = self.alert_rule.subscription_id
+-        alert_rule = update_alert_rule(self.alert_rule, query="some new query")
+-        assert old_subscription_id != alert_rule.subscription_id
++        old_subscription_id = self.alert_rule.query_subscriptions.get().subscription_id
++        update_alert_rule(self.alert_rule, query="some new query")
++        assert old_subscription_id != self.alert_rule.query_subscriptions.get().subscription_id
+ 
+     def test_empty_query(self):
+         alert_rule = update_alert_rule(self.alert_rule, query="")
+@@ -887,7 +886,7 @@ class UpdateAlertRuleTest(TestCase, BaseIncidentsTest):
+             used_name,
+             AlertRuleThresholdType.ABOVE,
+             "level:error",
+-            AlertRuleAggregations.TOTAL,
++            QueryAggregations.TOTAL,
+             10,
+             1000,
+             400,
+@@ -909,7 +908,7 @@ class DeleteAlertRuleTest(TestCase, BaseIncidentsTest):
+             "hello",
+             AlertRuleThresholdType.ABOVE,
+             "level:error",
+-            AlertRuleAggregations.TOTAL,
++            QueryAggregations.TOTAL,
+             10,
+             1000,
+             400,
+diff --git a/tests/sentry/incidents/test_subscription_processor.py b/tests/sentry/incidents/test_subscription_processor.py
+index 24db9c32f2..748c309e8a 100644
+--- a/tests/sentry/incidents/test_subscription_processor.py
++++ b/tests/sentry/incidents/test_subscription_processor.py
+@@ -9,18 +9,12 @@ from django.utils import timezone
+ from exam import fixture, patcher
+ from freezegun import freeze_time
+ 
+-from sentry.incidents.logic import alert_aggregation_to_snuba, create_alert_rule
+-from sentry.incidents.models import (
+-    AlertRuleAggregations,
+-    AlertRuleThresholdType,
+-    Incident,
+-    IncidentStatus,
+-    IncidentType,
+-    SnubaDatasets,
+-)
++from sentry.incidents.logic import create_alert_rule
++from sentry.snuba.subscriptions import query_aggregation_to_snuba
++from sentry.incidents.models import AlertRuleThresholdType, Incident, IncidentStatus, IncidentType
+ from sentry.incidents.subscription_processor import get_alert_rule_stats, SubscriptionProcessor
+ from sentry.incidents.tasks import INCIDENTS_SNUBA_SUBSCRIPTION_TYPE
+-from sentry.snuba.models import QuerySubscription
++from sentry.snuba.models import QueryAggregations, QueryDatasets, QuerySubscription
+ from sentry.testutils import TestCase
+ from sentry.utils.dates import to_timestamp
+ 
+@@ -35,9 +29,9 @@ class ProcessUpdateTest(TestCase):
+             project=self.project,
+             type=INCIDENTS_SNUBA_SUBSCRIPTION_TYPE,
+             subscription_id="some_id",
+-            dataset=SnubaDatasets.EVENTS.value,
++            dataset=QueryDatasets.EVENTS.value,
+             query="",
+-            aggregations=[AlertRuleAggregations.TOTAL.value],
++            aggregations=[QueryAggregations.TOTAL.value],
+             time_window=1,
+             resolution=1,
+         )
+@@ -50,7 +44,7 @@ class ProcessUpdateTest(TestCase):
+             "some rule",
+             AlertRuleThresholdType.ABOVE,
+             query="",
+-            aggregation=AlertRuleAggregations.TOTAL,
++            aggregation=QueryAggregations.TOTAL,
+             time_window=1,
+             alert_threshold=100,
+             resolve_threshold=10,
+@@ -68,8 +62,8 @@ class ProcessUpdateTest(TestCase):
+         values = {}
+ 
+         if subscription:
+-            aggregation_type = alert_aggregation_to_snuba[
+-                AlertRuleAggregations(subscription.aggregations[0])
++            aggregation_type = query_aggregation_to_snuba[
++                QueryAggregations(subscription.aggregations[0])
+             ]
+             value = randint(0, 100) if value is None else value
+             values = {aggregation_type[2]: value}
+diff --git a/tests/sentry/snuba/test_subscriptions.py b/tests/sentry/snuba/test_subscriptions.py
+new file mode 100644
+index 0000000000..b11e322ac6
+--- /dev/null
++++ b/tests/sentry/snuba/test_subscriptions.py
+@@ -0,0 +1,71 @@
++from __future__ import absolute_import
++
++from sentry.snuba.models import QueryAggregations, QueryDatasets, QuerySubscription
++from sentry.snuba.subscriptions import (
++    create_snuba_subscription,
++    delete_snuba_subscription,
++    update_snuba_subscription,
++)
++from sentry.testutils import TestCase
++
++
++class CreateSnubaSubscriptionTest(TestCase):
++    def test(self):
++        type = "something"
++        dataset = QueryDatasets.EVENTS
++        query = "level:error"
++        aggregation = QueryAggregations.TOTAL
++        time_window = 10
++        resolution = 1
++        subscription = create_snuba_subscription(
++            self.project, type, dataset, query, aggregation, time_window, resolution
++        )
++        assert subscription.project == self.project
++        assert subscription.type == type
++        assert subscription.subscription_id != ""
++        assert subscription.dataset == dataset.value
++        assert subscription.query == query
++        assert subscription.aggregation == aggregation.value
++        assert subscription.time_window == time_window
++        assert subscription.resolution == resolution
++
++
++class UpdateSnubaSubscriptionTest(TestCase):
++    def test(self):
++        subscription = create_snuba_subscription(
++            self.project,
++            "something",
++            QueryDatasets.EVENTS,
++            "level:error",
++            QueryAggregations.TOTAL,
++            10,
++            1,
++        )
++
++        query = "level:warning"
++        aggregation = QueryAggregations.UNIQUE_USERS
++        time_window = 20
++        resolution = 2
++        old_subscription_id = subscription.subscription_id
++        update_snuba_subscription(subscription, query, aggregation, time_window, resolution)
++        assert subscription.subscription_id != old_subscription_id
++        assert subscription.query == query
++        assert subscription.aggregation == aggregation.value
++        assert subscription.time_window == time_window
++        assert subscription.resolution == resolution
++
++
++class DeleteSnubaSubscriptionTest(TestCase):
++    def test(self):
++        subscription = create_snuba_subscription(
++            self.project,
++            "something",
++            QueryDatasets.EVENTS,
++            "level:error",
++            QueryAggregations.TOTAL,
++            10,
++            1,
++        )
++        subscription_id = subscription.id
++        delete_snuba_subscription(subscription)
++        assert not QuerySubscription.objects.filter(id=subscription_id).exists()
+diff --git a/tests/snuba/incidents/test_tasks.py b/tests/snuba/incidents/test_tasks.py
+index 39b58caa56..6d1ed1e5ed 100644
+--- a/tests/snuba/incidents/test_tasks.py
++++ b/tests/snuba/incidents/test_tasks.py
+@@ -9,25 +9,19 @@ from django.conf import settings
+ from django.test.utils import override_settings
+ from exam import fixture
+ 
+-from sentry.incidents.logic import alert_aggregation_to_snuba, create_alert_rule
+-from sentry.incidents.models import (
+-    AlertRuleAggregations,
+-    AlertRuleThresholdType,
+-    Incident,
+-    IncidentStatus,
+-    IncidentType,
+-    SnubaDatasets,
+-)
++from sentry.incidents.logic import create_alert_rule
++from sentry.snuba.subscriptions import query_aggregation_to_snuba
++from sentry.incidents.models import AlertRuleThresholdType, Incident, IncidentStatus, IncidentType
+ from sentry.incidents.tasks import INCIDENTS_SNUBA_SUBSCRIPTION_TYPE
+-from sentry.snuba.models import QuerySubscription
++from sentry.snuba.models import QueryAggregations, QueryDatasets, QuerySubscription
+ from sentry.snuba.query_subscription_consumer import QuerySubscriptionConsumer, subscriber_registry
+ 
+ from sentry.testutils import TestCase
+ 
+ 
+-class HandleSubaQueryUpdateTest(TestCase):
++class HandleSnubaQueryUpdateTest(TestCase):
+     def setUp(self):
+-        super(HandleSubaQueryUpdateTest, self).setUp()
++        super(HandleSnubaQueryUpdateTest, self).setUp()
+         self.override_settings_cm = override_settings(
+             KAFKA_TOPICS={self.topic: {"cluster": "default", "topic": self.topic}}
+         )
+@@ -35,7 +29,7 @@ class HandleSubaQueryUpdateTest(TestCase):
+         self.orig_registry = deepcopy(subscriber_registry)
+ 
+     def tearDown(self):
+-        super(HandleSubaQueryUpdateTest, self).tearDown()
++        super(HandleSnubaQueryUpdateTest, self).tearDown()
+         self.override_settings_cm.__exit__(None, None, None)
+         subscriber_registry.clear()
+         subscriber_registry.update(self.orig_registry)
+@@ -46,9 +40,9 @@ class HandleSubaQueryUpdateTest(TestCase):
+             project=self.project,
+             type=INCIDENTS_SNUBA_SUBSCRIPTION_TYPE,
+             subscription_id="some_id",
+-            dataset=SnubaDatasets.EVENTS.value,
++            dataset=QueryDatasets.EVENTS.value,
+             query="",
+-            aggregation=AlertRuleAggregations.TOTAL.value,
++            aggregation=QueryAggregations.TOTAL.value,
+             time_window=1,
+             resolution=1,
+         )
+@@ -61,7 +55,7 @@ class HandleSubaQueryUpdateTest(TestCase):
+             "some rule",
+             AlertRuleThresholdType.ABOVE,
+             query="",
+-            aggregation=AlertRuleAggregations.TOTAL,
++            aggregation=QueryAggregations.TOTAL,
+             time_window=1,
+             alert_threshold=100,
+             resolve_threshold=10,
+@@ -97,9 +91,7 @@ class HandleSubaQueryUpdateTest(TestCase):
+             callback(*args, **kwargs)
+             raise KeyboardInterrupt()
+ 
+-        value_name = alert_aggregation_to_snuba[
+-            AlertRuleAggregations(self.subscription.aggregation)
+-        ][2]
++        value_name = query_aggregation_to_snuba[QueryAggregations(self.subscription.aggregation)][2]
+ 
+         subscriber_registry[INCIDENTS_SNUBA_SUBSCRIPTION_TYPE] = exception_callback
+         message = {

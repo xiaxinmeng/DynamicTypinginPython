@@ -1,0 +1,265 @@
+commit ec9af96759b60941306678ba20dd90074cddf9af
+Author: adhiraj <693121+adhiraj@users.noreply.github.com>
+Date:   Thu Jul 5 14:30:06 2018 -0700
+
+    feat(identity): Don't relink identity if login depends on it (#8860)
+    
+    * feat(identity): Don't relink identity if login depends on it
+    
+    When a user sets up an integration, if their identity is linked to a different user or user is linked to a different identity, we delete those before creating a new link. Now that we're using identity for login, we restrict this deletion to users that have a password so that they don't get locked out if we delete an identity they use for login.
+
+diff --git a/src/sentry/integrations/pipeline.py b/src/sentry/integrations/pipeline.py
+index 7440b1e36c..70b62cb9a3 100644
+--- a/src/sentry/integrations/pipeline.py
++++ b/src/sentry/integrations/pipeline.py
+@@ -3,9 +3,9 @@ from __future__ import absolute_import, print_function
+ __all__ = ['IntegrationPipeline']
+ 
+ from django.db import IntegrityError
+-from django.db.models import Q
+ from django.http import HttpResponse
+ from django.utils import timezone
++from django.utils.translation import ugettext as _
+ 
+ from sentry.api.serializers import serialize
+ from sentry.models import Identity, IdentityProvider, IdentityStatus, Integration
+@@ -99,20 +99,36 @@ class IntegrationPipeline(Pipeline):
+                 )
+ 
+                 if not created:
+-                    identity_model.update(data=identity['data'], scopes=identity['scopes'])
++                    identity_model.update(**identity_data)
+             except IntegrityError:
+                 # If the external_id is already used for a different user or
+                 # the user already has a different external_id remove those
+-                # identities and recreate it.
+-                lookup = Q(external_id=identity['external_id']) | Q(user=self.request.user)
+-                Identity.objects.filter(lookup, idp=idp).delete()
+-
+-                identity_model = Identity.objects.create(
+-                    idp=idp,
+-                    user=self.request.user,
+-                    external_id=identity['external_id'],
+-                    **identity_data
+-                )
++                # identities and recreate it, except in the case of Github
++                # where we need to be more careful because users may be using
++                # those identities to log in.
++                if idp.type == 'github':
++                    try:
++                        other_identity = Identity.objects.get(
++                            idp=idp,
++                            external_id=identity['external_id'],
++                        )
++                    except Identity.DoesNotExist:
++                        # The user is linked to a different external_id. It's ok to relink
++                        # here because they'll still be able to log in with the new external_id.
++                        pass
++                    else:
++                        # The external_id is linked to a different user. If that user doesn't
++                        # have a password, we don't delete the link as it may lock them out.
++                        if not other_identity.user.has_usable_password():
++                            return self._dialog_response({
++                                'error': _(
++                                    'The provided Github account is linked to a different user. '
++                                    'Please try again with a different Github account.'
++                                )},
++                                False,
++                            )
++                identity_model = Identity.reattach(
++                    idp, identity['external_id'], self.request.user, identity_data)
+ 
+         org_integration_args = {}
+ 
+diff --git a/src/sentry/integrations/slack/link_identity.py b/src/sentry/integrations/slack/link_identity.py
+index 2e355e7af9..33105bd96e 100644
+--- a/src/sentry/integrations/slack/link_identity.py
++++ b/src/sentry/integrations/slack/link_identity.py
+@@ -1,7 +1,9 @@
+ from __future__ import absolute_import, print_function
+ 
+ from django.core.urlresolvers import reverse
++from django.db import IntegrityError
+ from django.http import Http404
++from django.utils import timezone
+ from django.views.decorators.cache import never_cache
+ 
+ from sentry import http
+@@ -68,40 +70,21 @@ class SlackLinkIdentitiyView(BaseView):
+ 
+         # Link the user with the identity. Handle the case where the user is linked to a
+         # different identity or the identity is linked to a different user.
++        defaults = {
++            'status': IdentityStatus.VALID,
++            'date_verified': timezone.now(),
++        }
+         try:
+-            id_by_user = Identity.objects.get(user=request.user, idp=idp)
+-        except Identity.DoesNotExist:
+-            id_by_user = None
+-        try:
+-            id_by_external_id = Identity.objects.get(external_id=params['slack_id'], idp=idp)
+-        except Identity.DoesNotExist:
+-            id_by_external_id = None
+-
+-        if not id_by_user and not id_by_external_id:
+-            Identity.objects.create(
+-                user=request.user,
+-                external_id=params['slack_id'],
++            identity, created = Identity.objects.get_or_create(
+                 idp=idp,
+-                status=IdentityStatus.VALID,
+-            )
+-        elif id_by_user and not id_by_external_id:
+-            # TODO(epurkhiser): In this case we probably want to prompt and
+-            # warn them that they had a previous identity linked to slack.
+-            id_by_user.update(
+-                external_id=params['slack_id'],
+-                status=IdentityStatus.VALID,
+-            )
+-        elif id_by_external_id and not id_by_user:
+-            id_by_external_id.update(
+                 user=request.user,
+-                status=IdentityStatus.VALID,
++                external_id=params['slack_id'],
++                defaults=defaults,
+             )
+-        else:
+-            updates = {'status': IdentityStatus.VALID}
+-            if id_by_user != id_by_external_id:
+-                id_by_external_id.delete()
+-                updates['external_id'] = params['slack_id']
+-            id_by_user.update(**updates)
++            if not created:
++                identity.update(**defaults)
++        except IntegrityError:
++            Identity.reattach(idp, params['slack_id'], request.user, defaults)
+ 
+         payload = {
+             'replace_original': False,
+diff --git a/src/sentry/models/identity.py b/src/sentry/models/identity.py
+index 4fce348fd9..5f82804c40 100644
+--- a/src/sentry/models/identity.py
++++ b/src/sentry/models/identity.py
+@@ -2,6 +2,7 @@ from __future__ import absolute_import
+ 
+ from django.conf import settings
+ from django.db import models
++from django.db.models import Q
+ from django.utils import timezone
+ 
+ from sentry.db.models import (
+@@ -63,3 +64,19 @@ class Identity(Model):
+     def get_provider(self):
+         from sentry.identity import get
+         return get(self.idp.type)
++
++    @classmethod
++    def reattach(cls, idp, external_id, user, defaults):
++        """
++        Removes identities under `idp` associated with either `external_id` or `user`
++        and creates a new identity linking them.
++        """
++        lookup = Q(external_id=external_id) | Q(user=user)
++        Identity.objects.filter(lookup, idp=idp).delete()
++
++        return Identity.objects.create(
++            idp=idp,
++            user=user,
++            external_id=external_id,
++            **defaults
++        )
+diff --git a/src/sentry/static/sentry/app/views/organizationIntegrations/addIntegrationButton.jsx b/src/sentry/static/sentry/app/views/organizationIntegrations/addIntegrationButton.jsx
+index dc0dd27573..d32522f3ee 100644
+--- a/src/sentry/static/sentry/app/views/organizationIntegrations/addIntegrationButton.jsx
++++ b/src/sentry/static/sentry/app/views/organizationIntegrations/addIntegrationButton.jsx
+@@ -75,7 +75,7 @@ export default class AddIntegrationButton extends React.Component {
+     const {success, data} = message.data;
+ 
+     if (!success) {
+-      IndicatorStore.addError(t('Unable to add Integration'));
++      IndicatorStore.addError(data.error);
+       return;
+     }
+ 
+diff --git a/tests/sentry/integrations/github/test_integration.py b/tests/sentry/integrations/github/test_integration.py
+index 01692749d1..e96dd47801 100644
+--- a/tests/sentry/integrations/github/test_integration.py
++++ b/tests/sentry/integrations/github/test_integration.py
+@@ -16,7 +16,8 @@ class GitHubIntegrationTest(IntegrationTestCase):
+     provider = GitHubIntegrationProvider
+ 
+     @patch('sentry.integrations.github.integration.get_jwt', return_value='jwt_token_1')
+-    def assert_setup_flow(self, get_jwt, installation_id='install_id_1', app_id='app_1', user_id='user_id_1'):
++    def assert_setup_flow(self, get_jwt, installation_id='install_id_1',
++                          app_id='app_1', user_id='user_id_1'):
+         responses.reset()
+ 
+         resp = self.client.get(self.init_path)
+@@ -102,6 +103,7 @@ class GitHubIntegrationTest(IntegrationTestCase):
+         assert auth_header == 'Bearer jwt_token_1'
+ 
+         self.assertDialogSuccess(resp)
++        return resp
+ 
+     @responses.activate
+     def test_basic_flow(self):
+@@ -133,3 +135,24 @@ class GitHubIntegrationTest(IntegrationTestCase):
+         assert identity.data == {
+             'access_token': 'xxxxx-xxxxxxxxx-xxxxxxxxxx-xxxxxxxxxxxx'
+         }
++
++    @responses.activate
++    def test_reassign_user(self):
++        self.assert_setup_flow()
++
++        # Associate the identity with a user that has a password.
++        # Identity should be relinked.
++        user2 = self.create_user()
++        Identity.objects.get().update(user=user2)
++        self.assert_setup_flow()
++        identity = Identity.objects.get()
++        assert identity.user == self.user
++
++        # Associate the identity with a user without a password.
++        # Identity should not be relinked.
++        user2.set_unusable_password()
++        user2.save()
++        Identity.objects.get().update(user=user2)
++        resp = self.assert_setup_flow()
++        assert '"success":false' in resp.content
++        assert 'The provided Github account is linked to a different user' in resp.content
+diff --git a/tests/sentry/integrations/slack/test_link_identity.py b/tests/sentry/integrations/slack/test_link_identity.py
+index 97d2496d60..c8f819ccf5 100644
+--- a/tests/sentry/integrations/slack/test_link_identity.py
++++ b/tests/sentry/integrations/slack/test_link_identity.py
+@@ -85,13 +85,13 @@ class SlackIntegrationLinkIdentityTest(TestCase):
+     @responses.activate
+     @patch('sentry.integrations.slack.link_identity.unsign')
+     def test_overwrites_existing_identities(self, unsign):
+-        existing_id1 = Identity.objects.create(
++        Identity.objects.create(
+             user=self.user1,
+             idp=self.idp,
+             external_id='slack-id1',
+             status=IdentityStatus.VALID,
+         )
+-        existing_id2 = Identity.objects.create(
++        Identity.objects.create(
+             user=self.user2,
+             idp=self.idp,
+             external_id='slack-id2',
+@@ -123,10 +123,6 @@ class SlackIntegrationLinkIdentityTest(TestCase):
+ 
+         self.client.post(linking_url)
+ 
+-        assert Identity.objects.filter(
+-            id=existing_id1.id,
+-            external_id='slack-id2',
+-            user=self.user1,
+-        ).exists()
+-
+-        assert not Identity.objects.filter(id=existing_id2.id).exists()
++        Identity.objects.get(external_id='slack-id2', user=self.user1)
++        assert not Identity.objects.filter(external_id='slack-id1', user=self.user1).exists()
++        assert not Identity.objects.filter(external_id='slack-id2', user=self.user2).exists()

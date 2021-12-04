@@ -1,0 +1,1280 @@
+commit 085f45046f626edd1742b87588fe094fe178e030
+Author: David Cramer <dcramer@gmail.com>
+Date:   Wed Nov 28 10:27:42 2018 -0800
+
+    feat(api): Treat issues "fixed in commit" as resolved
+    
+    Add a check for GroupLink on the regression path to determine if there is a suggested
+    pending fix which has yet to be released.
+    
+    Additionally:
+    
+    - Mark issues as resolved immediately when they're fixed in an upcoming commit
+    - Fix auto assignment and subscription in release webhooks
+    - Unresolve issues when GroupLink is removed (when appropriate)
+    - Adds a resolution reason in the UI when fixed via a commit
+
+diff --git a/src/sentry/api/endpoints/project_group_index.py b/src/sentry/api/endpoints/project_group_index.py
+index d164d05822..c60192670f 100644
+--- a/src/sentry/api/endpoints/project_group_index.py
++++ b/src/sentry/api/endpoints/project_group_index.py
+@@ -94,8 +94,8 @@ class ValidationError(Exception):
+ 
+ 
+ class InCommitValidator(serializers.Serializer):
+-    commit = serializers.CharField()
+-    repository = serializers.CharField()
++    commit = serializers.CharField(required=True)
++    repository = serializers.CharField(required=True)
+ 
+     def validate_repository(self, attrs, source):
+         value = attrs[source]
+@@ -112,24 +112,33 @@ class InCommitValidator(serializers.Serializer):
+         return attrs
+ 
+     def validate(self, attrs):
+-        repository = attrs['repository']
++        attrs = super(InCommitValidator, self).validate(attrs)
++        repository = attrs.get('repository')
++        commit = attrs.get('commit')
++        if not repository:
++            raise serializers.ValidationError({
++                'repository': ['Unable to find the given repository.'],
++            })
++        if not commit:
++            raise serializers.ValidationError({
++                'commit': ['Unable to find the given commit.'],
++            })
+         try:
+             commit = Commit.objects.get(
+                 repository_id=repository.id,
+-                key=attrs['commit'],
++                key=commit,
+             )
+-            attrs['commit'] = commit
+         except Commit.DoesNotExist:
+             raise serializers.ValidationError({
+-                'commit': 'Unable to find the given commit.',
++                'commit': ['Unable to find the given commit.'],
+             })
+-        return attrs
++        return commit
+ 
+ 
+ class StatusDetailsValidator(serializers.Serializer):
+     inNextRelease = serializers.BooleanField()
+     inRelease = serializers.CharField()
+-    inCommit = InCommitValidator()
++    inCommit = InCommitValidator(required=False)
+     ignoreDuration = serializers.IntegerField()
+     ignoreCount = serializers.IntegerField()
+     # in minutes, max of one week
+@@ -291,7 +300,7 @@ class ProjectGroupIndexEndpoint(ProjectEndpoint, EnvironmentMixin):
+                 user=acting_user, key='self_assign_issue', default='0'
+             )
+             if self_assign_issue == '1' and not group.assignee_set.exists():
+-                result['assignedTo'] = Actor(type=User, id=extract_lazy_object(acting_user).id)
++                result['assignedTo'] = Actor(type=User, id=acting_user.id)
+ 
+     # statsPeriod=24h
+     @attach_scenarios([list_project_issues_scenario])
+@@ -595,17 +604,13 @@ class ProjectGroupIndexEndpoint(ProjectEndpoint, EnvironmentMixin):
+                 res_type_str = 'in_release'
+                 res_status = GroupResolution.Status.resolved
+             elif statusDetails.get('inCommit'):
+-                in_commit = statusDetails['inCommit']
+-                commit = in_commit['commit']
++                commit = statusDetails['inCommit']
+                 activity_type = Activity.SET_RESOLVED_IN_COMMIT
+                 activity_data = {
+-                    'commit': in_commit['commit'].id,
++                    'commit': commit.id,
+                 }
+                 status_details = {
+-                    'inCommit': {
+-                        'commit': in_commit['commit'].key,
+-                        'repository': in_commit['repository'].name,
+-                    },
++                    'inCommit': serialize(commit, request.user),
+                     'actor': serialize(extract_lazy_object(request.user), request.user),
+                 }
+                 res_type_str = 'in_commit'
+@@ -665,25 +670,21 @@ class ProjectGroupIndexEndpoint(ProjectEndpoint, EnvironmentMixin):
+                             linked_id=commit.id,
+                         )
+ 
+-                    # TODO(dcramer): we'd like this to mark things as resolved, but the current
+-                    # behavior does not yet do this due to some issues with 'resolved in commit'
+-                    if not commit or release:
+-                        affected = Group.objects.filter(
+-                            id=group.id,
+-                        ).update(
+-                            status=GroupStatus.RESOLVED,
+-                            resolved_at=now,
+-                        )
+-                        if not resolution:
+-                            created = affected
++                    affected = Group.objects.filter(
++                        id=group.id,
++                    ).update(
++                        status=GroupStatus.RESOLVED,
++                        resolved_at=now,
++                    )
++                    if not resolution:
++                        created = affected
+ 
+-                        group.status = GroupStatus.RESOLVED
+-                        group.resolved_at = now
+-                    else:
+-                        created = True
++                    group.status = GroupStatus.RESOLVED
++                    group.resolved_at = now
+ 
+                     self._subscribe_and_assign_issue(
+                         acting_user, group, result)
++
+                     if created:
+                         activity = Activity.objects.create(
+                             project=group.project,
+diff --git a/src/sentry/api/serializers/models/group.py b/src/sentry/api/serializers/models/group.py
+index f4228eddd8..7aafab1738 100644
+--- a/src/sentry/api/serializers/models/group.py
++++ b/src/sentry/api/serializers/models/group.py
+@@ -15,7 +15,7 @@ from sentry.api.serializers.models.actor import ActorSerializer
+ from sentry.api.fields.actor import Actor
+ from sentry.constants import LOG_LEVELS, StatsPeriod
+ from sentry.models import (
+-    Environment, Group, GroupAssignee, GroupBookmark, GroupMeta, GroupResolution, GroupSeen, GroupSnooze,
++    Commit, Environment, Group, GroupAssignee, GroupBookmark, GroupLink, GroupMeta, GroupResolution, GroupSeen, GroupSnooze,
+     GroupShare, GroupStatus, GroupSubscription, GroupSubscriptionReason, User, UserOption,
+     UserOptionValue
+ )
+@@ -187,18 +187,47 @@ class GroupSerializer(Serializer):
+             group__in=item_list,
+         )}
+ 
+-        resolutions = {
+-            i[0]: i[1:]
+-            for i in GroupResolution.objects.filter(
+-                group__in=item_list,
+-            ).values_list(
+-                'group',
+-                'type',
+-                'release__version',
+-                'actor_id',
+-            )
+-        }
+-        actor_ids = set(r[-1] for r in six.itervalues(resolutions))
++        resolved_item_list = [i for i in item_list if i.status == GroupStatus.RESOLVED]
++        if resolved_item_list:
++            release_resolutions = {
++                i[0]: i[1:]
++                for i in GroupResolution.objects.filter(
++                    group__in=resolved_item_list,
++                ).values_list(
++                    'group',
++                    'type',
++                    'release__version',
++                    'actor_id',
++                )
++            }
++
++            # due to our laziness, and django's inability to do a reasonable join here
++            # we end up with two queries
++            commit_results = list(Commit.objects.extra(
++                select={
++                    'group_id': 'sentry_grouplink.group_id',
++                },
++                tables=['sentry_grouplink'],
++                where=[
++                    'sentry_grouplink.linked_id = sentry_commit.id',
++                    'sentry_grouplink.group_id IN ({})'.format(
++                        ', '.join(six.text_type(i.id) for i in resolved_item_list)),
++                    'sentry_grouplink.linked_type = %s',
++                    'sentry_grouplink.relationship = %s',
++                ],
++                params=[
++                    int(GroupLink.LinkedType.commit),
++                    int(GroupLink.Relationship.resolves),
++                ]
++            ))
++            commit_resolutions = {
++                i.group_id: d for i, d in itertools.izip(commit_results, serialize(commit_results, user))
++            }
++        else:
++            release_resolutions = {}
++            commit_resolutions = {}
++
++        actor_ids = set(r[-1] for r in six.itervalues(release_resolutions))
+         actor_ids.update(r.actor_id for r in six.itervalues(ignore_items))
+         if actor_ids:
+             users = list(User.objects.filter(
+@@ -225,11 +254,16 @@ class GroupSerializer(Serializer):
+                     safe_execute(plugin.get_annotations, group=item, _with_transaction=False) or ()
+                 )
+ 
+-            resolution = resolutions.get(item.id)
++            resolution_actor = None
++            resolution_type = None
++            resolution = release_resolutions.get(item.id)
+             if resolution:
++                resolution_type = 'release'
+                 resolution_actor = actors.get(resolution[-1])
+-            else:
+-                resolution_actor = None
++            if not resolution:
++                resolution = commit_resolutions.get(item.id)
++                if resolution:
++                    resolution_type = 'commit'
+ 
+             ignore_item = ignore_items.get(item.id)
+             if ignore_item:
+@@ -247,6 +281,7 @@ class GroupSerializer(Serializer):
+                 'ignore_until': ignore_item,
+                 'ignore_actor': ignore_actor,
+                 'resolution': resolution,
++                'resolution_type': resolution_type,
+                 'resolution_actor': resolution_actor,
+                 'share_id': share_ids.get(item.id),
+                 'times_seen': times_seen.get(item.id, 0),
+@@ -289,13 +324,15 @@ class GroupSerializer(Serializer):
+             status_details['autoResolved'] = True
+         if status == GroupStatus.RESOLVED:
+             status_label = 'resolved'
+-            if attrs['resolution']:
++            if attrs['resolution_type'] == 'release':
+                 res_type, res_version, _ = attrs['resolution']
+                 if res_type in (GroupResolution.Type.in_next_release, None):
+                     status_details['inNextRelease'] = True
+                 elif res_type == GroupResolution.Type.in_release:
+                     status_details['inRelease'] = res_version
+                 status_details['actor'] = attrs['resolution_actor']
++            elif attrs['resolution_type'] == 'commit':
++                status_details['inCommit'] = attrs['resolution']
+         elif status == GroupStatus.IGNORED:
+             status_label = 'ignored'
+         elif status in [GroupStatus.PENDING_DELETION, GroupStatus.DELETION_IN_PROGRESS]:
+@@ -371,7 +408,8 @@ class StreamGroupSerializer(GroupSerializer):
+         '24h': StatsPeriod(24, timedelta(hours=1)),
+     }
+ 
+-    def __init__(self, environment_func=None, stats_period=None, matching_event_id=None, matching_event_environment=None):
++    def __init__(self, environment_func=None, stats_period=None,
++                 matching_event_id=None, matching_event_environment=None):
+         super(StreamGroupSerializer, self).__init__(environment_func)
+ 
+         if stats_period is not None:
+diff --git a/src/sentry/event_manager.py b/src/sentry/event_manager.py
+index d73617a939..d414331d79 100644
+--- a/src/sentry/event_manager.py
++++ b/src/sentry/event_manager.py
+@@ -37,7 +37,7 @@ from sentry.interfaces.schemas import validate_and_default_interface
+ from sentry.lang.native.utils import get_sdk_from_event
+ from sentry.models import (
+     Activity, Environment, Event, EventError, EventMapping, EventUser, Group,
+-    GroupEnvironment, GroupHash, GroupRelease, GroupResolution, GroupStatus,
++    GroupEnvironment, GroupHash, GroupLink, GroupRelease, GroupResolution, GroupStatus,
+     Project, Release, ReleaseEnvironment, ReleaseProject,
+     ReleaseProjectEnvironment, UserReport
+ )
+@@ -215,6 +215,17 @@ def process_timestamp(value, current_datetime=None):
+     return float(value.strftime('%s'))
+ 
+ 
++def has_pending_commit_resolution(group):
++    return GroupLink.objects.filter(
++        group_id=group.id,
++        linked_type=GroupLink.LinkedType.commit,
++        relationship=GroupLink.Relationship.resolves,
++    ).extra(
++        where=[
++            "NOT EXISTS(SELECT 1 FROM sentry_releasecommit where commit_id = sentry_grouplink.linked_id)"]
++    ).exists()
++
++
+ class HashDiscarded(Exception):
+     pass
+ 
+@@ -1321,6 +1332,9 @@ class EventManager(object):
+         elif GroupResolution.has_resolution(group, release):
+             return
+ 
++        elif has_pending_commit_resolution(group):
++            return
++
+         if not plugin_is_regression(group, event):
+             return
+ 
+diff --git a/src/sentry/models/grouplink.py b/src/sentry/models/grouplink.py
+index 21d2f505a7..58c8afbc6e 100644
+--- a/src/sentry/models/grouplink.py
++++ b/src/sentry/models/grouplink.py
+@@ -54,4 +54,4 @@ class GroupLink(Model):
+         db_table = 'sentry_grouplink'
+         unique_together = (('group_id', 'linked_type', 'linked_id'), )
+ 
+-    __repr__ = sane_repr('group_id', 'link', 'datetime')
++    __repr__ = sane_repr('group_id', 'linked_type', 'linked_id', 'relationship', 'datetime')
+diff --git a/src/sentry/receivers/releases.py b/src/sentry/receivers/releases.py
+index 7d99bb0b04..d1377a6855 100644
+--- a/src/sentry/receivers/releases.py
++++ b/src/sentry/receivers/releases.py
+@@ -2,10 +2,11 @@ from __future__ import absolute_import, print_function
+ 
+ from django.db import IntegrityError, transaction
+ from django.db.models.signals import post_save
++from django.utils import timezone
+ 
+ from sentry import analytics
+ from sentry.models import (
+-    Activity, Commit, GroupAssignee, GroupLink, Release, Repository, PullRequest
++    Activity, Commit, Group, GroupAssignee, GroupLink, GroupSubscription, GroupSubscriptionReason, GroupStatus, Release, Repository, PullRequest, UserOption
+ )
+ from sentry.signals import resolved_with_commit
+ from sentry.tasks.clear_expired_resolutions import clear_expired_resolutions
+@@ -18,7 +19,30 @@ def resolve_group_resolutions(instance, created, **kwargs):
+     clear_expired_resolutions.delay(release_id=instance.id)
+ 
+ 
++def remove_resolved_link(link):
++    # TODO(dcramer): ideally this would simply "undo" the link change,
++    # but we don't know for a fact that the resolution was most recently from
++    # the GroupLink
++    with transaction.atomic():
++        link.delete()
++        affected = Group.objects.filter(
++            status=GroupStatus.RESOLVED,
++            id=link.group_id,
++        ).update(
++            status=GroupStatus.UNRESOLVED,
++        )
++        if affected:
++            Activity.objects.create(
++                project_id=link.project_id,
++                group_id=link.group_id,
++                type=Activity.SET_UNRESOLVED,
++                ident=link.group_id,
++            )
++
++
+ def resolved_in_commit(instance, created, **kwargs):
++    current_datetime = timezone.now()
++
+     groups = instance.find_referenced_groups()
+ 
+     # Delete GroupLinks where message may have changed
+@@ -30,7 +54,7 @@ def resolved_in_commit(instance, created, **kwargs):
+     )
+     for link in group_links:
+         if link.group_id not in group_ids:
+-            link.delete()
++            remove_resolved_link(link)
+ 
+     try:
+         repo = Repository.objects.get(id=instance.repository_id)
+@@ -39,6 +63,8 @@ def resolved_in_commit(instance, created, **kwargs):
+ 
+     for group in groups:
+         try:
++            # XXX(dcramer): This code is somewhat duplicated from the
++            # project_group_index mutation api
+             with transaction.atomic():
+                 GroupLink.objects.create(
+                     group_id=group.id,
+@@ -52,19 +78,40 @@ def resolved_in_commit(instance, created, **kwargs):
+                     user_list = list(instance.author.find_users())
+                 else:
+                     user_list = ()
++
+                 if user_list:
++                    acting_user = user_list[0]
+                     Activity.objects.create(
+                         project_id=group.project_id,
+                         group=group,
+                         type=Activity.SET_RESOLVED_IN_COMMIT,
+                         ident=instance.id,
+-                        user=user_list[0],
++                        user=acting_user,
+                         data={
+                             'commit': instance.id,
+                         }
+                     )
+-                    GroupAssignee.objects.assign(
+-                        group=group, assigned_to=user_list[0], acting_user=user_list[0])
++                    self_assign_issue = UserOption.objects.get_value(
++                        user=acting_user,
++                        key='self_assign_issue',
++                        default='0'
++                    )
++                    if self_assign_issue == '1' and not group.assignee_set.exists():
++                        GroupAssignee.objects.assign(
++                            group=group,
++                            assigned_to=acting_user,
++                            acting_user=acting_user,
++                        )
++
++                    # while we only create activity and assignment for one user we want to
++                    # subscribe every user
++                    for user in user_list:
++                        GroupSubscription.objects.subscribe(
++                            user=user,
++                            group=group,
++                            reason=GroupSubscriptionReason.status_change,
++                        )
++
+                 else:
+                     Activity.objects.create(
+                         project_id=group.project_id,
+@@ -75,6 +122,12 @@ def resolved_in_commit(instance, created, **kwargs):
+                             'commit': instance.id,
+                         }
+                     )
++                Group.objects.filter(
++                    id=group.id,
++                ).update(
++                    status=GroupStatus.RESOLVED,
++                    resolved_at=current_datetime,
++                )
+         except IntegrityError:
+             pass
+         else:
+@@ -103,7 +156,7 @@ def resolved_in_pull_request(instance, created, **kwargs):
+     )
+     for link in group_links:
+         if link.group_id not in group_ids:
+-            link.delete()
++            remove_resolved_link(link)
+ 
+     try:
+         repo = Repository.objects.get(id=instance.repository_id)
+diff --git a/src/sentry/static/sentry/app/components/resolutionBox.jsx b/src/sentry/static/sentry/app/components/resolutionBox.jsx
+index 6dfcd474b6..a448950a39 100644
+--- a/src/sentry/static/sentry/app/components/resolutionBox.jsx
++++ b/src/sentry/static/sentry/app/components/resolutionBox.jsx
+@@ -2,6 +2,7 @@ import PropTypes from 'prop-types';
+ import React from 'react';
+ 
+ import Avatar from 'app/components/avatar';
++import CommitLink from 'app/components/commitLink';
+ import Version from 'app/components/version';
+ import {t, tct} from 'app/locale';
+ 
+@@ -46,15 +47,29 @@ export default class ResolutionBox extends React.Component {
+           />
+         ),
+       });
++    } else if (!!statusDetails.inCommit) {
++      return tct('This issue has been marked as resolved by [commit]', {
++        commit: (
++          <CommitLink
++            commitId={statusDetails.inCommit.id}
++            repository={statusDetails.inCommit.repository}
++          />
++        ),
++      });
+     }
+     return t('This issue has been marked as resolved.');
+   };
+ 
+   render = () => {
+     return (
+-      <div className="box">
+-        <span className="icon icon-checkmark" />
+-        <p className="truncate break-all">{this.renderReason()}</p>
++      <div
++        className="box"
++        style={{display: 'flex', alignItems: 'center', flex: 1, paddingBottom: 15}}
++      >
++        <span className="icon icon-checkmark" style={{position: 'static', top: 0}} />
++        <p className="truncate break-all" style={{paddingBottom: 0, paddingLeft: 16}}>
++          {this.renderReason()}
++        </p>
+       </div>
+     );
+   };
+diff --git a/src/sentry/testutils/fixtures.py b/src/sentry/testutils/fixtures.py
+index 54d90c4be3..ad8f0a551e 100644
+--- a/src/sentry/testutils/fixtures.py
++++ b/src/sentry/testutils/fixtures.py
+@@ -350,7 +350,7 @@ class Fixtures(object):
+ 
+         # add commits
+         if user:
+-            author = self.create_commit_author(project, user)
++            author = self.create_commit_author(project=project, user=user)
+             repo = self.create_repo(project, name='organization-{}'.format(project.slug))
+             commit = self.create_commit(
+                 project=project,
+@@ -377,46 +377,47 @@ class Fixtures(object):
+         )
+         return repo
+ 
+-    def create_commit(self, project, repo, author=None, release=None,
++    def create_commit(self, repo, project=None, author=None, release=None,
+                       message=None, key=None, date_added=None):
+         commit = Commit.objects.get_or_create(
+-            organization_id=project.organization_id,
++            organization_id=repo.organization_id,
+             repository_id=repo.id,
+             key=key or sha1(uuid4().hex).hexdigest(),
+             defaults={
+                 'message': message or make_sentence(),
+-                'author': author or self.create_commit_author(project),
++                'author': author or self.create_commit_author(organization_id=repo.organization_id),
+                 'date_added': date_added or timezone.now(),
+             }
+         )[0]
+ 
+         if release:
++            assert project
+             ReleaseCommit.objects.create(
+-                organization_id=project.organization_id,
++                organization_id=repo.organization_id,
+                 project_id=project.id,
+                 release=release,
+                 commit=commit,
+                 order=1,
+             )
+ 
+-        self.create_commit_file_change(commit, project, '/models/foo.py')
+-        self.create_commit_file_change(commit, project, '/worsematch/foo.py')
+-        self.create_commit_file_change(commit, project, '/models/other.py')
++        self.create_commit_file_change(commit=commit, filename='/models/foo.py')
++        self.create_commit_file_change(commit=commit, filename='/worsematch/foo.py')
++        self.create_commit_file_change(commit=commit, filename='/models/other.py')
+ 
+         return commit
+ 
+-    def create_commit_author(self, project, user=None):
++    def create_commit_author(self, organization_id=None, project=None, user=None):
+         return CommitAuthor.objects.get_or_create(
+-            organization_id=project.organization_id,
++            organization_id=organization_id or project.organization_id,
+             email=user.email if user else '{}@example.com'.format(make_word()),
+             defaults={
+                 'name': user.name if user else make_word(),
+             }
+         )[0]
+ 
+-    def create_commit_file_change(self, commit, project, filename):
++    def create_commit_file_change(self, commit, filename):
+         commit_file_change = CommitFileChange.objects.get_or_create(
+-            organization_id=project.organization_id,
++            organization_id=commit.organization_id,
+             commit=commit,
+             filename=filename,
+             type='M',
+diff --git a/tests/js/fixtures/commit.js b/tests/js/fixtures/commit.js
+new file mode 100644
+index 0000000000..5b1eb48085
+--- /dev/null
++++ b/tests/js/fixtures/commit.js
+@@ -0,0 +1,14 @@
++import {CommitAuthor} from './commitAuthor';
++import {Repository} from './repository';
++
++export function Commit(params = {}) {
++  return {
++    dateCreated: '2018-11-30T18:46:31Z',
++    message:
++      '(improve) Add Links to Spike-Protection Email (#2408)\n\n* (improve) Add Links to Spike-Protection Email\r\n\r\nUsers now have access to useful links from the blogs and docs on Spike-protection.\r\n\r\n* fixed wording',
++    id: 'f7f395d14b2fe29a4e253bf1d3094d61e6ad4434',
++    author: CommitAuthor(),
++    repository: Repository(),
++    ...params,
++  };
++}
+diff --git a/tests/js/fixtures/commitAuthor.js b/tests/js/fixtures/commitAuthor.js
+new file mode 100644
+index 0000000000..cf5ac2e6e1
+--- /dev/null
++++ b/tests/js/fixtures/commitAuthor.js
+@@ -0,0 +1,29 @@
++export function CommitAuthor(params = {}) {
++  return {
++    username: 'example@sentry.io',
++    lastLogin: '2018-11-30T21:18:09.812Z',
++    isSuperuser: true,
++    isManaged: false,
++    lastActive: '2018-11-30T21:25:15.222Z',
++    id: '224288',
++    isActive: true,
++    has2fa: false,
++    name: 'Foo Bar',
++    avatarUrl: 'https://example.com/avatar.png',
++    dateJoined: '2018-02-26T23:57:43.766Z',
++    emails: [
++      {
++        is_verified: true,
++        id: '231605',
++        email: 'example@sentry.io',
++      },
++    ],
++    avatar: {
++      avatarUuid: null,
++      avatarType: 'letter_avatar',
++    },
++    hasPasswordAuth: true,
++    email: 'example@sentry.io',
++    ...params,
++  };
++}
+diff --git a/tests/js/spec/components/__snapshots__/resolutionBox.spec.jsx.snap b/tests/js/spec/components/__snapshots__/resolutionBox.spec.jsx.snap
+index 1e2ab1e0a8..7c81eec728 100644
+--- a/tests/js/spec/components/__snapshots__/resolutionBox.spec.jsx.snap
++++ b/tests/js/spec/components/__snapshots__/resolutionBox.spec.jsx.snap
+@@ -3,27 +3,124 @@
+ exports[`ResolutionBox render() handles default 1`] = `
+ <div
+   className="box"
++  style={
++    Object {
++      "alignItems": "center",
++      "display": "flex",
++      "flex": 1,
++      "paddingBottom": 15,
++    }
++  }
+ >
+   <span
+     className="icon icon-checkmark"
++    style={
++      Object {
++        "position": "static",
++        "top": 0,
++      }
++    }
+   />
+   <p
+     className="truncate break-all"
++    style={
++      Object {
++        "paddingBottom": 0,
++        "paddingLeft": 16,
++      }
++    }
+   >
+     This issue has been marked as resolved.
+   </p>
+ </div>
+ `;
+ 
++exports[`ResolutionBox render() handles inCommit 1`] = `
++<div
++  className="box"
++  style={
++    Object {
++      "alignItems": "center",
++      "display": "flex",
++      "flex": 1,
++      "paddingBottom": 15,
++    }
++  }
++>
++  <span
++    className="icon icon-checkmark"
++    style={
++      Object {
++        "position": "static",
++        "top": 0,
++      }
++    }
++  />
++  <p
++    className="truncate break-all"
++    style={
++      Object {
++        "paddingBottom": 0,
++        "paddingLeft": 16,
++      }
++    }
++  >
++    <span
++      key="3"
++    >
++      <span
++        key="0"
++      >
++        This issue has been marked as resolved by 
++      </span>
++      <CommitLink
++        commitId="f7f395d14b2fe29a4e253bf1d3094d61e6ad4434"
++        key="1"
++        repository={
++          Object {
++            "externalSlug": "example/repo-name",
++            "id": "4",
++            "name": "example/repo-name",
++            "provider": "github",
++            "status": "active",
++            "url": "https://github.com/example/repo-name",
++          }
++        }
++      />
++    </span>
++  </p>
++</div>
++`;
++
+ exports[`ResolutionBox render() handles inNextRelease 1`] = `
+ <div
+   className="box"
++  style={
++    Object {
++      "alignItems": "center",
++      "display": "flex",
++      "flex": 1,
++      "paddingBottom": 15,
++    }
++  }
+ >
+   <span
+     className="icon icon-checkmark"
++    style={
++      Object {
++        "position": "static",
++        "top": 0,
++      }
++    }
+   />
+   <p
+     className="truncate break-all"
++    style={
++      Object {
++        "paddingBottom": 0,
++        "paddingLeft": 16,
++      }
++    }
+   >
+     This issue has been marked as resolved in the upcoming release.
+   </p>
+@@ -33,12 +130,32 @@ exports[`ResolutionBox render() handles inNextRelease 1`] = `
+ exports[`ResolutionBox render() handles inNextRelease with actor 1`] = `
+ <div
+   className="box"
++  style={
++    Object {
++      "alignItems": "center",
++      "display": "flex",
++      "flex": 1,
++      "paddingBottom": 15,
++    }
++  }
+ >
+   <span
+     className="icon icon-checkmark"
++    style={
++      Object {
++        "position": "static",
++        "top": 0,
++      }
++    }
+   />
+   <p
+     className="truncate break-all"
++    style={
++      Object {
++        "paddingBottom": 0,
++        "paddingLeft": 16,
++      }
++    }
+   >
+     <span
+       key="3"
+@@ -81,12 +198,32 @@ exports[`ResolutionBox render() handles inNextRelease with actor 1`] = `
+ exports[`ResolutionBox render() handles inRelease 1`] = `
+ <div
+   className="box"
++  style={
++    Object {
++      "alignItems": "center",
++      "display": "flex",
++      "flex": 1,
++      "paddingBottom": 15,
++    }
++  }
+ >
+   <span
+     className="icon icon-checkmark"
++    style={
++      Object {
++        "position": "static",
++        "top": 0,
++      }
++    }
+   />
+   <p
+     className="truncate break-all"
++    style={
++      Object {
++        "paddingBottom": 0,
++        "paddingLeft": 16,
++      }
++    }
+   >
+     <span
+       key="4"
+@@ -117,12 +254,32 @@ exports[`ResolutionBox render() handles inRelease 1`] = `
+ exports[`ResolutionBox render() handles inRelease with actor 1`] = `
+ <div
+   className="box"
++  style={
++    Object {
++      "alignItems": "center",
++      "display": "flex",
++      "flex": 1,
++      "paddingBottom": 15,
++    }
++  }
+ >
+   <span
+     className="icon icon-checkmark"
++    style={
++      Object {
++        "position": "static",
++        "top": 0,
++      }
++    }
+   />
+   <p
+     className="truncate break-all"
++    style={
++      Object {
++        "paddingBottom": 0,
++        "paddingLeft": 16,
++      }
++    }
+   >
+     <span
+       key="5"
+diff --git a/tests/js/spec/components/resolutionBox.spec.jsx b/tests/js/spec/components/resolutionBox.spec.jsx
+index ed3f9dbc34..239a130a3b 100644
+--- a/tests/js/spec/components/resolutionBox.spec.jsx
++++ b/tests/js/spec/components/resolutionBox.spec.jsx
+@@ -55,5 +55,16 @@ describe('ResolutionBox', function() {
+       );
+       expect(wrapper).toMatchSnapshot();
+     });
++    it('handles inCommit', function() {
++      let wrapper = shallow(
++        <ResolutionBox
++          statusDetails={{
++            inCommit: TestStubs.Commit(),
++          }}
++          params={{orgId: 'org', projectId: 'project'}}
++        />
++      );
++      expect(wrapper).toMatchSnapshot();
++    });
+   });
+ });
+diff --git a/tests/sentry/api/endpoints/test_project_group_index.py b/tests/sentry/api/endpoints/test_project_group_index.py
+index b9b65f9184..fa814095f5 100644
+--- a/tests/sentry/api/endpoints/test_project_group_index.py
++++ b/tests/sentry/api/endpoints/test_project_group_index.py
+@@ -993,16 +993,11 @@ class GroupUpdateTest(APITestCase):
+         )
+         assert response.status_code == 200
+         assert response.data['status'] == 'resolved'
+-        assert response.data['statusDetails']['inCommit'] == {
+-            'commit': commit.key,
+-            'repository': repo.name,
+-        }
++        assert response.data['statusDetails']['inCommit']['id'] == commit.key
+         assert response.data['statusDetails']['actor']['id'] == six.text_type(self.user.id)
+ 
+         group = Group.objects.get(id=group.id)
+-        # TODO(dcramer): we'd like this to mark things as resolved, but the current
+-        # behavior does not yet do this due to some issues with 'resolved in commit'
+-        assert group.status != GroupStatus.RESOLVED
++        assert group.status == GroupStatus.RESOLVED
+ 
+         link = GroupLink.objects.get(group_id=group.id)
+         assert link.linked_type == GroupLink.LinkedType.commit
+@@ -1061,10 +1056,7 @@ class GroupUpdateTest(APITestCase):
+         )
+         assert response.status_code == 200
+         assert response.data['status'] == 'resolved'
+-        assert response.data['statusDetails']['inCommit'] == {
+-            'commit': commit.key,
+-            'repository': repo.name,
+-        }
++        assert response.data['statusDetails']['inCommit']['id'] == commit.key
+         assert response.data['statusDetails']['actor']['id'] == six.text_type(self.user.id)
+ 
+         group = Group.objects.get(id=group.id)
+diff --git a/tests/sentry/api/serializers/test_group.py b/tests/sentry/api/serializers/test_group.py
+index 358862f11a..9881a9ff6f 100644
+--- a/tests/sentry/api/serializers/test_group.py
++++ b/tests/sentry/api/serializers/test_group.py
+@@ -13,7 +13,7 @@ from mock import patch
+ from sentry.api.serializers import serialize
+ from sentry.api.serializers.models.group import StreamGroupSerializer
+ from sentry.models import (
+-    Environment, GroupResolution, GroupSnooze, GroupStatus,
++    Environment, GroupLink, GroupResolution, GroupSnooze, GroupStatus,
+     GroupSubscription, UserOption, UserOptionValue
+ )
+ from sentry.testutils import TestCase
+@@ -123,6 +123,25 @@ class GroupSerializerTest(TestCase):
+         assert result['status'] == 'resolved'
+         assert result['statusDetails']['actor']['id'] == six.text_type(user.id)
+ 
++    def test_resolved_in_commit(self):
++        repo = self.create_repo(project=self.project)
++        commit = self.create_commit(repo=repo)
++        user = self.create_user()
++        group = self.create_group(
++            status=GroupStatus.RESOLVED,
++        )
++        GroupLink.objects.create(
++            group_id=group.id,
++            project_id=group.project_id,
++            linked_id=commit.id,
++            linked_type=GroupLink.LinkedType.commit,
++            relationship=GroupLink.Relationship.resolves,
++        )
++
++        result = serialize(group, user)
++        assert result['status'] == 'resolved'
++        assert result['statusDetails']['inCommit']['id'] == commit.key
++
+     @patch('sentry.models.Group.is_over_resolve_age')
+     def test_auto_resolved(self, mock_is_over_resolve_age):
+         mock_is_over_resolve_age.return_value = True
+diff --git a/tests/sentry/event_manager/test_event_manager.py b/tests/sentry/event_manager/test_event_manager.py
+index f76a976cbb..67eec55e0f 100644
+--- a/tests/sentry/event_manager/test_event_manager.py
++++ b/tests/sentry/event_manager/test_event_manager.py
+@@ -503,6 +503,95 @@ class EventManagerTest(TransactionTestCase):
+ 
+                 mock_send_activity_notifications_delay.assert_called_once_with(activity.id)
+ 
++    @mock.patch('sentry.tasks.activity.send_activity_notifications.delay')
++    @mock.patch('sentry.event_manager.plugin_is_regression')
++    def test_does_not_mark_as_unresolved_with_pending_commit(
++        self, plugin_is_regression, mock_send_activity_notifications_delay
++    ):
++        plugin_is_regression.return_value = True
++
++        repo = self.create_repo(project=self.project)
++        commit = self.create_commit(repo=repo)
++
++        manager = EventManager(
++            make_event(
++                event_id='a' * 32,
++                checksum='a' * 32,
++                timestamp=time() - 50000,  # need to work around active_at
++            )
++        )
++        event = manager.save(self.project.id)
++
++        group = event.group
++
++        group.update(status=GroupStatus.RESOLVED)
++        GroupLink.objects.create(
++            group_id=group.id,
++            project_id=group.project_id,
++            linked_id=commit.id,
++            linked_type=GroupLink.LinkedType.commit,
++            relationship=GroupLink.Relationship.resolves,
++        )
++
++        manager = EventManager(
++            make_event(
++                event_id='b' * 32,
++                checksum='a' * 32,
++                timestamp=time(),
++            )
++        )
++        event = manager.save(self.project.id)
++        assert event.group_id == group.id
++
++        group = Group.objects.get(id=group.id)
++        assert group.status == GroupStatus.RESOLVED
++
++    @mock.patch('sentry.tasks.activity.send_activity_notifications.delay')
++    @mock.patch('sentry.event_manager.plugin_is_regression')
++    def test_mark_as_unresolved_with_released_commit(
++        self, plugin_is_regression, mock_send_activity_notifications_delay
++    ):
++        plugin_is_regression.return_value = True
++
++        release = self.create_release(project=self.project)
++        repo = self.create_repo(project=self.project)
++        commit = self.create_commit(repo=repo, release=release, project=self.project)
++
++        manager = EventManager(
++            make_event(
++                event_id='a' * 32,
++                checksum='a' * 32,
++                timestamp=time() - 50000,  # need to work around active_at
++            )
++        )
++        event = manager.save(self.project.id)
++
++        group = event.group
++
++        group.update(status=GroupStatus.RESOLVED)
++
++        GroupLink.objects.create(
++            group_id=group.id,
++            project_id=group.project_id,
++            linked_id=commit.id,
++            linked_type=GroupLink.LinkedType.commit,
++            relationship=GroupLink.Relationship.resolves,
++        )
++
++        manager = EventManager(
++            make_event(
++                event_id='b' * 32,
++                checksum='a' * 32,
++                timestamp=time(),
++            )
++        )
++
++        event = manager.save(self.project.id)
++        assert event.group_id == group.id
++
++        group = Group.objects.get(id=group.id)
++        assert group.status == GroupStatus.UNRESOLVED
++
+     @mock.patch('sentry.models.Group.is_resolved')
+     def test_unresolves_group_with_auto_resolve(self, mock_is_resolved):
+         ts = time() - 100
+diff --git a/tests/sentry/receivers/test_releases.py b/tests/sentry/receivers/test_releases.py
+index 968ea4a49b..c1982e6b89 100644
+--- a/tests/sentry/receivers/test_releases.py
++++ b/tests/sentry/receivers/test_releases.py
+@@ -6,8 +6,8 @@ from mock import patch
+ from uuid import uuid4
+ 
+ from sentry.models import (
+-    Activity, Commit, CommitAuthor, GroupAssignee, GroupLink, OrganizationMember,
+-    Release, Repository, UserEmail
++    Activity, Commit, CommitAuthor, Group, GroupAssignee, GroupLink, GroupStatus, GroupSubscription, OrganizationMember,
++    Release, Repository, UserEmail, UserOption
+ )
+ from sentry.testutils import TestCase
+ 
+@@ -27,8 +27,31 @@ class ResolveGroupResolutionsTest(TestCase):
+ 
+ 
+ class ResolvedInCommitTest(TestCase):
++    def assertResolvedFromCommit(self, group, commit):
++        assert GroupLink.objects.filter(
++            group_id=group.id,
++            linked_type=GroupLink.LinkedType.commit,
++            linked_id=commit.id,
++        ).exists()
++        assert Group.objects.filter(
++            id=group.id,
++            status=GroupStatus.RESOLVED,
++            resolved_at__isnull=False,
++        ).exists()
++
++    def assertNotResolvedFromCommit(self, group, commit):
++        assert not GroupLink.objects.filter(
++            group_id=group.id,
++            linked_type=GroupLink.LinkedType.commit,
++            linked_id=commit.id,
++        ).exists()
++        assert not Group.objects.filter(
++            id=group.id,
++            status=GroupStatus.RESOLVED,
++        ).exists()
++
+     # TODO(dcramer): pull out short ID matching and expand regexp tests
+-    def test_simple(self):
++    def test_simple_no_author(self):
+         group = self.create_group()
+ 
+         repo = Repository.objects.create(
+@@ -43,10 +66,7 @@ class ResolvedInCommitTest(TestCase):
+             message=u'Foo Biz\n\nFixes {}'.format(group.qualified_short_id),
+         )
+ 
+-        assert GroupLink.objects.filter(
+-            group_id=group.id,
+-            linked_type=GroupLink.LinkedType.commit,
+-            linked_id=commit.id).exists()
++        self.assertResolvedFromCommit(group, commit)
+ 
+     def test_updating_commit(self):
+         group = self.create_group()
+@@ -62,18 +82,12 @@ class ResolvedInCommitTest(TestCase):
+             organization_id=group.organization.id,
+         )
+ 
+-        assert not GroupLink.objects.filter(
+-            group_id=group.id,
+-            linked_type=GroupLink.LinkedType.commit,
+-            linked_id=commit.id).exists()
++        self.assertNotResolvedFromCommit(group, commit)
+ 
+         commit.message = u'Foo Biz\n\nFixes {}'.format(group.qualified_short_id)
+         commit.save()
+ 
+-        assert GroupLink.objects.filter(
+-            group_id=group.id,
+-            linked_type=GroupLink.LinkedType.commit,
+-            linked_id=commit.id).exists()
++        self.assertResolvedFromCommit(group, commit)
+ 
+     def test_updating_commit_with_existing_grouplink(self):
+         group = self.create_group()
+@@ -90,18 +104,12 @@ class ResolvedInCommitTest(TestCase):
+             message=u'Foo Biz\n\nFixes {}'.format(group.qualified_short_id),
+         )
+ 
+-        assert GroupLink.objects.filter(
+-            group_id=group.id,
+-            linked_type=GroupLink.LinkedType.commit,
+-            linked_id=commit.id).exists()
++        self.assertResolvedFromCommit(group, commit)
+ 
+         commit.message = u'Foo Bar Biz\n\nFixes {}'.format(group.qualified_short_id)
+         commit.save()
+ 
+-        assert GroupLink.objects.filter(
+-            group_id=group.id,
+-            linked_type=GroupLink.LinkedType.commit,
+-            linked_id=commit.id).count() == 1
++        self.assertResolvedFromCommit(group, commit)
+ 
+     def test_removes_group_link_when_message_changes(self):
+         group = self.create_group()
+@@ -118,18 +126,12 @@ class ResolvedInCommitTest(TestCase):
+             message=u'Foo Biz\n\nFixes {}'.format(group.qualified_short_id),
+         )
+ 
+-        assert GroupLink.objects.filter(
+-            group_id=group.id,
+-            linked_type=GroupLink.LinkedType.commit,
+-            linked_id=commit.id).exists()
++        self.assertResolvedFromCommit(group, commit)
+ 
+         commit.message = 'no groups here'
+         commit.save()
+ 
+-        assert not GroupLink.objects.filter(
+-            group_id=group.id,
+-            linked_type=GroupLink.LinkedType.commit,
+-            linked_id=commit.id).exists()
++        self.assertNotResolvedFromCommit(group, commit)
+ 
+     def test_no_matching_group(self):
+         repo = Repository.objects.create(
+@@ -147,15 +149,27 @@ class ResolvedInCommitTest(TestCase):
+ 
+         assert not GroupLink.objects.filter(
+             linked_type=GroupLink.LinkedType.commit,
+-            linked_id=commit.id).exists()
++            linked_id=commit.id,
++        ).exists()
+ 
+-    def test_matching_author(self):
++    def test_matching_author_with_assignment(self):
+         group = self.create_group()
+-
++        user = self.create_user(
++            name='Foo Bar', email='foo@example.com', is_active=True)
++        email = UserEmail.get_primary_email(user=user)
++        email.is_verified = True
++        email.save()
+         repo = Repository.objects.create(
+             name='example',
+             organization_id=self.group.organization.id,
+         )
++        OrganizationMember.objects.create(
++            organization=group.project.organization, user=user)
++        UserOption.objects.set_value(
++            user=user,
++            key='self_assign_issue',
++            value='1'
++        )
+ 
+         commit = Commit.objects.create(
+             key=sha1(uuid4().hex).hexdigest(),
+@@ -164,17 +178,32 @@ class ResolvedInCommitTest(TestCase):
+             message=u'Foo Biz\n\nFixes {}'.format(group.qualified_short_id),
+             author=CommitAuthor.objects.create(
+                 organization_id=group.organization.id,
+-                name=self.user.name,
+-                email=self.user.email,
++                name=user.name,
++                email=user.email,
+             )
+         )
+ 
+-        assert GroupLink.objects.filter(
+-            group_id=group.id,
+-            linked_type=GroupLink.LinkedType.commit,
+-            linked_id=commit.id).exists()
++        self.assertResolvedFromCommit(group, commit)
++
++        assert GroupAssignee.objects.filter(group=group, user=user).exists()
++
++        assert Activity.objects.filter(
++            project=group.project,
++            group=group,
++            type=Activity.ASSIGNED,
++            user=user,
++        )[0].data == {
++            'assignee': six.text_type(user.id),
++            'assigneeEmail': user.email,
++            'assigneeType': 'user',
++        }
++
++        assert GroupSubscription.objects.filter(
++            group=group,
++            user=user,
++        ).exists()
+ 
+-    def test_assigns_author(self):
++    def test_matching_author_without_assignment(self):
+         group = self.create_group()
+         user = self.create_user(
+             name='Foo Bar', email='foo@example.com', is_active=True)
+@@ -187,6 +216,12 @@ class ResolvedInCommitTest(TestCase):
+         )
+         OrganizationMember.objects.create(
+             organization=group.project.organization, user=user)
++        UserOption.objects.set_value(
++            user=user,
++            key='self_assign_issue',
++            value='0'
++        )
++
+         commit = Commit.objects.create(
+             key=sha1(uuid4().hex).hexdigest(),
+             organization_id=group.organization.id,
+@@ -199,20 +234,16 @@ class ResolvedInCommitTest(TestCase):
+             )
+         )
+ 
+-        assert GroupLink.objects.filter(
+-            group_id=group.id,
+-            linked_type=GroupLink.LinkedType.commit,
+-            linked_id=commit.id).exists()
+-
+-        assert GroupAssignee.objects.filter(group=group, user=user).exists()
++        self.assertResolvedFromCommit(group, commit)
+ 
+-        assert Activity.objects.filter(
++        assert not Activity.objects.filter(
+             project=group.project,
+             group=group,
+             type=Activity.ASSIGNED,
+             user=user,
+-        )[0].data == {
+-            'assignee': six.text_type(user.id),
+-            'assigneeEmail': user.email,
+-            'assigneeType': 'user',
+-        }
++        ).exists()
++
++        assert GroupSubscription.objects.filter(
++            group=group,
++            user=user,
++        ).exists()

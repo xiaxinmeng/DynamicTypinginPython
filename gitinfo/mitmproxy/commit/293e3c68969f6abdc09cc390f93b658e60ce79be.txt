@@ -1,0 +1,324 @@
+commit 293e3c68969f6abdc09cc390f93b658e60ce79be
+Author: Thomas Kriechbaumer <thomas@kriechbaumer.name>
+Date:   Mon Jun 8 10:45:17 2015 +0200
+
+    http2: add request-response handling
+
+diff --git a/libpathod/language/__init__.py b/libpathod/language/__init__.py
+index c41e8602..ae9a8c76 100644
+--- a/libpathod/language/__init__.py
++++ b/libpathod/language/__init__.py
+@@ -3,7 +3,7 @@ import time
+ 
+ import pyparsing as pp
+ 
+-from . import http, websockets, writer, exceptions
++from . import http, http2, websockets, writer, exceptions
+ 
+ from exceptions import *
+ from base import Settings
+@@ -39,20 +39,24 @@ def parse_pathod(s):
+     return itertools.chain(*[expand(i) for i in reqs])
+ 
+ 
+-def parse_pathoc(s):
++def parse_pathoc(s, use_http2=False):
+     try:
+         s = s.decode("ascii")
+     except UnicodeError:
+         raise exceptions.ParseException("Spec must be valid ASCII.", 0, 0)
+     try:
+-        reqs = pp.OneOrMore(
+-            pp.Or(
+-                [
+-                    websockets.WebsocketClientFrame.expr(),
+-                    http.Request.expr(),
+-                ]
+-            )
+-        ).parseString(s, parseAll=True)
++        if use_http2:
++            expressions = [
++                # http2.Frame.expr(),
++                http2.Request.expr(),
++            ]
++        else:
++            expressions = [
++                websockets.WebsocketClientFrame.expr(),
++                http.Request.expr(),
++            ]
++
++        reqs = pp.OneOrMore(pp.Or(expressions)).parseString(s, parseAll=True)
+     except pp.ParseException as v:
+         raise exceptions.ParseException(v.msg, v.line, v.col)
+     return itertools.chain(*[expand(i) for i in reqs])
+diff --git a/libpathod/language/base.py b/libpathod/language/base.py
+index ee5d05b5..88712d69 100644
+--- a/libpathod/language/base.py
++++ b/libpathod/language/base.py
+@@ -15,13 +15,15 @@ class Settings:
+         staticdir = None,
+         unconstrained_file_access = False,
+         request_host = None,
+-        websocket_key = None
++        websocket_key = None,
++        protocol = None,
+     ):
++        self.is_client = is_client
+         self.staticdir = staticdir
+         self.unconstrained_file_access = unconstrained_file_access
+         self.request_host = request_host
+-        self.websocket_key = websocket_key
+-        self.is_client = is_client
++        self.websocket_key = websocket_key  # TODO: refactor this into the protocol
++        self.protocol = protocol
+ 
+ 
+ Sep = pp.Optional(pp.Literal(":")).suppress()
+diff --git a/libpathod/language/http2.py b/libpathod/language/http2.py
+new file mode 100644
+index 00000000..d78fc5c8
+--- /dev/null
++++ b/libpathod/language/http2.py
+@@ -0,0 +1,119 @@
++import os
++import netlib.http2
++import pyparsing as pp
++from . import base, generators, actions, message
++
++"""
++    Normal HTTP requests:
++        <method>:<path>:<header>:<body>
++    e.g.:
++        GET:/
++        GET:/:foo=bar
++        POST:/:foo=bar:'content body payload'
++
++    Individual HTTP/2 frames:
++        h2f:<payload_length>:<type>:<flags>:<stream_id>:<payload>
++    e.g.:
++        h2f:0:PING
++        h2f:42:HEADERS:END_HEADERS:0x1234567:foo=bar,host=example.com
++        h2f:42:DATA:END_STREAM,PADDED:0x1234567:'content body payload'
++"""
++
++
++class Method(base.OptionsOrValue):
++    options = [
++        "GET",
++        "HEAD",
++        "POST",
++        "PUT",
++        "DELETE",
++    ]
++
++
++class Path(base.Value):
++    pass
++
++
++class Header(base.KeyValue):
++    preamble = "h"
++
++
++class Body(base.Value):
++    preamble = "b"
++
++
++class Times(base.Integer):
++    preamble = "x"
++
++
++class Request(message.Message):
++    comps = (
++        Header,
++        Body,
++
++        Times,
++    )
++
++    @property
++    def method(self):
++        return self.tok(Method)
++
++    @property
++    def path(self):
++        return self.tok(Path)
++
++    @property
++    def headers(self):
++        return self.toks(Header)
++
++    @property
++    def body(self):
++        return self.tok(Body)
++
++    @property
++    def times(self):
++        return self.tok(Times)
++
++    @property
++    def actions(self):
++        return []
++
++    @classmethod
++    def expr(klass):
++        parts = [i.expr() for i in klass.comps]
++        atom = pp.MatchFirst(parts)
++        resp = pp.And(
++            [
++                Method.expr(),
++                base.Sep,
++                Path.expr(),
++                base.Sep,
++                pp.ZeroOrMore(base.Sep + atom)
++            ]
++        )
++        resp = resp.setParseAction(klass)
++        return resp
++
++    def resolve(self, settings, msg=None):
++        tokens = self.tokens[:]
++        return self.__class__(
++            [i.resolve(settings, self) for i in tokens]
++        )
++
++    def values(self, settings):
++        return settings.protocol.create_request(
++            self.method.value.get_generator(settings),
++            self.path,
++            self.headers,
++            self.body)
++
++    def spec(self):
++        return ":".join([i.spec() for i in self.tokens])
++
++
++# class H2F(base.CaselessLiteral):
++#     TOK = "h2f"
++#
++#
++# class WebsocketFrame(message.Message):
++#     pass
+diff --git a/libpathod/pathoc.py b/libpathod/pathoc.py
+index 55a012e4..ba06b2f1 100644
+--- a/libpathod/pathoc.py
++++ b/libpathod/pathoc.py
+@@ -17,6 +17,9 @@ import language.http
+ import language.websockets
+ from . import utils, log
+ 
++import logging
++logging.getLogger("hpack").setLevel(logging.WARNING)
++
+ 
+ class PathocError(Exception):
+     pass
+@@ -187,12 +190,7 @@ class Pathoc(tcp.TCPClient):
+             ignorecodes: Sequence of return codes to ignore
+         """
+         tcp.TCPClient.__init__(self, address)
+-        self.settings = language.Settings(
+-            staticdir = os.getcwd(),
+-            unconstrained_file_access = True,
+-            request_host = self.address.host,
+-            is_client = True
+-        )
++
+         self.ssl, self.sni = ssl, sni
+         self.clientcert = clientcert
+         self.sslversion = utils.SSLVERSIONS[sslversion]
+@@ -217,6 +215,20 @@ class Pathoc(tcp.TCPClient):
+ 
+         self.ws_framereader = None
+ 
++        if self.use_http2:
++            self.protocol = http2.HTTP2Protocol(self)
++        else:
++            # TODO: create HTTP or Websockets protocol
++            self.protocol = None
++
++        self.settings = language.Settings(
++            is_client = True,
++            staticdir = os.getcwd(),
++            unconstrained_file_access = True,
++            request_host = self.address.host,
++            protocol = self.protocol,
++        )
++
+     def log(self):
+         return log.Log(
+             self.fp,
+@@ -257,9 +269,9 @@ class Pathoc(tcp.TCPClient):
+         self.sslinfo = None
+         if self.ssl:
+             try:
+-                alpn_protos=[b'http1.1']
++                alpn_protos = [b'http1.1']  # TODO: move to a new HTTP1 protocol
+                 if self.use_http2:
+-                    alpn_protos.append(HTTP2Protocol.ALPN_PROTO_H2)
++                    alpn_protos.append(http2.HTTP2Protocol.ALPN_PROTO_H2)
+ 
+                 self.convert_to_ssl(
+                     sni=self.sni,
+@@ -280,9 +292,9 @@ class Pathoc(tcp.TCPClient):
+                 print >> fp, str(self.sslinfo)
+ 
+             if self.use_http2:
+-                h2.HTTP2Protocol.check_alpn(self)
++                self.protocol.check_alpn()
+                 if not self.http2_skip_connection_preface:
+-                    h2.HTTP2Protocol.send_connection_preface(self)
++                    self.protocol.perform_connection_preface()
+ 
+         if self.timeout:
+             self.settimeout(self.timeout)
+@@ -368,15 +380,20 @@ class Pathoc(tcp.TCPClient):
+             try:
+                 req = language.serve(r, self.wfile, self.settings)
+                 self.wfile.flush()
+-                resp = list(
+-                    http.read_response(
+-                        self.rfile,
+-                        req["method"],
+-                        None
++
++                if self.use_http2:
++                    status_code, headers, body = self.protocol.read_response()
++                    resp = Response("HTTP/2", status_code, "", headers, body, self.sslinfo)
++                else:
++                    resp = list(
++                        http.read_response(
++                            self.rfile,
++                            req["method"],
++                            None
++                        )
+                     )
+-                )
+-                resp.append(self.sslinfo)
+-                resp = Response(*resp)
++                    resp.append(self.sslinfo)
++                    resp = Response(*resp)
+             except http.HttpError, v:
+                 log("Invalid server response: %s" % v)
+                 raise
+@@ -405,7 +422,8 @@ class Pathoc(tcp.TCPClient):
+             May raise http.HTTPError, tcp.NetLibError
+         """
+         if isinstance(r, basestring):
+-            r = language.parse_pathoc(r).next()
++            r = language.parse_pathoc(r, self.use_http2).next()
++
+         if isinstance(r, language.http.Request):
+             if r.ws:
+                 return self.websocket_start(r)
+@@ -413,6 +431,10 @@ class Pathoc(tcp.TCPClient):
+                 return self.http(r)
+         elif isinstance(r, language.websockets.WebsocketFrame):
+             self.websocket_send_frame(r)
++        elif isinstance(r, language.http2.Request):
++            return self.http(r)
++        # elif isinstance(r, language.http2.Frame):
++            # TODO: do something
+ 
+ 
+ def main(args):  # pragma: nocover

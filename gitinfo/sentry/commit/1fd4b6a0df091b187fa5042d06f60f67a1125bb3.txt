@@ -1,0 +1,161 @@
+commit 1fd4b6a0df091b187fa5042d06f60f67a1125bb3
+Author: Jess MacQueen <jess@getsentry.com>
+Date:   Thu Jun 29 18:04:06 2017 -0700
+
+    possibly get event discarding working in event_manager
+
+diff --git a/src/sentry/event_manager.py b/src/sentry/event_manager.py
+index 03b847fd2d..d42b4d8dae 100644
+--- a/src/sentry/event_manager.py
++++ b/src/sentry/event_manager.py
+@@ -190,6 +190,10 @@ def plugin_is_regression(group, event):
+     return True
+ 
+ 
++class DiscardedHash(Exception):
++    pass
++
++
+ class ScoreClause(object):
+     def __init__(self, group):
+         self.group = group
+@@ -820,9 +824,16 @@ class EventManager(object):
+         all_hashes = self._find_hashes(project, hashes)
+ 
+         try:
+-            existing_group_id = six.next(h.group_id for h in all_hashes if h.group_id is not None)
++            existing_group_id, existing_tombstone_id = six.next(
++                (h.group_id, h.group_tombstone_id)
++                for h in all_hashes if h.group_id is not None or h.group_tombstone_id is not None
++            )
+         except StopIteration:
+             existing_group_id = None
++            existing_tombstone_id = None
++
++        if existing_tombstone_id is not None:
++            raise DiscardedHash('Matches discarded group %s' % existing_tombstone_id)
+ 
+         # XXX(dcramer): this has the opportunity to create duplicate groups
+         # it should be resolved by the hash merging function later but this
+diff --git a/src/sentry/models/group.py b/src/sentry/models/group.py
+index fad11dbfb0..42b46f0fbc 100644
+--- a/src/sentry/models/group.py
++++ b/src/sentry/models/group.py
+@@ -104,11 +104,19 @@ class GroupManager(BaseManager):
+         )
+ 
+     def from_kwargs(self, project, **kwargs):
+-        from sentry.event_manager import EventManager
++        from sentry.event_manager import DiscardedHash, EventManager
+ 
+         manager = EventManager(kwargs)
+         manager.normalize()
+-        return manager.save(project)
++        try:
++            return manager.save(project)
++
++        # TODO(jess): this method maybe isn't even used?
++        except DiscardedHash as exc:
++            logger.info('discarded.hash', extra={
++                'project_id': project.id,
++                'message': exc.message,
++            })
+ 
+     def add_tags(self, group, tags):
+         from sentry.models import TagValue, GroupTagValue
+diff --git a/src/sentry/tasks/merge.py b/src/sentry/tasks/merge.py
+index b8b9d42995..154135694b 100644
+--- a/src/sentry/tasks/merge.py
++++ b/src/sentry/tasks/merge.py
+@@ -200,6 +200,7 @@ def _rehash_group_events(group, limit=100):
+ 
+         # XXX(dcramer): doesnt support checksums as they're not stored
+         hashes = map(md5_from_hash, get_hashes_from_fingerprint(event, fingerprint))
++        # TODO(jess): should we be worried about hitting a discarded hash here?
+         for hash in hashes:
+             new_group, _, _, _ = manager._save_aggregate(
+                 event=event,
+diff --git a/src/sentry/tasks/store.py b/src/sentry/tasks/store.py
+index 0ec9630479..61392b69e4 100644
+--- a/src/sentry/tasks/store.py
++++ b/src/sentry/tasks/store.py
+@@ -270,7 +270,7 @@ def save_event(cache_key=None, data=None, start_time=None, event_id=None, **kwar
+     """
+     Saves an event to the database.
+     """
+-    from sentry.event_manager import EventManager
++    from sentry.event_manager import DiscardedHash, EventManager
+ 
+     if cache_key:
+         data = default_cache.get(cache_key)
+@@ -293,6 +293,11 @@ def save_event(cache_key=None, data=None, start_time=None, event_id=None, **kwar
+     try:
+         manager = EventManager(data)
+         manager.save(project)
++    except DiscardedHash as exc:
++        error_logger.info('discarded.hash', extra={
++            'project_id': project.id,
++            'message': exc.message,
++        })
+     finally:
+         if cache_key:
+             default_cache.delete(cache_key)
+diff --git a/tests/sentry/test_event_manager.py b/tests/sentry/test_event_manager.py
+index 84036f021e..a08d230ca0 100644
+--- a/tests/sentry/test_event_manager.py
++++ b/tests/sentry/test_event_manager.py
+@@ -14,12 +14,12 @@ from time import time
+ from sentry.app import tsdb
+ from sentry.constants import MAX_CULPRIT_LENGTH, DEFAULT_LOGGER_NAME
+ from sentry.event_manager import (
+-    EventManager, EventUser, get_hashes_for_event, get_hashes_from_fingerprint,
++    DiscardedHash, EventManager, EventUser, get_hashes_for_event, get_hashes_from_fingerprint,
+     generate_culprit, md5_from_hash
+ )
+ from sentry.models import (
+-    Activity, Event, Group, GroupRelease, GroupResolution, GroupStatus,
+-    EventMapping, Release
++    Activity, Event, Group, GroupHash, GroupRelease, GroupResolution,
++    GroupStatus, GroupTombstone, EventMapping, Release
+ )
+ from sentry.testutils import TestCase, TransactionTestCase
+ 
+@@ -760,6 +760,38 @@ class EventManagerTest(TransactionTestCase):
+             'formatted': 'world hello',
+         }
+ 
++    def test_trows_when_matches_discarded_hash(self):
++        manager = EventManager(self.make_event(
++            message='foo', event_id='a' * 32,
++            fingerprint=['a' * 32],
++        ))
++        with self.tasks():
++            event = manager.save(1)
++
++        group = Group.objects.get(id=event.group_id)
++        tombstone = GroupTombstone.objects.create(
++            project_id=group.project_id,
++            level=group.level,
++            message=group.message,
++            culprit=group.culprit,
++            type=group.get_event_type(),
++        )
++        GroupHash.objects.filter(
++            group=group,
++        ).update(
++            group=None,
++            group_tombstone=tombstone,
++        )
++
++        manager = EventManager(self.make_event(
++            message='foo', event_id='a' * 32,
++            fingerprint=['a' * 32],
++        ))
++
++        with self.tasks():
++            with self.assertRaises(DiscardedHash):
++                event = manager.save(1)
++
+ 
+ class GetHashesFromEventTest(TestCase):
+     @patch('sentry.interfaces.stacktrace.Stacktrace.compute_hashes')

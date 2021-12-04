@@ -1,0 +1,239 @@
+commit 552f1ac7300d4b40cf1d3b4303e15af9c9629e20
+Author: Lyn Nagara <lyn.nagara@gmail.com>
+Date:   Mon Oct 21 10:30:47 2019 -0700
+
+    feat(deletions): Trigger nodestore deletions from group deletions (#15065)
+    
+    When we stop writing events to postgres, we will no longer be able to
+    trigger nodestore deletions from an event.
+
+diff --git a/src/sentry/deletions/defaults/group.py b/src/sentry/deletions/defaults/group.py
+index 631b69af2f..90cd8ccec1 100644
+--- a/src/sentry/deletions/defaults/group.py
++++ b/src/sentry/deletions/defaults/group.py
+@@ -1,6 +1,56 @@
+ from __future__ import absolute_import, print_function
+ 
+-from ..base import ModelDeletionTask, ModelRelation
++from sentry import eventstore, nodestore
++from sentry.models import Event
++
++from ..base import BaseDeletionTask, BaseRelation, ModelDeletionTask, ModelRelation
++
++
++class GroupNodeDeletionTask(BaseDeletionTask):
++    """
++    Deletes nodestore data for group
++    """
++
++    DEFAULT_CHUNK_SIZE = 10000
++
++    def __init__(self, manager, group_id, project_id, **kwargs):
++        self.group_id = group_id
++        self.project_id = project_id
++        self.last_event = None
++        super(GroupNodeDeletionTask, self).__init__(manager, **kwargs)
++
++    def chunk(self):
++        conditions = []
++        if self.last_event is not None:
++            conditions.extend(
++                [
++                    ["timestamp", "<=", self.last_event.timestamp],
++                    [
++                        ["timestamp", "<", self.last_event.timestamp],
++                        ["event_id", "<", self.last_event.event_id],
++                    ],
++                ]
++            )
++
++        events = eventstore.get_events(
++            filter=eventstore.Filter(
++                conditions=conditions, project_ids=[self.project_id], group_ids=[self.group_id]
++            ),
++            limit=self.DEFAULT_CHUNK_SIZE,
++            referrer="deletions.group",
++            orderby=["-timestamp", "-event_id"],
++        )
++
++        if not events:
++            return False
++
++        self.last_event = events[-1]
++
++        node_ids = [Event.generate_node_id(self.project_id, event.id) for event in events]
++
++        nodestore.delete_multi(node_ids)
++
++        return True
+ 
+ 
+ class GroupDeletionTask(ModelDeletionTask):
+@@ -36,6 +86,15 @@ class GroupDeletionTask(ModelDeletionTask):
+ 
+         relations.extend([ModelRelation(m, {"group_id": instance.id}) for m in model_list])
+ 
++        relations.extend(
++            [
++                BaseRelation(
++                    {"group_id": instance.id, "project_id": instance.project_id},
++                    GroupNodeDeletionTask,
++                )
++            ]
++        )
++
+         return relations
+ 
+     def delete_instance(self, instance):
+diff --git a/tests/sentry/deletions/test_group.py b/tests/sentry/deletions/test_group.py
+index c1c2f86653..1adb39780a 100644
+--- a/tests/sentry/deletions/test_group.py
++++ b/tests/sentry/deletions/test_group.py
+@@ -13,32 +13,57 @@ from sentry.models import (
+     ScheduledDeletion,
+     UserReport,
+ )
++from sentry import nodestore
++from sentry.deletions.defaults.group import GroupNodeDeletionTask
+ from sentry.tasks.deletion import run_deletion
+-from sentry.testutils import TestCase
++
++from sentry.testutils import TestCase, SnubaTestCase
+ from sentry.testutils.helpers.datetime import iso_format, before_now
+ 
+ 
+-class DeleteGroupTest(TestCase):
++class DeleteGroupTest(TestCase, SnubaTestCase):
+     def test_simple(self):
+-        key = "key"
+-        value = "value"
+-
++        GroupNodeDeletionTask.DEFAULT_CHUNK_SIZE = 1  # test chunking logic
+         event_id = "a" * 32
++        event_id2 = "b" * 32
++        event_id3 = "c" * 32
+         project = self.create_project()
++        node_id = Event.generate_node_id(project.id, event_id)
++        node_id2 = Event.generate_node_id(project.id, event_id2)
++        node_id3 = Event.generate_node_id(project.id, event_id3)
++
+         event = self.store_event(
+             data={
+                 "event_id": event_id,
+-                "tags": {key: value},
++                "tags": {"foo": "bar"},
++                "timestamp": iso_format(before_now(minutes=1)),
++                "fingerprint": ["group1"],
++            },
++            project_id=project.id,
++        )
++
++        self.store_event(
++            data={
++                "event_id": event_id2,
+                 "timestamp": iso_format(before_now(minutes=1)),
++                "fingerprint": ["group1"],
+             },
+             project_id=project.id,
+         )
++
++        self.store_event(
++            data={
++                "event_id": event_id3,
++                "timestamp": iso_format(before_now(minutes=1)),
++                "fingerprint": ["group2"],
++            },
++            project_id=project.id,
++        )
++
+         group = event.group
+         group.update(status=GroupStatus.PENDING_DELETION)
+ 
+         project = self.create_project()
+-        group = self.create_group(project=project)
+-        event = self.create_event(group=group)
+ 
+         UserReport.objects.create(group_id=group.id, project_id=event.project_id, name="Jane Doe")
+ 
+@@ -50,6 +75,10 @@ class DeleteGroupTest(TestCase):
+         deletion = ScheduledDeletion.schedule(group, days=0)
+         deletion.update(in_progress=True)
+ 
++        assert nodestore.get(node_id)
++        assert nodestore.get(node_id2)
++        assert nodestore.get(node_id3)
++
+         with self.tasks():
+             run_deletion(deletion.id)
+ 
+@@ -58,3 +87,7 @@ class DeleteGroupTest(TestCase):
+         assert not GroupRedirect.objects.filter(group_id=group.id).exists()
+         assert not GroupHash.objects.filter(group_id=group.id).exists()
+         assert not Group.objects.filter(id=group.id).exists()
++
++        assert not nodestore.get(node_id)
++        assert not nodestore.get(node_id2)
++        assert nodestore.get(node_id3), "Does not remove from second group"
+diff --git a/tests/sentry/tasks/test_deletion.py b/tests/sentry/tasks/test_deletion.py
+index 1c37161cbd..be6f54219a 100644
+--- a/tests/sentry/tasks/test_deletion.py
++++ b/tests/sentry/tasks/test_deletion.py
+@@ -6,6 +6,7 @@ from uuid import uuid4
+ 
+ import pytest
+ 
++from sentry import nodestore
+ from sentry.constants import ObjectStatus
+ from sentry.exceptions import DeleteAborted
+ from sentry.models import (
+@@ -178,12 +179,30 @@ class DeleteProjectTest(TestCase):
+ class DeleteGroupTest(TestCase):
+     def test_simple(self):
+         event_id = "a" * 32
++        event_id_2 = "b" * 32
+         project = self.create_project()
+ 
++        node_id = Event.generate_node_id(project.id, event_id)
++        node_id_2 = Event.generate_node_id(project.id, event_id_2)
++
+         event = self.store_event(
+-            data={"event_id": event_id, "timestamp": iso_format(before_now(minutes=1))},
++            data={
++                "event_id": event_id,
++                "timestamp": iso_format(before_now(minutes=1)),
++                "fingerprint": ["group1"],
++            },
++            project_id=project.id,
++        )
++
++        self.store_event(
++            data={
++                "event_id": event_id_2,
++                "timestamp": iso_format(before_now(minutes=1)),
++                "fingerprint": ["group1"],
++            },
+             project_id=project.id,
+         )
++
+         group = event.group
+         group.update(status=GroupStatus.PENDING_DELETION)
+ 
+@@ -192,6 +211,9 @@ class DeleteGroupTest(TestCase):
+         GroupMeta.objects.create(group=group, key="foo", value="bar")
+         GroupRedirect.objects.create(group_id=group.id, previous_group_id=1)
+ 
++        assert nodestore.get(node_id)
++        assert nodestore.get(node_id_2)
++
+         with self.tasks():
+             delete_groups(object_ids=[group.id])
+ 
+@@ -199,6 +221,8 @@ class DeleteGroupTest(TestCase):
+         assert not GroupRedirect.objects.filter(group_id=group.id).exists()
+         assert not GroupHash.objects.filter(group_id=group.id).exists()
+         assert not Group.objects.filter(id=group.id).exists()
++        assert not nodestore.get(node_id)
++        assert not nodestore.get(node_id_2)
+ 
+ 
+ class DeleteApplicationTest(TestCase):

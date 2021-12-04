@@ -1,0 +1,831 @@
+commit 4a852d1c941e4927f39a1896bdfd9bd52c33b7f8
+Author: Brett Hoerner <brett@bretthoerner.com>
+Date:   Tue Dec 19 15:38:44 2017 -0600
+
+    feat(tags): Add tagstore multi backend (#6768)
+
+diff --git a/.travis.yml b/.travis.yml
+index e79d06258d..6ef49caed2 100644
+--- a/.travis.yml
++++ b/.travis.yml
+@@ -118,6 +118,12 @@ matrix:
+         - memcached
+         - redis-server
+         - postgresql
++    - python: 2.7
++      env: SENTRY_TAGSTORE=sentry.tagstore.multi.MultiTagStorage SENTRY_TAGSTORE_DEFAULT_MULTI_OPTIONS=1 TEST_SUITE=postgres DB=postgres
++      services:
++        - memcached
++        - redis-server
++        - postgresql
+ notifications:
+   webhooks:
+     urls:
+diff --git a/src/sentry/conf/server.py b/src/sentry/conf/server.py
+index 17fc6dd095..758a2c3ce9 100644
+--- a/src/sentry/conf/server.py
++++ b/src/sentry/conf/server.py
+@@ -928,8 +928,18 @@ SENTRY_NODESTORE = 'sentry.nodestore.django.DjangoNodeStorage'
+ SENTRY_NODESTORE_OPTIONS = {}
+ 
+ # Tag storage backend
++_SENTRY_TAGSTORE_DEFAULT_MULTI_OPTIONS = {
++    'backends': [
++        ('sentry.tagstore.legacy.LegacyTagStorage', {}),
++        ('sentry.tagstore.v2.V2TagStorage', {}),
++    ],
++    'runner': 'ImmediateRunner',
++}
+ SENTRY_TAGSTORE = os.environ.get('SENTRY_TAGSTORE', 'sentry.tagstore.legacy.LegacyTagStorage')
+-SENTRY_TAGSTORE_OPTIONS = {}
++SENTRY_TAGSTORE_OPTIONS = (
++    _SENTRY_TAGSTORE_DEFAULT_MULTI_OPTIONS if 'SENTRY_TAGSTORE_DEFAULT_MULTI_OPTIONS' in os.environ
++    else {}
++)
+ 
+ # Search backend
+ SENTRY_SEARCH = 'sentry.search.django.DjangoSearchBackend'
+diff --git a/src/sentry/tagstore/base.py b/src/sentry/tagstore/base.py
+index b8fb506c16..97419cda4b 100644
+--- a/src/sentry/tagstore/base.py
++++ b/src/sentry/tagstore/base.py
+@@ -123,15 +123,13 @@ class TagStorage(Service):
+             grouptagkey_model,
+         ]
+ 
+-    def setup_tasks(self, tagkey_model):
+-        from .tasks import setup_tasks
+-
+-        setup_tasks(tagkey_model=tagkey_model)
+-
+     def setup_receivers(self, tagvalue_model, grouptagvalue_model):
+-        from .receivers import setup_receivers
++        from django.db.models.signals import post_save
++        from sentry.receivers.releases import ensure_release_exists
+ 
+-        setup_receivers(tagvalue_model=tagvalue_model, grouptagvalue_model=grouptagvalue_model)
++        post_save.connect(
++            ensure_release_exists, sender=tagvalue_model, dispatch_uid="ensure_release_exists", weak=False
++        )
+ 
+     def is_valid_key(self, key):
+         return bool(TAG_KEY_RE.match(key))
+@@ -194,8 +192,7 @@ class TagStorage(Service):
+         """
+         raise NotImplementedError
+ 
+-    def get_or_create_tag_value(self, project_id, environment_id,
+-                                key, value, key_id=None, **kwargs):
++    def get_or_create_tag_value(self, project_id, environment_id, key, value, **kwargs):
+         """
+         >>> get_or_create_tag_key(1, 2, "key1", "value1")
+         """
+@@ -229,7 +226,7 @@ class TagStorage(Service):
+ 
+     def create_event_tags(self, project_id, group_id, environment_id, event_id, tags):
+         """
+-        >>> create_event_tags(1, 2, 3, 4, [(5, 6)])
++        >>> create_event_tags(1, 2, 3, 4, [('foo', 'bar'), ('baz', 'qux')])
+         """
+         raise NotImplementedError
+ 
+diff --git a/src/sentry/tagstore/legacy/backend.py b/src/sentry/tagstore/legacy/backend.py
+index 395ba0d465..de7b6682e9 100644
+--- a/src/sentry/tagstore/legacy/backend.py
++++ b/src/sentry/tagstore/legacy/backend.py
+@@ -51,10 +51,6 @@ class LegacyTagStorage(TagStorage):
+             grouptagvalue_model=GroupTagValue,
+         )
+ 
+-        self.setup_tasks(
+-            tagkey_model=TagKey,
+-        )
+-
+         self.setup_receivers(
+             tagvalue_model=TagValue,
+             grouptagvalue_model=GroupTagValue,
+@@ -180,6 +176,13 @@ class LegacyTagStorage(TagStorage):
+             project_id=project_id, group_id=group_id, key=key, value=value, **kwargs)
+ 
+     def create_event_tags(self, project_id, group_id, environment_id, event_id, tags):
++        tag_ids = []
++        for key, value in tags:
++            tagkey, _ = self.get_or_create_tag_key(project_id, environment_id, key)
++            tagvalue, _ = self.get_or_create_tag_value(
++                project_id, environment_id, key, value)
++            tag_ids.append((tagkey.id, tagvalue.id))
++
+         try:
+             # don't let a duplicate break the outer transaction
+             with transaction.atomic():
+@@ -194,7 +197,7 @@ class LegacyTagStorage(TagStorage):
+                         key_id=key_id,
+                         value_id=value_id,
+                     )
+-                    for key_id, value_id in tags
++                    for key_id, value_id in tag_ids
+                 ])
+         except IntegrityError:
+             pass
+@@ -298,7 +301,7 @@ class LegacyTagStorage(TagStorage):
+             ).update(status=TagKeyStatus.PENDING_DELETION)
+ 
+             if updated:
+-                delete_tag_key_task.delay(object_id=tagkey.id)
++                delete_tag_key_task.delay(object_id=tagkey.id, model=TagKey)
+                 deleted.append(tagkey)
+ 
+         return deleted
+diff --git a/src/sentry/tagstore/models.py b/src/sentry/tagstore/models.py
+index be50ada2ea..eb0277879f 100644
+--- a/src/sentry/tagstore/models.py
++++ b/src/sentry/tagstore/models.py
+@@ -13,9 +13,19 @@ from django.core.exceptions import ImproperlyConfigured
+ 
+ # HACK: This was taken from nodestore.models. Django doesn't play well with our
+ # naming schemes, and we prefer our methods ways over Django's limited scoping
+-if settings.SENTRY_TAGSTORE.startswith('sentry.tagstore.legacy.LegacyTagStorage'):
++if settings.SENTRY_TAGSTORE.startswith('sentry.tagstore.legacy'):
+     from sentry.tagstore.legacy.models import *  # NOQA
+ elif settings.SENTRY_TAGSTORE.startswith('sentry.tagstore.v2'):
+     from sentry.tagstore.v2.models import *  # NOQA
++elif settings.SENTRY_TAGSTORE.startswith('sentry.tagstore.multi'):
++    for backend in settings.SENTRY_TAGSTORE_OPTIONS.get('backends', []):
++        if backend[0].startswith('sentry.tagstore.legacy'):
++            from sentry.tagstore.legacy.models import *  # NOQA
++        elif backend[0].startswith('sentry.tagstore.v2'):
++            from sentry.tagstore.v2.models import TagKey as V2TagKey  # NOQA
++            from sentry.tagstore.v2.models import TagValue as V2TagValue  # NOQA
++            from sentry.tagstore.v2.models import GroupTagKey as V2GroupTagKey  # NOQA
++            from sentry.tagstore.v2.models import GroupTagValue as V2GroupTagValue  # NOQA
++            from sentry.tagstore.v2.models import EventTag as V2EventTag  # NOQA
+ else:
+     raise ImproperlyConfigured("Found unknown tagstore backend '%s'" % settings.SENTRY_TAGSTORE)
+diff --git a/src/sentry/tagstore/multi/__init__.py b/src/sentry/tagstore/multi/__init__.py
+new file mode 100644
+index 0000000000..6a6bffc2d1
+--- /dev/null
++++ b/src/sentry/tagstore/multi/__init__.py
+@@ -0,0 +1,10 @@
++"""
++sentry.tagstore.multi
++~~~~~~~~~~~~~~~~~~~~~~~
++
++:copyright: (c) 2010-2017 by the Sentry Team, see AUTHORS for more details.
++:license: BSD, see LICENSE for more details.
++"""
++from __future__ import absolute_import
++
++from .backend import MultiTagStorage  # NOQA
+diff --git a/src/sentry/tagstore/multi/backend.py b/src/sentry/tagstore/multi/backend.py
+new file mode 100644
+index 0000000000..e90283a857
+--- /dev/null
++++ b/src/sentry/tagstore/multi/backend.py
+@@ -0,0 +1,238 @@
++"""
++sentry.tagstore.multi.backend
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++:copyright: (c) 2010-2017 by the Sentry Team, see AUTHORS for more details.
++:license: BSD, see LICENSE for more details.
++"""
++
++from __future__ import absolute_import
++
++import six
++import random
++from threading import Thread
++from six.moves.queue import Queue, Full
++from django.conf import settings
++from operator import itemgetter
++
++from sentry.tagstore.base import TagStorage
++from sentry.utils.imports import import_string
++
++
++class QueuedRunner(object):
++    """\
++    Secondary backend runner that puts method calls on a bounded queue and drops them
++    when the queue is full.
++
++    A separate (non-main) thread works the queue.
++    """
++
++    def __init__(self):
++        self.q = q = Queue(maxsize=100)
++        self.sample_channel = getattr(settings, 'SENTRY_TAGSTORE_MULTI_SAMPLING', 1.0)
++
++        def worker():
++            while True:
++                (func, args, kwargs) = q.get()
++                try:
++                    func(*args, **kwargs)
++                except Exception:
++                    pass
++                finally:
++                    q.task_done()
++
++        t = Thread(target=worker)
++        t.setDaemon(True)
++        t.start()
++
++    def run(self, f, *args, **kwargs):
++        if random.random() <= self.sample_channel:
++            try:
++                self.q.put((f, args, kwargs), block=False)
++            except Full:
++                return
++
++
++class ImmediateRunner(object):
++    """\
++    Secondary backend runner that runs functions immediately. Useful for tests.
++    """
++
++    def run(self, f, *args, **kwargs):
++        return f(*args, **kwargs)
++
++
++class MultiTagStorage(TagStorage):
++    """
++    A backend which will write to multiple backends, and read from the first (by default).
++    Writes to non-primary backends will happen on a background thread. This is designed to
++    allow you to dual-write for the purpose of migration.
++
++    >>> MultiTagStorage(backends=[
++    >>>     ('sentry.tagstore.legacy.LegacyTagStorage', {}),
++    >>>     ('sentry.tagstore.v2.V2TagStorage', {}),
++    >>> ])
++    """
++
++    def __init__(self, backends, read_selector=itemgetter(0),
++                 runner='QueuedRunner', **kwargs):
++        assert backends, "you should provide at least one backend"
++
++        self.backends = []
++        for backend, backend_options in backends:
++            if isinstance(backend, six.string_types):
++                backend = import_string(backend)
++            self.backends.append(backend(**backend_options))
++
++        self.read_selector = read_selector
++        self.runner = {'QueuedRunner': QueuedRunner, 'ImmediateRunner': ImmediateRunner}[runner]()
++
++        super(TagStorage, self).__init__(**kwargs)
++
++    def _call_all_backends(self, func, *args, **kwargs):
++        """\
++        Call `func` on all backends, returning the first backend's return value, or raising any exception.
++        """
++
++        ret_val = None
++        exc = None
++        for i, backend in enumerate(self.backends):
++            try:
++                f = getattr(backend, func)
++
++                if (i == 0):
++                    ret_val = f(*args, **kwargs)
++                else:
++                    self.runner.run(f, *args, **kwargs)
++            except Exception as e:
++                if exc is None:
++                    exc = e
++
++        if exc is not None:
++            raise exc
++
++        return ret_val
++
++    def _call_one_backend(self, func, *args, **kwargs):
++        """\
++        Call `func` on one backend, using `read_selector` to choose which.
++        """
++        backend = self.read_selector(self.backends)
++        return getattr(backend, func)(*args, **kwargs)
++
++    def setup(self):
++        return self._call_all_backends('setup')
++
++    def create_tag_key(self, *args, **kwargs):
++        return self._call_all_backends('create_tag_key', *args, **kwargs)
++
++    def get_or_create_tag_key(self, *args, **kwargs):
++        return self._call_all_backends('get_or_create_tag_key', *args, **kwargs)
++
++    def create_tag_value(self, *args, **kwargs):
++        return self._call_all_backends('create_tag_value', *args, **kwargs)
++
++    def get_or_create_tag_value(self, *args, **kwargs):
++        return self._call_all_backends('get_or_create_tag_value', *args, **kwargs)
++
++    def create_group_tag_key(self, *args, **kwargs):
++        return self._call_all_backends('create_group_tag_key', *args, **kwargs)
++
++    def get_or_create_group_tag_key(self, *args, **kwargs):
++        return self._call_all_backends('get_or_create_group_tag_key', *args, **kwargs)
++
++    def create_group_tag_value(self, *args, **kwargs):
++        return self._call_all_backends('create_group_tag_value', *args, **kwargs)
++
++    def get_or_create_group_tag_value(self, *args, **kwargs):
++        return self._call_all_backends('get_or_create_group_tag_value', *args, **kwargs)
++
++    def create_event_tags(self, *args, **kwargs):
++        return self._call_all_backends('create_event_tags', *args, **kwargs)
++
++    def get_tag_key(self, *args, **kwargs):
++        return self._call_one_backend('get_tag_key', *args, **kwargs)
++
++    def get_tag_keys(self, *args, **kwargs):
++        return self._call_one_backend('get_tag_keys', *args, **kwargs)
++
++    def get_tag_value(self, *args, **kwargs):
++        return self._call_one_backend('get_tag_value', *args, **kwargs)
++
++    def get_tag_values(self, *args, **kwargs):
++        return self._call_one_backend('get_tag_values', *args, **kwargs)
++
++    def get_group_tag_key(self, *args, **kwargs):
++        return self._call_one_backend('get_group_tag_key', *args, **kwargs)
++
++    def get_group_tag_keys(self, *args, **kwargs):
++        return self._call_one_backend('get_group_tag_keys', *args, **kwargs)
++
++    def get_group_tag_value(self, *args, **kwargs):
++        return self._call_one_backend('get_group_tag_value', *args, **kwargs)
++
++    def get_group_tag_values(self, *args, **kwargs):
++        return self._call_one_backend('get_group_tag_values', *args, **kwargs)
++
++    def delete_tag_key(self, *args, **kwargs):
++        return self._call_all_backends('delete_tag_key', *args, **kwargs)
++
++    def delete_all_group_tag_keys(self, *args, **kwargs):
++        return self._call_all_backends('delete_all_group_tag_keys', *args, **kwargs)
++
++    def delete_all_group_tag_values(self, *args, **kwargs):
++        return self._call_all_backends('delete_all_group_tag_values', *args, **kwargs)
++
++    def incr_tag_key_values_seen(self, *args, **kwargs):
++        return self._call_all_backends('incr_tag_key_values_seen', *args, **kwargs)
++
++    def incr_tag_value_times_seen(self, *args, **kwargs):
++        return self._call_all_backends('incr_tag_value_times_seen', *args, **kwargs)
++
++    def incr_group_tag_key_values_seen(self, *args, **kwargs):
++        return self._call_all_backends('incr_group_tag_key_values_seen', *args, **kwargs)
++
++    def incr_group_tag_value_times_seen(self, *args, **kwargs):
++        return self._call_all_backends('incr_group_tag_value_times_seen', *args, **kwargs)
++
++    def get_group_event_ids(self, *args, **kwargs):
++        return self._call_one_backend('get_group_event_ids', *args, **kwargs)
++
++    def get_groups_user_counts(self, *args, **kwargs):
++        return self._call_one_backend('get_groups_user_counts', *args, **kwargs)
++
++    def get_group_tag_value_count(self, *args, **kwargs):
++        return self._call_one_backend('get_group_tag_value_count', *args, **kwargs)
++
++    def get_top_group_tag_values(self, *args, **kwargs):
++        return self._call_one_backend('get_top_group_tag_values', *args, **kwargs)
++
++    def get_first_release(self, *args, **kwargs):
++        return self._call_one_backend('get_first_release', *args, **kwargs)
++
++    def get_last_release(self, *args, **kwargs):
++        return self._call_one_backend('get_last_release', *args, **kwargs)
++
++    def get_release_tags(self, *args, **kwargs):
++        return self._call_one_backend('get_release_tags', *args, **kwargs)
++
++    def get_group_ids_for_users(self, *args, **kwargs):
++        return self._call_one_backend('get_group_ids_for_users', *args, **kwargs)
++
++    def get_group_tag_values_for_users(self, *args, **kwargs):
++        return self._call_one_backend('get_group_tag_values_for_users', *args, **kwargs)
++
++    def get_group_ids_for_search_filter(self, *args, **kwargs):
++        return self._call_one_backend('get_group_ids_for_search_filter', *args, **kwargs)
++
++    def update_group_tag_key_values_seen(self, *args, **kwargs):
++        return self._call_all_backends('update_group_tag_key_values_seen', *args, **kwargs)
++
++    def get_tag_value_qs(self, *args, **kwargs):
++        return self._call_one_backend('get_tag_value_qs', *args, **kwargs)
++
++    def get_group_tag_value_qs(self, *args, **kwargs):
++        return self._call_one_backend('get_group_tag_value_qs', *args, **kwargs)
++
++    def update_group_for_events(self, *args, **kwargs):
++        return self._call_all_backends('update_group_for_events', *args, **kwargs)
+diff --git a/src/sentry/tagstore/receivers.py b/src/sentry/tagstore/receivers.py
+deleted file mode 100644
+index 2233846967..0000000000
+--- a/src/sentry/tagstore/receivers.py
++++ /dev/null
+@@ -1,18 +0,0 @@
+-"""
+-sentry.tagstore.receivers
+-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+-
+-:copyright: (c) 2010-2017 by the Sentry Team, see AUTHORS for more details.
+-:license: BSD, see LICENSE for more details.
+-"""
+-from __future__ import absolute_import
+-
+-from django.db.models.signals import post_save
+-
+-from sentry.receivers.releases import ensure_release_exists
+-
+-
+-def setup_receivers(tagvalue_model, grouptagvalue_model):
+-    post_save.connect(
+-        ensure_release_exists, sender=tagvalue_model, dispatch_uid="ensure_release_exists", weak=False
+-    )
+diff --git a/src/sentry/tagstore/tasks.py b/src/sentry/tagstore/tasks.py
+index 94718f84aa..449a5b75cc 100644
+--- a/src/sentry/tagstore/tasks.py
++++ b/src/sentry/tagstore/tasks.py
+@@ -15,36 +15,32 @@ from sentry.tasks.base import instrumented_task, retry
+ from sentry.tasks.deletion import MAX_RETRIES
+ 
+ 
+-# initialized below
+-delete_tag_key = None
+-
+-
+-def setup_tasks(tagkey_model):
+-    global delete_tag_key
+-
+-    @instrumented_task(
+-        name='sentry.tagstore.tasks.delete_tag_key',
+-        queue='cleanup',
+-        default_retry_delay=60 * 5,
+-        max_retries=MAX_RETRIES
++@instrumented_task(
++    name='sentry.tagstore.tasks.delete_tag_key',
++    queue='cleanup',
++    default_retry_delay=60 * 5,
++    max_retries=MAX_RETRIES
++)
++@retry(exclude=(DeleteAborted, ))
++def delete_tag_key(object_id, model=None, transaction_id=None, **kwargs):
++    from sentry import deletions
++
++    # TODO(brett): remove this (and make model a normal arg) after deploy
++    if model is None:
++        # if the model wasn't sent we can assume it's from legacy code
++        from sentry.tagstore.legacy.models import TagKey as model
++
++    task = deletions.get(
++        model=model,
++        query={
++            'id': object_id,
++        },
++        transaction_id=transaction_id or uuid4().hex,
+     )
+-    @retry(exclude=(DeleteAborted, ))
+-    def delete_tag_key_task(object_id, transaction_id=None, **kwargs):
+-        from sentry import deletions
+-
+-        task = deletions.get(
+-            model=tagkey_model,
+-            query={
+-                'id': object_id,
+-            },
+-            transaction_id=transaction_id or uuid4().hex,
++    has_more = task.chunk()
++    if has_more:
++        delete_tag_key.apply_async(
++            kwargs={'object_id': object_id,
++                    'transaction_id': transaction_id},
++            countdown=15,
+         )
+-        has_more = task.chunk()
+-        if has_more:
+-            delete_tag_key.apply_async(
+-                kwargs={'object_id': object_id,
+-                        'transaction_id': transaction_id},
+-                countdown=15,
+-            )
+-
+-    delete_tag_key = delete_tag_key_task
+diff --git a/src/sentry/tagstore/v2/backend.py b/src/sentry/tagstore/v2/backend.py
+index b36a3500d0..47684594e1 100644
+--- a/src/sentry/tagstore/v2/backend.py
++++ b/src/sentry/tagstore/v2/backend.py
+@@ -57,10 +57,6 @@ class V2TagStorage(TagStorage):
+             grouptagvalue_model=GroupTagValue,
+         )
+ 
+-        self.setup_tasks(
+-            tagkey_model=TagKey,
+-        )
+-
+         self.setup_receivers(
+             tagvalue_model=TagValue,
+             grouptagvalue_model=GroupTagValue,
+@@ -221,6 +217,13 @@ class V2TagStorage(TagStorage):
+     def create_event_tags(self, project_id, group_id, environment_id, event_id, tags):
+         assert environment_id is not None
+ 
++        tag_ids = []
++        for key, value in tags:
++            tagkey, _ = self.get_or_create_tag_key(project_id, environment_id, key)
++            tagvalue, _ = self.get_or_create_tag_value(
++                project_id, environment_id, key, value, key_id=tagkey.id)
++            tag_ids.append((tagkey.id, tagvalue.id))
++
+         try:
+             # don't let a duplicate break the outer transaction
+             with transaction.atomic():
+@@ -236,7 +239,7 @@ class V2TagStorage(TagStorage):
+                         key_id=key_id,
+                         value_id=value_id,
+                     )
+-                    for key_id, value_id in tags
++                    for key_id, value_id in tag_ids
+                 ])
+         except IntegrityError:
+             logger.error(
+@@ -368,7 +371,7 @@ class V2TagStorage(TagStorage):
+             ).update(status=TagKeyStatus.PENDING_DELETION)
+ 
+             if updated:
+-                delete_tag_key_task.delay(object_id=tagkey.id)
++                delete_tag_key_task.delay(object_id=tagkey.id, model=TagKey)
+                 deleted.append(tagkey)
+ 
+         return deleted
+diff --git a/src/sentry/tasks/post_process.py b/src/sentry/tasks/post_process.py
+index af1009fad6..c9a69009a8 100644
+--- a/src/sentry/tasks/post_process.py
++++ b/src/sentry/tasks/post_process.py
+@@ -30,8 +30,7 @@ def _get_service_hooks(project_id):
+     result = cache.get(cache_key)
+     if result is None:
+         result = [(h.id, h.events) for h in
+-            ServiceHook.objects.filter(project_id=project_id)
+-        ]
++                  ServiceHook.objects.filter(project_id=project_id)]
+         cache.set(result, 60)
+     return result
+ 
+@@ -168,17 +167,10 @@ def index_event_tags(organization_id, project_id, event_id, tags,
+         'project': project_id,
+     })
+ 
+-    tag_ids = []
+-    for key, value in tags:
+-        tagkey, _ = tagstore.get_or_create_tag_key(project_id, environment_id, key)
+-        tagvalue, _ = tagstore.get_or_create_tag_value(
+-            project_id, environment_id, key, value, key_id=tagkey.id)
+-        tag_ids.append((tagkey.id, tagvalue.id))
+-
+     tagstore.create_event_tags(
+         project_id=project_id,
+         group_id=group_id,
+         environment_id=environment_id,
+         event_id=event_id,
+-        tags=tag_ids,
++        tags=tags,
+     )
+diff --git a/src/sentry/tasks/unmerge.py b/src/sentry/tasks/unmerge.py
+index 6a08aeec02..af8cfc9115 100644
+--- a/src/sentry/tasks/unmerge.py
++++ b/src/sentry/tasks/unmerge.py
+@@ -310,7 +310,7 @@ def repair_tag_data(caches, project, events):
+             # ingestion logic (but actually represent a more accurate value.)
+             # See GH-5289 for more details.
+             for value, (times_seen, first_seen, last_seen) in values.items():
+-                instance, created = tagstore.get_or_create_group_tag_value(
++                _, created = tagstore.get_or_create_group_tag_value(
+                     project_id=project.id,
+                     group_id=group_id,
+                     environment_id=environment.id,
+diff --git a/tests/sentry/api/endpoints/test_group_events.py b/tests/sentry/api/endpoints/test_group_events.py
+index 846f47c4b3..38f4f192c3 100644
+--- a/tests/sentry/api/endpoints/test_group_events.py
++++ b/tests/sentry/api/endpoints/test_group_events.py
+@@ -63,8 +63,8 @@ class GroupEventsTest(APITestCase):
+             environment_id=self.environment.id,
+             event_id=event_1.id,
+             tags=[
+-                (tagkey_1.id, tagvalue_1.id),
+-                (tagkey_2.id, tagvalue_3.id),
++                (tagkey_1.key, tagvalue_1.value),
++                (tagkey_2.key, tagvalue_3.value),
+             ],
+         )
+         tagstore.create_event_tags(
+@@ -73,7 +73,7 @@ class GroupEventsTest(APITestCase):
+             environment_id=self.environment.id,
+             event_id=event_2.id,
+             tags=[
+-                (tagkey_2.id, tagvalue_2.id),
++                (tagkey_2.key, tagvalue_2.value),
+             ],
+         )
+ 
+diff --git a/tests/sentry/api/endpoints/test_project_tagkey_details.py b/tests/sentry/api/endpoints/test_project_tagkey_details.py
+index 5926830374..6d0f963127 100644
+--- a/tests/sentry/api/endpoints/test_project_tagkey_details.py
++++ b/tests/sentry/api/endpoints/test_project_tagkey_details.py
+@@ -3,6 +3,7 @@ from __future__ import absolute_import
+ import mock
+ import six
+ 
++from django.conf import settings
+ from django.core.urlresolvers import reverse
+ 
+ from sentry import tagstore
+@@ -62,7 +63,12 @@ class ProjectTagKeyDeleteTest(APITestCase):
+ 
+         assert response.status_code == 204
+ 
+-        mock_delete_tag_key.delay.assert_called_once_with(object_id=tagkey.id)
++        if settings.SENTRY_TAGSTORE.startswith('sentry.tagstore.multi'):
++            backend_count = len(settings.SENTRY_TAGSTORE_OPTIONS.get('backends', []))
++            assert mock_delete_tag_key.delay.call_count == backend_count
++        else:
++            from sentry.tagstore.models import TagKey
++            mock_delete_tag_key.delay.assert_called_once_with(object_id=tagkey.id, model=TagKey)
+ 
+         assert tagstore.get_tag_key(
+             project.id,
+diff --git a/tests/sentry/deletions/test_group.py b/tests/sentry/deletions/test_group.py
+index 1733c32b9d..d414c31273 100644
+--- a/tests/sentry/deletions/test_group.py
++++ b/tests/sentry/deletions/test_group.py
+@@ -43,7 +43,7 @@ class DeleteGroupTest(TestCase):
+             project_id=project.id,
+             environment_id=self.environment.id,
+             tags=[
+-                (tk.id, tv.id),
++                (tk.key, tv.value),
+             ],
+         )
+         GroupAssignee.objects.create(
+diff --git a/tests/sentry/deletions/test_tagkey.py b/tests/sentry/deletions/test_tagkey.py
+index f533d8a5b3..7fbee2ff5c 100644
+--- a/tests/sentry/deletions/test_tagkey.py
++++ b/tests/sentry/deletions/test_tagkey.py
+@@ -37,7 +37,7 @@ class DeleteTagKeyTest(TestCase):
+             event_id=1,
+             environment_id=self.environment.id,
+             tags=[
+-                (tk.id, tv.id),
++                (tk.key, tv.value),
+             ]
+         )
+ 
+@@ -65,7 +65,7 @@ class DeleteTagKeyTest(TestCase):
+             environment_id=env2.id,
+             event_id=1,
+             tags=[
+-                (tk2.id, tv2.id),
++                (tk2.key, tv2.value),
+             ],
+         )
+ 
+diff --git a/tests/sentry/runner/commands/test_cleanup.py b/tests/sentry/runner/commands/test_cleanup.py
+index 2fa0a90853..30044be127 100644
+--- a/tests/sentry/runner/commands/test_cleanup.py
++++ b/tests/sentry/runner/commands/test_cleanup.py
+@@ -19,6 +19,9 @@ class SentryCleanupTest(CliTestCase):
+         fixtures += ['tests/fixtures/cleanup-tagstore-legacy.json']
+     elif settings.SENTRY_TAGSTORE.startswith('sentry.tagstore.v2'):
+         fixtures += ['tests/fixtures/cleanup-tagstore-v2.json']
++    elif settings.SENTRY_TAGSTORE.startswith('sentry.tagstore.multi'):
++        fixtures += ['tests/fixtures/cleanup-tagstore-legacy.json',
++                     'tests/fixtures/cleanup-tagstore-v2.json']
+     else:
+         raise NotImplementedError
+ 
+diff --git a/tests/sentry/tagstore/v2/test_backend.py b/tests/sentry/tagstore/v2/test_backend.py
+index 5372f5eea0..968890c4b7 100644
+--- a/tests/sentry/tagstore/v2/test_backend.py
++++ b/tests/sentry/tagstore/v2/test_backend.py
+@@ -321,24 +321,24 @@ class TagStorage(TestCase):
+         v2, _ = self.ts.get_or_create_tag_value(self.proj1.id, self.proj1env1.id, 'k2', 'v2')
+         v3, _ = self.ts.get_or_create_tag_value(self.proj1.id, self.proj1env1.id, 'k3', 'v3')
+ 
+-        tags = [(v1._key.id, v1.id), (v2._key.id, v2.id), (v3._key.id, v3.id)]
++        tags = [(v1._key, v1), (v2._key, v2), (v3._key, v3)]
+         self.ts.create_event_tags(
+             project_id=self.proj1.id,
+             group_id=self.proj1group1.id,
+             environment_id=self.proj1env1.id,
+             event_id=self.proj1group1event1.id,
+-            tags=tags
++            tags=[(k.key, v.value) for k, v in tags]
+         )
+ 
+         assert EventTag.objects.count() == 3
+-        for (key_id, value_id) in tags:
++        for (k, v) in tags:
+             assert EventTag.objects.get(
+                 project_id=self.proj1.id,
+                 group_id=self.proj1group1.id,
+                 environment_id=self.proj1env1.id,
+                 event_id=self.proj1group1event1.id,
+-                key_id=key_id,
+-                value_id=value_id,
++                key_id=k.id,
++                value_id=v.id,
+             ) is not None
+ 
+     def test_delete_tag_key(self):
+@@ -408,16 +408,6 @@ class TagStorage(TestCase):
+             'baz': 'quux',
+         }
+ 
+-        def _create_tags_for_dict(tags):
+-            ids = []
+-            for k, v in tags.items():
+-                key, _ = self.ts.get_or_create_tag_key(self.proj1.id, self.proj1env1.id, k)
+-                value, _ = self.ts.get_or_create_tag_value(self.proj1.id, self.proj1env1.id, k, v)
+-                ids.append((key.id, value.id))
+-            return ids
+-
+-        tags_ids = _create_tags_for_dict(tags)
+-
+         # 2 events with the same tags
+         for event in (self.proj1group1event1, self.proj1group1event2):
+             self.ts.create_event_tags(
+@@ -425,7 +415,7 @@ class TagStorage(TestCase):
+                 group_id=self.proj1group1.id,
+                 environment_id=self.proj1env1.id,
+                 event_id=event.id,
+-                tags=tags_ids,
++                tags=tags.items(),
+             )
+ 
+         different_tags = {
+@@ -434,15 +424,13 @@ class TagStorage(TestCase):
+             'baz': 'quux',
+         }
+ 
+-        different_tags_ids = _create_tags_for_dict(different_tags)
+-
+         # 1 event with different tags
+         self.ts.create_event_tags(
+             project_id=self.proj1.id,
+             group_id=self.proj1group1.id,
+             environment_id=self.proj1env1.id,
+             event_id=self.proj1group1event3.id,
+-            tags=different_tags_ids,
++            tags=different_tags.items(),
+         )
+ 
+         assert len(
+@@ -645,7 +633,7 @@ class TagStorage(TestCase):
+         v2, _ = self.ts.get_or_create_tag_value(self.proj1.id, self.proj1env1.id, 'k2', 'v2')
+         v3, _ = self.ts.get_or_create_tag_value(self.proj1.id, self.proj1env1.id, 'k3', 'v3')
+ 
+-        tags = [(v1._key.id, v1.id), (v2._key.id, v2.id), (v3._key.id, v3.id)]
++        tags = [(v1.key, v1.value), (v2.key, v2.value), (v3.key, v3.value)]
+         self.ts.create_event_tags(
+             project_id=self.proj1.id,
+             group_id=self.proj1group1.id,
+diff --git a/tests/sentry/tasks/test_deletion.py b/tests/sentry/tasks/test_deletion.py
+index c399963596..91f274129d 100644
+--- a/tests/sentry/tasks/test_deletion.py
++++ b/tests/sentry/tasks/test_deletion.py
+@@ -215,7 +215,7 @@ class DeleteTagKeyTest(TestCase):
+             environment_id=self.environment.id,
+             event_id=1,
+             tags=[
+-                (tk.id, tv.id),
++                (tk.key, tv.value),
+             ],
+         )
+ 
+@@ -252,7 +252,7 @@ class DeleteTagKeyTest(TestCase):
+             environment_id=env2.id,
+             event_id=1,
+             tags=[
+-                (tk2.id, tv2.id)
++                (tk2.key, tv2.value)
+             ],
+         )
+ 
+@@ -300,13 +300,14 @@ class DeleteGroupTest(TestCase):
+             event_id='a' * 32,
+             group_id=group.id,
+         )
++        tv, _ = tagstore.get_or_create_tag_value(project.id, self.environment.id, 'key1', 'value1')
+         tagstore.create_event_tags(
+             event_id=event.id,
+             group_id=group.id,
+             project_id=project.id,
+             environment_id=self.environment.id,
+             tags=[
+-                (1, 1),
++                (tv.key, tv.value),
+             ],
+         )
+         GroupAssignee.objects.create(

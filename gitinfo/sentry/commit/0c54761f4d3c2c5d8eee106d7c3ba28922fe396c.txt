@@ -1,0 +1,185 @@
+commit 0c54761f4d3c2c5d8eee106d7c3ba28922fe396c
+Author: David Cramer <dcramer@gmail.com>
+Date:   Wed Jan 28 22:35:49 2015 -0800
+
+    Add mailgun webhook support (refs GH-1407)
+
+diff --git a/src/sentry/conf/server.py b/src/sentry/conf/server.py
+index 4713904e0f..9aaa573be1 100644
+--- a/src/sentry/conf/server.py
++++ b/src/sentry/conf/server.py
+@@ -241,6 +241,8 @@ TRELLO_API_SECRET = ''
+ BITBUCKET_CONSUMER_KEY = ''
+ BITBUCKET_CONSUMER_SECRET = ''
+ 
++MAILGUN_API_KEY = ''
++
+ SOCIAL_AUTH_PIPELINE = (
+     'social_auth.backends.pipeline.user.get_username',
+     'social_auth.backends.pipeline.social.social_auth_user',
+diff --git a/src/sentry/utils/runner.py b/src/sentry/utils/runner.py
+index a80bba80ed..3d3e59d04a 100644
+--- a/src/sentry/utils/runner.py
++++ b/src/sentry/utils/runner.py
+@@ -185,6 +185,10 @@ EMAIL_USE_TLS = False
+ # The email address to send on behalf of
+ SERVER_EMAIL = 'root@localhost'
+ 
++# If you're using mailgun for inbound mail, set your API key and configure a
++# route to forward to /api/hooks/mailgun/inbound/
++MAILGUN_API_KEY = ''
++
+ ###########
+ ## etc. ##
+ ###########
+diff --git a/src/sentry/web/frontend/mailgun_inbound_webhook.py b/src/sentry/web/frontend/mailgun_inbound_webhook.py
+new file mode 100644
+index 0000000000..2e82554c6d
+--- /dev/null
++++ b/src/sentry/web/frontend/mailgun_inbound_webhook.py
+@@ -0,0 +1,52 @@
++from __future__ import absolute_import, print_function
++
++import hashlib
++import hmac
++import logging
++
++from django.conf import settings
++from django.http import HttpResponse
++from django.views.generic import View
++from email_reply_parser import EmailReplyParser
++from email.utils import parseaddr
++
++from sentry.tasks.email import process_inbound_email
++from sentry.utils.email import email_to_group_id
++
++
++class MailgunInboundWebhookView(View):
++    auth_required = False
++
++    def verify(self, api_key, token, timestamp, signature):
++        return signature == hmac.new(
++            key=api_key,
++            msg='{}{}'.format(timestamp, token),
++            digestmod=hashlib.sha256
++        ).hexdigest()
++
++    def post(self, request):
++        token = request.POST['token']
++        signature = request.POST['signature']
++        timestamp = request.POST['timestamp']
++
++        if not self.verify(settings.MAILGUN_API_KEY, token, timestamp, signature):
++            logging.info('Unable to verify signature for mailgun request')
++            return HttpResponse(status=403)
++
++        to_email = parseaddr(request.POST['To'])[1]
++        from_email = parseaddr(request.POST['From'])[1]
++
++        try:
++            group_id = email_to_group_id(to_email)
++        except Exception:
++            logging.info('%r is not a valid email address', to_email)
++            return HttpResponse(status=500)
++
++        payload = EmailReplyParser.parse_reply(request.POST['body-plain']).strip()
++        if not payload:
++            # If there's no body, we don't need to go any further
++            return HttpResponse(status=200)
++
++        process_inbound_email.delay(from_email, group_id, payload)
++
++        return HttpResponse(status=201)
+diff --git a/src/sentry/web/urls.py b/src/sentry/web/urls.py
+index b8667d6d1c..d367376e7f 100644
+--- a/src/sentry/web/urls.py
++++ b/src/sentry/web/urls.py
+@@ -21,11 +21,6 @@ from sentry.web.frontend import (
+     admin, users, explore, explore_code,
+ )
+ 
+-from sentry.web.frontend.help_index import HelpIndexView
+-from sentry.web.frontend.help_page import HelpPageView
+-from sentry.web.frontend.help_platform_details import HelpPlatformDetailsView
+-from sentry.web.frontend.help_platform_index import HelpPlatformIndexView
+-
+ import sentry.web.frontend.projects.general
+ import sentry.web.frontend.projects.keys
+ import sentry.web.frontend.projects.notifications
+@@ -41,6 +36,11 @@ from sentry.web.frontend.access_group_migration import AccessGroupMigrationView
+ from sentry.web.frontend.auth_login import AuthLoginView
+ from sentry.web.frontend.auth_logout import AuthLogoutView
+ from sentry.web.frontend.home import HomeView
++from sentry.web.frontend.help_index import HelpIndexView
++from sentry.web.frontend.help_page import HelpPageView
++from sentry.web.frontend.help_platform_details import HelpPlatformDetailsView
++from sentry.web.frontend.help_platform_index import HelpPlatformIndexView
++from sentry.web.frontend.mailgun_inbound_webhook import MailgunInboundWebhookView
+ from sentry.web.frontend.organization_audit_log import OrganizationAuditLogView
+ from sentry.web.frontend.organization_home import OrganizationHomeView
+ from sentry.web.frontend.organization_members import OrganizationMembersView
+@@ -96,6 +96,8 @@ urlpatterns += patterns('',
+ 
+     # API
+     url(r'^api/0/', include('sentry.api.urls')),
++    url(r'^api/hooks/mailgun/inbound/', MailgunInboundWebhookView.as_view(),
++        name='sentry-mailgun-inbound-hook'),
+ 
+     # Account
+     url(r'^login/$', AuthLoginView.as_view(),
+diff --git a/tests/sentry/web/frontend/test_mailgun_inbound_webhook.py b/tests/sentry/web/frontend/test_mailgun_inbound_webhook.py
+new file mode 100644
+index 0000000000..b728dbfe60
+--- /dev/null
++++ b/tests/sentry/web/frontend/test_mailgun_inbound_webhook.py
+@@ -0,0 +1,50 @@
++from __future__ import absolute_import, print_function
++
++import mock
++
++from django.core.urlresolvers import reverse
++
++from sentry.testutils import TestCase
++from sentry.utils.email import group_id_to_email
++
++body_plain = "foo bar"
++
++
++class TestMailgunInboundWebhookView(TestCase):
++    def setUp(self):
++        super(TestMailgunInboundWebhookView, self).setUp()
++        self.event = self.create_event(event_id='a' * 32)
++        self.mailto = group_id_to_email(self.group.pk)
++
++    @mock.patch('sentry.web.frontend.mailgun_inbound_webhook.process_inbound_email')
++    def test_invalid_signature(self, process_inbound_email):
++        resp = self.client.post(reverse('sentry-mailgun-inbound-hook'), {
++            'To': 'Sentry <%s>' % (self.mailto,),
++            'From': 'David <%s>' % (self.user.email,),
++            'body-plain': body_plain,
++            'signature': '',
++            'token': '',
++            'timestamp': '',
++        })
++        assert resp.status_code == 403
++
++    @mock.patch('sentry.web.frontend.mailgun_inbound_webhook.process_inbound_email')
++    def test_simple(self, process_inbound_email):
++        token = 'a' * 50
++        timestamp = '1422513193'
++        signature = '436688eb38038505394ff31e621c1e4c61b26b09638016b6d630d6199aa48403'
++
++        resp = self.client.post(reverse('sentry-mailgun-inbound-hook'), {
++            'To': 'Sentry <%s>' % (self.mailto,),
++            'From': 'David <%s>' % (self.user.email,),
++            'body-plain': body_plain,
++            'signature': signature,
++            'token': token,
++            'timestamp': timestamp,
++        })
++        assert resp.status_code == 201
++        process_inbound_email.delay.assert_called_once_with(
++            self.user.email,
++            self.group.id,
++            body_plain,
++        )

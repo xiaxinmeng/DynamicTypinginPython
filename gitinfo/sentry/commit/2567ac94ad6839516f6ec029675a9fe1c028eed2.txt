@@ -1,0 +1,193 @@
+commit 2567ac94ad6839516f6ec029675a9fe1c028eed2
+Author: Brett Hoerner <brett@bretthoerner.com>
+Date:   Tue Jun 5 13:55:04 2018 -0500
+
+    snuba: Query GroupHashTombstone and pass down tombstone date with issues (#8632)
+
+diff --git a/src/sentry/testutils/fixtures.py b/src/sentry/testutils/fixtures.py
+index 7d28813044..fd489c7b0f 100644
+--- a/src/sentry/testutils/fixtures.py
++++ b/src/sentry/testutils/fixtures.py
+@@ -614,7 +614,7 @@ class Fixtures(object):
+             )
+         if 'short_id' not in kwargs:
+             kwargs['short_id'] = project.next_short_id()
+-        return Group.objects.create(project=project, ** kwargs)
++        return Group.objects.create(project=project, **kwargs)
+ 
+     def create_file(self, **kwargs):
+         return File.objects.create(**kwargs)
+diff --git a/src/sentry/utils/snuba.py b/src/sentry/utils/snuba.py
+index 458770e8d8..fe735b50d8 100644
+--- a/src/sentry/utils/snuba.py
++++ b/src/sentry/utils/snuba.py
+@@ -3,16 +3,19 @@ from __future__ import absolute_import
+ from contextlib import contextmanager
+ from dateutil.parser import parse as parse_datetime
+ from itertools import chain
++from operator import or_
+ import json
+ import six
+ import time
+ import urllib3
+ 
+ from django.conf import settings
++from django.db.models import Q
+ 
+-from sentry.models import Group, GroupHash, Environment, Release, ReleaseProject
++from sentry.models import Group, GroupHash, GroupHashTombstone, Environment, Release, ReleaseProject
+ from sentry.utils import metrics
+ from sentry.utils.dates import to_timestamp
++from functools import reduce
+ 
+ 
+ class SnubaError(Exception):
+@@ -222,9 +225,32 @@ def get_project_issues(project_ids, issue_ids=None):
+         hashes = GroupHash.objects.filter(group_id__in=issue_ids)
+     else:
+         hashes = GroupHash.objects.filter(project__in=project_ids)
++
++    hashes = list(hashes)
++    if not hashes:
++        return []
++
++    hashes_by_project = {}
++    for h in hashes:
++        hashes_by_project.setdefault(h.project_id, []).append(h.hash)
++
++    tombstones = GroupHashTombstone.objects.filter(
++        reduce(or_, (Q(project_id=pid, hash__in=hshes)
++                    for pid, hshes in six.iteritems(hashes_by_project)))
++    )
++
++    tombstones_by_project = {}
++    for tombstone in tombstones:
++        tombstones_by_project.setdefault(
++            tombstone.project_id, {}
++        )[tombstone.hash] = tombstone.deleted_at
++
++    # return [(gid, [(hash, tombstone_date), (hash, tombstone_date), ...]), ...]
+     result = {}
+-    for gid, hsh in hashes.values_list('group_id', 'hash'):
+-        result.setdefault(gid, []).append(hsh)
++    for h in hashes:
++        tombstone_date = tombstones_by_project.get(h.project_id, {}).get(h.hash, None)
++        pair = (h.hash, tombstone_date.strftime("%Y-%m-%d %H:%M:%S") if tombstone_date else None)
++        result.setdefault(h.group_id, []).append(pair)
+     return list(result.items())
+ 
+ 
+diff --git a/tests/snuba/tagstore/test_tagstore_backend.py b/tests/snuba/tagstore/test_tagstore_backend.py
+index 891656d141..efbb212afb 100644
+--- a/tests/snuba/tagstore/test_tagstore_backend.py
++++ b/tests/snuba/tagstore/test_tagstore_backend.py
+@@ -18,12 +18,12 @@ from sentry.tagstore.exceptions import (
+     TagValueNotFound,
+ )
+ from sentry.tagstore.snuba.backend import SnubaTagStorage
+-from sentry.testutils import TestCase
++from sentry.testutils import SnubaTestCase
+ 
+ 
+-class TagStorage(TestCase):
++class TagStorageTest(SnubaTestCase):
+     def setUp(self):
+-        assert requests.post(settings.SENTRY_SNUBA + '/tests/drop').status_code == 200
++        super(TagStorageTest, self).setUp()
+ 
+         self.ts = SnubaTagStorage()
+ 
+@@ -258,6 +258,8 @@ class TagStorage(TestCase):
+             self.proj1group1.id,
+             self.proj1group2.id,
+         ])
++        assert set(v.last_seen for v in result) == \
++            set([self.now - timedelta(seconds=1), self.now - timedelta(seconds=2)])
+         assert result[0].last_seen == self.now - timedelta(seconds=1)
+         assert result[1].last_seen == self.now - timedelta(seconds=2)
+         for v in result:
+diff --git a/tests/snuba/test_snuba.py b/tests/snuba/test_snuba.py
+index 65e8b58006..5f0452dc51 100644
+--- a/tests/snuba/test_snuba.py
++++ b/tests/snuba/test_snuba.py
+@@ -3,7 +3,9 @@ from __future__ import absolute_import
+ from datetime import datetime, timedelta
+ import pytest
+ import time
++import uuid
+ 
++from sentry.models import GroupHash, GroupHashTombstone
+ from sentry.testutils import SnubaTestCase
+ from sentry.utils import snuba
+ 
+@@ -44,3 +46,70 @@ class SnubaTest(SnubaTestCase):
+                 filter_keys={'project_id': [100]},
+                 groupby=[")("],
+             )
++
++    def test_project_issues_with_tombstones(self):
++        base_time = datetime.utcnow()
++        a_hash = 'a' * 32
++
++        def _insert_event_for_time(ts):
++            self.snuba_insert({
++                'event_id': uuid.uuid4().hex,
++                'primary_hash': a_hash,
++                'project_id': 100,
++                'message': 'message',
++                'platform': 'python',
++                'datetime': ts.strftime('%Y-%m-%dT%H:%M:%S.%fZ'),
++                'data': {
++                    'received': time.mktime(ts.timetuple()),
++                }
++            })
++
++        def _query_for_issue(group_id):
++            return snuba.query(
++                start=base_time - timedelta(days=1),
++                end=base_time + timedelta(days=1),
++                groupby=['issue'],
++                filter_keys={
++                    'project_id': [100],
++                    'issue': [group_id]
++                },
++            )
++
++        group1 = self.create_group()
++        group2 = self.create_group()
++
++        GroupHash.objects.create(
++            project=self.project,
++            group=group1,
++            hash=a_hash)
++        assert snuba.get_project_issues([self.project], [group1.id]) == \
++            [(group1.id, [('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', None)])]
++
++        # 1 event in the groups, no deletes have happened
++        _insert_event_for_time(base_time)
++        assert _query_for_issue(group1.id) == {group1.id: 1}
++
++        # group is deleted and then returns (as a new group with the same hash)
++        GroupHashTombstone.tombstone_groups(self.project.id, [group1.id])
++
++        ght = GroupHashTombstone.objects.get(project_id=self.project.id)
++        assert ght
++
++        GroupHash.objects.create(
++            project=self.project,
++            group=group2,
++            hash=a_hash,
++        )
++
++        # tombstone time is returned as expected
++        assert snuba.get_project_issues([self.project], [group2.id]) == \
++            [(group2.id, [('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
++                           ght.deleted_at.strftime("%Y-%m-%d %H:%M:%S"))])]
++
++        # events <= to the tombstone date aren't returned
++        _insert_event_for_time(ght.deleted_at)
++        assert _query_for_issue(group2.id) == {}
++
++        # only the event > than the tombstone date is returned
++        _insert_event_for_time(ght.deleted_at + timedelta(seconds=1))
++        assert _query_for_issue(group2.id) == {group2.id: 1}

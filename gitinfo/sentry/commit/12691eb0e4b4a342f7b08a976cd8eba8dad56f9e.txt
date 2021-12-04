@@ -1,0 +1,444 @@
+commit 12691eb0e4b4a342f7b08a976cd8eba8dad56f9e
+Author: Chris Fuller <cfuller@sentry.io>
+Date:   Thu Apr 30 19:24:13 2020 -0400
+
+    feat(workflow): Creating CombinedQuerysetPaginator (#18540)
+    
+    * Adding CombinedQuerysetPaginator and making alert rule list endpoint use it
+
+diff --git a/src/sentry/api/paginator.py b/src/sentry/api/paginator.py
+index 21bfef6dd6..ac64543867 100644
+--- a/src/sentry/api/paginator.py
++++ b/src/sentry/api/paginator.py
+@@ -470,3 +470,111 @@ class GenericOffsetPaginator(object):
+         # TODO use Cursor.value as the `end` argument to data_fn() so that
+         # subsequent pages returned using these cursors are using the same end
+         # date for queries, this should stop drift from new incoming events.
++
++
++class CombinedQuerysetPaginator(object):
++    multiplier = 1000000  # Use microseconds for date keys.
++
++    def __init__(self, order_by, querysets, on_results=None):
++        if order_by:
++            if order_by.startswith("-"):
++                self.key, self.desc = order_by[1:], True
++            else:
++                self.key, self.desc = order_by, False
++        else:
++            self.key = None
++            self.desc = False
++
++        self.querysets = querysets
++        self.on_results = on_results
++        # IMPROVEMENT: Ensure each model in the querysets has attribute of self.key
++        # ... or accept a function that can map to the proper key based on model instance
++        # use case could be sorting by name/label for AlertRule / Rule
++        # For now...just be diligent in your usage.
++
++    def get_item_key(self, item, for_prev=False):
++        if self.key == "date_added":  # Could generalize this more
++            return self.multiplier * float(getattr(item, self.key).strftime("%s.%f"))
++        else:
++            value = getattr(item, self.key)
++            return math.floor(value) if self._is_asc(for_prev) else math.ceil(value)
++
++    def value_from_cursor(self, cursor):
++        if self.key == "date_added":  # Could generalize this more
++            return datetime.fromtimestamp(float(cursor.value) / self.multiplier).replace(
++                tzinfo=timezone.utc
++            )
++        else:
++            return cursor.value
++
++    def _is_asc(self, is_prev):
++        return (self.desc and is_prev) or not (self.desc or is_prev)
++
++    def _build_combined_querysets(self, value, is_prev, limit, extra):
++        asc = self._is_asc(is_prev)
++
++        if asc:
++            order_by = self.key
++            filter_condition = "%s__gte" % self.key
++        else:
++            order_by = "-%s" % self.key
++            filter_condition = "%s__lte" % self.key
++
++        filters = {}
++        if value is not None:
++            assert self.key
++            filters[filter_condition] = value
++
++        combined_querysets = list()
++        for queryset in self.querysets:
++            queryset = queryset.filter(**filters).order_by(order_by)[: (limit + extra)]
++            combined_querysets += list(queryset)
++
++        combined_querysets.sort(
++            key=lambda item: (getattr(item, self.key), type(item).__name__), reverse=not asc
++        )
++        return combined_querysets
++
++    def get_result(self, cursor=None, limit=100):
++        if cursor is None:
++            cursor = Cursor(0, 0, 0)
++
++        if cursor.value:
++            cursor_value = self.value_from_cursor(cursor)
++        else:
++            cursor_value = None
++
++        limit = min(limit, MAX_LIMIT)
++
++        offset = cursor.offset
++        extra = 1
++        if cursor.is_prev and cursor.value:
++            extra += 1
++        combined_querysets = self._build_combined_querysets(
++            cursor_value, cursor.is_prev, limit, extra
++        )
++
++        stop = offset + limit + extra
++        results = list(combined_querysets[offset:stop])
++
++        if cursor.is_prev and cursor.value:
++            # If the first result is equal to the cursor_value then it's safe to filter
++            # it out, since the value hasn't been updated
++            if results and self.get_item_key(results[0], for_prev=True) == cursor.value:
++                results = results[1:]
++            # Otherwise we may have fetched an extra row, just drop it off the end if so.
++            elif len(results) == offset + limit + extra:
++                results = results[:-1]
++
++        # We reversed the results when generating the querysets, so we need to reverse back now.
++        if cursor.is_prev:
++            results.reverse()
++
++        return build_cursor(
++            results=results,
++            cursor=cursor,
++            key=self.get_item_key,
++            limit=limit,
++            is_desc=self.desc,
++            on_results=self.on_results,
++        )
+diff --git a/src/sentry/incidents/endpoints/project_alert_rule_index.py b/src/sentry/incidents/endpoints/project_alert_rule_index.py
+index f537206ed8..f216f46beb 100644
+--- a/src/sentry/incidents/endpoints/project_alert_rule_index.py
++++ b/src/sentry/incidents/endpoints/project_alert_rule_index.py
+@@ -1,24 +1,18 @@
+ from __future__ import absolute_import
+ 
+-import six
+-import time
+-from datetime import datetime
+ from copy import deepcopy
+ 
+ from rest_framework import status
+ from rest_framework.response import Response
+ 
+-from django.utils import timezone
+-
+ from sentry import features
+ from sentry.api.bases.project import ProjectEndpoint
+ from sentry.api.exceptions import ResourceDoesNotExist
+-from sentry.api.paginator import OffsetPaginator
++from sentry.api.paginator import OffsetPaginator, CombinedQuerysetPaginator
+ from sentry.api.serializers import serialize, CombinedRuleSerializer
+ from sentry.incidents.endpoints.serializers import AlertRuleSerializer
+ from sentry.incidents.models import AlertRule
+ from sentry.models import Rule, RuleStatus
+-from sentry.utils.cursors import build_cursor, Cursor
+ 
+ 
+ class ProjectCombinedRuleIndexEndpoint(ProjectEndpoint):
+@@ -26,52 +20,19 @@ class ProjectCombinedRuleIndexEndpoint(ProjectEndpoint):
+         """
+         Fetches alert rules and legacy rules for an organization
+         """
+-        cursor_string = request.GET.get(
+-            "cursor", six.binary_type(int(time.time() * 1000000)) + ":0:0"
+-        )
+-        try:
+-            limit = min(100, int(request.GET.get("limit", 25)))
+-        except ValueError as e:
+-            return Response(
+-                {"detail": "Invalid input for `limit`. Error: %s" % six.text_type(e)}, status=400
+-            )
+-
+-        cursor = Cursor.from_string(cursor_string)
+-        cursor_date = datetime.fromtimestamp(float(cursor.value) / 1000000).replace(
+-            tzinfo=timezone.utc
+-        )
+-
+-        alert_rule_queryset = (
+-            AlertRule.objects.fetch_for_project(project)
+-            .filter(date_added__lte=cursor_date)
+-            .order_by("-date_added")[: limit + 1]
+-        )
+-
+-        legacy_rule_queryset = (
+-            Rule.objects.filter(
+-                project=project, status__in=[RuleStatus.ACTIVE, RuleStatus.INACTIVE]
+-            )
+-            .select_related("project")
+-            .filter(date_added__lte=cursor_date)
+-            .order_by("-date_added")[: (limit + 1)]
+-        )
+-        combined_rules = list(alert_rule_queryset) + list(legacy_rule_queryset)
+-        combined_rules.sort(
+-            key=lambda instance: (instance.date_added, type(instance)), reverse=True
+-        )
+-        combined_rules = combined_rules[cursor.offset : cursor.offset + limit + 1]
+-
+-        def get_item_key(item, for_prev=False):
+-            return 1000000 * float(item.date_added.strftime("%s.%f"))
+-
+-        cursor_result = build_cursor(
+-            results=combined_rules, cursor=cursor, key=get_item_key, limit=limit, is_desc=True
++        return self.paginate(
++            request,
++            paginator_cls=CombinedQuerysetPaginator,
++            on_results=lambda x: serialize(x, request.user, CombinedRuleSerializer()),
++            default_per_page=25,
++            order_by="-date_added",
++            querysets=[
++                AlertRule.objects.fetch_for_project(project),
++                Rule.objects.filter(
++                    project=project, status__in=[RuleStatus.ACTIVE, RuleStatus.INACTIVE]
++                ),
++            ],
+         )
+-        results = list(cursor_result)
+-        context = serialize(results, request.user, CombinedRuleSerializer())
+-        response = Response(context)
+-        self.add_cursor_headers(request, response, cursor_result)
+-        return response
+ 
+ 
+ class ProjectAlertRuleIndexEndpoint(ProjectEndpoint):
+diff --git a/src/sentry/incidents/models.py b/src/sentry/incidents/models.py
+index 059e7e6398..fdcc87c7c7 100644
+--- a/src/sentry/incidents/models.py
++++ b/src/sentry/incidents/models.py
+@@ -431,6 +431,8 @@ class AlertRule(Model):
+         # a partial index where status=0
+         unique_together = (("organization", "name", "status"),)
+ 
++    __repr__ = sane_repr("id", "name", "date_added")
++
+ 
+ class TriggerStatus(Enum):
+     ACTIVE = 0
+diff --git a/src/sentry/static/sentry/app/views/settings/projectAlerts/list.tsx b/src/sentry/static/sentry/app/views/settings/projectAlerts/list.tsx
+index 1a88c932a8..973b19dac9 100644
+--- a/src/sentry/static/sentry/app/views/settings/projectAlerts/list.tsx
++++ b/src/sentry/static/sentry/app/views/settings/projectAlerts/list.tsx
+@@ -11,6 +11,7 @@ import {t} from 'app/locale';
+ import AsyncView from 'app/views/asyncView';
+ import Button from 'app/components/button';
+ import OnboardingHovercard from 'app/views/settings/projectAlerts/onboardingHovercard';
++import Pagination from 'app/components/pagination';
+ import PermissionAlert from 'app/views/settings/project/permissionAlert';
+ import RuleRow from 'app/views/settings/projectAlerts/ruleRow';
+ import SettingsPageHeader from 'app/views/settings/components/settingsPageHeader';
+@@ -77,7 +78,7 @@ class ProjectAlertRules extends AsyncView<Props, State> {
+   renderBody() {
+     const {canEditRule, location, organization, params} = this.props;
+     const {orgId, projectId} = params;
+-    const {loading, rules} = this.state;
++    const {loading, rules, rulesPageLinks} = this.state;
+ 
+     const basePath = `/settings/${orgId}/projects/${projectId}/alerts/`;
+ 
+@@ -126,6 +127,8 @@ class ProjectAlertRules extends AsyncView<Props, State> {
+             {() => this.renderResults()}
+           </StyledPanelTable>
+         </ScrollWrapper>
++
++        <Pagination pageLinks={rulesPageLinks} />
+       </React.Fragment>
+     );
+   }
+diff --git a/tests/sentry/api/test_paginator.py b/tests/sentry/api/test_paginator.py
+index 9b23400c0b..be8e85b487 100644
+--- a/tests/sentry/api/test_paginator.py
++++ b/tests/sentry/api/test_paginator.py
+@@ -11,10 +11,12 @@ from sentry.api.paginator import (
+     OffsetPaginator,
+     SequencePaginator,
+     GenericOffsetPaginator,
++    CombinedQuerysetPaginator,
+     reverse_bisect_left,
+ )
+-from sentry.models import User
+-from sentry.testutils import TestCase
++from sentry.models import User, Rule
++from sentry.incidents.models import AlertRule
++from sentry.testutils import TestCase, APITestCase
+ from sentry.utils.cursors import Cursor
+ 
+ 
+@@ -530,3 +532,77 @@ class GenericOffsetPaginatorTest(TestCase):
+         assert list(result2) == [5]
+         assert result2.prev == Cursor(0, 0, True, True)
+         assert result2.next == Cursor(0, 10, False, False)
++
++
++class CombinedQuerysetPaginatorTest(APITestCase):
++    def test_simple(self):
++        Rule.objects.all().delete()
++
++        alert_rule0 = self.create_alert_rule(name="alertrule0")
++        alert_rule1 = self.create_alert_rule(name="alertrule1")
++        rule1 = Rule.objects.create(label="rule1", project=self.project)
++        alert_rule2 = self.create_alert_rule(name="alertrule2")
++        alert_rule3 = self.create_alert_rule(name="alertrule3")
++        rule2 = Rule.objects.create(label="rule2", project=self.project)
++        rule3 = Rule.objects.create(label="rule3", project=self.project)
++
++        paginator = CombinedQuerysetPaginator(
++            querysets=[AlertRule.objects.all(), Rule.objects.all()], order_by="-date_added",
++        )
++
++        result = paginator.get_result(limit=3, cursor=None)
++        assert len(result) == 3
++        page1_results = list(result)
++        assert page1_results[0].id == rule3.id
++        assert page1_results[1].id == rule2.id
++        assert page1_results[2].id == alert_rule3.id
++
++        next_cursor = result.next
++        result = paginator.get_result(limit=3, cursor=next_cursor)
++        page2_results = list(result)
++        assert len(result) == 3
++        assert page2_results[0].id == alert_rule2.id
++        assert page2_results[1].id == rule1.id
++        assert page2_results[2].id == alert_rule1.id
++
++        next_cursor = result.next
++        prev_cursor = result.prev
++        result = paginator.get_result(limit=3, cursor=next_cursor)
++        page3_results = list(result)
++        print(page3_results)
++        assert len(result) == 2
++        assert page3_results[0].id == alert_rule0.id
++
++        result = paginator.get_result(limit=3, cursor=prev_cursor)
++        assert list(result) == page1_results
++
++        # Test reverse sorting:
++        paginator = CombinedQuerysetPaginator(
++            querysets=[AlertRule.objects.all(), Rule.objects.all()], order_by="date_added"
++        )
++        result = paginator.get_result(limit=3, cursor=None)
++        assert len(result) == 3
++        page1_results = list(result)
++        assert page1_results[0].id == Rule.objects.all().first().id
++        assert page1_results[1].id == alert_rule0.id
++        assert page1_results[2].id == alert_rule1.id
++
++        next_cursor = result.next
++        result = paginator.get_result(limit=3, cursor=next_cursor)
++        page2_results = list(result)
++        assert len(result) == 3
++        assert page2_results[0].id == rule1.id
++        assert page2_results[1].id == alert_rule2.id
++        assert page2_results[2].id == alert_rule3.id
++
++        next_cursor = result.next
++        prev_cursor = result.prev
++        result = paginator.get_result(limit=3, cursor=next_cursor)
++        page3_results = list(result)
++        print(page3_results)
++        assert len(result) == 2
++        assert page3_results[0].id == rule2.id
++        assert page3_results[1].id == rule3.id
++
++        result = paginator.get_result(limit=3, cursor=prev_cursor)
++        assert list(result) == page1_results
+diff --git a/tests/sentry/incidents/endpoints/test_project_alert_rule_index.py b/tests/sentry/incidents/endpoints/test_project_alert_rule_index.py
+index a25e4f65fd..fe8ad1fe16 100644
+--- a/tests/sentry/incidents/endpoints/test_project_alert_rule_index.py
++++ b/tests/sentry/incidents/endpoints/test_project_alert_rule_index.py
+@@ -169,7 +169,7 @@ class ProjectCombinedRuleIndexEndpointTest(BaseAlertRuleSerializerTest, TestCase
+     def test_invalid_limit(self):
+         self.setup_project_and_rules()
+         with self.feature("organizations:incidents"):
+-            request_data = {"limit": "notaninteger"}
++            request_data = {"per_page": "notaninteger"}
+             response = self.client.get(
+                 path=self.combined_rules_url, data=request_data, content_type="application/json"
+             )
+@@ -179,7 +179,7 @@ class ProjectCombinedRuleIndexEndpointTest(BaseAlertRuleSerializerTest, TestCase
+         self.setup_project_and_rules()
+         # Test limit above result count (which is 4), no cursor.
+         with self.feature("organizations:incidents"):
+-            request_data = {"limit": "5"}
++            request_data = {"per_page": "5"}
+             response = self.client.get(
+                 path=self.combined_rules_url, data=request_data, content_type="application/json"
+             )
+@@ -197,7 +197,7 @@ class ProjectCombinedRuleIndexEndpointTest(BaseAlertRuleSerializerTest, TestCase
+ 
+         # Test Limit as 1, no cursor:
+         with self.feature("organizations:incidents"):
+-            request_data = {"limit": "1"}
++            request_data = {"per_page": "1"}
+             response = self.client.get(
+                 path=self.combined_rules_url, data=request_data, content_type="application/json"
+             )
+@@ -214,7 +214,7 @@ class ProjectCombinedRuleIndexEndpointTest(BaseAlertRuleSerializerTest, TestCase
+ 
+         # Test Limit as 1, next page of previous request:
+         with self.feature("organizations:incidents"):
+-            request_data = {"cursor": next_cursor, "limit": "1"}
++            request_data = {"cursor": next_cursor, "per_page": "1"}
+             response = self.client.get(
+                 path=self.combined_rules_url, data=request_data, content_type="application/json"
+             )
+@@ -229,7 +229,7 @@ class ProjectCombinedRuleIndexEndpointTest(BaseAlertRuleSerializerTest, TestCase
+ 
+         # Test Limit as 2, no cursor:
+         with self.feature("organizations:incidents"):
+-            request_data = {"limit": "2"}
++            request_data = {"per_page": "2"}
+             response = self.client.get(
+                 path=self.combined_rules_url, data=request_data, content_type="application/json"
+             )
+@@ -247,7 +247,7 @@ class ProjectCombinedRuleIndexEndpointTest(BaseAlertRuleSerializerTest, TestCase
+         next_cursor = links[1]["cursor"]
+         # Test Limit 2, next page of previous request:
+         with self.feature("organizations:incidents"):
+-            request_data = {"cursor": next_cursor, "limit": "2"}
++            request_data = {"cursor": next_cursor, "per_page": "2"}
+             response = self.client.get(
+                 path=self.combined_rules_url, data=request_data, content_type="application/json"
+             )
+@@ -265,7 +265,7 @@ class ProjectCombinedRuleIndexEndpointTest(BaseAlertRuleSerializerTest, TestCase
+ 
+         # Test Limit 2, next page of previous request - should get no results since there are only 4 total:
+         with self.feature("organizations:incidents"):
+-            request_data = {"cursor": next_cursor, "limit": "2"}
++            request_data = {"cursor": next_cursor, "per_page": "2"}
+             response = self.client.get(
+                 path=self.combined_rules_url, data=request_data, content_type="application/json"
+             )
+@@ -287,7 +287,7 @@ class ProjectCombinedRuleIndexEndpointTest(BaseAlertRuleSerializerTest, TestCase
+         self.three_alert_rule = self.create_alert_rule(projects=self.projects)
+ 
+         with self.feature("organizations:incidents"):
+-            request_data = {"limit": "2"}
++            request_data = {"per_page": "2"}
+             response = self.client.get(
+                 path=self.combined_rules_url, data=request_data, content_type="application/json"
+             )
+@@ -305,7 +305,7 @@ class ProjectCombinedRuleIndexEndpointTest(BaseAlertRuleSerializerTest, TestCase
+         assert next_cursor.split(":")[1] == "1"  # Assert offset is properly calculated.
+ 
+         with self.feature("organizations:incidents"):
+-            request_data = {"cursor": next_cursor, "limit": "2"}
++            request_data = {"cursor": next_cursor, "per_page": "2"}
+             response = self.client.get(
+                 path=self.combined_rules_url, data=request_data, content_type="application/json"
+             )

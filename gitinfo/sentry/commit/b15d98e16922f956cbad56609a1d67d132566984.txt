@@ -1,0 +1,875 @@
+commit b15d98e16922f956cbad56609a1d67d132566984
+Author: ted kaemming <ted@kaemming.com>
+Date:   Wed Apr 5 15:40:48 2017 -0700
+
+    Merge time series data as part of group merge operation. (#5196)
+    
+    Adds merge methods for counters, distinct counters, and frequency tables to the abstract backend, the dummy backend, the in-memory backend, and the Redis backend.
+    
+    These operations are not atomic, as they may cross database boundaries.
+    
+    Fixes GH-3136.
+
+diff --git a/CHANGES b/CHANGES
+index 4828cb1fde..253a30797e 100644
+--- a/CHANGES
++++ b/CHANGES
+@@ -16,6 +16,7 @@ Version 8.15
+ - Resolve issues when commits with ``Fixes SHORTID`` are included in releases
+ - Added support for associating debug symbols with iTunes applications and builds.
+ - Added the ability to claim unassigned issues when resolving them.
++- Time series data (used by graphs and other features) is now updated when groups are merged.
+ 
+ API Changes
+ ~~~~~~~~~~~
+diff --git a/src/sentry/scripts/tsdb/cmsketch.lua b/src/sentry/scripts/tsdb/cmsketch.lua
+index d5214f36e2..214fbd276d 100644
+--- a/src/sentry/scripts/tsdb/cmsketch.lua
++++ b/src/sentry/scripts/tsdb/cmsketch.lua
+@@ -318,6 +318,116 @@ function Sketch:increment(items)
+     return results
+ end
+ 
++local function response_to_table(response)
++    local result = {}
++    for i = 1, #response, 2 do
++        result[response[i]] = response[i + 1]
++    end
++    return result
++end
++
++function Sketch:export()
++    -- If there's no data, there's nothing meaningful to export.
++    if not self:exists() then
++        return cmsgpack.pack(nil)
++    end
++    return cmsgpack.pack({
++        response_to_table(redis.call('ZRANGE', self.index, 0, -1, 'WITHSCORES')),
++        response_to_table(redis.call('HGETALL', self.estimates)),
++    })
++end
++
++function table.is_empty(t)
++    return next(t) == nil
++end
++
++function Sketch:import(payload)
++    local data = cmsgpack.unpack(payload)
++    if data == nil then
++        return  -- nothing to do here
++    end
++
++    local source_index, source_estimators = unpack(data)
++
++    if table.is_empty(source_estimators) then
++        -- If we're just writing the source index values (and not estimators)
++        -- to the destination, we can just directly increment the sketch which
++        -- will take care of destinaton estimator updates and index truncation,
++        -- if necessary.
++        local items = {}
++        for key, value in pairs(source_index) do
++            table.insert(
++                items,
++                {key, tonumber(value)}
++            )
++        end
++        self:increment(items)
++    else
++        -- If the source does have estimators, we'll have to add those to the
++        -- destination estimators and rebuild the index from the combined
++        -- estimates and the known top values from both indices.
++        local destination_index = response_to_table(
++            redis.call('ZRANGE', self.index, 0, -1, 'WITHSCORES')
++        )
++
++        -- If this sketch doesn't yet have any estimators, we'll need to derive
++        -- them from the index data before we merge in the source estimators.
++        if tonumber(redis.call('EXISTS', self.estimates)) ~= 1 then
++            for key, score in pairs(destination_index) do
++                for _, coordinates in ipairs(self:coordinates(key)) do
++                    local estimate = self:observations(coordinates)
++                    if estimate == nil or tonumber(score) > estimate then
++                        redis.call(
++                            'HSET',
++                            self.estimates,
++                            struct.pack('>HH', unpack(coordinates)),
++                            score
++                        )
++                    end
++                end
++            end
++        end
++
++        -- Merge in the source estimators.
++        for key, value in pairs(source_estimators) do
++            redis.call('HINCRBY', self.estimates, key, value)
++        end
++
++        -- Rebuild the index by using the keys from both indices and the new estimates.
++        local members = {}
++
++        for key, _ in pairs(source_index) do
++            members[key] = true
++        end
++
++        for key, _ in pairs(destination_index) do
++            members[key] = true
++        end
++
++        redis.call('DEL', self.index)
++
++        for key, _ in pairs(members) do
++            redis.call(
++                'ZADD',
++                self.index,
++                reduce(
++                    math.min,
++                    map(
++                        function (coordinates)
++                            return self:observations(coordinates)
++                        end,
++                        self:coordinates(key)
++                    )
++                ),
++                key
++            )
++        end
++
++        -- Remove extra items from the index.
++        redis.call('ZREMRANGEBYRANK', self.index, 0, -self.configuration.index - 1)
++    end
++end
++
+ 
+ --[[ Redis API ]]--
+ 
+@@ -511,5 +621,29 @@ return Router:new({
+                 return trimmed
+             end
+         end
+-    )
++    ),
++
++    EXPORT = Command:new(
++        function (sketches, arguments)
++            return map(
++                function (sketch)
++                    return sketch:export()
++                end,
++                sketches
++            )
++        end
++    ),
++
++    IMPORT = Command:new(
++        function (sketches, arguments)
++            return map(
++                function (item)
++                    local sketch, data = unpack(item)
++                    return sketch:import(data)
++                end,
++                zip({sketches, arguments})
++            )
++        end
++    ),
++
+ })(KEYS, ARGV)
+diff --git a/src/sentry/tasks/merge.py b/src/sentry/tasks/merge.py
+index cb08951ace..6190154b9c 100644
+--- a/src/sentry/tasks/merge.py
++++ b/src/sentry/tasks/merge.py
+@@ -13,6 +13,7 @@ import logging
+ from django.db import DataError, IntegrityError, router, transaction
+ from django.db.models import F
+ 
++from sentry.app import tsdb
+ from sentry.similarity import features
+ from sentry.tasks.base import instrumented_task, retry
+ from sentry.tasks.deletion import delete_group
+@@ -94,6 +95,15 @@ def merge_group(from_object_id=None, to_object_id=None, transaction_id=None,
+ 
+     features.merge(new_group, [group], allow_unsafe=True)
+ 
++    for model in [tsdb.models.group]:
++        tsdb.merge(model, new_group.id, [group.id])
++
++    for model in [tsdb.models.users_affected_by_group]:
++        tsdb.merge_distinct_counts(model, new_group.id, [group.id])
++
++    for model in [tsdb.models.frequent_releases_by_group, tsdb.models.frequent_environments_by_group]:
++        tsdb.merge_frequencies(model, new_group.id, [group.id])
++
+     previous_group_id = group.id
+ 
+     group.delete()
+diff --git a/src/sentry/tsdb/base.py b/src/sentry/tsdb/base.py
+index 139db1d32a..cac6b7ec4a 100644
+--- a/src/sentry/tsdb/base.py
++++ b/src/sentry/tsdb/base.py
+@@ -226,6 +226,12 @@ class BaseTSDB(object):
+         for model, key in items:
+             self.incr(model, key, timestamp, count)
+ 
++    def merge(self, model, destination, sources, timestamp=None):
++        """
++        Transfer all counters from the source keys to the destination key.
++        """
++        raise NotImplementedError
++
+     def get_range(self, model, keys, start, end, rollup=None):
+         """
+         To get a range of data for group ID=[1, 2, 3]:
+@@ -298,6 +304,13 @@ class BaseTSDB(object):
+         """
+         raise NotImplementedError
+ 
++    def merge_distinct_counts(self, model, destination, sources, timestamp=None):
++        """
++        Transfer all distinct counters from the source keys to the
++        destination key.
++        """
++        raise NotImplementedError
++
+     def record_frequency_multi(self, requests, timestamp=None):
+         """
+         Record items in a frequency table.
+@@ -360,3 +373,10 @@ class BaseTSDB(object):
+         total score of items over the interval.
+         """
+         raise NotImplementedError
++
++    def merge_frequencies(self, model, destination, sources, timestamp=None):
++        """
++        Transfer all frequency tables from the source keys to the destination
++        key.
++        """
++        raise NotImplementedError
+diff --git a/src/sentry/tsdb/dummy.py b/src/sentry/tsdb/dummy.py
+index a1e7708b37..0d6cdd968a 100644
+--- a/src/sentry/tsdb/dummy.py
++++ b/src/sentry/tsdb/dummy.py
+@@ -17,6 +17,9 @@ class DummyTSDB(BaseTSDB):
+     def incr(self, model, key, timestamp=None, count=1):
+         pass
+ 
++    def merge(self, model, destination, sources, timestamp=None):
++        pass
++
+     def get_range(self, model, keys, start, end, rollup=None):
+         _, series = self.get_optimal_rollup_series(start, end, rollup)
+         return {k: [(ts, 0) for ts in series] for k in keys}
+@@ -34,6 +37,9 @@ class DummyTSDB(BaseTSDB):
+     def get_distinct_counts_union(self, model, keys, start, end=None, rollup=None):
+         return 0
+ 
++    def merge_distinct_counts(self, model, destination, sources, timestamp=None):
++        pass
++
+     def record_frequency_multi(self, requests, timestamp=None):
+         pass
+ 
+@@ -63,3 +69,6 @@ class DummyTSDB(BaseTSDB):
+         for key, members in items.items():
+             results[key] = {member: 0.0 for member in members}
+         return results
++
++    def merge_frequencies(self, model, destination, sources, timestamp=None):
++        pass
+diff --git a/src/sentry/tsdb/inmemory.py b/src/sentry/tsdb/inmemory.py
+index 2e7514425f..8e2cc82e5f 100644
+--- a/src/sentry/tsdb/inmemory.py
++++ b/src/sentry/tsdb/inmemory.py
+@@ -34,6 +34,12 @@ class InMemoryTSDB(BaseTSDB):
+             norm_epoch = self.normalize_to_rollup(timestamp, rollup)
+             self.data[model][key][norm_epoch] += count
+ 
++    def merge(self, model, destination, sources, timestamp=None):
++        destination = self.data[model][destination]
++        for source in sources:
++            for bucket, count in self.data[model].pop(source, {}).items():
++                destination[bucket] += count
++
+     def get_range(self, model, keys, start, end, rollup=None):
+         rollup, series = self.get_optimal_rollup_series(start, end, rollup)
+ 
+@@ -100,9 +106,21 @@ class InMemoryTSDB(BaseTSDB):
+ 
+         return len(values)
+ 
++    def merge_distinct_counts(self, model, destination, sources, timestamp=None):
++        destination = self.sets[model][destination]
++        for source in sources:
++            for bucket, values in self.sets[model].pop(source, {}).items():
++                destination[bucket].update(values)
++
+     def flush(self):
+-        # model => key => timestamp = count
+-        self.data = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
++        # self.data[model][key][rollup] = count
++        self.data = defaultdict(
++            lambda: defaultdict(
++                lambda: defaultdict(
++                    int,
++                )
++            )
++        )
+ 
+         # self.sets[model][key][rollup] = set of elements
+         self.sets = defaultdict(
+@@ -174,3 +192,9 @@ class InMemoryTSDB(BaseTSDB):
+                     result[member] = result.get(member, 0.0) + score
+ 
+         return results
++
++    def merge_frequencies(self, model, destination, sources, timestamp=None):
++        destination = self.frequencies[model][destination]
++        for source in sources:
++            for bucket, counter in self.data[model].pop(source, {}).items():
++                destination[bucket].update(counter)
+diff --git a/src/sentry/tsdb/redis.py b/src/sentry/tsdb/redis.py
+index c80d2fdcf6..a660b4c91f 100644
+--- a/src/sentry/tsdb/redis.py
++++ b/src/sentry/tsdb/redis.py
+@@ -213,6 +213,58 @@ class RedisTSDB(BaseTSDB):
+             results_by_key[key] = sorted(points.items())
+         return dict(results_by_key)
+ 
++    def merge(self, model, destination, sources, timestamp=None):
++        rollups = {}
++        for rollup, samples in self.rollups.items():
++            _, series = self.get_optimal_rollup_series(
++                to_datetime(self.get_earliest_timestamp(rollup, timestamp=timestamp)),
++                end=None,
++                rollup=rollup,
++            )
++            rollups[rollup] = map(to_datetime, series)
++
++        with self.cluster.map() as client:
++            data = {}
++            for rollup, series in rollups.items():
++                data[rollup] = {}
++                for timestamp in series:
++                    results = data[rollup][timestamp] = []
++                    for source in sources:
++                        source_model_key = self.get_model_key(source)
++                        key = self.make_counter_key(
++                            model,
++                            self.normalize_to_rollup(timestamp, rollup),
++                            source_model_key,
++                        )
++                        results.append(client.hget(key, source_model_key))
++                        client.hdel(key, source_model_key)
++
++        with self.cluster.map() as client:
++            destination_model_key = self.get_model_key(destination)
++
++            for rollup, series in data.items():
++                for timestamp, results in series.items():
++                    total = sum(int(result.value or 0) for result in results)
++                    if total:
++                        destination_counter_key = self.make_counter_key(
++                            model,
++                            self.normalize_to_rollup(timestamp, rollup),
++                            destination_model_key,
++                        )
++                        client.hincrby(
++                            destination_counter_key,
++                            destination_model_key,
++                            total,
++                        )
++                        client.expireat(
++                            destination_counter_key,
++                            self.calculate_expiry(
++                                rollup,
++                                self.rollups[rollup],
++                                timestamp,
++                            ),
++                        )
++
+     def record(self, model, key, values, timestamp=None):
+         self.record_multi(((model, key, values),), timestamp)
+ 
+@@ -381,6 +433,72 @@ class RedisTSDB(BaseTSDB):
+             ]
+         )
+ 
++    def merge_distinct_counts(self, model, destination, sources, timestamp=None):
++        rollups = {}
++        for rollup, samples in self.rollups.items():
++            _, series = self.get_optimal_rollup_series(
++                to_datetime(self.get_earliest_timestamp(rollup, timestamp=timestamp)),
++                end=None,
++                rollup=rollup,
++            )
++            rollups[rollup] = map(to_datetime, series)
++
++        temporary_id = uuid.uuid1().hex
++
++        def make_temporary_key(key):
++            return '{}{}:{}'.format(self.prefix, temporary_id, key)
++
++        data = {}
++        for rollup, series in rollups.items():
++            data[rollup] = {timestamp: [] for timestamp in series}
++
++        with self.cluster.fanout() as client:
++            for source in sources:
++                c = client.target_key(source)
++                for rollup, series in data.items():
++                    for timestamp, results in series.items():
++                        key = self.make_key(
++                            model,
++                            rollup,
++                            to_timestamp(timestamp),
++                            source,
++                        )
++                        results.append(c.get(key))
++                        c.delete(key)
++
++        with self.cluster.fanout() as client:
++            c = client.target_key(destination)
++
++            temporary_key_sequence = itertools.count()
++
++            for rollup, series in data.items():
++                for timestamp, results in series.items():
++                    values = {}
++                    for result in results:
++                        if result.value is None:
++                            continue
++                        k = make_temporary_key(next(temporary_key_sequence))
++                        values[k] = result.value
++
++                    if values:
++                        key = self.make_key(
++                            model,
++                            rollup,
++                            to_timestamp(timestamp),
++                            destination,
++                        )
++                        c.mset(values)
++                        c.pfmerge(key, key, *values.keys())
++                        c.delete(*values.keys())
++                        c.expireat(
++                            key,
++                            self.calculate_expiry(
++                                rollup,
++                                self.rollups[rollup],
++                                timestamp,
++                            ),
++                        )
++
+     def make_frequency_table_keys(self, model, rollup, timestamp, key):
+         prefix = self.make_key(model, rollup, timestamp, key)
+         return map(
+@@ -524,3 +642,58 @@ class RedisTSDB(BaseTSDB):
+                     response[member] = response.get(member, 0.0) + value
+ 
+         return responses
++
++    def merge_frequencies(self, model, destination, sources, timestamp=None):
++        if not self.enable_frequency_sketches:
++            return
++
++        rollups = []
++        for rollup, samples in self.rollups.items():
++            _, series = self.get_optimal_rollup_series(
++                to_datetime(self.get_earliest_timestamp(rollup, timestamp=timestamp)),
++                end=None,
++                rollup=rollup,
++            )
++            rollups.append((
++                rollup,
++                map(to_datetime, series),
++            ))
++
++        exports = defaultdict(list)
++
++        for source in sources:
++            for rollup, series in rollups:
++                for timestamp in series:
++                    keys = self.make_frequency_table_keys(
++                        model,
++                        rollup,
++                        to_timestamp(timestamp),
++                        source,
++                    )
++                    arguments = ['EXPORT'] + list(self.DEFAULT_SKETCH_PARAMETERS)
++                    exports[source].extend([
++                        (CountMinScript, keys, arguments),
++                        ('DEL',) + tuple(keys),
++                    ])
++
++        imports = []
++
++        for source, results in self.cluster.execute_commands(exports).items():
++            results = iter(results)
++            for rollup, series in rollups:
++                for timestamp in series:
++                    imports.append((
++                        CountMinScript,
++                        self.make_frequency_table_keys(
++                            model,
++                            rollup,
++                            to_timestamp(timestamp),
++                            destination,
++                        ),
++                        ['IMPORT'] + list(self.DEFAULT_SKETCH_PARAMETERS) + next(results).value,
++                    ))
++                    next(results)  # pop off the result of DEL
++
++        self.cluster.execute_commands({
++            destination: imports,
++        })
+diff --git a/tests/sentry/tsdb/test_redis.py b/tests/sentry/tsdb/test_redis.py
+index 7f6c63205e..fa8f086061 100644
+--- a/tests/sentry/tsdb/test_redis.py
++++ b/tests/sentry/tsdb/test_redis.py
+@@ -9,7 +9,7 @@ from datetime import (
+ 
+ from sentry.testutils import TestCase
+ from sentry.tsdb.base import TSDBModel, ONE_MINUTE, ONE_HOUR, ONE_DAY
+-from sentry.tsdb.redis import RedisTSDB
++from sentry.tsdb.redis import RedisTSDB, CountMinScript
+ from sentry.utils.dates import to_timestamp
+ 
+ 
+@@ -42,7 +42,7 @@ class RedisTSDBTest(TestCase):
+         assert result == 'bf4e529197e56a48ae2737505b9736e4'
+ 
+     def test_simple(self):
+-        now = datetime.utcnow().replace(tzinfo=pytz.UTC)
++        now = datetime.utcnow().replace(tzinfo=pytz.UTC) - timedelta(hours=4)
+         dts = [now + timedelta(hours=i) for i in range(4)]
+ 
+         def timestamp(d):
+@@ -82,8 +82,35 @@ class RedisTSDBTest(TestCase):
+             2: 4,
+         }
+ 
++        self.db.merge(TSDBModel.project, 1, [2], now)
++
++        results = self.db.get_range(TSDBModel.project, [1], dts[0], dts[-1])
++        assert results == {
++            1: [
++                (timestamp(dts[0]), 1),
++                (timestamp(dts[1]), 3),
++                (timestamp(dts[2]), 1),
++                (timestamp(dts[3]), 8),
++            ],
++        }
++        results = self.db.get_range(TSDBModel.project, [2], dts[0], dts[-1])
++        assert results == {
++            2: [
++                (timestamp(dts[0]), 0),
++                (timestamp(dts[1]), 0),
++                (timestamp(dts[2]), 0),
++                (timestamp(dts[3]), 0),
++            ],
++        }
++
++        results = self.db.get_sums(TSDBModel.project, [1, 2], dts[0], dts[-1])
++        assert results == {
++            1: 13,
++            2: 0,
++        }
++
+     def test_count_distinct(self):
+-        now = datetime.utcnow().replace(tzinfo=pytz.UTC)
++        now = datetime.utcnow().replace(tzinfo=pytz.UTC) - timedelta(hours=4)
+         dts = [now + timedelta(hours=i) for i in range(4)]
+ 
+         model = TSDBModel.users_affected_by_group
+@@ -153,6 +180,37 @@ class RedisTSDBTest(TestCase):
+         assert self.db.get_distinct_counts_union(model, [], dts[0], dts[-1], rollup=3600) == 0
+         assert self.db.get_distinct_counts_union(model, [1, 2], dts[0], dts[-1], rollup=3600) == 3
+ 
++        self.db.merge_distinct_counts(model, 1, [2], dts[0])
++
++        assert self.db.get_distinct_counts_series(model, [1], dts[0], dts[-1], rollup=3600) == {
++            1: [
++                (timestamp(dts[0]), 2),
++                (timestamp(dts[1]), 1),
++                (timestamp(dts[2]), 3),
++                (timestamp(dts[3]), 1),
++            ],
++        }
++
++        assert self.db.get_distinct_counts_series(model, [2], dts[0], dts[-1], rollup=3600) == {
++            2: [
++                (timestamp(dts[0]), 0),
++                (timestamp(dts[1]), 0),
++                (timestamp(dts[2]), 0),
++                (timestamp(dts[3]), 0),
++            ],
++        }
++
++        results = self.db.get_distinct_counts_totals(model, [1, 2], dts[0], dts[-1], rollup=3600)
++        assert results == {
++            1: 3,
++            2: 0,
++        }
++
++        assert self.db.get_distinct_counts_union(model, [], dts[0], dts[-1], rollup=3600) == 0
++        assert self.db.get_distinct_counts_union(model, [1], dts[0], dts[-1], rollup=3600) == 3
++        assert self.db.get_distinct_counts_union(model, [1, 2], dts[0], dts[-1], rollup=3600) == 3
++        assert self.db.get_distinct_counts_union(model, [2], dts[0], dts[-1], rollup=3600) == 0
++
+     def test_frequency_tables(self):
+         now = datetime.utcnow().replace(tzinfo=pytz.UTC)
+         model = TSDBModel.frequent_projects_by_organization
+@@ -327,3 +385,254 @@ class RedisTSDBTest(TestCase):
+                 "project:1": 0.0,
+             },
+         }
++
++    def test_frequency_table_import_export_no_estimators(self):
++        client = self.db.cluster.get_local_client_for_key('key')
++
++        parameters = [64, 5, 10]
++
++        CountMinScript(
++            ['1:i', '1:e'],
++            ['INCR'] + parameters + [
++                1, 'foo',
++                2, 'bar',
++                3, 'baz',
++            ],
++            client=client,
++        )
++
++        CountMinScript(
++            ['2:i', '2:e'],
++            ['INCR'] + parameters + [
++                1, 'alpha',
++                2, 'beta',
++                3, 'gamma',
++                4, 'delta',
++                5, 'epsilon',
++                6, 'zeta',
++                7, 'eta',
++                8, 'theta',
++                9, 'iota',
++            ],
++            client=client,
++        )
++
++        assert client.exists('1:i')
++        assert not client.exists('1:e')
++        assert client.exists('2:i')
++        assert not client.exists('2:e')
++
++        exports = CountMinScript(
++            ['2:i', '2:e'],
++            ['EXPORT'] + parameters,
++            client=client,
++        )
++
++        assert len(exports) == 1
++
++        CountMinScript(
++            ['1:i', '1:e'],
++            ['IMPORT'] + parameters + [exports[0]],
++            client=client,
++        )
++
++        assert client.exists('1:i')
++        assert client.exists('1:e')
++
++    def test_frequency_table_import_export_both_estimators(self):
++        client = self.db.cluster.get_local_client_for_key('key')
++
++        parameters = [64, 5, 5]
++
++        CountMinScript(
++            ['1:i', '1:e'],
++            ['INCR'] + parameters + [
++                1, 'foo',
++                2, 'bar',
++                3, 'baz',
++                4, 'wilco',
++                5, 'tango',
++                6, 'foxtrot',
++            ],
++            client=client,
++        )
++
++        CountMinScript(
++            ['2:i', '2:e'],
++            ['INCR'] + parameters + [
++                1, 'alpha',
++                2, 'beta',
++                3, 'gamma',
++                4, 'delta',
++                5, 'epsilon',
++                6, 'zeta',
++                7, 'eta',
++                8, 'theta',
++                9, 'iota',
++            ],
++            client=client,
++        )
++
++        assert client.exists('1:i')
++        assert client.exists('1:e')
++        assert client.exists('2:i')
++        assert client.exists('2:e')
++
++        exports = CountMinScript(
++            ['2:i', '2:e'],
++            ['EXPORT'] + parameters,
++            client=client,
++        )
++
++        assert len(exports) == 1
++
++        CountMinScript(
++            ['1:i', '1:e'],
++            ['IMPORT'] + parameters + [exports[0]],
++            client=client,
++        )
++
++        assert client.exists('1:i')
++        assert client.exists('1:e')
++
++        assert CountMinScript(
++            ['1:i', '1:e'],
++            ['RANKED'] + parameters,
++            client=client,
++        ) == [
++            ['iota', '9'],
++            ['theta', '8'],
++            ['eta', '7'],
++            ['zeta', '6'],
++            ['foxtrot', '6'],
++        ]
++
++    def test_frequency_table_import_export_source_estimators(self):
++        client = self.db.cluster.get_local_client_for_key('key')
++
++        parameters = [64, 5, 5]
++
++        CountMinScript(
++            ['1:i', '1:e'],
++            ['INCR'] + parameters + [
++                5, 'foo',
++                7, 'bar',
++                9, 'baz',
++            ],
++            client=client,
++        )
++
++        CountMinScript(
++            ['2:i', '2:e'],
++            ['INCR'] + parameters + [
++                1, 'alpha',
++                2, 'beta',
++                3, 'gamma',
++                4, 'delta',
++                5, 'epsilon',
++                6, 'zeta',
++                7, 'eta',
++                8, 'theta',
++                9, 'iota',
++            ],
++            client=client,
++        )
++
++        assert client.exists('1:i')
++        assert not client.exists('1:e')
++        assert client.exists('2:i')
++        assert client.exists('2:e')
++
++        exports = CountMinScript(
++            ['2:i', '2:e'],
++            ['EXPORT'] + parameters,
++            client=client,
++        )
++
++        assert len(exports) == 1
++
++        CountMinScript(
++            ['1:i', '1:e'],
++            ['IMPORT'] + parameters + [exports[0]],
++            client=client,
++        )
++
++        assert client.exists('1:i')
++        assert client.exists('1:e')
++
++        assert CountMinScript(
++            ['1:i', '1:e'],
++            ['RANKED'] + parameters,
++            client=client,
++        ) == [
++            ['iota', '9'],
++            ['baz', '9'],
++            ['theta', '8'],
++            ['eta', '7'],
++            ['bar', '7'],
++        ]
++
++    def test_frequency_table_import_export_destination_estimators(self):
++        client = self.db.cluster.get_local_client_for_key('key')
++
++        parameters = [64, 5, 5]
++
++        CountMinScript(
++            ['1:i', '1:e'],
++            ['INCR'] + parameters + [
++                1, 'alpha',
++                2, 'beta',
++                3, 'gamma',
++                4, 'delta',
++                5, 'epsilon',
++                6, 'zeta',
++                7, 'eta',
++                8, 'theta',
++                9, 'iota',
++            ],
++            client=client,
++        )
++
++        CountMinScript(
++            ['2:i', '2:e'],
++            ['INCR'] + parameters + [
++                5, 'foo',
++                7, 'bar',
++                9, 'baz',
++            ],
++            client=client,
++        )
++
++        assert client.exists('1:i')
++        assert client.exists('1:e')
++        assert client.exists('2:i')
++        assert not client.exists('2:e')
++
++        exports = CountMinScript(
++            ['2:i', '2:e'],
++            ['EXPORT'] + parameters,
++            client=client,
++        )
++
++        assert len(exports) == 1
++
++        CountMinScript(
++            ['1:i', '1:e'],
++            ['IMPORT'] + parameters + [exports[0]],
++            client=client,
++        )
++
++        assert client.exists('1:i')
++        assert client.exists('1:e')
++
++        assert CountMinScript(
++            ['1:i', '1:e'],
++            ['RANKED'] + parameters,
++            client=client,
++        ) == [
++            ['iota', '9'],
++            ['baz', '9'],
++            ['theta', '8'],
++            ['eta', '7'],
++            ['bar', '7'],
++        ]

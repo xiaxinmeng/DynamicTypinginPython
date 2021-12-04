@@ -1,0 +1,281 @@
+commit 5015eb0b1987470497b900008ff3f0c0963fcd6b
+Author: Armin Ronacher <armin.ronacher@active-4.com>
+Date:   Tue Oct 10 16:52:09 2017 +0200
+
+    feat(s3): Added prefetch support for files (S3) (#6279)
+    
+    * ref(s3): Change s3 to not go to tempfile as that did not work anyways
+    
+    * feat(file): Change behavior of ChunkedFileBlobIndexWrapper.read to standard beahvior
+    
+    * fix(file): Fixed chunk seeking and telling (and fixed bad test)
+    
+    * feat(file): Added a concurrent prefetch mode for files
+    
+    * fix(file): Use a proper assert for nextidx
+
+diff --git a/src/sentry/filestore/s3.py b/src/sentry/filestore/s3.py
+index 9a19cec2b3..ded0966b7c 100644
+--- a/src/sentry/filestore/s3.py
++++ b/src/sentry/filestore/s3.py
+@@ -41,7 +41,6 @@ import posixpath
+ import mimetypes
+ import threading
+ from gzip import GzipFile
+-from tempfile import SpooledTemporaryFile
+ 
+ from django.conf import settings
+ from django.core.exceptions import ImproperlyConfigured, SuspiciousOperation
+@@ -156,11 +155,7 @@ class S3Boto3StorageFile(File):
+ 
+     def _get_file(self):
+         if self._file is None:
+-            self._file = SpooledTemporaryFile(
+-                max_size=self._storage.max_memory_size,
+-                suffix=".S3Boto3StorageFile",
+-                dir=None,
+-            )
++            self._file = BytesIO()
+             if 'r' in self._mode:
+                 self._is_dirty = False
+                 self._file.write(self.obj.get()['Body'].read())
+@@ -245,6 +240,10 @@ class S3Boto3Storage(Storage):
+     mode and supports streaming(buffering) data in chunks to S3
+     when writing.
+     """
++    # XXX: note that this file reads entirely into memory before the first
++    # read happens.  This means that it should only be used for small
++    # files (eg: see how sentry.models.file works with it through the
++    # ChunkedFileBlobIndexWrapper.
+     connection_class = staticmethod(resource)
+     connection_service_name = 's3'
+     default_content_type = 'application/octet-stream'
+@@ -286,10 +285,6 @@ class S3Boto3Storage(Storage):
+     region_name = None
+     use_ssl = True
+ 
+-    # The max amount of memory a returned file can take up before being
+-    # rolled over into a temporary file on disk. Default is 0: Do not roll over.
+-    max_memory_size = 0
+-
+     def __init__(self, acl=None, bucket=None, **settings):
+         # check if some of the settings we've provided as class attributes
+         # need to be overwritten with values passed in here
+diff --git a/src/sentry/models/file.py b/src/sentry/models/file.py
+index afda28d3e8..61a6a42da7 100644
+--- a/src/sentry/models/file.py
++++ b/src/sentry/models/file.py
+@@ -9,9 +9,12 @@ sentry.models.file
+ from __future__ import absolute_import
+ 
+ import six
++import shutil
++import tempfile
+ 
+ from hashlib import sha1
+ from uuid import uuid4
++from concurrent.futures import ThreadPoolExecutor
+ 
+ from django.conf import settings
+ from django.core.files.base import File as FileObj
+@@ -160,15 +163,15 @@ class File(Model):
+         app_label = 'sentry'
+         db_table = 'sentry_file'
+ 
+-    def getfile(self, *args, **kwargs):
+-        return FileObj(
+-            ChunkedFileBlobIndexWrapper(
+-                FileBlobIndex.objects.filter(
+-                    file=self,
+-                ).select_related('blob').order_by('offset'),
+-                mode=kwargs.get('mode'),
+-            ), self.name
++    def getfile(self, mode=None, prefetch=False):
++        cfbiw = ChunkedFileBlobIndexWrapper(
++            FileBlobIndex.objects.filter(
++                file=self,
++            ).select_related('blob').order_by('offset'),
++            mode=mode,
++            prefetch=prefetch
+         )
++        return FileObj(cfbiw, self.name)
+ 
+     def putfile(self, fileobj, blob_size=DEFAULT_BLOB_SIZE, commit=True):
+         """
+@@ -219,11 +222,16 @@ class FileBlobIndex(Model):
+ 
+ 
+ class ChunkedFileBlobIndexWrapper(object):
+-    def __init__(self, indexes, mode=None):
++    def __init__(self, indexes, mode=None, prefetch=False):
+         # eager load from database incase its a queryset
+         self._indexes = list(indexes)
+         self._curfile = None
+         self._curidx = None
++        if prefetch:
++            self.prefetched = True
++            self._prefetch()
++        else:
++            self.prefetched = False
+         self.mode = mode
+         self.open()
+ 
+@@ -234,12 +242,18 @@ class ChunkedFileBlobIndexWrapper(object):
+         self.close()
+ 
+     def _nextidx(self):
++        assert not self.prefetched, 'this makes no sense'
++        old_file = self._curfile
+         try:
+-            self._curidx = six.next(self._idxiter)
+-            self._curfile = self._curidx.blob.getfile()
+-        except StopIteration:
+-            self._curidx = None
+-            self._curfile = None
++            try:
++                self._curidx = six.next(self._idxiter)
++                self._curfile = self._curidx.blob.getfile()
++            except StopIteration:
++                self._curidx = None
++                self._curfile = None
++        finally:
++            if old_file is not None:
++                old_file.close()
+ 
+     @property
+     def size(self):
+@@ -249,6 +263,23 @@ class ChunkedFileBlobIndexWrapper(object):
+         self.closed = False
+         self.seek(0)
+ 
++    def _prefetch(self):
++        f = tempfile.NamedTemporaryFile()
++        fpath = f.name
++
++        def fetch_file(offset, getfile):
++            with open(fpath, 'r+') as f:
++                f.seek(offset)
++                with getfile() as sf:
++                    shutil.copyfileobj(sf, f)
++                f.flush()
++
++        with ThreadPoolExecutor(max_workers=4) as exe:
++            for idx in self._indexes:
++                exe.submit(fetch_file, idx.offset, idx.blob.getfile)
++
++        self._curfile = f
++
+     def close(self):
+         if self._curfile:
+             self._curfile.close()
+@@ -259,6 +290,10 @@ class ChunkedFileBlobIndexWrapper(object):
+     def seek(self, pos):
+         if self.closed:
+             raise ValueError('I/O operation on closed file')
++
++        if self.prefetched:
++            return self._curfile.seek(pos)
++
+         if pos < 0:
+             raise IOError('Invalid argument')
+         for n, idx in enumerate(self._indexes[::-1]):
+@@ -274,17 +309,38 @@ class ChunkedFileBlobIndexWrapper(object):
+     def tell(self):
+         if self.closed:
+             raise ValueError('I/O operation on closed file')
++        if self.prefetched:
++            return self._curfile.tell()
++        if self._curfile is None:
++            return self.size
+         return self._curidx.offset + self._curfile.tell()
+ 
+-    def read(self, bytes=4096):
++    def read(self, n=-1):
+         if self.closed:
+             raise ValueError('I/O operation on closed file')
+-        result = ''
+-        while bytes and self._curfile is not None:
+-            blob_result = self._curfile.read(bytes)
+-            if not blob_result:
+-                self._nextidx()
+-                continue
+-            bytes -= len(blob_result)
+-            result += blob_result
+-        return result
++
++        if self.prefetched:
++            return self._curfile.read(n)
++
++        result = bytearray()
++
++        # Read to the end of the file
++        if n < 0:
++            while self._curfile is not None:
++                blob_result = self._curfile.read(32768)
++                if not blob_result:
++                    self._nextidx()
++                else:
++                    result.extend(blob_result)
++
++        # Read until a certain number of bytes are read
++        else:
++            while n > 0 and self._curfile is not None:
++                blob_result = self._curfile.read(min(n, 32768))
++                if not blob_result:
++                    self._nextidx()
++                else:
++                    n -= len(blob_result)
++                    result.extend(blob_result)
++
++        return bytes(result)
+diff --git a/tests/sentry/models/test_file.py b/tests/sentry/models/test_file.py
+index 0f85fe4bfa..876e7a26c6 100644
+--- a/tests/sentry/models/test_file.py
++++ b/tests/sentry/models/test_file.py
+@@ -1,5 +1,7 @@
+ from __future__ import absolute_import
+ 
++import os
++
+ from django.core.files.base import ContentFile
+ 
+ from sentry.models import File, FileBlob
+@@ -39,16 +41,16 @@ class FileTest(TestCase):
+         with file1.getfile() as fp:
+             assert fp.read().decode('utf-8') == 'foo bar'
+             fp.seek(2)
+-            fp.tell() == 2
++            assert fp.tell() == 2
+             assert fp.read().decode('utf-8') == 'o bar'
+             fp.seek(0)
+-            fp.tell() == 0
++            assert fp.tell() == 0
+             assert fp.read().decode('utf-8') == 'foo bar'
+             fp.seek(4)
+-            fp.tell() == 4
++            assert fp.tell() == 4
+             assert fp.read().decode('utf-8') == 'bar'
+             fp.seek(1000)
+-            fp.tell() == 1000
++            assert fp.tell() == 1000
+ 
+             with self.assertRaises(IOError):
+                 fp.seek(-1)
+@@ -61,3 +63,17 @@ class FileTest(TestCase):
+ 
+         with self.assertRaises(ValueError):
+             fp.read()
++
++    def test_multi_chunk_prefetch(self):
++        random_data = os.urandom(1 << 16)
++
++        fileobj = ContentFile(random_data)
++        file = File.objects.create(
++            name='test.bin',
++            type='default',
++            size=len(random_data),
++        )
++        file.putfile(fileobj, 128)
++
++        f = file.getfile(prefetch=True)
++        assert f.read() == random_data

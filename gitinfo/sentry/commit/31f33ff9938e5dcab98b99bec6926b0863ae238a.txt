@@ -1,0 +1,1542 @@
+commit 31f33ff9938e5dcab98b99bec6926b0863ae238a
+Author: David Cramer <dcramer@gmail.com>
+Date:   Fri Sep 8 13:33:50 2017 -0700
+
+    feat(cloudflare): Respond to various webhook conditions
+    
+    Add various form responses for account, organization, and project selection, as well as the required signature verification for webhooks.
+
+diff --git a/src/sentry/api/bases/user.py b/src/sentry/api/bases/user.py
+index c2accd0b73..17079f1964 100644
+--- a/src/sentry/api/bases/user.py
++++ b/src/sentry/api/bases/user.py
+@@ -7,7 +7,9 @@ from sentry.models import User
+ 
+ 
+ class UserPermission(ScopedPermission):
+-    def has_object_permission(self, request, view, user):
++    def has_object_permission(self, request, view, user=None):
++        if user is None:
++            user = request.user
+         if request.user == user:
+             return True
+         if request.auth:
+diff --git a/src/sentry/integrations/cloudflare/metadata.py b/src/sentry/integrations/cloudflare/metadata.py
+index 268c25367f..d60dab00cb 100644
+--- a/src/sentry/integrations/cloudflare/metadata.py
++++ b/src/sentry/integrations/cloudflare/metadata.py
+@@ -3,16 +3,16 @@ from __future__ import absolute_import
+ import logging
+ import six
+ 
++from rest_framework.permissions import IsAuthenticated
+ from rest_framework.response import Response
+ 
+ from sentry.api.base import Endpoint
+-from sentry.api.bases.user import UserPermission
+ 
+ logger = logging.getLogger('sentry.integrations.cloudflare')
+ 
+ 
+ class CloudflareMetadataEndpoint(Endpoint):
+-    permission_classes = (UserPermission, )
++    permission_classes = (IsAuthenticated, )
+ 
+     def get(self, request):
+         logger.info('cloudflare.metadata', extra={
+diff --git a/src/sentry/integrations/cloudflare/webhook.py b/src/sentry/integrations/cloudflare/webhook.py
+index 8335cbecca..fcf453e839 100644
+--- a/src/sentry/integrations/cloudflare/webhook.py
++++ b/src/sentry/integrations/cloudflare/webhook.py
+@@ -1,21 +1,230 @@
+ from __future__ import absolute_import
+ 
++import hmac
+ import logging
++import six
+ 
++from django.utils.crypto import constant_time_compare
++from functools import wraps
++from hashlib import sha256
+ from rest_framework.response import Response
+ 
++from sentry import options
++from sentry.api.authentication import TokenAuthentication
+ from sentry.api.base import Endpoint
++from sentry.models import Organization, Project, ProjectKey, Team
+ 
+ logger = logging.getLogger('sentry.integrations.cloudflare')
+ 
+ 
++def requires_auth(func):
++    @wraps(func)
++    def wrapped(self, request, *args, **kwargs):
++        if not request.user.is_authenticated():
++            return Response({
++                'proceed': False,
++            }, 401)
++        return func(self, request, *args, **kwargs)
++    return wrapped
++
++
++class CloudflareTokenAuthentication(TokenAuthentication):
++    def authenticate(self, request):
++        # XXX(dcramer): Hack around CF needing a token in the JSON body,
++        # but us additionally needing to verify the signature of the payload.
++        # This technically lets a user brute force a token before we actually
++        # verify the signature, HOWEVER, they could do that either way so we
++        # are ok with it.
++        request.body = six.text_type(request.body)
++        try:
++            token = request.DATA['authentications']['account']['token']['token']
++        except KeyError:
++            return None
++        return self.authenticate_credentials(token)
++
++
+ class CloudflareWebhookEndpoint(Endpoint):
++    authentication_classes = (CloudflareTokenAuthentication, )
+     permission_classes = ()
+ 
++    def verify(self, payload, key, signature):
++        return constant_time_compare(
++            signature,
++            hmac.new(
++                key=key.encode('utf-8'),
++                msg=payload.encode('utf-8'),
++                digestmod=sha256,
++            ).hexdigest()
++        )
++
++    def organization_from_json(self, request, data, scope='project:write'):
++        try:
++            organization_id = data['install']['options']['organization']
++        except KeyError:
++            return None
++
++        organizations = Organization.objects.get_for_user(request.user, scope=scope)
++        for org in organizations:
++            if six.text_type(org.id) == organization_id:
++                return org
++        return None
++
++    def project_from_json(self, request, data, scope='project:write'):
++        try:
++            project_id = data['install']['options']['project']
++        except KeyError:
++            return None
++
++        org = self.organization_from_json(request, data)
++
++        projects = Project.objects.filter(
++            organization=org,
++            team__in=Team.objects.get_for_user(org, request.user, scope='project:write'),
++        )
++        for project in projects:
++            if six.text_type(project.id) == project_id:
++                return project
++        return None
++
++    def on_preview(self, request, data, is_test):
++        if not request.user.is_authenticated():
++            return Response({
++                'install': data['install'],
++                'proceed': True
++            })
++
++        return self.on_account_change(request, data, is_test)
++
++    @requires_auth
++    def on_account_change(self, request, data, is_test):
++        organizations = sorted(
++            Organization.objects.get_for_user(request.user, scope='project:write'),
++            key=lambda x: x.slug
++        )
++
++        data['install']['schema']['properties']['organization'] = {
++            'type': 'string',
++            'title': 'Sentry Organization',
++            'order': 1,
++            'enum': [six.text_type(o.id) for o in organizations],
++            'enumNames': {
++                six.text_type(o.id): o.slug for o in organizations
++            },
++            'required': True,
++        }
++        if organizations:
++            data['install']['options']['organization'] = data['install']['schema']['properties']['organization']['enum'][0]
++            return self.on_organization_change(request, data, is_test)
++
++        return Response({
++            'install': data['install'],
++            'proceed': True
++        })
++
++    @requires_auth
++    def on_organization_change(self, request, data, is_test):
++        org = self.organization_from_json(request, data)
++
++        projects = sorted(Project.objects.filter(
++            organization=org,
++            team__in=Team.objects.get_for_user(org, request.user, scope='project:write'),
++        ), key=lambda x: x.slug)
++
++        data['install']['schema']['properties']['project'] = {
++            'type': 'string',
++            'title': 'Sentry Project',
++            'order': 2,
++            'enum': [six.text_type(o.id) for o in projects],
++            'enumNames': {
++                six.text_type(o.id): o.slug for o in projects
++            },
++            'required': True,
++        }
++        if projects:
++            data['install']['options']['project'] = data['install']['schema']['properties']['project']['enum'][0]
++            return self.on_project_change(request, data, is_test)
++
++        return Response({
++            'install': data['install'],
++            'proceed': True
++        })
++
++    @requires_auth
++    def on_project_change(self, request, data, is_test):
++        project = self.project_from_json(request, data)
++
++        keys = sorted(ProjectKey.objects.filter(
++            project=project,
++        ), key=lambda x: x.public_key)
++
++        data['install']['schema']['properties']['dsn'] = {
++            'type': 'string',
++            'title': 'DSN',
++            'description': 'Your automatically configured DSN for communicating with Sentry.',
++            'placeholder': 'https://public_key@sentry.io/1',
++            'order': 3,
++            'enum': [o.get_dsn(public=True) for o in keys],
++            'required': True,
++        }
++        if keys:
++            data['install']['options']['dsn'] = data['install']['schema']['properties']['dsn']['enum'][0]
++
++        return Response({
++            'install': data['install'],
++            'proceed': True
++        })
++
+     def post(self, request):
+-        event = request.DATA.get('event')
+-        logger.info('cloudflare.webhook.{}'.format(event), extra={
++        signature = request.META.get('HTTP_X_SIGNATURE_HMAC_SHA256_HEX')
++        variant = request.META.get('HTTP_X_SIGNATURE_KEY_VARIANT')
++        logging_data = {
+             'user_id': request.user.id if request.user.is_authenticated() else None,
++            'signature': signature,
++            'variant': variant,
++        }
++
++        payload = request.body
++        try:
++            data = request.DATA
++        except (ValueError, TypeError):
++            logger.error('cloudflare.webhook.invalid-json', extra=logging_data)
++            return Response(status=400)
++
++        event = data.get('event')
++        logger.info('cloudflare.webhook.{}'.format(event), extra=logging_data)
++        if not signature:
++            logger.error('cloudflare.webhook.invalid-signature', extra=logging_data)
++            return Response(status=400)
++        if not variant:
++            logger.error('cloudflare.webhook.invalid-variant', extra=logging_data)
++            return Response(status=400)
++
++        if variant == 'test':
++            key = 'test-key'
++        elif variant == '1':
++            key = options.get('cloudflare.secret-key')
++        else:
++            logger.error('cloudflare.webhook.invalid-variant', extra=logging_data)
++            return Response(status=400)
++
++        app_id = data.get('app', {}).get('id')
++        if app_id not in ('local', '') and variant == 'test':
++            logger.error('cloudflare.webhook.invalid-variant', extra=logging_data)
++            return Response(status=400)
++
++        if not self.verify(payload, key, signature):
++            logger.error('cloudflare.webhook.invalid-signature'.format(event), extra=logging_data)
++            return Response(status=400)
++
++        if event == 'option-change:account':
++            return self.on_account_change(request, data, is_test=variant == 'test')
++        if event == 'option-change:organization':
++            return self.on_organization_change(request, data, is_test=variant == 'test')
++        if event == 'option-change:project':
++            return self.on_project_change(request, data, is_test=variant == 'test')
++        elif event == 'preview':
++            return self.on_preview(request, data, is_test=variant == 'test')
++        return Response({
++            'install': data['install'],
++            'proceed': True
+         })
+-        # TODO(dcramer): We still need to implement various hooks for CF
+-        return Response({})
+diff --git a/src/sentry/options/defaults.py b/src/sentry/options/defaults.py
+index d1f6ff5fa9..d91452216c 100644
+--- a/src/sentry/options/defaults.py
++++ b/src/sentry/options/defaults.py
+@@ -108,3 +108,5 @@ register(
+ # Analytics
+ register('analytics.backend', default='noop', flags=FLAG_NOSTORE)
+ register('analytics.options', default={}, flags=FLAG_NOSTORE)
++
++register('cloudflare.secret-key', default='')
+diff --git a/src/sentry/utils/pytest/sentry.py b/src/sentry/utils/pytest/sentry.py
+index d421d3a696..9338ef35e4 100644
+--- a/src/sentry/utils/pytest/sentry.py
++++ b/src/sentry/utils/pytest/sentry.py
+@@ -74,6 +74,8 @@ def pytest_configure(config):
+     middleware[sudo] = 'sentry.testutils.middleware.SudoMiddleware'
+     settings.MIDDLEWARE_CLASSES = tuple(middleware)
+ 
++    settings.SENTRY_OPTIONS['cloudflare.secret-key'] = 'cloudflare-secret-key'
++
+     # enable draft features
+     settings.SENTRY_OPTIONS['mail.enable-replies'] = True
+ 
+diff --git a/tests/fixtures/cloudflare/oauth-login-webhook.json b/tests/fixtures/cloudflare/oauth-login-webhook.json
+new file mode 100644
+index 0000000000..63c77dab8f
+--- /dev/null
++++ b/tests/fixtures/cloudflare/oauth-login-webhook.json
+@@ -0,0 +1,279 @@
++{
++  "nonce": "Ei7VZruhJqnJ",
++  "authentications": {
++    "account": {
++      "account": {
++        "account": {},
++        "managed": false,
++        "service": {
++          "description": "",
++          "title": "Sentry QA (dcramer)",
++          "created": "2017-09-07T16:47:05.777063Z",
++          "visible": true,
++          "metadata": {
++            "modalHeight": 600,
++            "modalWidth": 400,
++            "hasRegistration": true
++          },
++          "approved": true,
++          "alias": "sentry-qa-dcramer",
++          "points": 0,
++          "orgId": "f5a54c9c5b86f45095b559369b4e0f18",
++          "oAuth": {
++            "default": {
++              "scopes": [],
++              "authURL": "http://fizzbuzz-123.ngrok.io/oauth/authorize/",
++              "tokenURL": "http://fizzbuzz-123.ngrok.io/oauth/token/",
++              "clientID": "998fe23be6bf443ba63a0856b6414c5a3c01d4b10f57428d8cb8d4a9da0d8dc2",
++              "clientSecret": "5e0db3991c2048a2b84c93929a9044c5e1cc4345d12c4901b856abd3d28c6276"
++            }
++          },
++          "org": {
++            "username": "f5a54c9c5b86f45095b559369b4e0f18",
++            "personal": true,
++            "created": null,
++            "id": "f5a54c9c5b86f45095b559369b4e0f18",
++            "title": ""
++          },
++          "endpoints": {
++            "apiProvision": "",
++            "oauthProvision": "",
++            "metadata": "http://fizzbuzz-123.ngrok.io/integrations/cloudflare/metadata/"
++          },
++          "id": "ZvlDQw7LjHEJ",
++          "icon": ""
++        },
++        "title": "",
++        "createdForInstallId": "UyQXS8EkJIz9",
++        "created": "2017-09-08T18:03:42.446265116Z",
++        "lastUsed": null,
++        "visible": true,
++        "state": 1,
++        "serviceId": "ZvlDQw7LjHEJ",
++        "orgId": "",
++        "id": "sKyaRh9xkrHL",
++        "lastAuthed": "2017-09-08T18:03:41.718257286Z"
++      },
++      "token": {
++        "refreshToken": "20196e90255047e88074b4243110d15c7f8021542fff486aa1786499057aa336",
++        "token": "55838c83b3ec4e3ebc24c10c7bd071ffb1dc91161d3d49aeaedd9bd35d84bbe2",
++        "type": "bearer",
++        "expiration": "2017-10-08T18:03:40.718230972Z"
++      }
++    }
++  },
++  "timestamp": 1504893822,
++  "app": {
++    "color": "",
++    "termsOfServiceURL": "",
++    "screenshots": null,
++    "id": "",
++    "userVisible": false,
++    "title": "",
++    "tagline": "",
++    "categoryIds": null,
++    "source": "",
++    "agreements": null,
++    "products": null,
++    "instructions": "",
++    "infoVersion": "",
++    "installable": false,
++    "website": "",
++    "privacyPolicyURL": "",
++    "codeVersion": "",
++    "longDescription": "",
++    "tileImage": "",
++    "icon": "",
++    "shortDescription": "",
++    "adminVisible": false,
++    "created": null,
++    "author": "",
++    "alias": "",
++    "points": 0,
++    "orgId": "",
++    "supportEmail": ""
++  },
++  "site": {
++    "active": false,
++    "orgId": "",
++    "id": "",
++    "name": ""
++  },
++  "version": {
++    "files": [],
++    "definition": {
++      "hooks": [
++        {
++          "failure": {
++            "action": "notify",
++            "message": "There was an error communicating with Sentry."
++          },
++          "endpoint": "https://fizzbuzz-123.ngrok.io/extensions/cloudflare/webhook/",
++          "events": [
++            "option-change:account",
++            "option-change:organization",
++            "option-change:project",
++            "preview",
++            "oauth-login",
++            "account-logout",
++            "new-install",
++            "update-install",
++            "before-new-install",
++            "before-update-install",
++            "delete-install"
++          ],
++          "block": true,
++          "authenticate": [
++            "account"
++          ]
++        }
++      ],
++      "preview": {
++        "hide": true
++      },
++      "options": {
++        "properties": {
++          "dsn": {
++            "description": "Your automatically configured DSN for communicating with Sentry.",
++            "title": "DSN",
++            "placeholder": "https://public_key@sentry.io/1",
++            "readonly": true,
++            "type": "string",
++            "order": 3
++          },
++          "organization": {
++            "enum": [],
++            "type": "string",
++            "order": 1,
++            "title": "Sentry Organization"
++          },
++          "account": {
++            "services": [
++              "sentry-qa-dcramer"
++            ],
++            "title": "Sentry Account",
++            "type": "object",
++            "order": 0,
++            "format": "account"
++          },
++          "project": {
++            "enum": [],
++            "type": "string",
++            "order": 2,
++            "title": "Sentry Project"
++          }
++        }
++      },
++      "resources": {
++        "body": [
++          {
++            "src": "./source/sentry.js",
++            "type": "script"
++          },
++          {
++            "src": "./source/app.js",
++            "type": "script"
++          }
++        ]
++      }
++    },
++    "creatorUserId": "",
++    "hasCode": true,
++    "created": null,
++    "manual": true,
++    "moderationStatus": "",
++    "source": "",
++    "tag": "FBxPSIbK5-6S",
++    "appId": "local",
++    "fileHandle": "local/FBxPSIbK5-6S",
++    "installable": false
++  },
++  "user": {
++    "username": "f5a54c9c5b86f45095b559369b4e0f18",
++    "firstName": "",
++    "created": null,
++    "lastName": "",
++    "email": "david@sentry.io",
++    "personalOrgId": "",
++    "id": "f5a54c9c5b86f45095b559369b4e0f18",
++    "developer": false
++  },
++  "install": {
++    "installerUserId": "",
++    "versionTag": "FBxPSIbK5-6S",
++    "created": null,
++    "deleted": false,
++    "deactivatedAt": null,
++    "metadata": {
++      "userId": "f5a54c9c5b86f45095b559369b4e0f18"
++    },
++    "id": "UyQXS8EkJIz9",
++    "refundedAt": null,
++    "amount": 0,
++    "siteId": "preview",
++    "pastDue": false,
++    "appId": "local",
++    "active": true,
++    "subscriptionId": "",
++    "productId": "",
++    "options": {
++      "dsn": "",
++      "account": {
++        "service": "sentry-qa-dcramer",
++        "accountId": "sKyaRh9xkrHL"
++      }
++    },
++    "schema": {
++      "type": "object",
++      "properties": {
++        "dsn": {
++          "description": "Your automatically configured DSN for communicating with Sentry.",
++          "title": "DSN",
++          "_show": true,
++          "readonly": true,
++          "type": "string",
++          "placeholder": "https://public_key@sentry.io/1",
++          "order": 3
++        },
++        "organization": {
++          "_show": true,
++          "enum": [],
++          "type": "string",
++          "order": 1,
++          "title": "Sentry Organization"
++        },
++        "account": {
++          "title": "Sentry Account",
++          "_show": true,
++          "format": "account",
++          "order": 0,
++          "services": [
++            "sentry-qa-dcramer"
++          ],
++          "type": "object",
++          "properties": {}
++        },
++        "project": {
++          "_show": true,
++          "enum": [],
++          "type": "string",
++          "order": 2,
++          "title": "Sentry Project"
++        }
++      }
++    }
++  },
++  "org": {
++    "username": "",
++    "personal": false,
++    "created": null,
++    "id": "",
++    "title": ""
++  },
++  "event": "oauth-login",
++  "metadata": {
++    "serviceId": "ZvlDQw7LjHEJ",
++    "code": "62e586ce44234196a1735416d029ad43",
++    "key": "account"
++  }
++}
+diff --git a/tests/fixtures/cloudflare/option-change-account-webhook.json b/tests/fixtures/cloudflare/option-change-account-webhook.json
+new file mode 100644
+index 0000000000..6ea505757e
+--- /dev/null
++++ b/tests/fixtures/cloudflare/option-change-account-webhook.json
+@@ -0,0 +1,282 @@
++{
++  "nonce": "9YuFTPpTV5rS",
++  "authentications": {
++    "account": {
++      "account": {
++        "account": {},
++        "managed": false,
++        "service": {
++          "description": "",
++          "title": "Sentry QA (dcramer)",
++          "created": "2017-09-07T16:47:05.777063Z",
++          "visible": true,
++          "metadata": {
++            "modalHeight": 600,
++            "modalWidth": 400,
++            "hasRegistration": true
++          },
++          "approved": true,
++          "alias": "sentry-qa-dcramer",
++          "points": 0,
++          "orgId": "f5a54c9c5b86f45095b559369b4e0f18",
++          "oAuth": {
++            "default": {
++              "scopes": [],
++              "authURL": "http://fizzbuzz-123.ngrok.io/oauth/authorize/",
++              "tokenURL": "http://fizzbuzz-123.ngrok.io/oauth/token/",
++              "clientID": "998fe23be6bf443ba63a0856b6414c5a3c01d4b10f57428d8cb8d4a9da0d8dc2",
++              "clientSecret": "5e0db3991c2048a2b84c93929a9044c5e1cc4345d12c4901b856abd3d28c6276"
++            }
++          },
++          "org": {
++            "username": "f5a54c9c5b86f45095b559369b4e0f18",
++            "personal": true,
++            "created": null,
++            "id": "f5a54c9c5b86f45095b559369b4e0f18",
++            "title": ""
++          },
++          "endpoints": {
++            "apiProvision": "",
++            "oauthProvision": "",
++            "metadata": "http://fizzbuzz-123.ngrok.io/integrations/cloudflare/metadata/"
++          },
++          "id": "ZvlDQw7LjHEJ",
++          "icon": ""
++        },
++        "title": "",
++        "createdForInstallId": "UyQXS8EkJIz9",
++        "created": "2017-09-08T18:03:42.446265Z",
++        "lastUsed": "2017-09-08T18:03:43.63426608Z",
++        "visible": true,
++        "state": 1,
++        "serviceId": "ZvlDQw7LjHEJ",
++        "orgId": "",
++        "encryptedAccessToken": "1:beC1cxdcOH1PtjP83lNxaA==:LaH8OTQwT2Qa4t8jAG+kPyeEbM/4KtIG4REOxYz9fcxovlXYDOrrlNIOGCDenVvLVD5alMJRJgK27JHe7UiQNNsqqjcCUB6gsERfXxjOtaewXo4OO5wFhMVHNJ3QqWVrP19lFNdAIp/LV7eAOfMJbyBLsvs5T8w6bl5Ks8sl9ZciyZwRADusBvykqmZ7JVUJg2f2Z2eHKr0PSs28y0AJzAy7lVEb/HgHVgdaNGxuYLab1g86WqBLRb13fY8pwLWWfkt6HUpfrYaX+8hxSeSNM/XUoj4CwL4ND7EFTg==",
++        "id": "sKyaRh9xkrHL",
++        "lastAuthed": "2017-09-08T18:03:41.718257Z"
++      },
++      "token": {
++        "refreshToken": "20196e90255047e88074b4243110d15c7f8021542fff486aa1786499057aa336",
++        "token": "55838c83b3ec4e3ebc24c10c7bd071ffb1dc91161d3d49aeaedd9bd35d84bbe2",
++        "type": "bearer",
++        "expiration": "2017-10-08T18:03:40.718230972Z"
++      }
++    }
++  },
++  "timestamp": 1504893823,
++  "app": {
++    "color": "",
++    "termsOfServiceURL": "",
++    "screenshots": null,
++    "id": "",
++    "userVisible": false,
++    "title": "",
++    "tagline": "",
++    "categoryIds": null,
++    "source": "",
++    "agreements": null,
++    "products": null,
++    "instructions": "",
++    "infoVersion": "",
++    "installable": false,
++    "website": "",
++    "privacyPolicyURL": "",
++    "codeVersion": "",
++    "longDescription": "",
++    "tileImage": "",
++    "icon": "",
++    "shortDescription": "",
++    "adminVisible": false,
++    "created": null,
++    "author": "",
++    "alias": "",
++    "points": 0,
++    "orgId": "",
++    "supportEmail": ""
++  },
++  "site": {
++    "active": false,
++    "orgId": "",
++    "id": "",
++    "name": ""
++  },
++  "version": {
++    "files": [],
++    "definition": {
++      "hooks": [
++        {
++          "failure": {
++            "action": "notify",
++            "message": "There was an error communicating with Sentry."
++          },
++          "endpoint": "https://fizzbuzz-123.ngrok.io/extensions/cloudflare/webhook/",
++          "events": [
++            "option-change:account",
++            "option-change:organization",
++            "option-change:project",
++            "preview",
++            "oauth-login",
++            "account-logout",
++            "new-install",
++            "update-install",
++            "before-new-install",
++            "before-update-install",
++            "delete-install"
++          ],
++          "block": true,
++          "authenticate": [
++            "account"
++          ]
++        }
++      ],
++      "preview": {
++        "hide": true
++      },
++      "options": {
++        "properties": {
++          "dsn": {
++            "description": "Your automatically configured DSN for communicating with Sentry.",
++            "title": "DSN",
++            "placeholder": "https://public_key@sentry.io/1",
++            "readonly": true,
++            "type": "string",
++            "order": 3
++          },
++          "organization": {
++            "enum": [],
++            "type": "string",
++            "order": 1,
++            "title": "Sentry Organization"
++          },
++          "account": {
++            "services": [
++              "sentry-qa-dcramer"
++            ],
++            "title": "Sentry Account",
++            "type": "object",
++            "order": 0,
++            "format": "account"
++          },
++          "project": {
++            "enum": [],
++            "type": "string",
++            "order": 2,
++            "title": "Sentry Project"
++          }
++        }
++      },
++      "resources": {
++        "body": [
++          {
++            "src": "./source/sentry.js",
++            "type": "script"
++          },
++          {
++            "src": "./source/app.js",
++            "type": "script"
++          }
++        ]
++      }
++    },
++    "creatorUserId": "",
++    "hasCode": true,
++    "created": null,
++    "manual": true,
++    "moderationStatus": "",
++    "source": "",
++    "tag": "FBxPSIbK5-6S",
++    "appId": "local",
++    "fileHandle": "local/FBxPSIbK5-6S",
++    "installable": false
++  },
++  "user": {
++    "username": "f5a54c9c5b86f45095b559369b4e0f18",
++    "firstName": "",
++    "created": null,
++    "lastName": "",
++    "email": "david@sentry.io",
++    "personalOrgId": "",
++    "id": "f5a54c9c5b86f45095b559369b4e0f18",
++    "developer": false
++  },
++  "install": {
++    "installerUserId": "",
++    "versionTag": "FBxPSIbK5-6S",
++    "created": null,
++    "deleted": false,
++    "deactivatedAt": null,
++    "metadata": {
++      "userId": "f5a54c9c5b86f45095b559369b4e0f18"
++    },
++    "id": "UyQXS8EkJIz9",
++    "refundedAt": null,
++    "amount": 0,
++    "siteId": "preview",
++    "pastDue": false,
++    "appId": "local",
++    "active": true,
++    "subscriptionId": "",
++    "productId": "",
++    "options": {
++      "dsn": "",
++      "account": {
++        "service": "sentry-qa-dcramer",
++        "accountId": "sKyaRh9xkrHL"
++      }
++    },
++    "schema": {
++      "type": "object",
++      "properties": {
++        "dsn": {
++          "description": "Your automatically configured DSN for communicating with Sentry.",
++          "title": "DSN",
++          "_show": true,
++          "readonly": true,
++          "type": "string",
++          "placeholder": "https://public_key@sentry.io/1",
++          "order": 3
++        },
++        "organization": {
++          "_show": true,
++          "enum": [],
++          "type": "string",
++          "order": 1,
++          "title": "Sentry Organization"
++        },
++        "account": {
++          "title": "Sentry Account",
++          "_show": true,
++          "format": "account",
++          "order": 0,
++          "services": [
++            "sentry-qa-dcramer"
++          ],
++          "type": "object",
++          "properties": {}
++        },
++        "project": {
++          "_show": true,
++          "enum": [],
++          "type": "string",
++          "order": 2,
++          "title": "Sentry Project"
++        }
++      }
++    }
++  },
++  "org": {
++    "username": "",
++    "personal": false,
++    "created": null,
++    "id": "",
++    "title": ""
++  },
++  "event": "option-change:account",
++  "metadata": {
++    "newValue": {
++      "service": "sentry-qa-dcramer",
++      "accountId": "sKyaRh9xkrHL"
++    },
++    "key": "account"
++  }
++}
+diff --git a/tests/fixtures/cloudflare/preview-webhook-authenticated.json b/tests/fixtures/cloudflare/preview-webhook-authenticated.json
+new file mode 100644
+index 0000000000..d58700a557
+--- /dev/null
++++ b/tests/fixtures/cloudflare/preview-webhook-authenticated.json
+@@ -0,0 +1,242 @@
++{
++  "nonce": "fPg41GY7uMDz",
++  "authentications": {
++    "account": {
++      "account": {
++        "account": {},
++        "managed": false,
++        "service": {
++          "description": "",
++          "title": "Sentry QA (dcramer)",
++          "created": "2017-09-07T16:47:05.777063Z",
++          "visible": true,
++          "metadata": {
++            "modalHeight": 600,
++            "modalWidth": 400,
++            "hasRegistration": true
++          },
++          "approved": true,
++          "alias": "sentry-qa-dcramer",
++          "points": 0,
++          "orgId": "f5a54c9c5b86f45095b559369b4e0f18",
++          "oAuth": {
++            "default": {
++              "scopes": [],
++              "authURL": "http://fizzbuzz-123.ngrok.io/oauth/authorize/",
++              "tokenURL": "http://fizzbuzz-123.ngrok.io/oauth/token/",
++              "clientID": "998fe23be6bf443ba63a0856b6414c5a3c01d4b10f57428d8cb8d4a9da0d8dc2",
++              "clientSecret": "5e0db3991c2048a2b84c93929a9044c5e1cc4345d12c4901b856abd3d28c6276"
++            }
++          },
++          "org": {
++            "username": "f5a54c9c5b86f45095b559369b4e0f18",
++            "personal": true,
++            "created": null,
++            "id": "f5a54c9c5b86f45095b559369b4e0f18",
++            "title": ""
++          },
++          "endpoints": {
++            "apiProvision": "",
++            "oauthProvision": "",
++            "metadata": "http://fizzbuzz-123.ngrok.io/integrations/cloudflare/metadata/"
++          },
++          "id": "ZvlDQw7LjHEJ",
++          "icon": ""
++        },
++        "title": "",
++        "createdForInstallId": "UyQXS8EkJIz9",
++        "created": "2017-09-08T18:03:42.446265116Z",
++        "lastUsed": null,
++        "visible": true,
++        "state": 1,
++        "serviceId": "ZvlDQw7LjHEJ",
++        "orgId": "",
++        "id": "sKyaRh9xkrHL",
++        "lastAuthed": "2017-09-08T18:03:41.718257286Z"
++      },
++      "token": {
++        "refreshToken": "20196e90255047e88074b4243110d15c7f8021542fff486aa1786499057aa336",
++        "token": "55838c83b3ec4e3ebc24c10c7bd071ffb1dc91161d3d49aeaedd9bd35d84bbe2",
++        "type": "bearer",
++        "expiration": "2017-10-08T18:03:40.718230972Z"
++      }
++    }
++  },
++  "timestamp": 1504893617,
++  "app": {
++    "color": "",
++    "termsOfServiceURL": "",
++    "screenshots": null,
++    "id": "",
++    "userVisible": false,
++    "title": "",
++    "tagline": "",
++    "categoryIds": null,
++    "source": "",
++    "agreements": null,
++    "products": null,
++    "instructions": "",
++    "infoVersion": "",
++    "installable": false,
++    "website": "",
++    "privacyPolicyURL": "",
++    "codeVersion": "",
++    "longDescription": "",
++    "tileImage": "",
++    "icon": "",
++    "shortDescription": "",
++    "adminVisible": false,
++    "created": null,
++    "author": "",
++    "alias": "",
++    "points": 0,
++    "orgId": "",
++    "supportEmail": ""
++  },
++  "site": {
++    "active": false,
++    "orgId": "",
++    "id": "",
++    "name": ""
++  },
++  "version": {
++    "files": [],
++    "definition": {
++      "hooks": [
++        {
++          "failure": {
++            "action": "notify",
++            "message": "There was an error communicating with Sentry."
++          },
++          "endpoint": "https://fizzbuzz-123.ngrok.io/extensions/cloudflare/webhook/",
++          "events": [
++            "option-change:account",
++            "option-change:organization",
++            "option-change:project",
++            "preview",
++            "oauth-login",
++            "account-logout",
++            "new-install",
++            "update-install",
++            "before-new-install",
++            "before-update-install",
++            "delete-install"
++          ],
++          "block": true,
++          "authenticate": [
++            "account"
++          ]
++        }
++      ],
++      "preview": {
++        "hide": true
++      },
++      "options": {
++        "properties": {
++          "dsn": {
++            "description": "Your automatically configured DSN for communicating with Sentry.",
++            "title": "DSN",
++            "placeholder": "https://public_key@sentry.io/1",
++            "readonly": true,
++            "type": "string",
++            "order": 3
++          },
++          "organization": {
++            "enum": [],
++            "type": "string",
++            "order": 1,
++            "title": "Sentry Organization"
++          },
++          "account": {
++            "services": [
++              "sentry-qa-dcramer"
++            ],
++            "title": "Sentry Account",
++            "type": "object",
++            "order": 0,
++            "format": "account"
++          },
++          "project": {
++            "enum": [],
++            "type": "string",
++            "order": 2,
++            "title": "Sentry Project"
++          }
++        }
++      },
++      "resources": {
++        "body": [
++          {
++            "src": "./source/sentry.js",
++            "type": "script"
++          },
++          {
++            "src": "./source/app.js",
++            "type": "script"
++          }
++        ]
++      }
++    },
++    "creatorUserId": "",
++    "hasCode": true,
++    "created": null,
++    "manual": true,
++    "moderationStatus": "",
++    "source": "",
++    "tag": "FBxPSIbK5-6S",
++    "appId": "local",
++    "fileHandle": "local/FBxPSIbK5-6S",
++    "installable": false
++  },
++  "user": {
++    "username": "f5a54c9c5b86f45095b559369b4e0f18",
++    "firstName": "",
++    "created": null,
++    "lastName": "",
++    "email": "sentry@example.com",
++    "personalOrgId": "",
++    "id": "f5a54c9c5b86f45095b559369b4e0f18",
++    "developer": false
++  },
++  "install": {
++    "installerUserId": "",
++    "versionTag": "FBxPSIbK5-6S",
++    "created": null,
++    "deleted": false,
++    "deactivatedAt": null,
++    "metadata": {
++      "userId": "f5a54c9c5b86f45095b559369b4e0f18"
++    },
++    "id": "UyQXS8EkJIz9",
++    "refundedAt": null,
++    "amount": 0,
++    "siteId": "preview",
++    "pastDue": false,
++    "appId": "local",
++    "active": true,
++    "subscriptionId": "",
++    "productId": "",
++    "options": {},
++    "schema": {
++      "properties": {
++        "account": {
++          "services": [
++            "sentry-qa-dcramer"
++          ],
++          "title": "Sentry Account",
++          "type": "object",
++          "order": 0,
++          "format": "account"
++        }
++      }
++    }
++  },
++  "org": {
++    "username": "",
++    "personal": false,
++    "created": null,
++    "id": "",
++    "title": ""
++  },
++  "event": "preview"
++}
+diff --git a/tests/fixtures/cloudflare/preview-webhook.json b/tests/fixtures/cloudflare/preview-webhook.json
+new file mode 100644
+index 0000000000..8f8f3e4380
+--- /dev/null
++++ b/tests/fixtures/cloudflare/preview-webhook.json
+@@ -0,0 +1,180 @@
++{
++  "nonce": "fPg41GY7uMDz",
++  "timestamp": 1504893617,
++  "app": {
++    "color": "",
++    "termsOfServiceURL": "",
++    "screenshots": null,
++    "id": "",
++    "userVisible": false,
++    "title": "",
++    "tagline": "",
++    "categoryIds": null,
++    "source": "",
++    "agreements": null,
++    "products": null,
++    "instructions": "",
++    "infoVersion": "",
++    "installable": false,
++    "website": "",
++    "privacyPolicyURL": "",
++    "codeVersion": "",
++    "longDescription": "",
++    "tileImage": "",
++    "icon": "",
++    "shortDescription": "",
++    "adminVisible": false,
++    "created": null,
++    "author": "",
++    "alias": "",
++    "points": 0,
++    "orgId": "",
++    "supportEmail": ""
++  },
++  "site": {
++    "active": false,
++    "orgId": "",
++    "id": "",
++    "name": ""
++  },
++  "version": {
++    "files": [],
++    "definition": {
++      "hooks": [
++        {
++          "failure": {
++            "action": "notify",
++            "message": "There was an error communicating with Sentry."
++          },
++          "endpoint": "https://fizzbuzz-123.ngrok.io/extensions/cloudflare/webhook/",
++          "events": [
++            "option-change:account",
++            "option-change:organization",
++            "option-change:project",
++            "preview",
++            "oauth-login",
++            "account-logout",
++            "new-install",
++            "update-install",
++            "before-new-install",
++            "before-update-install",
++            "delete-install"
++          ],
++          "block": true,
++          "authenticate": [
++            "account"
++          ]
++        }
++      ],
++      "preview": {
++        "hide": true
++      },
++      "options": {
++        "properties": {
++          "account": {
++            "services": [
++              "sentry-qa-dcramer"
++            ],
++            "title": "Sentry Account",
++            "type": "object",
++            "order": 0,
++            "format": "account"
++          }
++        }
++      },
++      "resources": {
++        "body": [
++          {
++            "src": "./source/sentry.js",
++            "type": "script"
++          },
++          {
++            "src": "./source/app.js",
++            "type": "script"
++          }
++        ]
++      }
++    },
++    "creatorUserId": "",
++    "hasCode": true,
++    "created": null,
++    "manual": true,
++    "moderationStatus": "",
++    "source": "",
++    "tag": "FBxPSIbK5-6S",
++    "appId": "local",
++    "fileHandle": "local/FBxPSIbK5-6S",
++    "installable": false
++  },
++  "user": {
++    "username": "f5a54c9c5b86f45095b559369b4e0f18",
++    "firstName": "",
++    "created": null,
++    "lastName": "",
++    "email": "sentry@example.com",
++    "personalOrgId": "",
++    "id": "f5a54c9c5b86f45095b559369b4e0f18",
++    "developer": false
++  },
++  "install": {
++    "installerUserId": "",
++    "versionTag": "FBxPSIbK5-6S",
++    "created": null,
++    "deleted": false,
++    "deactivatedAt": null,
++    "metadata": {
++      "userId": "f5a54c9c5b86f45095b559369b4e0f18"
++    },
++    "id": "UyQXS8EkJIz9",
++    "refundedAt": null,
++    "amount": 0,
++    "siteId": "preview",
++    "pastDue": false,
++    "appId": "local",
++    "active": true,
++    "subscriptionId": "",
++    "productId": "",
++    "options": {},
++    "schema": {
++      "properties": {
++        "dsn": {
++          "description": "Your automatically configured DSN for communicating with Sentry.",
++          "title": "DSN",
++          "placeholder": "https://public_key@sentry.io/1",
++          "readonly": true,
++          "type": "string",
++          "order": 3
++        },
++        "organization": {
++          "enum": [],
++          "type": "string",
++          "order": 1,
++          "title": "Sentry Organization"
++        },
++        "account": {
++          "services": [
++            "sentry-qa-dcramer"
++          ],
++          "title": "Sentry Account",
++          "type": "object",
++          "order": 0,
++          "format": "account"
++        },
++        "project": {
++          "enum": [],
++          "type": "string",
++          "order": 2,
++          "title": "Sentry Project"
++        }
++      }
++    }
++  },
++  "org": {
++    "username": "",
++    "personal": false,
++    "created": null,
++    "id": "",
++    "title": ""
++  },
++  "event": "preview"
++}
+diff --git a/tests/sentry/integrations/cloudflare/test_webhook.py b/tests/sentry/integrations/cloudflare/test_webhook.py
+index 842e9da072..b790484409 100644
+--- a/tests/sentry/integrations/cloudflare/test_webhook.py
++++ b/tests/sentry/integrations/cloudflare/test_webhook.py
+@@ -1,13 +1,215 @@
+ from __future__ import absolute_import
+ 
+-from sentry.testutils import APITestCase
++from hashlib import sha256
++import hmac
++import json
++import six
+ 
++from sentry import options
++from sentry.models import ApiToken, ProjectKey
++from sentry.testutils import TestCase
+ 
+-class CloudflareWebhookTest(APITestCase):
+-    def test_simple(self):
+-        resp = self.client.post('/extensions/cloudflare/webhook/', data={
+-            'event': 'preview',
+-        })
++UNSET = object()
+ 
++
++class BaseWebhookTest(TestCase):
++    def setUp(self):
++        super(BaseWebhookTest, self).setUp()
++        self.user = self.create_user(is_superuser=False)
++        self.org = self.create_organization(owner=None)
++        self.team = self.create_team(organization=self.org)
++        self.create_member(organization=self.org, user=self.user, role='owner', teams=[self.team])
++        self.project = self.create_project(name='a', team=self.team)
++        self.token = ApiToken.objects.create(
++            user=self.user,
++            token='55838c83b3ec4e3ebc24c10c7bd071ffb1dc91161d3d49aeaedd9bd35d84bbe2',
++        )
++        self.key = ProjectKey.objects.get_or_create(project=self.project)[0]
++
++    def post_webhook(self, data, signature=UNSET, variant=UNSET, key=None):
++        if key is None:
++            key = options.get('cloudflare.secret-key')
++        if not isinstance(data, six.string_types):
++            body = json.dumps(data)
++        else:
++            body = data
++        if signature is UNSET:
++            signature = hmac.new(
++                key=key.encode('utf-8'),
++                msg=body.encode('utf-8'),
++                digestmod=sha256,
++            ).hexdigest()
++        if variant is UNSET:
++            variant = '1'
++
++        headers = {
++            'HTTP_X_SIGNATURE_HMAC_SHA256_HEX': signature,
++            'HTTP_X_SIGNATURE_KEY_VARIANT': variant,
++        }
++
++        return self.client.post(
++            '/extensions/cloudflare/webhook/',
++            body,
++            content_type='application/json',
++            **headers
++        )
++
++
++class CloudflareWebhookTest(BaseWebhookTest):
++    def test_missing_signature(self):
++        resp = self.post_webhook(
++            {'event': 'test'},
++            signature=None,
++        )
++        assert resp.status_code == 400
++
++    def test_invalid_signature(self):
++        resp = self.post_webhook(
++            {'event': 'test'},
++            signature='a' * 40,
++        )
++        assert resp.status_code == 400
++
++    def test_invalid_json(self):
++        resp = self.post_webhook('a')
++        assert resp.status_code == 400
++
++    def test_missing_variant(self):
++        resp = self.post_webhook(
++            {'event': 'test'},
++            variant=None,
++        )
++        assert resp.status_code == 400
++
++    def test_invalid_variant(self):
++        resp = self.post_webhook(
++            {'event': 'test'},
++            variant='fizzbuz',
++        )
++        assert resp.status_code == 400
++
++    def test_invalid_signature_with_test_variant(self):
++        resp = self.post_webhook(
++            {'event': 'test'},
++            variant='test',
++        )
++        assert resp.status_code == 400
++
++    def test_invalid_app_id_test_variant(self):
++        resp = self.post_webhook(
++            {'event': 'test', 'app': {'id': 'buzz'}},
++            variant='test',
++            key='test-key',
++        )
++        assert resp.status_code == 400
++
++    def test_valid_test_variant(self):
++        resp = self.post_webhook(
++            {'event': 'test', 'app': {'id': 'local'}, 'install': {}},
++            variant='test',
++            key='test-key',
++        )
++        assert resp.status_code == 200
++
++
++class PreviewWebhookTest(BaseWebhookTest):
++    def test_empty(self):
++        webhook_data = json.loads(self.load_fixture('cloudflare/preview-webhook.json'))
++        resp = self.post_webhook(webhook_data)
++
++        assert resp.status_code == 200, resp.content
++        assert resp.data == {
++            'install': webhook_data['install'],
++            'proceed': True,
++        }
++
++    def test_prefills_data(self):
++        webhook_data = json.loads(self.load_fixture(
++            'cloudflare/preview-webhook-authenticated.json'))
++        webhook_data['install']['options']['organization'] = six.text_type(self.org.id)
++        resp = self.post_webhook(data=webhook_data)
++
++        assert resp.status_code == 200, resp.content
++        assert resp.data['proceed']
++        assert resp.data['install']['schema']['properties']['organization']['enum'] == [
++            six.text_type(self.org.id)]
++        assert resp.data['install']['schema']['properties']['organization']['enumNames'] == {
++            six.text_type(self.org.id): self.org.slug,
++        }
++        assert resp.data['install']['options']['organization'] == six.text_type(self.org.id)
++        assert resp.data['install']['schema']['properties']['project']['enum'] == [
++            six.text_type(self.project.id)]
++        assert resp.data['install']['schema']['properties']['project']['enumNames'] == {
++            six.text_type(self.project.id): self.project.slug,
++        }
++        assert resp.data['install']['options']['project'] == six.text_type(self.project.id)
++        assert resp.data['install']['schema']['properties']['dsn']['enum'] == [
++            self.key.get_dsn(public=True)]
++        assert resp.data['install']['options']['dsn'] == six.text_type(
++            self.key.get_dsn(public=True))
++
++    def test_multiple_projects(self):
++        project2 = self.create_project(name='b', team=self.team)
++
++        webhook_data = json.loads(self.load_fixture(
++            'cloudflare/preview-webhook-authenticated.json'))
++        webhook_data['install']['options']['organization'] = six.text_type(self.org.id)
++        resp = self.post_webhook(webhook_data)
++
++        assert resp.status_code == 200, resp.content
++        assert resp.data['proceed']
++        assert resp.data['install']['schema']['properties']['organization']['enum'] == [
++            six.text_type(self.org.id)]
++        assert resp.data['install']['options']['organization'] == six.text_type(self.org.id)
++        assert resp.data['install']['schema']['properties']['project']['enum'] == [
++            six.text_type(self.project.id), six.text_type(project2.id)]
++        assert resp.data['install']['options']['project'] == six.text_type(self.project.id)
++        assert resp.data['install']['schema']['properties']['dsn']['enum'] == [
++            self.key.get_dsn(public=True)]
++        assert resp.data['install']['options']['dsn'] == six.text_type(
++            self.key.get_dsn(public=True))
++
++    def test_no_projects(self):
++        self.project.delete()
++
++        webhook_data = json.loads(self.load_fixture(
++            'cloudflare/preview-webhook-authenticated.json'))
++        webhook_data['install']['options']['organization'] = six.text_type(self.org.id)
++        resp = self.post_webhook(webhook_data)
++
++        assert resp.status_code == 200, resp.content
++        assert resp.data['proceed']
++        assert resp.data['install']['schema']['properties']['organization']['enum'] == [
++            six.text_type(self.org.id)]
++        assert resp.data['install']['options']['organization'] == six.text_type(self.org.id)
++        assert resp.data['install']['schema']['properties']['project']['enum'] == []
++        assert 'dsn' not in resp.data['install']['schema']['properties']
++
++
++class OptionChangeAccountWebhookTest(BaseWebhookTest):
++    def test_without_authentication(self):
++        webhook_data = json.loads(self.load_fixture(
++            'cloudflare/option-change-account-webhook.json'))
++        del webhook_data['authentications']
++        resp = self.post_webhook(webhook_data)
++
++        assert resp.status_code == 401, resp.content
++
++    def test_prefills_data(self):
++        webhook_data = json.loads(self.load_fixture(
++            'cloudflare/option-change-account-webhook.json'))
++        resp = self.post_webhook(webhook_data)
++
++        assert resp.status_code == 200, resp.content
+         assert resp.status_code == 200, resp.content
+-        assert resp.data == {}
++        assert resp.data['proceed']
++        assert resp.data['install']['schema']['properties']['organization']['enum'] == [
++            six.text_type(self.org.id)]
++        assert resp.data['install']['options']['organization'] == six.text_type(self.org.id)
++        assert resp.data['install']['schema']['properties']['project']['enum'] == [
++            six.text_type(self.project.id)]
++        assert resp.data['install']['options']['project'] == six.text_type(self.project.id)
++        assert resp.data['install']['schema']['properties']['dsn']['enum'] == [
++            self.key.get_dsn(public=True)]
++        assert resp.data['install']['options']['dsn'] == six.text_type(
++            self.key.get_dsn(public=True))

@@ -1,0 +1,464 @@
+commit 159f676f92aa2e8104862667d415387074641ffa
+Author: ted kaemming <ted@kaemming.com>
+Date:   Thu Jan 26 16:09:00 2017 -0800
+
+    Add `MinHashIndex`. (#4813)
+
+diff --git a/src/sentry/similarity.py b/src/sentry/similarity.py
+new file mode 100644
+index 0000000000..caec406f01
+--- /dev/null
++++ b/src/sentry/similarity.py
+@@ -0,0 +1,245 @@
++from __future__ import absolute_import
++
++import math
++import random
++import struct
++
++
++def scale_to_total(value):
++    """\
++    Convert a mapping of distinct quantities to a mapping of proportions of the
++    total quantity.
++    """
++    total = float(sum(value.values()))
++    return {k: (v / total) for k, v in value.items()}
++
++
++def get_distance(target, other):
++    """\
++    Calculate the N-dimensional Euclidian between two mappings.
++
++    The mappings are used to represent sparse arrays -- if a key is not present
++    in both mappings, it's assumed to be 0 in the mapping where it is missing.
++    """
++    return math.sqrt(
++        sum(
++            (target.get(k, 0) - other.get(k, 0)) ** 2
++            for k in set(target) | set(other)
++        )
++    )
++
++
++formatters = sorted([
++    (2 ** 8 - 1, struct.Struct('>B').pack),
++    (2 ** 16 - 1, struct.Struct('>H').pack),
++    (2 ** 32 - 1, struct.Struct('>L').pack),
++    (2 ** 64 - 1, struct.Struct('>Q').pack),
++])
++
++
++def get_number_formatter(size):
++    """\
++    Returns a function that packs a number no larger than the provided size
++    into to an efficient binary representation.
++    """
++    assert size > 0
++
++    for maximum, formatter in formatters:
++        if maximum >= size:
++            return formatter
++
++    raise ValueError('No registered formatter can handle the provided value.')
++
++
++class MinHashIndex(object):
++    """\
++    Implements an index that can be used to efficiently search for items that
++    share similar characteristics.
++
++    This implementation is based on MinHash (which is used quickly identify
++    similar items and estimate the Jaccard similarity of their characteristic
++    sets) but this implementation extends the typical design to add the ability
++    to record items by an arbitrary key. This allows querying for similar
++    groups that contain many different characteristic sets.
++
++    The ``rows`` parameter is the size of the hash ring used to collapse the
++    domain of all tokens to a fixed-size range. The total size of the LSH
++    signature is ``bands * buckets``. These attributes control the distribution
++    of data within the index, and modifying them after data has already been
++    written will cause data loss and/or corruption.
++
++    This is modeled as two data structures:
++
++    - A bucket frequency sorted set, which maintains a count of what buckets
++      have been recorded -- and how often -- in a ``(band, key)`` pair. This
++      data can be used to identify what buckets a key is a member of, and also
++      used to identify the degree of bucket similarity when comparing with data
++      associated with another key.
++    - A bucket membership set, which maintains a record of what keys have been
++      record in a ``(band, bucket)`` pair. This data can be used to identify
++      what other keys may be similar to the lookup key (but not the degree of
++      similarity.)
++    """
++    BUCKET_MEMBERSHIP = '0'
++    BUCKET_FREQUENCY = '1'
++
++    def __init__(self, cluster, rows, bands, buckets):
++        self.namespace = b'sim'
++
++        self.cluster = cluster
++        self.rows = rows
++
++        generator = random.Random(0)
++
++        def shuffle(value):
++            generator.shuffle(value)
++            return value
++
++        self.bands = [
++            [shuffle(range(rows)) for _ in xrange(buckets)]
++            for _ in xrange(bands)
++        ]
++
++        self.__bucket_formatter = get_number_formatter(rows)
++
++    def __format_buckets(self, bucket):
++        return b''.join(
++            map(self.__bucket_formatter, bucket)
++        )
++
++    def get_signature(self, value):
++        """Generate a minhash signature for a value."""
++        columns = set(hash(token) % self.rows for token in value)
++        return map(
++            lambda band: map(
++                lambda permutation: next(i for i, a in enumerate(permutation) if a in columns),
++                band,
++            ),
++            self.bands,
++        )
++
++    def get_similarity(self, target, other):
++        """\
++        Calculate the degree of similarity between two bucket frequency
++        sequences which represent two different keys.
++
++        This is mainly an implementation detail for sorting query results, but
++        is exposed publically for testing. This method assumes all input
++        values have already been normalized using ``scale_to_total``.
++        """
++        assert len(target) == len(other)
++        assert len(target) == len(self.bands)
++        return 1 - sum(
++            map(
++                lambda (left, right): get_distance(
++                    left,
++                    right,
++                ),
++                zip(target, other)
++            )
++        ) / math.sqrt(2) / len(target)
++
++    def query(self, scope, key):
++        """\
++        Find other entries that are similar to the one repesented by ``key``.
++
++        This returns an sequence of ``(key, estimated similarity)`` pairs,
++        where a similarity score of 1 is completely similar, and a similarity
++        score of 0 is completely dissimilar. The result sequence is ordered
++        from most similar to least similar. (For example, the search key itself
++        isn't filtered from the result and will always have a similarity of 1,
++        typically making it the first result.)
++        """
++        def fetch_bucket_frequencies(keys):
++            """Fetch the bucket frequencies for each band for each provided key."""
++            with self.cluster.map() as client:
++                responses = {
++                    key: map(
++                        lambda band: client.zrange(
++                            b'{}:{}:{}:{}:{}'.format(self.namespace, scope, self.BUCKET_FREQUENCY, band, key),
++                            0,
++                            -1,
++                            desc=True,
++                            withscores=True,
++                        ),
++                        range(len(self.bands)),
++                    ) for key in keys
++                }
++
++            result = {}
++            for key, promises in responses.items():
++                # Resolve each promise, and scale the number of observations
++                # for each bucket to [0,1] value (the proportion of items
++                # observed in that band that belong to the bucket for the key.)
++                result[key] = map(
++                    lambda promise: scale_to_total(
++                        dict(promise.value)
++                    ),
++                    promises,
++                )
++
++            return result
++
++        def fetch_candidates(signature):
++            """Fetch all the similar candidates for a given signature."""
++            with self.cluster.map() as client:
++                responses = map(
++                    lambda (band, buckets): map(
++                        lambda bucket: client.smembers(
++                            b'{}:{}:{}:{}:{}'.format(self.namespace, scope, self.BUCKET_MEMBERSHIP, band, bucket)
++                        ),
++                        buckets,
++                    ),
++                    enumerate(signature),
++                )
++
++            # Resolve all of the promises for each band and reduce them into a
++            # single set per band.
++            return map(
++                lambda band: reduce(
++                    lambda values, promise: values | promise.value,
++                    band,
++                    set(),
++                ),
++                responses,
++            )
++
++        target_frequencies = fetch_bucket_frequencies([key])[key]
++
++        # Flatten the results of each band into a single set. (In the future we
++        # might want to change this to only calculate the similarity for keys
++        # that show up in some threshold number of bands.)
++        candidates = reduce(
++            lambda total, band: total | band,
++            fetch_candidates(target_frequencies),
++            set(),
++        )
++
++        return sorted(
++            map(
++                lambda (key, candidate_frequencies): (
++                    key,
++                    self.get_similarity(
++                        target_frequencies,
++                        candidate_frequencies,
++                    ),
++                ),
++                fetch_bucket_frequencies(candidates).items(),
++            ),
++            key=lambda (key, similarity): (similarity * -1, key),
++        )
++
++    def record(self, scope, key, characteristics):
++        """Records the presence of a set of characteristics within a group."""
++        with self.cluster.map() as client:
++            for band, buckets in enumerate(self.get_signature(characteristics)):
++                buckets = self.__format_buckets(buckets)
++                client.sadd(
++                    b'{}:{}:{}:{}:{}'.format(self.namespace, scope, self.BUCKET_MEMBERSHIP, band, buckets),
++                    key,
++                )
++                client.zincrby(
++                    b'{}:{}:{}:{}:{}'.format(self.namespace, scope, self.BUCKET_FREQUENCY, band, key),
++                    buckets,
++                    1,
++                )
+diff --git a/src/sentry/utils/iterators.py b/src/sentry/utils/iterators.py
+index 215c85d1ba..8dc2b4cba1 100644
+--- a/src/sentry/utils/iterators.py
++++ b/src/sentry/utils/iterators.py
+@@ -1,5 +1,30 @@
+ from __future__ import absolute_import
+ 
++import itertools
++
++
++def advance(n, iterator):
++    """Advances an iterator n places."""
++    next(itertools.islice(iterator, n, n), None)
++    return iterator
++
++
++def shingle(n, iterator):
++    """\
++    Shingle a token stream into N-grams.
++
++    >>> list(shingle(2, ('foo', 'bar', 'baz')))
++    [('foo', 'bar'), ('bar', 'baz')]
++    """
++    return itertools.izip(
++        *map(
++            lambda (i, iterator): advance(i, iterator),
++            enumerate(
++                itertools.tee(iterator, n)
++            ),
++        )
++    )
++
+ 
+ def chunked(iterator, size):
+     chunk = []
+diff --git a/tests/sentry/test_similarity.py b/tests/sentry/test_similarity.py
+new file mode 100644
+index 0000000000..bc95ff6c6e
+--- /dev/null
++++ b/tests/sentry/test_similarity.py
+@@ -0,0 +1,129 @@
++from __future__ import absolute_import
++
++import math
++
++import pytest
++
++from sentry.similarity import MinHashIndex, get_distance, get_number_formatter, scale_to_total
++from sentry.testutils import TestCase
++from sentry.utils import redis
++
++
++def test_get_distance():
++    assert get_distance({}, {}) == 0
++
++    assert get_distance(
++        {'a': 1},
++        {'a': 1},
++    ) == 0
++
++    assert get_distance(
++        {'a': 1, 'b': 0},
++        {'a': 0, 'b': 1},
++    ) == math.sqrt(2)
++
++    assert get_distance(
++        {'a': 1},
++        {'b': 1},
++    ) == math.sqrt(2)
++
++
++def test_get_similarity():
++    index = MinHashIndex(None, 0xFFFF, 2, 1)
++
++    assert index.get_similarity(
++        [
++            {'a': 1},
++            {'a': 1},
++        ],
++        [
++            {'a': 1},
++            {'a': 1},
++        ],
++    ) == 1.0
++
++    assert index.get_similarity(
++        [
++            {'a': 1},
++            {'a': 1},
++        ],
++        [
++            {'b': 1},
++            {'b': 1},
++        ],
++    ) == 0
++
++    assert index.get_similarity(
++        [
++            {'a': 1},
++            {'b': 1},
++        ],
++        [
++            {'b': 1},
++            {'b': 1},
++        ],
++    ) == 0.5
++
++    with pytest.raises(AssertionError):
++        assert index.get_similarity(
++            range(10),
++            range(10),
++        )
++
++    with pytest.raises(AssertionError):
++        assert index.get_similarity(
++            range(1),
++            range(10),
++        )
++
++
++def test_scale_to_total():
++    assert scale_to_total({}) == {}
++
++    assert scale_to_total({
++        'a': 10,
++        'b': 10,
++    }) == {
++        'a': 0.5,
++        'b': 0.5,
++    }
++
++
++def test_get_number_formatter():
++    assert get_number_formatter(0xFF)(0xFF) == '\xff'
++    assert get_number_formatter(0xFF + 1)(0xFF) == '\x00\xff'
++
++    assert get_number_formatter(0xFFFF)(0xFFFF) == '\xff\xff'
++    assert get_number_formatter(0xFFFF + 1)(0xFFFF) == '\x00\x00\xff\xff'
++
++    assert get_number_formatter(0xFFFFFFFF)(0xFFFFFFFF) == '\xff\xff\xff\xff'
++    assert get_number_formatter(0xFFFFFFFF + 1)(0xFFFFFFFF) == '\x00\x00\x00\x00\xff\xff\xff\xff'
++
++    assert get_number_formatter(0xFFFFFFFFFFFFFFFF)(0xFFFFFFFFFFFFFFFF) == '\xff\xff\xff\xff\xff\xff\xff\xff'
++
++    with pytest.raises(ValueError):
++        assert get_number_formatter(0xFFFFFFFFFFFFFFFF + 1)
++
++
++class MinHashIndexTestCase(TestCase):
++    def test_index(self):
++        index = MinHashIndex(
++            redis.clusters.get('default'),
++            0xFFFF,
++            8,
++            2,
++        )
++
++        index.record('example', '1', 'hello world')
++        index.record('example', '2', 'hello world')
++        index.record('example', '3', 'jello world')
++        index.record('example', '4', 'yellow world')
++        index.record('example', '4', 'mellow world')
++        index.record('example', '5', 'pizza world')
++
++        results = index.query('example', '1')
++        assert results[0] == ('1', 1.0)
++        assert results[1] == ('2', 1.0)  # identical contents
++        assert results[2][0] == '3'
++        assert results[3][0] == '4'
++        assert results[4][0] == '5'
+diff --git a/tests/sentry/utils/test_iterators.py b/tests/sentry/utils/test_iterators.py
+index 5f7c529090..5a423c3a7d 100644
+--- a/tests/sentry/utils/test_iterators.py
++++ b/tests/sentry/utils/test_iterators.py
+@@ -1,6 +1,8 @@
+ from __future__ import absolute_import
+ 
+-from sentry.utils.iterators import chunked
++import pytest
++
++from sentry.utils.iterators import advance, chunked, shingle
+ 
+ 
+ def test_chunked():
+@@ -13,3 +15,22 @@ def test_chunked():
+         [4, 5, 6, 7],
+         [8, 9],
+     ]
++
++
++def test_advance():
++    i = iter(xrange(10))
++
++    advance(5, i)   # [0, 1, 2, 3, 4]
++    assert next(i) == 5
++
++    advance(10, i)  # don't raise if slicing past end of iterator
++    with pytest.raises(StopIteration):
++        next(i)
++
++
++def test_shingle():
++    assert list(shingle(5, 'x')) == []
++    assert list(shingle(2, ('foo', 'bar', 'baz'))) == [
++        ('foo', 'bar'),
++        ('bar', 'baz'),
++    ]

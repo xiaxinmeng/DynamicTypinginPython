@@ -1,0 +1,402 @@
+commit fdf496aa52b1c45c111debc1334e2dfff48854e9
+Author: Markus Unterwaditzer <markus@unterwaditzer.net>
+Date:   Thu Nov 7 14:41:19 2019 +0100
+
+    ref: Performance work on relay projectconfig endpoint (#15464)
+    
+    * ref: More spans
+    
+    * ref: Batch requests efficiently
+    
+    * ref: Restore old code, put new behind sampling option
+    
+    * fix: Update doccomment
+    
+    * ref: Remove pointless span
+    
+    * fix: Fix tests
+    
+    * fix: Do not hit memcached if all results are from local cache
+    
+    * ref: Remove refactor of get_from_cache for now
+    
+    * ref: Apply suggestions from jauer
+    
+    * fix: Fix tests again
+    
+    * fix: Fix a bug that would return None in get_many
+    
+    * fix: Fix another bug
+
+diff --git a/src/sentry/api/endpoints/relay_projectconfigs.py b/src/sentry/api/endpoints/relay_projectconfigs.py
+index f79cdcdc53..26bdcf8f6d 100644
+--- a/src/sentry/api/endpoints/relay_projectconfigs.py
++++ b/src/sentry/api/endpoints/relay_projectconfigs.py
+@@ -10,7 +10,7 @@ from sentry.api.base import Endpoint
+ from sentry.api.permissions import RelayPermission
+ from sentry.api.authentication import RelayAuthentication
+ from sentry.relay import config
+-from sentry.models import Project, Organization, OrganizationOption
++from sentry.models import Project, ProjectKey, Organization, OrganizationOption
+ from sentry.utils import metrics
+ 
+ 
+@@ -37,7 +37,7 @@ class RelayProjectConfigsEndpoint(Endpoint):
+             project_ids = set(request.relay_request_data.get("projects") or ())
+             if project_ids:
+                 with metrics.timer("relay_project_configs.fetching_projects.duration"):
+-                    projects = {p.id: p for p in Project.objects.filter(pk__in=project_ids)}
++                    projects = {p.id: p for p in Project.objects.get_many_from_cache(project_ids)}
+             else:
+                 projects = {}
+ 
+@@ -49,7 +49,7 @@ class RelayProjectConfigsEndpoint(Endpoint):
+                 with metrics.timer("relay_project_configs.fetching_orgs.duration"):
+                     orgs = {
+                         o.id: o
+-                        for o in Organization.objects.filter(pk__in=org_ids)
++                        for o in Organization.objects.get_many_from_cache(org_ids)
+                         if request.relay.has_org_access(o)
+                     }
+             else:
+@@ -58,6 +58,11 @@ class RelayProjectConfigsEndpoint(Endpoint):
+                 i: OrganizationOption.objects.get_all_values(i) for i in six.iterkeys(orgs)
+             }
+ 
++        with Hub.current.start_span(op="relay_fetch_keys"):
++            project_keys = {}
++            for key in ProjectKey.objects.get_many_from_cache(project_ids, key="project_id"):
++                project_keys.setdefault(key.project_id, []).append(key)
++
+         metrics.timing("relay_project_configs.projects_requested", len(project_ids))
+         metrics.timing("relay_project_configs.projects_fetched", len(projects))
+         metrics.timing("relay_project_configs.orgs_fetched", len(orgs))
+@@ -80,8 +85,12 @@ class RelayProjectConfigsEndpoint(Endpoint):
+             with Hub.current.start_span(op="get_config"):
+                 with metrics.timer("relay_project_configs.get_config.duration"):
+                     project_config = config.get_project_config(
+-                        project, org_options=org_opts, full_config=full_config_requested
++                        project,
++                        org_options=org_opts,
++                        full_config=full_config_requested,
++                        project_keys=project_keys.get(project.id, []),
+                     )
+-                configs[six.text_type(project_id)] = project_config.to_camel_case_dict()
++
++            configs[six.text_type(project_id)] = project_config.to_camel_case_dict()
+ 
+         return Response({"configs": configs}, status=200)
+diff --git a/src/sentry/db/models/manager.py b/src/sentry/db/models/manager.py
+index 3b64b77fca..c3b9857452 100644
+--- a/src/sentry/db/models/manager.py
++++ b/src/sentry/db/models/manager.py
+@@ -318,6 +318,114 @@ class BaseManager(Manager):
+         else:
+             return self.get(**kwargs)
+ 
++    def get_many_from_cache(self, values, key="pk"):
++        """
++        Wrapper around `QuerySet.filter(pk__in=values)` which supports caching of
++        the intermediate value.  Callee is responsible for making sure the
++        cache key is cleared on save.
++        """
++
++        pk_name = self.model._meta.pk.name
++
++        if key == "pk":
++            key = pk_name
++
++        # Kill __exact since it's the default behavior
++        if key.endswith("__exact"):
++            key = key.split("__exact", 1)[0]
++
++        if key not in self.cache_fields and key != pk_name:
++            return self.filter(**{key + "__in": values})
++
++        final_results = []
++        cache_lookup_cache_keys = []
++        cache_lookup_values = []
++
++        local_cache = self._get_local_cache()
++        for value in values:
++            cache_key = self.__get_lookup_cache_key(**{key: value})
++            result = local_cache and local_cache.get(cache_key)
++            if result is not None:
++                final_results.append(result)
++            else:
++                cache_lookup_cache_keys.append(cache_key)
++                cache_lookup_values.append(value)
++
++        if not cache_lookup_cache_keys:
++            return final_results
++
++        cache_results = cache.get_many(cache_lookup_cache_keys, version=self.cache_version)
++
++        db_lookup_cache_keys = []
++        db_lookup_values = []
++
++        nested_lookup_cache_keys = []
++        nested_lookup_values = []
++
++        for cache_key, value in zip(cache_lookup_cache_keys, cache_lookup_values):
++            cache_result = cache_results.get(cache_key)
++            if cache_result is None:
++                db_lookup_cache_keys.append(cache_key)
++                db_lookup_values.append(value)
++                continue
++
++            # If we didn't look up by pk we need to hit the reffed key
++            if key != pk_name:
++                nested_lookup_cache_keys.append(cache_key)
++                nested_lookup_values.append(cache_result)
++                continue
++
++            if not isinstance(cache_result, self.model):
++                if settings.DEBUG:
++                    raise ValueError("Unexpected value type returned from cache")
++                logger.error("Cache response returned invalid value %r", cache_result)
++                db_lookup_cache_keys.append(cache_key)
++                db_lookup_values.append(value)
++                continue
++
++            if key == pk_name and int(value) != cache_result.pk:
++                if settings.DEBUG:
++                    raise ValueError("Unexpected value returned from cache")
++                logger.error("Cache response returned invalid value %r", cache_result)
++                db_lookup_cache_keys.append(cache_key)
++                db_lookup_values.append(value)
++                continue
++
++            final_results.append(cache_result)
++
++        if nested_lookup_values:
++            nested_results = self.get_many_from_cache(nested_lookup_values, key=pk_name)
++            final_results.extend(nested_results)
++            if local_cache is not None:
++                for nested_result in nested_results:
++                    value = getattr(nested_result, key)
++                    cache_key = self.__get_lookup_cache_key(**{key: value})
++                    local_cache[cache_key] = nested_result
++
++        if not db_lookup_values:
++            return final_results
++
++        cache_writes = []
++
++        db_results = {getattr(x, key): x for x in self.filter(**{key + "__in": db_lookup_values})}
++        for cache_key, value in zip(db_lookup_cache_keys, db_lookup_values):
++            db_result = db_results.get(value)
++            if db_result is None:
++                continue  # This model ultimately does not exist
++
++            # Ensure we're pushing it into the cache
++            cache_writes.append(db_result)
++            if local_cache is not None:
++                local_cache[cache_key] = db_result
++
++            final_results.append(db_result)
++
++        # XXX: Should use set_many here, but __post_save code is too complex
++        for instance in cache_writes:
++            self.__post_save(instance=instance)
++
++        return final_results
++
+     def create_or_update(self, **kwargs):
+         return create_or_update(self.model, **kwargs)
+ 
+diff --git a/src/sentry/relay/config.py b/src/sentry/relay/config.py
+index d09d879593..d262989cc4 100644
+--- a/src/sentry/relay/config.py
++++ b/src/sentry/relay/config.py
+@@ -4,6 +4,8 @@ import six
+ import uuid
+ import sentry.utils as utils
+ 
++from sentry_sdk import Hub
++
+ from datetime import datetime
+ from pytz import utc
+ 
+@@ -15,7 +17,6 @@ from sentry import quotas
+ from sentry.models.organizationoption import OrganizationOption
+ from sentry.utils.data_filters import FilterTypes, FilterStatKeys
+ from sentry.utils.http import get_origins
+-from sentry.models.projectkey import ProjectKey
+ from sentry.utils.sdk import configure_scope
+ 
+ 
+@@ -24,7 +25,7 @@ def get_project_key_config(project_key):
+     return {"dsn": project_key.dsn_public}
+ 
+ 
+-def get_project_config(project, org_options=None, full_config=True, for_store=False):
++def get_project_config(project, org_options=None, full_config=True, project_keys=None):
+     """
+     Constructs the ProjectConfig information.
+ 
+@@ -36,24 +37,19 @@ def get_project_config(project, org_options=None, full_config=True, for_store=Fa
+     :param full_config: True if only the full config is required, False
+         if only the restricted (for external relays) is required
+         (default True, i.e. full configuration)
+-    :param for_store: If set to true, this omits all parameters that are not
+-        needed for Relay. This is a temporary flag that should be removed once
+-        store has been moved to Relay. Most importantly, this avoids database
+-        accesses.
++    :param project_keys: Pre-fetched project keys for performance, similar to
++        org_options. However, if no project keys are provided it is assumed
++        that the config does not need to contain auth information (this is the
++        case when used in python's StoreView)
+ 
+     :return: a ProjectConfig object for the given project
+     """
+     with configure_scope() as scope:
+         scope.set_tag("project", project.id)
+ 
+-    if for_store:
+-        project_keys = []
+-    else:
+-        project_keys = ProjectKey.objects.filter(project=project).all()
+-
+     public_keys = []
+ 
+-    for project_key in project_keys:
++    for project_key in project_keys or ():
+         key = {"publicKey": project_key.public_key, "isEnabled": project_key.status == 0}
+         if full_config:
+             key["numericId"] = project_key.id
+@@ -68,21 +64,22 @@ def get_project_config(project, org_options=None, full_config=True, for_store=Fa
+     if org_options is None:
+         org_options = OrganizationOption.objects.get_all_values(project.organization_id)
+ 
+-    cfg = {
+-        "disabled": project.status > 0,
+-        "slug": project.slug,
+-        "lastFetch": now,
+-        "lastChange": project.get_option("sentry:relay-rev-lastchange", now),
+-        "rev": project.get_option("sentry:relay-rev", uuid.uuid4().hex),
+-        "publicKeys": public_keys,
+-        "config": {
+-            "allowedDomains": project.get_option("sentry:origins", ["*"]),
+-            "trustedRelays": org_options.get("sentry:trusted-relays", []),
+-            "piiConfig": _get_pii_config(project),
+-            "datascrubbingSettings": _get_datascrubbing_settings(project, org_options),
+-        },
+-        "project_id": project.id,
+-    }
++    with Hub.current.start_span(op="get_public_config"):
++        cfg = {
++            "disabled": project.status > 0,
++            "slug": project.slug,
++            "lastFetch": now,
++            "lastChange": project.get_option("sentry:relay-rev-lastchange", now),
++            "rev": project.get_option("sentry:relay-rev", uuid.uuid4().hex),
++            "publicKeys": public_keys,
++            "config": {
++                "allowedDomains": project.get_option("sentry:origins", ["*"]),
++                "trustedRelays": org_options.get("sentry:trusted-relays", []),
++                "piiConfig": _get_pii_config(project),
++                "datascrubbingSettings": _get_datascrubbing_settings(project, org_options),
++            },
++            "project_id": project.id,
++        }
+ 
+     if not full_config:
+         # This is all we need for external Relay processors
+@@ -94,33 +91,34 @@ def get_project_config(project, org_options=None, full_config=True, for_store=Fa
+ 
+     project_cfg = cfg["config"]
+ 
+-    # get the filter settings for this project
+-    filter_settings = {}
+-    project_cfg["filter_settings"] = filter_settings
++    with Hub.current.start_span(op="get_filter_settings"):
++        # get the filter settings for this project
++        filter_settings = {}
++        project_cfg["filter_settings"] = filter_settings
+ 
+-    for flt in get_all_filters():
+-        filter_id = get_filter_key(flt)
+-        settings = _load_filter_settings(flt, project)
+-        filter_settings[filter_id] = settings
++        for flt in get_all_filters():
++            filter_id = get_filter_key(flt)
++            settings = _load_filter_settings(flt, project)
++            filter_settings[filter_id] = settings
+ 
+-    invalid_releases = project.get_option(u"sentry:{}".format(FilterTypes.RELEASES))
+-    if invalid_releases:
+-        filter_settings[FilterTypes.RELEASES] = {"releases": invalid_releases}
++        invalid_releases = project.get_option(u"sentry:{}".format(FilterTypes.RELEASES))
++        if invalid_releases:
++            filter_settings[FilterTypes.RELEASES] = {"releases": invalid_releases}
+ 
+-    blacklisted_ips = project.get_option("sentry:blacklisted_ips")
+-    if blacklisted_ips:
+-        filter_settings["client_ips"] = {"blacklisted_ips": blacklisted_ips}
++        blacklisted_ips = project.get_option("sentry:blacklisted_ips")
++        if blacklisted_ips:
++            filter_settings["client_ips"] = {"blacklisted_ips": blacklisted_ips}
+ 
+-    error_messages = project.get_option(u"sentry:{}".format(FilterTypes.ERROR_MESSAGES))
+-    if error_messages:
+-        filter_settings[FilterTypes.ERROR_MESSAGES] = {"patterns": error_messages}
++        error_messages = project.get_option(u"sentry:{}".format(FilterTypes.ERROR_MESSAGES))
++        if error_messages:
++            filter_settings[FilterTypes.ERROR_MESSAGES] = {"patterns": error_messages}
+ 
+-    csp_disallowed_sources = []
+-    if bool(project.get_option("sentry:csp_ignored_sources_defaults", True)):
+-        csp_disallowed_sources += DEFAULT_DISALLOWED_SOURCES
+-    csp_disallowed_sources += project.get_option("sentry:csp_ignored_sources", [])
+-    if csp_disallowed_sources:
+-        filter_settings["csp"] = {"disallowed_sources": csp_disallowed_sources}
++        csp_disallowed_sources = []
++        if bool(project.get_option("sentry:csp_ignored_sources_defaults", True)):
++            csp_disallowed_sources += DEFAULT_DISALLOWED_SOURCES
++        csp_disallowed_sources += project.get_option("sentry:csp_ignored_sources", [])
++        if csp_disallowed_sources:
++            filter_settings["csp"] = {"disallowed_sources": csp_disallowed_sources}
+ 
+     scrub_ip_address = org_options.get(
+         "sentry:require_scrub_ip_address", False
+@@ -128,8 +126,11 @@ def get_project_config(project, org_options=None, full_config=True, for_store=Fa
+ 
+     project_cfg["scrub_ip_addresses"] = scrub_ip_address
+ 
+-    project_cfg["grouping_config"] = get_grouping_config_dict_for_project(project)
+-    project_cfg["allowed_domains"] = list(get_origins(project))
++    with Hub.current.start_span(op="get_grouping_config_dict_for_project"):
++        project_cfg["grouping_config"] = get_grouping_config_dict_for_project(project)
++
++    with Hub.current.start_span(op="get_origins"):
++        project_cfg["allowed_domains"] = list(get_origins(project))
+ 
+     return ProjectConfig(project, **cfg)
+ 
+diff --git a/src/sentry/web/api.py b/src/sentry/web/api.py
+index 86c18b67be..cfe8246cf3 100644
+--- a/src/sentry/web/api.py
++++ b/src/sentry/web/api.py
+@@ -424,7 +424,7 @@ class APIView(BaseView):
+             # implicitly fetched from database.
+             project.organization = Organization.objects.get_from_cache(id=project.organization_id)
+ 
+-            project_config = get_project_config(project, for_store=True)
++            project_config = get_project_config(project)
+ 
+             helper.context.bind_project(project_config.project)
+ 
+diff --git a/tests/sentry/event_manager/test_event_manager.py b/tests/sentry/event_manager/test_event_manager.py
+index a6ff1fe25f..18405b7fcc 100644
+--- a/tests/sentry/event_manager/test_event_manager.py
++++ b/tests/sentry/event_manager/test_event_manager.py
+@@ -1060,7 +1060,7 @@ class EventManagerTest(TestCase):
+ 
+         data = {"exception": {"values": [item.value for item in items]}}
+ 
+-        project_config = get_project_config(self.project, for_store=True)
++        project_config = get_project_config(self.project)
+         manager = EventManager(data, project=self.project, project_config=project_config)
+ 
+         mock_is_valid_error_message.side_effect = [item.result for item in items]

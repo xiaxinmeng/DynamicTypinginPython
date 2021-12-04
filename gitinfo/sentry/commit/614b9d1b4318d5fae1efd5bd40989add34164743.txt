@@ -1,0 +1,232 @@
+commit 614b9d1b4318d5fae1efd5bd40989add34164743
+Author: David Cramer <dcramer@gmail.com>
+Date:   Thu Feb 2 19:25:03 2017 -0800
+
+    [quotas] overhaul rate limits and add reason
+    
+    - move from namedtuples to basic class instances
+    - add reason to RateLimit
+    - add reason_code to RateLimit
+    - abstract redis quotas into helper class (to provide reason_code)
+
+diff --git a/CHANGES b/CHANGES
+index 81d6b5622b..3c2c6577e0 100644
+--- a/CHANGES
++++ b/CHANGES
+@@ -6,9 +6,12 @@ Version 8.14 (Unreleased)
+ - Added data migration to merge legacy releases
+ - Added support for symbolizing inlined frames and added heuristics for fixing up native stacktraces.
+ - Removed instruction_offset as a frame attribute from stacktraces
++- [BREAKING] Quotas must now instantiate RateLimited and NotRateLimited return values.
++- [BREAKING] Redis quota implementations now return BasicRedisQuota instead of tuples.
+ 
+ Schema Changes
+ ~~~~~~~~~~~~~~
++
+ - Added unique index on ``Release(organization_id, version)``
+ - Removed unique index on ``Release(project_id, version)``
+ 
+@@ -33,6 +36,7 @@ Version 8.13
+ 
+ Schema Changes
+ ~~~~~~~~~~~~~~
++
+ - Added ``ReleaseProject.new_groups`` column.
+ - Added ``OrganizationAvatar`` model.
+ 
+diff --git a/src/sentry/quotas/base.py b/src/sentry/quotas/base.py
+index 79d1746edd..e2bb5cf4d3 100644
+--- a/src/sentry/quotas/base.py
++++ b/src/sentry/quotas/base.py
+@@ -9,15 +9,33 @@ from __future__ import absolute_import
+ 
+ import six
+ 
+-from collections import namedtuple
+-from functools import partial
+ from django.conf import settings
+ 
+ from sentry import options
+ 
+-RateLimit = namedtuple('RateLimit', ('is_limited', 'retry_after'))
+-NotRateLimited = RateLimit(False, None)
+-RateLimited = partial(RateLimit, is_limited=True)
++
++class RateLimit(object):
++    __slots__ = ['is_limited', 'retry_after', 'reason', 'reason_code']
++
++    def __init__(self, is_limited, retry_after=None, reason=None,
++                 reason_code=None):
++        self.is_limited = is_limited
++        # delta of seconds in the future to retry
++        self.retry_after = retry_after
++        # human readable description
++        self.reason = reason
++        # machine readable description
++        self.reason_code = reason_code
++
++
++class NotRateLimited(RateLimit):
++    def __init__(self, **kwargs):
++        super(NotRateLimited, self).__init__(False, **kwargs)
++
++
++class RateLimited(RateLimit):
++    def __init__(self, **kwargs):
++        super(RateLimited, self).__init__(True, **kwargs)
+ 
+ 
+ class Quota(object):
+@@ -38,7 +56,7 @@ class Quota(object):
+         """
+ 
+     def is_rate_limited(self, project):
+-        return NotRateLimited
++        return NotRateLimited()
+ 
+     def get_time_remaining(self):
+         return 0
+diff --git a/src/sentry/quotas/redis.py b/src/sentry/quotas/redis.py
+index 384a060e34..1b1a22256d 100644
+--- a/src/sentry/quotas/redis.py
++++ b/src/sentry/quotas/redis.py
+@@ -18,6 +18,16 @@ from sentry.utils.redis import get_cluster_from_options, load_script
+ is_rate_limited = load_script('quotas/is_rate_limited.lua')
+ 
+ 
++class BasicRedisQuota(object):
++    __slots__ = ['key', 'limit', 'window', 'reason_code']
++
++    def __init__(self, key, limit=0, window=60, reason_code=None):
++        self.key = key
++        self.limit = limit
++        self.window = window
++        self.reason_code = reason_code
++
++
+ class RedisQuota(Quota):
+     #: The ``grace`` period allows accomodating for clock drift in TTL
+     #: calculation since the clock on the Redis instance used to store quota
+@@ -37,9 +47,21 @@ class RedisQuota(Quota):
+             raise InvalidConfiguration(six.text_type(e))
+ 
+     def get_quotas(self, project):
++        pquota = self.get_project_quota(project)
++        oquota = self.get_organization_quota(project.organization)
+         return (
+-            ('p:{}'.format(project.id),) + self.get_project_quota(project),
+-            ('o:{}'.format(project.organization.id),) + self.get_organization_quota(project.organization),
++            BasicRedisQuota(
++                key='p:{}'.format(project.id),
++                limit=pquota[0],
++                window=pquota[1],
++                reason_code='project_quota',
++            ),
++            BasicRedisQuota(
++                key='o:{}'.format(project.organization.id),
++                limit=oquota[0],
++                window=oquota[1],
++                reason_code='org_quota',
++            ),
+         )
+ 
+     def get_redis_key(self, key, timestamp, interval):
+@@ -49,15 +71,15 @@ class RedisQuota(Quota):
+         timestamp = time()
+ 
+         quotas = [
+-            (key, limit, interval)
+-            for key, limit, interval in self.get_quotas(project)
++            quota
++            for quota in self.get_quotas(project)
+             # x = (key, limit, interval)
+-            if limit and limit > 0  # a zero limit means "no limit", not "reject all"
++            if quota.limit > 0  # a zero limit means "no limit", not "reject all"
+         ]
+ 
+         # If there are no quotas to actually check, skip the trip to the database.
+         if not quotas:
+-            return NotRateLimited
++            return NotRateLimited()
+ 
+         def get_next_period_start(interval):
+             """Return the timestamp when the next rate limit period begins for an interval."""
+@@ -65,15 +87,24 @@ class RedisQuota(Quota):
+ 
+         keys = []
+         args = []
+-        for key, limit, interval in quotas:
+-            keys.append(self.get_redis_key(key, timestamp, interval))
+-            expiry = get_next_period_start(interval) + self.grace
+-            args.extend((limit, int(expiry)))
++        for quota in quotas:
++            keys.append(self.get_redis_key(quota.key, timestamp, quota.window))
++            expiry = get_next_period_start(quota.window) + self.grace
++            args.extend((quota.limit, int(expiry)))
+ 
+         client = self.cluster.get_local_client_for_key(six.text_type(project.organization.pk))
+         rejections = is_rate_limited(client, keys, args)
+         if any(rejections):
+-            delay = max(get_next_period_start(interval) - timestamp for (key, limit, interval), rejected in zip(quotas, rejections) if rejected)
+-            return RateLimited(retry_after=delay)
++            worst_case = (0, None)
++            for quota, rejected in zip(quotas, rejections):
++                if not rejected:
++                    continue
++                delay = get_next_period_start(quota.window) - timestamp
++                if delay > worst_case[0]:
++                    worst_case = (delay, quota.reason_code)
++            return RateLimited(
++                retry_after=worst_case[0],
++                reason_code=worst_case[1],
++            )
+         else:
+-            return NotRateLimited
++            return NotRateLimited()
+diff --git a/src/sentry/signals.py b/src/sentry/signals.py
+index 307ee69f6e..397447f50e 100644
+--- a/src/sentry/signals.py
++++ b/src/sentry/signals.py
+@@ -31,7 +31,7 @@ class BetterSignal(Signal):
+ regression_signal = BetterSignal(providing_args=["instance"])
+ buffer_incr_complete = BetterSignal(providing_args=["model", "columns", "extra", "result"])
+ event_accepted = BetterSignal(providing_args=["ip", "data", "project"])
+-event_dropped = BetterSignal(providing_args=["ip", "data", "project"])
++event_dropped = BetterSignal(providing_args=["ip", "data", "project", "reason_code"])
+ event_filtered = BetterSignal(providing_args=["ip", "data", "project"])
+ event_received = BetterSignal(providing_args=["ip", "project"])
+ pending_delete = BetterSignal(providing_args=['instance', 'actor'])
+diff --git a/src/sentry/web/api.py b/src/sentry/web/api.py
+index fd5159e43d..12e5c4c400 100644
+--- a/src/sentry/web/api.py
++++ b/src/sentry/web/api.py
+@@ -371,6 +371,7 @@ class StoreView(APIView):
+                 ip=remote_addr,
+                 project=project,
+                 sender=type(self),
++                reason_code=rate_limit.reason_code if rate_limit else None,
+             )
+             if rate_limit is not None:
+                 raise APIRateLimited(rate_limit.retry_after)
+diff --git a/tests/sentry/quotas/redis/tests.py b/tests/sentry/quotas/redis/tests.py
+index 160ce96651..a19410c650 100644
+--- a/tests/sentry/quotas/redis/tests.py
++++ b/tests/sentry/quotas/redis/tests.py
+@@ -62,10 +62,13 @@ class RedisQuotaTest(TestCase):
+     def test_uses_defined_quotas(self):
+         self.get_project_quota.return_value = (200, 60)
+         self.get_organization_quota.return_value = (300, 60)
+-        assert set(self.quota.get_quotas(self.project)) == set((
+-            ('p:{}'.format(self.project.id), 200, 60),
+-            ('o:{}'.format(self.project.organization.id), 300, 60),
+-        ))
++        quotas = self.quota.get_quotas(self.project)
++        assert quotas[0].key == 'p:{}'.format(self.project.id)
++        assert quotas[0].limit == 200
++        assert quotas[0].window == 60
++        assert quotas[1].key == 'o:{}'.format(self.project.organization.id)
++        assert quotas[1].limit == 300
++        assert quotas[1].window == 60
+ 
+     @mock.patch('sentry.quotas.redis.is_rate_limited')
+     @mock.patch.object(RedisQuota, 'get_quotas', return_value=[])

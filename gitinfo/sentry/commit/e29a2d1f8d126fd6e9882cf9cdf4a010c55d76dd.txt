@@ -1,0 +1,989 @@
+commit e29a2d1f8d126fd6e9882cf9cdf4a010c55d76dd
+Author: Markus Unterwaditzer <markus@unterwaditzer.net>
+Date:   Wed Jan 15 09:44:28 2020 +0100
+
+    feat(relay): Push projectconfigs into Redis (#16437)
+    
+    Synchronize projectconfigs into Redis to make internal Relays faster.
+    
+    This PR is incomplete even if successfully deployed, as we still need to hook some things in getsentry to make quotas behave correctly.
+
+diff --git a/src/sentry/api/endpoints/relay_projectconfigs.py b/src/sentry/api/endpoints/relay_projectconfigs.py
+index 6f8f4faedb..5128c3b5e5 100644
+--- a/src/sentry/api/endpoints/relay_projectconfigs.py
++++ b/src/sentry/api/endpoints/relay_projectconfigs.py
+@@ -11,6 +11,7 @@ from sentry.api.base import Endpoint
+ from sentry.api.permissions import RelayPermission
+ from sentry.api.authentication import RelayAuthentication
+ from sentry.relay import config
++from sentry.relay import projectconfig_cache
+ from sentry.models import Project, ProjectKey, Organization, OrganizationOption
+ from sentry.utils import metrics, json
+ 
+@@ -101,6 +102,7 @@ class RelayProjectConfigsEndpoint(Endpoint):
+                     )
+ 
+             configs[six.text_type(project_id)] = serialized_config = project_config.to_dict()
++
+             config_size = len(json.dumps(serialized_config))
+             metrics.timing("relay_project_configs.config_size", config_size)
+ 
+@@ -111,4 +113,7 @@ class RelayProjectConfigsEndpoint(Endpoint):
+                     extra={"project_id": project_id, "size": config_size},
+                 )
+ 
++        if full_config_requested:
++            projectconfig_cache.set_many(list(six.itervalues(configs)))
++
+         return Response({"configs": configs}, status=200)
+diff --git a/src/sentry/conf/server.py b/src/sentry/conf/server.py
+index 57deb8f20a..d383152b14 100644
+--- a/src/sentry/conf/server.py
++++ b/src/sentry/conf/server.py
+@@ -552,6 +552,7 @@ CELERY_IMPORTS = (
+     "sentry.tasks.store",
+     "sentry.tasks.unmerge",
+     "sentry.tasks.update_user_reports",
++    "sentry.tasks.relay",
+ )
+ CELERY_QUEUES = [
+     Queue("activity.notify", routing_key="activity.notify"),
+@@ -579,6 +580,7 @@ CELERY_QUEUES = [
+     Queue("integrations", routing_key="integrations"),
+     Queue("merge", routing_key="merge"),
+     Queue("options", routing_key="options"),
++    Queue("relay_config", routing_key="relay_config"),
+     Queue("reports.deliver", routing_key="reports.deliver"),
+     Queue("reports.prepare", routing_key="reports.prepare"),
+     Queue("search", routing_key="search"),
+@@ -1038,6 +1040,10 @@ SENTRY_DIGESTS_OPTIONS = {}
+ SENTRY_QUOTAS = "sentry.quotas.Quota"
+ SENTRY_QUOTA_OPTIONS = {}
+ 
++# Cache for Relay project configs
++SENTRY_RELAY_PROJECTCONFIG_CACHE = "sentry.relay.projectconfig_cache.base.ProjectConfigCache"
++SENTRY_RELAY_PROJECTCONFIG_CACHE_OPTIONS = {}
++
+ # Rate limiting backend
+ SENTRY_RATELIMITER = "sentry.ratelimits.base.RateLimiter"
+ SENTRY_RATELIMITER_OPTIONS = {}
+diff --git a/src/sentry/models/organizationoption.py b/src/sentry/models/organizationoption.py
+index a331d1923e..6f5059d9b4 100644
+--- a/src/sentry/models/organizationoption.py
++++ b/src/sentry/models/organizationoption.py
+@@ -6,6 +6,7 @@ from sentry.db.models import Model, FlexibleForeignKey, sane_repr
+ from sentry.db.models.fields import EncryptedPickledObjectField
+ from sentry.db.models.manager import OptionManager
+ from sentry.utils.cache import cache
++from sentry.tasks.relay import schedule_update_config_cache
+ 
+ 
+ class OrganizationOptionManager(OptionManager):
+@@ -56,9 +57,19 @@ class OrganizationOptionManager(OptionManager):
+         return result
+ 
+     def post_save(self, instance, **kwargs):
++        schedule_update_config_cache(
++            organization_id=instance.organization_id,
++            generate=False,
++            update_reason="organizationoption.post_save",
++        )
+         self.reload_cache(instance.organization_id)
+ 
+     def post_delete(self, instance, **kwargs):
++        schedule_update_config_cache(
++            organization_id=instance.organization_id,
++            generate=False,
++            update_reason="organizationoption.post_delete",
++        )
+         self.reload_cache(instance.organization_id)
+ 
+ 
+diff --git a/src/sentry/models/projectoption.py b/src/sentry/models/projectoption.py
+index 4af1fd2126..3b4c484d85 100644
+--- a/src/sentry/models/projectoption.py
++++ b/src/sentry/models/projectoption.py
+@@ -7,6 +7,7 @@ from sentry.db.models import Model, FlexibleForeignKey, sane_repr
+ from sentry.db.models.fields import EncryptedPickledObjectField
+ from sentry.db.models.manager import OptionManager
+ from sentry.utils.cache import cache
++from sentry.tasks.relay import schedule_update_config_cache
+ 
+ 
+ class ProjectOptionManager(OptionManager):
+@@ -61,9 +62,15 @@ class ProjectOptionManager(OptionManager):
+         return result
+ 
+     def post_save(self, instance, **kwargs):
++        schedule_update_config_cache(
++            project_id=instance.project_id, generate=True, update_reason="projectoption.post_save"
++        )
+         self.reload_cache(instance.project_id)
+ 
+     def post_delete(self, instance, **kwargs):
++        schedule_update_config_cache(
++            project_id=instance.project_id, generate=True, update_reason="projectoption.post_delete"
++        )
+         self.reload_cache(instance.project_id)
+ 
+ 
+diff --git a/src/sentry/quotas/redis.py b/src/sentry/quotas/redis.py
+index 8f5afddba8..ac08edf519 100644
+--- a/src/sentry/quotas/redis.py
++++ b/src/sentry/quotas/redis.py
+@@ -5,24 +5,17 @@ import six
+ 
+ from time import time
+ 
+-from sentry import options
+-from sentry.exceptions import InvalidConfiguration
+ from sentry.quotas.base import NotRateLimited, Quota, RateLimited
+-from sentry.utils.redis import get_cluster_from_options, load_script, redis_clusters
++from sentry.utils.redis import (
++    get_dynamic_cluster_from_options,
++    validate_dynamic_cluster,
++    load_script,
++)
+ from sentry.utils.json import prune_empty_keys
+ 
+ is_rate_limited = load_script("quotas/is_rate_limited.lua")
+ 
+ 
+-def get_dynamic_cluster_from_options(setting, config):
+-    cluster_name = config.get("cluster", "default")
+-    cluster_opts = options.default_manager.get("redis.clusters").get(cluster_name)
+-    if cluster_opts is not None and cluster_opts.get("is_redis_cluster"):
+-        return True, redis_clusters.get(cluster_name), config
+-
+-    return (False,) + get_cluster_from_options(setting, config)
+-
+-
+ class BasicRedisQuota(object):
+     """
+     A quota in the most abstract sense consists of an identifier (such as
+@@ -144,14 +137,7 @@ class RedisQuota(Quota):
+         self.namespace = "quota"
+ 
+     def validate(self):
+-        try:
+-            if self.is_redis_cluster:
+-                self.cluster.ping()
+-            else:
+-                with self.cluster.all() as client:
+-                    client.ping()
+-        except Exception as e:
+-            raise InvalidConfiguration(six.text_type(e))
++        validate_dynamic_cluster(self.is_redis_cluster, self.cluster)
+ 
+     def __get_redis_client(self, routing_key):
+         if self.is_redis_cluster:
+diff --git a/src/sentry/relay/projectconfig_cache/__init__.py b/src/sentry/relay/projectconfig_cache/__init__.py
+new file mode 100644
+index 0000000000..72ffc62447
+--- /dev/null
++++ b/src/sentry/relay/projectconfig_cache/__init__.py
+@@ -0,0 +1,15 @@
++from __future__ import absolute_import
++
++from django.conf import settings
++
++from sentry.utils.services import LazyServiceWrapper
++
++from .base import ProjectConfigCache
++
++backend = LazyServiceWrapper(
++    ProjectConfigCache,
++    settings.SENTRY_RELAY_PROJECTCONFIG_CACHE,
++    settings.SENTRY_RELAY_PROJECTCONFIG_CACHE_OPTIONS,
++)
++
++backend.expose(locals())
+diff --git a/src/sentry/relay/projectconfig_cache/base.py b/src/sentry/relay/projectconfig_cache/base.py
+new file mode 100644
+index 0000000000..826d76a2d0
+--- /dev/null
++++ b/src/sentry/relay/projectconfig_cache/base.py
+@@ -0,0 +1,19 @@
++from __future__ import absolute_import
++
++from sentry.utils.services import Service
++
++
++class ProjectConfigCache(Service):
++    __all__ = ("set_many", "delete_many", "get")
++
++    def __init__(self, **options):
++        pass
++
++    def set_many(self, configs):
++        pass
++
++    def delete_many(self, project_ids):
++        pass
++
++    def get(self, project_id):
++        raise NotImplementedError()
+diff --git a/src/sentry/relay/projectconfig_cache/redis.py b/src/sentry/relay/projectconfig_cache/redis.py
+new file mode 100644
+index 0000000000..656ec3e2a6
+--- /dev/null
++++ b/src/sentry/relay/projectconfig_cache/redis.py
+@@ -0,0 +1,60 @@
++from __future__ import absolute_import
++
++from sentry.relay.projectconfig_cache.base import ProjectConfigCache
++from sentry.utils import json
++from sentry.utils.redis import get_dynamic_cluster_from_options, validate_dynamic_cluster
++
++
++REDIS_CACHE_TIMEOUT = 3600  # 1 hr
++
++
++class RedisProjectConfigCache(ProjectConfigCache):
++    def __init__(self, **options):
++        self.is_redis_cluster, self.cluster, options = get_dynamic_cluster_from_options(
++            "SENTRY_RELAY_PROJECTCONFIG_CACHE_OPTIONS", options
++        )
++        super(RedisProjectConfigCache, self).__init__(**options)
++
++    def validate(self):
++        validate_dynamic_cluster(self.is_redis_cluster, self.cluster)
++
++    def __get_redis_key(self, project_id):
++        return "relayconfig:%s" % (project_id,)
++
++    def __get_redis_client(self, routing_key):
++        if self.is_redis_cluster:
++            return self.cluster
++        else:
++            return self.cluster.get_local_client_for_key(routing_key)
++
++    def set_many(self, configs):
++        for config in configs:
++            # XXX(markus): Figure out how to do pipelining here. We may have
++            # multiple routing keys (-> multiple clients).
++            #
++            # We cannot route by org, because Relay does not know the org when
++            # fetching.
++
++            key = self.__get_redis_key(config["projectId"])
++            client = self.__get_redis_client(key)
++            client.setex(key, REDIS_CACHE_TIMEOUT, json.dumps(config))
++
++    def delete_many(self, project_ids):
++        for project_id in project_ids:
++            # XXX(markus): Figure out how to do pipelining here. We may have
++            # multiple routing keys (-> multiple clients).
++            #
++            # We cannot route by org, because Relay does not know the org when
++            # fetching.
++
++            key = self.__get_redis_key(project_id)
++            client = self.__get_redis_client(key)
++            client.delete(key)
++
++    def get(self, project_id):
++        key = self.__get_redis_key(project_id)
++        client = self.__get_redis_client(key)
++        rv = client.get(key)
++        if rv is not None:
++            return json.loads(rv)
++        return None
+diff --git a/src/sentry/tasks/relay.py b/src/sentry/tasks/relay.py
+new file mode 100644
+index 0000000000..792bc4176e
+--- /dev/null
++++ b/src/sentry/tasks/relay.py
+@@ -0,0 +1,118 @@
++from __future__ import absolute_import
++
++import logging
++
++from django.conf import settings
++from django.core.cache import cache
++
++from sentry.tasks.base import instrumented_task
++from sentry.utils import metrics
++
++logger = logging.getLogger(__name__)
++
++
++@instrumented_task(name="sentry.tasks.relay.update_config_cache", queue="relay_config")
++def update_config_cache(generate, organization_id=None, project_id=None, update_reason=None):
++    """
++    Update the Redis cache for the Relay projectconfig. This task is invoked
++    whenever a project/org option has been saved or smart quotas potentially
++    caused a change in projectconfig.
++
++    Either organization_id or project_id has to be provided.
++
++    :param organization_id: The organization for which to invalidate configs.
++    :param project_id: The project for which to invalidate configs.
++    :param generate: If `True`, caches will be eagerly regenerated, not only
++        invalidated.
++    """
++
++    from sentry.models import Project
++    from sentry.relay import projectconfig_cache
++    from sentry.relay.config import get_project_config
++
++    # Delete key before generating configs such that we never have an outdated
++    # but valid cache.
++    #
++    # If this was running at the end of the task, it would be more effective
++    # against bursts of updates, but introduces a different race where an
++    # outdated cache may be used.
++    debounce_key = _get_schedule_debounce_key(project_id, organization_id)
++    cache.delete(debounce_key)
++
++    if project_id:
++        projects = [Project.objects.get_from_cache(id=project_id)]
++    elif organization_id:
++        # XXX(markus): I feel like we should be able to cache this but I don't
++        # want to add another method to src/sentry/db/models/manager.py
++        projects = Project.objects.filter(organization_id=organization_id)
++
++    if generate:
++        projectconfig_cache.set_many(
++            [get_project_config(project, full_config=True).to_dict() for project in projects]
++        )
++    else:
++        projectconfig_cache.delete_many([project.id for project in projects])
++
++    metrics.incr(
++        "relay.projectconfig_cache.done",
++        tags={"generate": generate, "update_reason": update_reason},
++    )
++
++
++def _get_schedule_debounce_key(project_id, organization_id):
++    if organization_id:
++        return "relayconfig-debounce:o:%s" % (organization_id,)
++    elif project_id:
++        return "relayconfig-debounce:p:%s" % (project_id,)
++    else:
++        raise ValueError()
++
++
++def schedule_update_config_cache(
++    generate, project_id=None, organization_id=None, update_reason=None
++):
++    """
++    Schedule the `update_config_cache` with debouncing applied.
++
++    See documentation of `update_config_cache` for documentation of parameters.
++    """
++
++    if (
++        settings.SENTRY_RELAY_PROJECTCONFIG_CACHE
++        == "sentry.relay.projectconfig_cache.base.ProjectConfigCache"
++    ):
++        # This cache backend is a noop, don't bother creating a noop celery
++        # task.
++        metrics.incr(
++            "relay.projectconfig_cache.skipped",
++            tags={"reason": "noop_backend", "update_reason": update_reason},
++        )
++        return
++
++    if bool(organization_id) == bool(project_id):
++        raise TypeError("One of organization_id and project_id has to be provided, not both.")
++
++    debounce_key = _get_schedule_debounce_key(project_id, organization_id)
++    if cache.get(debounce_key, None):
++        metrics.incr(
++            "relay.projectconfig_cache.skipped",
++            tags={"reason": "debounce", "update_reason": update_reason},
++        )
++        # If this task is already in the queue, do not schedule another task.
++        return
++
++    cache.set(debounce_key, True, 3600)
++
++    # XXX(markus): We could schedule this task a couple seconds into the
++    # future, this would make debouncing more effective. If we want to do this
++    # we might want to use the sleep queue.
++    metrics.incr(
++        "relay.projectconfig_cache.scheduled",
++        tags={"generate": generate, "update_reason": update_reason},
++    )
++    update_config_cache.delay(
++        generate=generate,
++        project_id=project_id,
++        organization_id=organization_id,
++        update_reason=update_reason,
++    )
+diff --git a/src/sentry/utils/redis.py b/src/sentry/utils/redis.py
+index 5e5786c9dd..bbcbe6100d 100644
+--- a/src/sentry/utils/redis.py
++++ b/src/sentry/utils/redis.py
+@@ -198,6 +198,28 @@ def get_cluster_from_options(setting, options, cluster_manager=clusters):
+     return cluster, options
+ 
+ 
++def get_dynamic_cluster_from_options(setting, config):
++    cluster_name = config.get("cluster", "default")
++    cluster_opts = options.default_manager.get("redis.clusters").get(cluster_name)
++    if cluster_opts is not None and cluster_opts.get("is_redis_cluster"):
++        # RedisCluster
++        return True, redis_clusters.get(cluster_name), config
++
++    # RBCluster
++    return (False,) + get_cluster_from_options(setting, config)
++
++
++def validate_dynamic_cluster(is_redis_cluster, cluster):
++    try:
++        if is_redis_cluster:
++            cluster.ping()
++        else:
++            with cluster.all() as client:
++                client.ping()
++    except Exception as e:
++        raise InvalidConfiguration(six.text_type(e))
++
++
+ def check_cluster_versions(cluster, required, recommended=None, label=None):
+     try:
+         with cluster.all() as client:
+diff --git a/tests/sentry/api/endpoints/test_relay_projectconfigs.py b/tests/sentry/api/endpoints/test_relay_projectconfigs.py
+index bcb22b17fb..31c92f34d0 100644
+--- a/tests/sentry/api/endpoints/test_relay_projectconfigs.py
++++ b/tests/sentry/api/endpoints/test_relay_projectconfigs.py
+@@ -1,5 +1,6 @@
+ from __future__ import absolute_import
+ 
++import pytest
+ import json
+ import six
+ import re
+@@ -10,11 +11,13 @@ from django.core.urlresolvers import reverse
+ 
+ from sentry.utils import safe
+ from sentry.models.relay import Relay
+-from sentry.testutils import APITestCase
+ 
+ from semaphore.auth import generate_key_pair
+ 
+ 
++_date_regex = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z$")
++
++
+ def _get_all_keys(config):
+     for key in config:
+         yield key
+@@ -23,173 +26,263 @@ def _get_all_keys(config):
+                 yield key
+ 
+ 
+-class RelayQueryGetProjectConfigTest(APITestCase):
+-    _date_regex = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z$")
++@pytest.fixture
++def key_pair():
++    return generate_key_pair()
+ 
+-    def _setup_relay(self, internal, add_org_key):
+-        self.key_pair = generate_key_pair()
+ 
+-        self.public_key = self.key_pair[1]
+-        self.private_key = self.key_pair[0]
+-        self.relay_id = six.binary_type(uuid4())
++@pytest.fixture
++def public_key(key_pair):
++    return key_pair[1]
+ 
+-        self.relay = Relay.objects.create(
+-            relay_id=self.relay_id,
+-            public_key=six.binary_type(self.public_key),
+-            is_internal=internal,
+-        )
+ 
+-        self.project = self.create_project()
+-        self.project.update_option("sentry:scrub_ip_address", True)
+-        self.path = reverse("sentry-api-0-relay-projectconfigs")
++@pytest.fixture
++def private_key(key_pair):
++    return key_pair[0]
++
++
++@pytest.fixture
++def relay_id():
++    return six.binary_type(uuid4())
++
+ 
+-        org = self.project.organization
++@pytest.fixture
++def relay(relay_id, public_key):
++    return Relay.objects.create(
++        relay_id=relay_id, public_key=six.binary_type(public_key), is_internal=True
++    )
+ 
+-        if add_org_key:
+-            org.update_option("sentry:trusted-relays", [self.relay.public_key])
+ 
+-    def _call_endpoint(self, full_config):
+-        projects = [six.text_type(self.project.id)]
++@pytest.fixture(autouse=True)
++def setup_relay(default_project):
++    default_project.update_option("sentry:scrub_ip_address", True)
++
++
++@pytest.fixture
++def call_endpoint(client, relay, private_key, default_project):
++    def inner(full_config):
++        path = reverse("sentry-api-0-relay-projectconfigs")
++
++        projects = [six.text_type(default_project.id)]
+ 
+         if full_config is None:
+-            raw_json, signature = self.private_key.pack({"projects": projects})
++            raw_json, signature = private_key.pack({"projects": projects})
+         else:
+-            raw_json, signature = self.private_key.pack(
++            raw_json, signature = private_key.pack(
+                 {"projects": projects, "fullConfig": full_config}
+             )
+ 
+-        resp = self.client.post(
+-            self.path,
++        resp = client.post(
++            path,
+             data=raw_json,
+             content_type="application/json",
+-            HTTP_X_SENTRY_RELAY_ID=self.relay_id,
++            HTTP_X_SENTRY_RELAY_ID=relay.relay_id,
+             HTTP_X_SENTRY_RELAY_SIGNATURE=signature,
+         )
+ 
+         return json.loads(resp.content), resp.status_code
+ 
+-    def test_internal_relays_should_receive_minimal_configs_if_they_do_not_explicitly_ask_for_full_config(
+-        self
+-    ):
+-        self._setup_relay(internal=True, add_org_key=False)
+-        result, status_code = self._call_endpoint(full_config=False)
++    return inner
+ 
+-        assert status_code < 400
+ 
+-        # Sweeping assertion that we do not have any snake_case in that config.
+-        # Might need refining.
+-        assert not set(x for x in _get_all_keys(result) if "-" in x or "_" in x)
++@pytest.fixture
++def add_org_key(default_organization, relay):
++    default_organization.update_option("sentry:trusted-relays", [relay.public_key])
+ 
+-        cfg = safe.get_path(result, "configs", six.text_type(self.project.id))
+-        assert safe.get_path(cfg, "config", "filterSettings") is None
+-        assert safe.get_path(cfg, "config", "groupingConfig") is None
+ 
+-    def test_internal_relays_should_receive_full_configs(self):
+-        self._setup_relay(internal=True, add_org_key=False)
+-        result, status_code = self._call_endpoint(full_config=True)
++@pytest.mark.django_db
++def test_internal_relays_should_receive_minimal_configs_if_they_do_not_explicitly_ask_for_full_config(
++    call_endpoint, default_project
++):
++    result, status_code = call_endpoint(full_config=False)
+ 
+-        assert status_code < 400
++    assert status_code < 400
+ 
+-        # Sweeping assertion that we do not have any snake_case in that config.
+-        # Might need refining.
+-        assert not set(x for x in _get_all_keys(result) if "-" in x or "_" in x)
+-
+-        cfg = safe.get_path(result, "configs", six.text_type(self.project.id))
+-        assert safe.get_path(cfg, "disabled") is False
+-
+-        public_key, = cfg["publicKeys"]
+-        assert public_key["publicKey"] == self.projectkey.public_key
+-        assert public_key["isEnabled"]
+-        assert "quotas" in public_key
+-
+-        assert safe.get_path(cfg, "slug") == self.project.slug
+-        last_change = safe.get_path(cfg, "lastChange")
+-        assert self._date_regex.match(last_change) is not None
+-        last_fetch = safe.get_path(cfg, "lastFetch")
+-        assert self._date_regex.match(last_fetch) is not None
+-        assert safe.get_path(cfg, "organizationId") == self.project.organization.id
+-        assert safe.get_path(cfg, "projectId") == self.project.id
+-        assert safe.get_path(cfg, "slug") == self.project.slug
+-        assert safe.get_path(cfg, "rev") is not None
+-
+-        assert safe.get_path(cfg, "config", "trustedRelays") == []
+-        assert safe.get_path(cfg, "config", "filterSettings") is not None
+-        assert safe.get_path(cfg, "config", "groupingConfig", "enhancements") is not None
+-        assert safe.get_path(cfg, "config", "groupingConfig", "id") is not None
+-        assert safe.get_path(cfg, "config", "piiConfig", "applications") is None
+-        assert safe.get_path(cfg, "config", "piiConfig", "rules") is None
+-        assert safe.get_path(cfg, "config", "datascrubbingSettings", "scrubData") is True
+-        assert safe.get_path(cfg, "config", "datascrubbingSettings", "scrubDefaults") is True
+-        assert safe.get_path(cfg, "config", "datascrubbingSettings", "scrubIpAddresses") is True
+-        assert safe.get_path(cfg, "config", "datascrubbingSettings", "sensitiveFields") == []
+-
+-    def test_trusted_external_relays_should_not_be_able_to_request_full_configs(self):
+-        self._setup_relay(False, True)
+-        result, status_code = self._call_endpoint(full_config=True)
+-
+-        assert status_code == 403
+-
+-    def test_when_not_sending_full_config_info_into_a_internal_relay_a_restricted_config_is_returned(
+-        self
+-    ):
+-        self._setup_relay(internal=True, add_org_key=False)
+-        result, status_code = self._call_endpoint(full_config=None)
++    # Sweeping assertion that we do not have any snake_case in that config.
++    # Might need refining.
++    assert not set(x for x in _get_all_keys(result) if "-" in x or "_" in x)
+ 
+-        assert status_code < 400
++    cfg = safe.get_path(result, "configs", six.text_type(default_project.id))
++    assert safe.get_path(cfg, "config", "filterSettings") is None
++    assert safe.get_path(cfg, "config", "groupingConfig") is None
+ 
+-        cfg = safe.get_path(result, "configs", six.text_type(self.project.id))
+-        assert safe.get_path(cfg, "config", "filterSettings") is None
+-        assert safe.get_path(cfg, "config", "groupingConfig") is None
+ 
+-    def test_when_not_sending_full_config_info_into_an_external_relay_a_restricted_config_is_returned(
+-        self
+-    ):
+-        self._setup_relay(internal=False, add_org_key=True)
+-        result, status_code = self._call_endpoint(full_config=None)
++@pytest.mark.django_db
++def test_internal_relays_should_receive_full_configs(
++    call_endpoint, default_project, default_projectkey
++):
++    result, status_code = call_endpoint(full_config=True)
+ 
+-        assert status_code < 400
++    assert status_code < 400
++
++    # Sweeping assertion that we do not have any snake_case in that config.
++    # Might need refining.
++    assert not set(x for x in _get_all_keys(result) if "-" in x or "_" in x)
++
++    cfg = safe.get_path(result, "configs", six.text_type(default_project.id))
++    assert safe.get_path(cfg, "disabled") is False
++
++    public_key, = cfg["publicKeys"]
++    assert public_key["publicKey"] == default_projectkey.public_key
++    assert public_key["isEnabled"]
++    assert "quotas" in public_key
++
++    assert safe.get_path(cfg, "slug") == default_project.slug
++    last_change = safe.get_path(cfg, "lastChange")
++    assert _date_regex.match(last_change) is not None
++    last_fetch = safe.get_path(cfg, "lastFetch")
++    assert _date_regex.match(last_fetch) is not None
++    assert safe.get_path(cfg, "organizationId") == default_project.organization.id
++    assert safe.get_path(cfg, "projectId") == default_project.id
++    assert safe.get_path(cfg, "slug") == default_project.slug
++    assert safe.get_path(cfg, "rev") is not None
++
++    assert safe.get_path(cfg, "config", "trustedRelays") == []
++    assert safe.get_path(cfg, "config", "filterSettings") is not None
++    assert safe.get_path(cfg, "config", "groupingConfig", "enhancements") is not None
++    assert safe.get_path(cfg, "config", "groupingConfig", "id") is not None
++    assert safe.get_path(cfg, "config", "piiConfig", "applications") is None
++    assert safe.get_path(cfg, "config", "piiConfig", "rules") is None
++    assert safe.get_path(cfg, "config", "datascrubbingSettings", "scrubData") is True
++    assert safe.get_path(cfg, "config", "datascrubbingSettings", "scrubDefaults") is True
++    assert safe.get_path(cfg, "config", "datascrubbingSettings", "scrubIpAddresses") is True
++    assert safe.get_path(cfg, "config", "datascrubbingSettings", "sensitiveFields") == []
++
++
++@pytest.mark.django_db
++def test_trusted_external_relays_should_not_be_able_to_request_full_configs(
++    add_org_key, relay, call_endpoint
++):
++    relay.is_internal = False
++    relay.save()
++
++    result, status_code = call_endpoint(full_config=True)
++
++    assert status_code == 403
++
++
++@pytest.mark.django_db
++def test_when_not_sending_full_config_info_into_a_internal_relay_a_restricted_config_is_returned(
++    call_endpoint, default_project
++):
++    result, status_code = call_endpoint(full_config=None)
+ 
+-        cfg = safe.get_path(result, "configs", six.text_type(self.project.id))
+-        assert safe.get_path(cfg, "config", "filterSettings") is None
+-        assert safe.get_path(cfg, "config", "groupingConfig") is None
++    assert status_code < 400
+ 
+-    def test_trusted_external_relays_should_receive_minimal_configs(self):
+-        self._setup_relay(False, True)
+-        result, status_code = self._call_endpoint(full_config=False)
++    cfg = safe.get_path(result, "configs", six.text_type(default_project.id))
++    assert safe.get_path(cfg, "config", "filterSettings") is None
++    assert safe.get_path(cfg, "config", "groupingConfig") is None
+ 
++
++@pytest.mark.django_db
++def test_when_not_sending_full_config_info_into_an_external_relay_a_restricted_config_is_returned(
++    call_endpoint, add_org_key, relay, default_project
++):
++    relay.is_internal = False
++    relay.save()
++
++    result, status_code = call_endpoint(full_config=None)
++
++    assert status_code < 400
++
++    cfg = safe.get_path(result, "configs", six.text_type(default_project.id))
++    assert safe.get_path(cfg, "config", "filterSettings") is None
++    assert safe.get_path(cfg, "config", "groupingConfig") is None
++
++
++@pytest.mark.django_db
++def test_trusted_external_relays_should_receive_minimal_configs(
++    relay, add_org_key, call_endpoint, default_project, default_projectkey
++):
++    relay.is_internal = False
++    relay.save()
++
++    result, status_code = call_endpoint(full_config=False)
++
++    assert status_code < 400
++
++    cfg = safe.get_path(result, "configs", six.text_type(default_project.id))
++    assert safe.get_path(cfg, "disabled") is False
++    public_key, = cfg["publicKeys"]
++    assert public_key["publicKey"] == default_projectkey.public_key
++    assert public_key["isEnabled"]
++    assert "quotas" not in public_key
++
++    assert safe.get_path(cfg, "slug") == default_project.slug
++    last_change = safe.get_path(cfg, "lastChange")
++    assert _date_regex.match(last_change) is not None
++    last_fetch = safe.get_path(cfg, "lastFetch")
++    assert _date_regex.match(last_fetch) is not None
++    assert safe.get_path(cfg, "projectId") == default_project.id
++    assert safe.get_path(cfg, "slug") == default_project.slug
++    assert safe.get_path(cfg, "rev") is not None
++
++    assert safe.get_path(cfg, "organizationId") is None
++    assert safe.get_path(cfg, "config", "trustedRelays") == [relay.public_key]
++    assert safe.get_path(cfg, "config", "filterSettings") is None
++    assert safe.get_path(cfg, "config", "groupingConfig") is None
++    assert safe.get_path(cfg, "config", "datascrubbingSettings", "scrubData") is not None
++    assert safe.get_path(cfg, "config", "datascrubbingSettings", "scrubIpAddresses") is not None
++    assert safe.get_path(cfg, "config", "piiConfig", "rules") is None
++    assert safe.get_path(cfg, "config", "piiConfig", "applications") is None
++
++
++@pytest.mark.django_db
++def test_untrusted_external_relays_should_not_receive_configs(
++    relay, call_endpoint, default_project
++):
++    relay.is_internal = False
++    relay.save()
++
++    result, status_code = call_endpoint(full_config=False)
++
++    assert status_code < 400
++
++    cfg = result["configs"][six.text_type(default_project.id)]
++
++    assert cfg is None
++
++
++@pytest.fixture
++def projectconfig_cache_set(monkeypatch):
++    calls = []
++    monkeypatch.setattr("sentry.relay.projectconfig_cache.set_many", calls.append)
++    return calls
++
++
++@pytest.mark.django_db
++def test_relay_projectconfig_cache_minimal_config(
++    call_endpoint, default_project, projectconfig_cache_set, task_runner
++):
++    """
++    When a relay fetches a minimal config, that config should not end up in Redis.
++    """
++
++    with task_runner():
++        result, status_code = call_endpoint(full_config=False)
+         assert status_code < 400
+ 
+-        cfg = safe.get_path(result, "configs", six.text_type(self.project.id))
+-        assert safe.get_path(cfg, "disabled") is False
+-        public_key, = cfg["publicKeys"]
+-        assert public_key["publicKey"] == self.projectkey.public_key
+-        assert public_key["isEnabled"]
+-        assert "quotas" not in public_key
+-
+-        assert safe.get_path(cfg, "slug") == self.project.slug
+-        last_change = safe.get_path(cfg, "lastChange")
+-        assert self._date_regex.match(last_change) is not None
+-        last_fetch = safe.get_path(cfg, "lastFetch")
+-        assert self._date_regex.match(last_fetch) is not None
+-        assert safe.get_path(cfg, "projectId") == self.project.id
+-        assert safe.get_path(cfg, "slug") == self.project.slug
+-        assert safe.get_path(cfg, "rev") is not None
+-
+-        assert safe.get_path(cfg, "organizationId") is None
+-        assert safe.get_path(cfg, "config", "trustedRelays") == [self.relay.public_key]
+-        assert safe.get_path(cfg, "config", "filterSettings") is None
+-        assert safe.get_path(cfg, "config", "groupingConfig") is None
+-        assert safe.get_path(cfg, "config", "datascrubbingSettings", "scrubData") is not None
+-        assert safe.get_path(cfg, "config", "datascrubbingSettings", "scrubIpAddresses") is not None
+-        assert safe.get_path(cfg, "config", "piiConfig", "rules") is None
+-        assert safe.get_path(cfg, "config", "piiConfig", "applications") is None
+-
+-    def test_untrusted_external_relays_should_not_receive_configs(self):
+-        self._setup_relay(False, False)
+-        result, status_code = self._call_endpoint(full_config=False)
++    assert not projectconfig_cache_set
++
+ 
++@pytest.mark.django_db
++def test_relay_projectconfig_cache_full_config(
++    call_endpoint, default_project, projectconfig_cache_set, task_runner
++):
++    """
++    When a relay fetches a full config, that config should end up in Redis.
++    """
++
++    with task_runner():
++        result, status_code = call_endpoint(full_config=True)
+         assert status_code < 400
+ 
+-        cfg = result["configs"][six.text_type(self.project.id)]
++    http_cfg, = six.itervalues(result["configs"])
++    [[redis_cfg]] = projectconfig_cache_set
++
++    del http_cfg["lastFetch"]
++    del http_cfg["lastChange"]
++    del redis_cfg["lastFetch"]
++    del redis_cfg["lastChange"]
+ 
+-        assert cfg is None
++    assert redis_cfg == http_cfg
+diff --git a/tests/sentry/tasks/test_relay.py b/tests/sentry/tasks/test_relay.py
+new file mode 100644
+index 0000000000..78cd9440d3
+--- /dev/null
++++ b/tests/sentry/tasks/test_relay.py
+@@ -0,0 +1,114 @@
++from __future__ import absolute_import
++
++import pytest
++
++from sentry.tasks.relay import schedule_update_config_cache
++from sentry.relay.projectconfig_cache.redis import RedisProjectConfigCache
++
++
++@pytest.fixture
++def redis_cache(monkeypatch):
++    monkeypatch.setattr(
++        "django.conf.settings.SENTRY_RELAY_PROJECTCONFIG_CACHE",
++        "sentry.relay.projectconfig_cache.redis.RedisProjectConfigCache",
++    )
++
++    cache = RedisProjectConfigCache()
++    monkeypatch.setattr("sentry.relay.projectconfig_cache.set_many", cache.set_many)
++    monkeypatch.setattr("sentry.relay.projectconfig_cache.delete_many", cache.delete_many)
++    monkeypatch.setattr("sentry.relay.projectconfig_cache.get", cache.get)
++
++    return cache
++
++
++@pytest.mark.django_db
++def test_no_cache(monkeypatch, default_project):
++    def apply_async(*a, **kw):
++        assert False
++
++    monkeypatch.setattr("sentry.tasks.relay.update_config_cache.apply_async", apply_async)
++    schedule_update_config_cache(generate=True, project_id=default_project.id)
++
++
++@pytest.mark.django_db
++def test_debounce(monkeypatch, default_project, default_organization, redis_cache):
++    tasks = []
++
++    def apply_async(args, kwargs):
++        assert not args
++        tasks.append(kwargs)
++
++    monkeypatch.setattr("sentry.tasks.relay.update_config_cache.apply_async", apply_async)
++
++    schedule_update_config_cache(generate=True, project_id=default_project.id)
++    schedule_update_config_cache(generate=False, project_id=default_project.id)
++
++    schedule_update_config_cache(generate=True, organization_id=default_organization.id)
++    schedule_update_config_cache(generate=False, organization_id=default_organization.id)
++
++    assert tasks == [
++        {
++            "generate": True,
++            "project_id": default_project.id,
++            "organization_id": None,
++            "update_reason": None,
++        },
++        {
++            "generate": True,
++            "project_id": None,
++            "organization_id": default_organization.id,
++            "update_reason": None,
++        },
++    ]
++
++
++@pytest.mark.django_db
++@pytest.mark.parametrize("entire_organization", (True, False))
++def test_generate(
++    monkeypatch,
++    default_project,
++    default_organization,
++    task_runner,
++    entire_organization,
++    redis_cache,
++):
++    assert not redis_cache.get(default_project.id)
++
++    if not entire_organization:
++        kwargs = {"project_id": default_project.id}
++    else:
++        kwargs = {"organization_id": default_organization.id}
++
++    with task_runner():
++        schedule_update_config_cache(generate=True, **kwargs)
++
++    cfg = redis_cache.get(default_project.id)
++
++    assert cfg["organizationId"] == default_organization.id
++    assert cfg["projectId"] == default_project.id
++
++
++@pytest.mark.django_db
++@pytest.mark.parametrize("entire_organization", (True, False))
++def test_invalidate(
++    monkeypatch,
++    default_project,
++    default_organization,
++    task_runner,
++    entire_organization,
++    redis_cache,
++):
++
++    cfg = {"projectId": default_project.id, "foo": "bar"}
++    redis_cache.set_many([cfg])
++    assert redis_cache.get(default_project.id) == cfg
++
++    if not entire_organization:
++        kwargs = {"project_id": default_project.id}
++    else:
++        kwargs = {"organization_id": default_organization.id}
++
++    with task_runner():
++        schedule_update_config_cache(generate=False, **kwargs)
++
++    assert not redis_cache.get(default_project.id)

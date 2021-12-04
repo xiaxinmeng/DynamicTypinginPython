@@ -1,0 +1,799 @@
+commit 5fbbf0e75a0d7f2c71a6a2ccd19eaec6e4948d44
+Author: Jordan Borean <jborean93@gmail.com>
+Date:   Fri Aug 11 07:57:07 2017 +1000
+
+    win_hotfix: new module to install Windows hotfixes (#27260)
+    
+    * win_hotfix: new module to install Windows hotfixes
+    
+    * revert to older module util loader style to satisfy the checks for now
+    
+    * Changes from PR
+    
+    * changed the test hotfix so we can run tests in shippable
+
+diff --git a/lib/ansible/modules/windows/win_hotfix.ps1 b/lib/ansible/modules/windows/win_hotfix.ps1
+new file mode 100644
+index 0000000000..478d58be74
+--- /dev/null
++++ b/lib/ansible/modules/windows/win_hotfix.ps1
+@@ -0,0 +1,240 @@
++#!powershell
++# This file is part of Ansible
++
++# Copyright (c) 2017 Ansible Project
++# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
++
++#Requires -Module Ansible.ModuleUtils.Legacy.psm1
++
++$ErrorActionPreference = "Stop"
++
++$params = Parse-Args $args -supports_check_mode $true
++$check_mode = Get-AnsibleParam -obj $params -name "_ansible_check_mode" -type "bool" -default $false
++
++$hotfix_kb = Get-AnsibleParam -obj $params -name "hotfix_kb" -type "str"
++$hotfix_identifier = Get-AnsibleParam -obj $params -name "hotfix_identifier" -type "str"
++$state = Get-AnsibleParam -obj $params -name "state" -type "state" -default "present" -validateset "absent","present"
++$source = Get-AnsibleParam -obj $params -name "source" -type "path"
++
++$result = @{
++    changed = $false
++    reboot_required = $false
++}
++
++if (Get-Module -Name DISM -ListAvailable) {
++    Import-Module -Name DISM
++} else {
++    # Server 2008 R2 doesn't have the DISM module installed on the path, check the Windows ADK path
++    $adk_root = [System.Environment]::ExpandEnvironmentVariables("%PROGRAMFILES(X86)%\Windows Kits\*\Assessment and Deployment Kit\Deployment Tools\amd64\DISM")
++    if (Test-Path -Path $adk_root) {
++        Import-Module -Name (Get-Item -Path $adk_root).FullName
++    } else {
++        Fail-Json $result "The DISM PS module needs to be installed, this can be done through the windows-adk chocolately package"
++    }
++}
++
++
++Function Extract-MSU($msu) {
++    $temp_path = [IO.Path]::GetTempPath()
++    $temp_foldername = [Guid]::NewGuid()
++    $output_path = Join-Path -Path $temp_path -ChildPath $temp_foldername
++    New-Item -Path $output_path -ItemType Directory | Out-Null
++
++    $expand_args = @($msu, $output_path, "-F:*")
++
++    try {
++        &expand.exe $expand_args | Out-NUll
++    } catch {
++        Fail-Json $result "failed to run expand.exe $($expand_args): $($_.Exception.Message)"
++    }
++    if ($LASTEXITCODE -ne 0) {
++        Fail-Json $result "failed to run expand.exe $($expand_args): RC = $LASTEXITCODE"
++    }
++    
++    return $output_path
++}
++
++Function Get-HotfixMetadataFromName($name) {
++    try {
++        $dism_package_info = Get-WindowsPackage -Online -PackageName $name
++    } catch {
++        # build a basic stub for a missing result
++        $dism_package_info = @{
++            PackageState = "NotPresent"
++            Description = ""
++            PackageName = $name
++        }
++    }
++
++    if ($dism_package_info.Description -match "(KB\d*)") {
++        $hotfix_kb = $Matches[0]
++    } else {
++        $hotfix_kb = "UNKNOWN"
++    }
++
++    $metadata = @{
++        name = $dism_package_info.PackageName
++        state = $dism_package_info.PackageState
++        kb = $hotfix_kb
++    }
++
++    return $metadata
++}
++
++Function Get-HotfixMetadataFromFile($extract_path) {
++    # MSU contents https://support.microsoft.com/en-us/help/934307/description-of-the-windows-update-standalone-installer-in-windows
++    $metadata_path = Get-ChildItem -Path $extract_path | Where-Object { $_.Extension -eq ".xml" }
++    if ($metadata_path -eq $null) {
++        Fail-Json $result "failed to get metadata xml inside MSU file, cannot get hotfix metadata required for this task"
++    }
++    [xml]$xml = Get-Content -Path $metadata_path.FullName
++    
++    $cab_source_filename = $xml.unattend.servicing.package.source.GetAttribute("location")
++    $cab_source_filename = Split-Path -Path $cab_source_filename -Leaf
++    $cab_file = Join-Path -Path $extract_path -ChildPath $cab_source_filename
++
++    try {
++        $dism_package_info = Get-WindowsPackage -Online -PackagePath $cab_file
++    } catch {
++        Fail-Json $result "failed to get DISM package metadata from path $($extract_path): $($_.Exception.Message)"
++    }
++    if ($dism_package_info.Applicable -eq $false) {
++        Fail-Json $result "hotfix package is not applicable for this server"
++    }
++
++    $package_properties_path = Get-ChildItem -Path $extract_path | Where-Object { $_.Extension -eq ".txt" }
++    if ($package_properties_path -eq $null) {
++        $hotfix_kb = "UNKNOWN"
++    } else {
++        $package_ini = Get-Content -Path $package_properties_path.FullName
++        $entry = $package_ini | Where-Object { $_.StartsWith("KB Article Number") }
++        if ($entry -eq $null) {
++            $hotfix_kb = "UNKNOWN"
++        } else {
++            $hotfix_kb = ($entry -split '=')[-1]
++            $hotfix_kb = "KB$($hotfix_kb.Substring(1, $hotfix_kb.Length - 2))"
++        }
++    }
++
++    $metadata = @{
++        path = $cab_file
++        name = $dism_package_info.PackageName
++        state = $dism_package_info.PackageState
++        kb = $hotfix_kb
++    }
++
++    return $metadata
++}
++
++Function Get-HotfixMetadataFromKB($kb) {
++    # I really hate doing it this way
++    $packages = Get-WindowsPackage -Online
++    $identifier = $packages | Where-Object { $_.PackageName -like "*$kb*" }
++
++    if ($identifier -eq $null) {
++        # still haven't found the KB, need to loop through the results and check the description
++        foreach ($package in $packages) {
++            $raw_metadata = Get-HotfixMetadataFromName -name $package.PackageName
++            if ($raw_metadata.kb -eq $kb) {
++                $identifier = $raw_metadata
++                break
++            }
++        }
++
++        # if we still haven't found the package then we need to throw an error
++        if ($metadata -eq $null) {
++            Fail-Json $result "failed to get DISM package from KB, to continue specify hotfix_identifier instead"
++        }
++    } else {
++        $metadata = Get-HotfixMetadataFromName -name $identifier.PackageName
++    }
++
++    return $metadata
++}
++
++if ($state -eq "absent") {
++    # uninstall hotfix
++    # this is a pretty poor way of doing this, is there a better way?
++
++    if ($hotfix_identifier -ne $null) {
++        $hotfix_metadata = Get-HotfixMetadataFromName -name $hotfix_identifier
++    } elseif ($hotfix_kb -ne $null) {
++        $hotfix_install_info = Get-Hotfix -Id $hotfix_kb -ErrorAction SilentlyContinue
++        if ($hotfix_install_info -ne $null) {
++            $hotfix_metadata = Get-HotfixMetadataFromKB -kb $hotfix_kb
++        } else {
++            $hotfix_metadata = @{state = "NotPresent"}
++        }
++    } else {
++        Fail-Json $result "either hotfix_identifier or hotfix_kb needs to be set when state=absent"
++    }
++
++    # how do we want to deal with the other states?
++    if ($hotfix_metadata.state -eq "UninstallPending") {
++        $result.identifier = $hotfix_metadata.name
++        $result.kb = $hotfix_metadata.kb
++        $result.reboot_required = $true
++    } elseif ($hotfix_metadata.state -eq "Installed") {
++        $result.identifier = $hotfix_metadata.name
++        $result.kb = $hotfix_metadata.kb
++
++        if (-not $check_mode) {
++            try {
++                $remove_result = Remove-WindowsPackage -Online -PackageName $hotfix_metadata.name -NoRestart
++            } catch {
++                Fail-Json $result "failed to remove package $($hotfix_metadata.name): $($_.Exception.Message)"
++            }
++            $result.reboot_required = $remove_Result.RestartNeeded
++        }
++        
++        $result.changed = $true
++    }    
++} else {
++    if ($source -eq $null) {
++        Fail-Json $result "source must be set when state=present"
++    }
++    if (-not (Test-Path -Path $source -PathType Leaf)) {
++        Fail-Json $result "the path set for source $source does not exist or is not a file"
++    }
++
++    # while we do extract the file in check mode we need to do so for valid checking
++    $extract_path = Extract-MSU -msu $source
++    try {
++        $hotfix_metadata = Get-HotfixMetadataFromFile -extract_path $extract_path
++
++        # validate the hotfix matches if the hotfix id has been passed in
++        if ($hotfix_identifier -ne $null) {
++            if ($hotfix_metadata.name -ne $hotfix_identifier) {
++                Fail-Json $result "the hotfix identifier $hotfix_identifier does not match with the source msu identifier $($hotfix_metadata.name), please omit or specify the correct identifier to continue"
++            }
++        }
++        if ($hotfix_kb -ne $null) {
++            if ($hotfix_metadata.kb -ne $hotfix_kb) {
++                Fail-Json $result "the hotfix KB $hotfix_kb does not match with the source msu KB $($hotfix_metadata.kb), please omit or specify the correct KB to continue"
++            }
++        }
++
++        $result.identifier = $hotfix_metadata.name
++        $result.kb = $hotfix_metadata.kb
++
++        # how do we want to deal with other states
++        if ($hotfix_metadata.state -eq "InstallPending") {
++            # return the reboot required flag, should we fail here instead
++            $result.reboot_required = $true
++        } elseif ($hotfix_metadata.state -ne "Installed") {
++            if (-not $check_mode) {
++                try {
++                    $install_result = Add-WindowsPackage -Online -PackagePath $hotfix_metadata.path -NoRestart
++                } catch {
++                    Fail-Json $result "failed to add windows package from path $($hotfix_metadata.path): $($_.Exception.Message)"
++                }
++                $result.reboot_required = $install_result.RestartNeeded
++            }
++            $result.changed = $true
++        }
++    } finally {
++        Remove-Item -Path $extract_path -Force -Recurse
++    }
++}
++
++Exit-Json $result
+diff --git a/lib/ansible/modules/windows/win_hotfix.py b/lib/ansible/modules/windows/win_hotfix.py
+new file mode 100644
+index 0000000000..845b18c3ad
+--- /dev/null
++++ b/lib/ansible/modules/windows/win_hotfix.py
+@@ -0,0 +1,147 @@
++#!/usr/bin/python
++# This file is part of Ansible
++#
++# Ansible is free software: you can redistribute it and/or modify
++# it under the terms of the GNU General Public License as published by
++# the Free Software Foundation, either version 3 of the License, or
++# (at your option) any later version.
++#
++# Ansible is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU General Public License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
++
++# this is a windows documentation stub, actual code lives in the .ps1
++# file of the same name
++
++ANSIBLE_METADATA = {'metadata_version': '1.0',
++                    'status': ['preview'],
++                    'supported_by': 'community'}
++
++
++DOCUMENTATION = r'''
++---
++module: win_hotfix
++version_added: '2.4'
++short_description: install and uninstalls Windows hotfixes
++description:
++- Install, uninstall a Windows hotfix.
++options:
++  hotfix_identifier:
++    description:
++    - The name of the hotfix as shown in DISM, see examples for details.
++    - This or C(hotfix_kb) MUST be set when C(state=absent).
++    - If C(state=present) then the hotfix at C(source) will be validated
++      against this value, if it does not match an error will occur.
++    - You can get the identifier by running
++      'Get-WindowsPackage -Online -PackagePath path-to-cab-in-msu' after
++      expanding the msu file.
++  hotfix_kb:
++    description:
++    - The name of the KB the hotfix relates to, see examples for details.
++    - This of C(hotfix_identifier) MUST be set when C(state=absent).
++    - If C(state=present) then the hotfix at C(source) will be validated
++      against this value, if it does not match an error will occur.
++    - Because DISM uses the identifier as a key and doesn't refer to a KB in
++      all cases it is recommended to use C(hotfix_identifier) instead.
++  state:
++    description:
++    - Whether to install or uninstall the hotfix.
++    - When C(present), C(source) MUST be set.
++    - When C(absent), C(hotfix_identifier) or C(hotfix_kb) MUST be set.
++    default: present
++    choices: [ absent, present ]
++  source:
++    description:
++    - The path to the downloaded hotfix .msu file.
++    - This MUST be set if C(state=present) and MUST be a .msu hotfix file.
++notes:
++- This must be run on a host that has the DISM powershell module installed and
++  a Powershell version >= 4.
++- This module is installed by default on Windows 8 and Server 2012 and newer.
++- You can manually install this module on Windows 7 and Server 2008 R2 by
++  installing the Windows ADK
++  U(https://developer.microsoft.com/en-us/windows/hardware/windows-assessment-deployment-kit),
++  see examples to see how to do it with chocolatey.
++- You can download hotfixes from U(https://www.catalog.update.microsoft.com/Home.aspx).
++author:
++- Jordan Borean (@jborean93)
++'''
++
++EXAMPLES = r'''
++- name: install Windows ADK with DISM for Server 2008 R2
++  win_chocolatey:
++    name: windows-adk
++    version: 8.100.26866.0
++    state: present
++    install_args: /features OptionId.DeploymentTools
++
++- name: install hotfix without validating the KB and Identifier
++  win_hotfix:
++    source: C:\temp\windows8.1-kb3172729-x64_e8003822a7ef4705cbb65623b72fd3cec73fe222.msu
++    state: present
++  register: hotfix_install
++
++- win_reboot:
++  when: hotfix_install.reboot_required
++
++- name: install hotfix validating KB
++  win_hotfix:
++    hotfix_kb: KB3172729
++    source: C:\temp\windows8.1-kb3172729-x64_e8003822a7ef4705cbb65623b72fd3cec73fe222.msu
++    state: present
++  register: hotfix_install
++
++- win_reboot:
++  when: hotfix_install.reboot_required
++
++- name: install hotfix validating Identifier
++  win_hotfix:
++    hotfix_identifier: Package_for_KB3172729~31bf3856ad364e35~amd64~~6.3.1.0
++    source: C:\temp\windows8.1-kb3172729-x64_e8003822a7ef4705cbb65623b72fd3cec73fe222.msu
++    state: present
++  register: hotfix_install
++
++- win_reboot:
++  when: hotfix_install.reboot_required
++
++- name: uninstall hotfix with Identifier
++  win_hotfix:
++    hotfix_identifier: Package_for_KB3172729~31bf3856ad364e35~amd64~~6.3.1.0
++    state: absent
++  register: hotfix_uninstall
++
++- win_reboot:
++  when: hotfix_uninstall.reboot_required
++
++- name: uninstall hotfix with KB (not recommended)
++  win_hotfix:
++    hotfix_kb: KB3172729
++    state: absent
++  register: hotfix_uninstall
++
++- win_reboot:
++  when: hotfix_uninstall.reboot_required
++'''
++
++RETURN = r'''
++identifier:
++  description: The DISM identifier for the hotfix.
++  returned: success
++  type: str
++  sample: Package_for_KB3172729~31bf3856ad364e35~amd64~~6.3.1.0
++kb:
++  description: The KB the hotfix relates to.
++  returned: success
++  type: str
++  sample: KB3172729
++reboot_required:
++  description: Whether a reboot is required for the install or uninstall to
++    finalise.
++  returned: success
++  type: str
++  sample: True
++'''
+diff --git a/test/integration/targets/win_hotfix/aliases b/test/integration/targets/win_hotfix/aliases
+new file mode 100644
+index 0000000000..10e03fc2bf
+--- /dev/null
++++ b/test/integration/targets/win_hotfix/aliases
+@@ -0,0 +1 @@
++windows/ci/group1
+diff --git a/test/integration/targets/win_hotfix/defaults/main.yml b/test/integration/targets/win_hotfix/defaults/main.yml
+new file mode 100644
+index 0000000000..9a5244a4a4
+--- /dev/null
++++ b/test/integration/targets/win_hotfix/defaults/main.yml
+@@ -0,0 +1,13 @@
++---
++# these hotfixes, are for Hyper-V, there may be a chance the system already has them
++# but in most cases for our CI purposes they wouldn't be present
++test_win_hotfix_good_url: http://download.windowsupdate.com/c/msdownload/update/software/htfx/2015/01/windows8.1-kb3027108-v2-x64_66366c7be2d64d83b63cac42bc40c0a3c01bc70d.msu
++test_win_hotfix_reboot_url: http://download.windowsupdate.com/c/msdownload/update/software/htfx/2014/01/windows8.1-kb2913659-v2-x64_963a4d890c9ff9cc83a97cf54305de6451038ba4.msu
++test_win_hotfix_bad_url: http://download.windowsupdate.com/d/msdownload/update/software/secu/2016/07/windows8-rt-kb3172729-x64_69cab4c7785b1faa3fc450f32bed4873d53bb96f.msu
++test_win_hotfix_path: C:\ansible\win_hotfix
++
++test_win_hotfix_kb: KB3027108
++test_win_hotfix_identifier: Package_for_KB3027108~31bf3856ad364e35~amd64~~6.3.2.0
++
++test_win_hotfix_reboot_kb: KB2913659
++test_win_hotfix_reboot_identifier: Package_for_KB2913659~31bf3856ad364e35~amd64~~6.3.2.0
+diff --git a/test/integration/targets/win_hotfix/tasks/main.yml b/test/integration/targets/win_hotfix/tasks/main.yml
+new file mode 100644
+index 0000000000..8ae7a35003
+--- /dev/null
++++ b/test/integration/targets/win_hotfix/tasks/main.yml
+@@ -0,0 +1,54 @@
++---
++- name: filter servers that can support DISM
++  win_command: powershell.exe "Import-Module -Name DISM"
++  register: eligable_servers
++  ignore_errors: True
++
++- name: fail to run module on servers that don't support DISM
++  win_hotfix:
++    path: fake
++    state: present
++  register: fail_no_dism
++  failed_when: fail_no_dism.msg != 'The DISM PS module needs to be installed, this can be done through the windows-adk chocolately package'
++  when: eligable_servers.rc != 0
++
++- name: run tests on hosts that support DISM
++  include_tasks: tests.yml
++  when: eligable_servers.rc == 0
++
++- name: set output to true if running Server 2012 R2
++  win_command: powershell.exe "$version = [Environment]::OSVersion.Version; if ($version.Major -eq 6 -and $version.Minor -eq 3) { 'true' } else { 'false' }"
++  register: test_hotfix
++
++- block:
++  - name: ensure hotfixes are uninstalled before tests
++    win_hotfix:
++      hotfix_identifier: '{{item}}'
++      state: absent
++    register: pre_uninstall
++    with_items:
++    - '{{test_win_hotfix_identifier}}'
++    - '{{test_win_hotfix_reboot_identifier}}'
++
++  - name: reboot after pre test uninstall if required
++    win_reboot:
++    when: pre_uninstall.results[0].reboot_required == True or pre_uninstall.results[1].reboot_required == True
++
++  - name: run actual hotfix tests on Server 2012 R2 only
++    include_tasks: tests_2012R2.yml
++
++  always:
++  - name: ensure hotfixes are uninstalled after tests
++    win_hotfix:
++      hotfix_identifier: '{{item}}'
++      state: absent
++    register: post_uninstall
++    with_items:
++    - '{{test_win_hotfix_identifier}}'
++    - '{{test_win_hotfix_reboot_identifier}}'
++
++  - name: reboot after post test uninstall if required
++    win_reboot:
++    when: post_uninstall.results[0].reboot_required == True or post_uninstall.results[1].reboot_required == True
++
++  when: test_hotfix.stdout_lines[0] == "true"
+diff --git a/test/integration/targets/win_hotfix/tasks/tests.yml b/test/integration/targets/win_hotfix/tasks/tests.yml
+new file mode 100644
+index 0000000000..4d8aab1312
+--- /dev/null
++++ b/test/integration/targets/win_hotfix/tasks/tests.yml
+@@ -0,0 +1,35 @@
++# only basic tests, doesn't actually install/uninstall and hotfixes
++---
++- name: fail when source isn't set
++  win_hotfix:
++    state: present
++  register: fail_no_source
++  failed_when: fail_no_source.msg != 'source must be set when state=present'
++
++- name: fail when identifier or kb isn't set on absent
++  win_hotfix:
++    state: absent
++  register: fail_no_key
++  failed_when: fail_no_key.msg != 'either hotfix_identifier or hotfix_kb needs to be set when state=absent'
++
++- name: remove an identifier that isn't installed
++  win_hotfix:
++    hotfix_identifier: fake~identifier
++    state: absent
++  register: remove_missing_hotfix_identifier
++
++- name: assert remove an identifier that isn't installed
++  assert:
++    that:
++    - not remove_missing_hotfix_identifier|changed
++
++- name: remove a kb that isn't installed
++  win_hotfix:
++    hotfix_kb: KB123456
++    state: absent
++  register: remove_missing_hotfix_kb
++
++- name: assert remove a kb that isn't installed
++  assert:
++    that:
++    - not remove_missing_hotfix_kb|changed
+diff --git a/test/integration/targets/win_hotfix/tasks/tests_2012R2.yml b/test/integration/targets/win_hotfix/tasks/tests_2012R2.yml
+new file mode 100644
+index 0000000000..8d2dfce295
+--- /dev/null
++++ b/test/integration/targets/win_hotfix/tasks/tests_2012R2.yml
+@@ -0,0 +1,253 @@
++---
++- name: create test staging folder
++  win_file:
++    path: '{{test_win_hotfix_path}}'
++    state: directory
++
++- name: download hotfix
++  win_get_url:
++    url: '{{test_win_hotfix_good_url}}'
++    dest: '{{test_win_hotfix_path}}\good.msu'
++
++- name: download reboot hotfix
++  win_get_url:
++    url: '{{test_win_hotfix_reboot_url}}'
++    dest: '{{test_win_hotfix_path}}\reboot.msu'
++
++- name: download bad hotfix
++  win_get_url:
++    url: '{{test_win_hotfix_bad_url}}'
++    dest: '{{test_win_hotfix_path}}\bad.msu'
++
++- name: fail install install hotfix where kb doesn't match
++  win_hotfix:
++    hotfix_kb: KB0000000
++    source: '{{test_win_hotfix_path}}\good.msu'
++    state: present
++  register: fail_install_invalid_kb
++  failed_when: fail_install_invalid_kb.msg != 'the hotfix KB KB0000000 does not match with the source msu KB ' + test_win_hotfix_kb + ', please omit or specify the correct KB to continue'
++
++- name: fail install install hotfix where identifier doesn't match
++  win_hotfix:
++    hotfix_identifier: invalid
++    source: '{{test_win_hotfix_path}}\good.msu'
++    state: present
++  register: fail_install_invalid_identifier
++  failed_when: fail_install_invalid_identifier.msg != 'the hotfix identifier invalid does not match with the source msu identifier ' + test_win_hotfix_identifier + ', please omit or specify the correct identifier to continue'
++
++- name: fail install not applicable hotfix
++  win_hotfix:
++    source: '{{test_win_hotfix_path}}\bad.msu'
++    state: present
++  register: fail_install_not_applicable
++  failed_when: fail_install_not_applicable.msg != 'hotfix package is not applicable for this server'
++
++- name: install hotfix check
++  win_hotfix:
++    source: '{{test_win_hotfix_path}}\good.msu'
++    state: present
++  register: install_hotfix_check
++  check_mode: yes
++
++- name: get result of install hotfix check
++  win_command: powershell.exe Get-Hotfix -Id {{test_win_hotfix_kb}}
++  register: install_hotfix_actual_check
++  ignore_errors: True
++
++- name: assert install hotfix check
++  assert:
++    that:
++    - install_hotfix_check|changed
++    - install_hotfix_check.kb == test_win_hotfix_kb
++    - install_hotfix_check.identifier == test_win_hotfix_identifier
++    - install_hotfix_actual_check.rc != 0
++
++- name: install hotfix
++  win_hotfix:
++    source: '{{test_win_hotfix_path}}\good.msu'
++    state: present
++  register: install_hotfix
++
++- name: get result of install hotfix
++  win_command: powershell.exe Get-Hotfix -Id {{test_win_hotfix_kb}}
++  register: install_hotfix_actual
++
++- name: assert install hotfix
++  assert:
++    that:
++    - install_hotfix|changed
++    - install_hotfix.kb == test_win_hotfix_kb
++    - install_hotfix.identifier == test_win_hotfix_identifier
++    - install_hotfix.reboot_required == False
++    - install_hotfix_actual.rc == 0
++
++- name: install hotfix again
++  win_hotfix:
++    source: '{{test_win_hotfix_path}}\good.msu'
++    state: present
++  register: install_hotfix_again
++
++- name: assert install hotfix again
++  assert:
++    that:
++    - not install_hotfix_again|changed
++    - install_hotfix_again.kb == test_win_hotfix_kb
++    - install_hotfix_again.identifier == test_win_hotfix_identifier
++    - install_hotfix_again.reboot_required == False
++
++- name: uninstall hotfix check
++  win_hotfix:
++    hotfix_identifier: '{{test_win_hotfix_identifier}}'
++    state: absent
++  register: uninstall_hotfix_check
++  check_mode: yes
++
++- name: get result of uninstall hotfix check
++  win_command: powershell.exe Get-Hotfix -Id {{test_win_hotfix_kb}}
++  register: uninstall_hotfix_actual_check
++
++- name: assert uninstall hotfix check
++  assert:
++    that:
++    - uninstall_hotfix_check|changed
++    - uninstall_hotfix_check.kb == test_win_hotfix_kb
++    - uninstall_hotfix_check.identifier == test_win_hotfix_identifier
++    - uninstall_hotfix_actual_check.rc == 0
++
++- name: uninstall hotfix
++  win_hotfix:
++    hotfix_identifier: '{{test_win_hotfix_identifier}}'
++    state: absent
++  register: uninstall_hotfix
++
++- name: get result of uninstall hotfix
++  win_command: powershell.exe Get-Hotfix -Id {{test_win_hotfix_kb}}
++  register: uninstall_hotfix_actual
++  ignore_errors: True
++
++- name: assert uninstall hotfix
++  assert:
++    that:
++    - uninstall_hotfix|changed
++    - uninstall_hotfix.kb == test_win_hotfix_kb
++    - uninstall_hotfix.identifier == test_win_hotfix_identifier
++    - uninstall_hotfix.reboot_required == False
++    - uninstall_hotfix_actual.rc != 0
++
++- name: uninstall hotfix again
++  win_hotfix:
++    hotfix_identifier: '{{test_win_hotfix_identifier}}'
++    state: absent
++  register: uninstall_hotfix_again
++
++- name: assert uninstall hotfix again
++  assert:
++    that:
++    - not uninstall_hotfix_again|changed
++    - uninstall_hotfix_again.reboot_required == False
++
++- name: install reboot hotfix
++  win_hotfix:
++    hotfix_kb: '{{test_win_hotfix_reboot_kb}}'
++    source: '{{test_win_hotfix_path}}\reboot.msu'
++    state: present
++  register: install_reboot_hotfix
++
++- name: get result of install reboot hotfix
++  win_command: powershell.exe Get-Hotfix -Id {{test_win_hotfix_reboot_kb}}
++  register: install_hotfix_reboot_actual
++
++- name: assert install reboot hotfix
++  assert:
++    that:
++    - install_reboot_hotfix|changed
++    - install_reboot_hotfix.kb == test_win_hotfix_reboot_kb
++    - install_reboot_hotfix.identifier == test_win_hotfix_reboot_identifier
++    - install_reboot_hotfix.reboot_required == True
++    - install_hotfix_reboot_actual.rc == 0
++
++- name: run install reboot again before rebooting
++  win_hotfix:
++    source: '{{test_win_hotfix_path}}\reboot.msu'
++    state: present
++  register: install_before_rebooting
++
++- name: assert install reboot again before rebooting
++  assert:
++    that:
++    - not install_before_rebooting|changed
++    - install_before_rebooting.reboot_required == True
++
++- win_reboot:
++
++- name: install reboot hotfix again
++  win_hotfix:
++    hotfix_identifier: '{{test_win_hotfix_reboot_identifier}}'
++    source: '{{test_win_hotfix_path}}\reboot.msu'
++    state: present
++  register: install_reboot_hotfix_again
++
++- name: assert install reboot hotfix again
++  assert:
++    that:
++    - not install_reboot_hotfix_again|changed
++    - install_reboot_hotfix_again.reboot_required == False
++
++- name: uninstall hotfix with kb check
++  win_hotfix:
++    hotfix_kb: '{{test_win_hotfix_reboot_kb}}'
++    state: absent
++  register: uninstall_hotfix_kb_check
++  check_mode: yes
++
++- name: get result of uninstall hotfix with kb check
++  win_command: powershell.exe Get-Hotfix -Id {{test_win_hotfix_reboot_kb}}
++  register: uninstall_hotfix_kb_actual_check
++
++- name: assert uninstall hotfix with kb check
++  assert:
++    that:
++    - uninstall_hotfix_kb_check|changed
++    - uninstall_hotfix_kb_check.kb == test_win_hotfix_reboot_kb
++    - uninstall_hotfix_kb_check.identifier == test_win_hotfix_reboot_identifier
++    - uninstall_hotfix_kb_check.reboot_required == False
++    - uninstall_hotfix_kb_actual_check.rc == 0
++
++- name: uninstall hotfix with kb
++  win_hotfix:
++    hotfix_kb: '{{test_win_hotfix_reboot_kb}}'
++    state: absent
++  register: uninstall_hotfix_kb
++
++- name: get result of uninstall hotfix with kb
++  win_command: powershell.exe Get-Hotfix -Id {{test_win_hotfix_kb}}
++  register: uninstall_hotfix_kb_actual
++  ignore_errors: True
++
++- name: assert uninstall hotfix with kb
++  assert:
++    that:
++    - uninstall_hotfix_kb|changed
++    - uninstall_hotfix_kb.kb == test_win_hotfix_reboot_kb
++    - uninstall_hotfix_kb.identifier == test_win_hotfix_reboot_identifier
++    - uninstall_hotfix_kb.reboot_required == True
++    - uninstall_hotfix_kb_actual.rc != 0
++
++- win_reboot:
++
++- name: uninstall hotfix with kb again
++  win_hotfix:
++    hotfix_kb: '{{test_win_hotfix_reboot_kb}}'
++    state: absent
++  register: uninstall_hotfix_kb_again
++
++- name: assert uninstall hotfix with kb again
++  assert:
++    that:
++    - not uninstall_hotfix_kb_again|changed
++    - uninstall_hotfix_kb_again.reboot_required == False
++
++- name: remove test staging folder
++  win_file:
++    path: '{{test_win_hotfix_path}}'
++    state: absent

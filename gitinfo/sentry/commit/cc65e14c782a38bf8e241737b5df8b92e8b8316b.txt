@@ -1,0 +1,546 @@
+commit cc65e14c782a38bf8e241737b5df8b92e8b8316b
+Author: Dan Fuller <dfuller@sentry.io>
+Date:   Mon May 6 16:09:06 2019 -0700
+
+    feat(api): Add stats and rollups to IncidentSerializer (SEN-570)
+    
+    This adds various stats to the Incident serializer:
+     - Event stats over the duration of the incident.
+     - Aggregates of total unique users and total events
+    
+    I investigated parallelizing these calls via threads, but found it doesn't play well with Django
+    since each thread makes its own connection to the database. Probably not ideal that we create lots
+    of connections and just kill them. For now I'll leave it as is and we can optimize later. Path
+    forward there could be:
+    - Talk with ops and find out how much impact creating more connections per server could have. We
+      could create a pool of threads used for parallelizing serialization, so that at least the number
+      of connections remains bound.
+    - Refactor `raw_query` so that we can pass in bulk information, and just make the calls to Snuba in
+      threads, but keep the ORM calls in the main thread.
+
+diff --git a/src/sentry/api/endpoints/organization_events.py b/src/sentry/api/endpoints/organization_events.py
+index 20994de18d..60a05d4396 100644
+--- a/src/sentry/api/endpoints/organization_events.py
++++ b/src/sentry/api/endpoints/organization_events.py
+@@ -1,6 +1,5 @@
+ from __future__ import absolute_import
+ 
+-from collections import namedtuple
+ from datetime import timedelta
+ from functools import partial
+ 
+@@ -13,9 +12,10 @@ from sentry.api.serializers import EventSerializer, serialize, SimpleEventSerial
+ from sentry.api.serializers.snuba import SnubaTSResultSerializer
+ from sentry.models import SnubaEvent
+ from sentry.utils.dates import parse_stats_period
+-from sentry.utils.snuba import raw_query
+-
+-SnubaTSResult = namedtuple('SnubaTSResult', ('data', 'start', 'end', 'rollup'))
++from sentry.utils.snuba import (
++    raw_query,
++    SnubaTSResult,
++)
+ 
+ 
+ class OrganizationEventsEndpoint(OrganizationEventsEndpointBase):
+diff --git a/src/sentry/api/endpoints/organization_incident_index.py b/src/sentry/api/endpoints/organization_incident_index.py
+index c8a9409fed..ece957a59b 100644
+--- a/src/sentry/api/endpoints/organization_incident_index.py
++++ b/src/sentry/api/endpoints/organization_incident_index.py
+@@ -54,15 +54,18 @@ class IncidentSerializer(serializers.Serializer):
+         )
+         if len(projects) != len(slugs):
+             raise serializers.ValidationError('Invalid project slug(s)')
+-        attrs[source] = projects
++        attrs[source] = list(projects)
+         return attrs
+ 
+     def validate_groups(self, attrs, source):
+         group_ids = attrs[source]
+-        groups = Group.objects.filter(id__in=group_ids).select_related('project')
++        groups = Group.objects.filter(
++            project__organization=self.context['organization'],
++            id__in=group_ids,
++        ).select_related('project')
+         if len(groups) != len(group_ids):
+             raise serializers.ValidationError('Invalid group id(s)')
+-        attrs[source] = groups
++        attrs[source] = list(groups)
+         return attrs
+ 
+ 
+diff --git a/src/sentry/api/serializers/models/incident.py b/src/sentry/api/serializers/models/incident.py
+index bcfa4bf847..ce8d2820f4 100644
+--- a/src/sentry/api/serializers/models/incident.py
++++ b/src/sentry/api/serializers/models/incident.py
+@@ -8,6 +8,11 @@ from sentry.api.serializers import (
+     Serializer,
+     register,
+ )
++from sentry.api.serializers.snuba import SnubaTSResultSerializer
++from sentry.incidents.logic import (
++    get_incident_aggregates,
++    get_incident_event_stats,
++)
+ from sentry.incidents.models import (
+     Incident,
+     IncidentProject,
+@@ -25,9 +30,16 @@ class IncidentSerializer(Serializer):
+         results = {}
+         for item in item_list:
+             results[item] = {'projects': incident_projects.get(item.id, [])}
++
++        for incident in item_list:
++            results[item]['event_stats'] = get_incident_event_stats(incident)
++            results[item]['aggregates'] = get_incident_aggregates(incident)
++
+         return results
+ 
+     def serialize(self, obj, attrs, user):
++        serializer = SnubaTSResultSerializer(obj.organization, None, user)
++        aggregates = attrs['aggregates']
+         return {
+             'id': six.text_type(obj.id),
+             'identifier': obj.identifier,
+@@ -40,4 +52,7 @@ class IncidentSerializer(Serializer):
+             'dateDetected': obj.date_detected,
+             'dateAdded': obj.date_added,
+             'dateClosed': obj.date_closed,
++            'eventStats': serializer.serialize(attrs['event_stats']),
++            'totalEvents': aggregates['count'],
++            'uniqueUsers': aggregates['unique_users'],
+         }
+diff --git a/src/sentry/incidents/logic.py b/src/sentry/incidents/logic.py
+index bd702f5c25..7eb56e9459 100644
+--- a/src/sentry/incidents/logic.py
++++ b/src/sentry/incidents/logic.py
+@@ -2,11 +2,16 @@ from __future__ import absolute_import
+ 
+ from django.db import transaction
+ 
++from sentry.api.event_search import get_snuba_query_args
+ from sentry.incidents.models import (
+     Incident,
+     IncidentGroup,
+     IncidentProject,
+ )
++from sentry.utils.snuba import (
++    raw_query,
++    SnubaTSResult,
++)
+ 
+ 
+ def create_incident(
+@@ -23,6 +28,12 @@ def create_incident(
+     if date_detected is None:
+         date_detected = date_started
+ 
++    if groups:
++        group_projects = [g.project for g in groups]
++        if projects is None:
++            projects = []
++        projects = list(set(projects + group_projects))
++
+     with transaction.atomic():
+         incident = Incident.objects.create(
+             organization=organization,
+@@ -42,3 +53,53 @@ def create_incident(
+                 IncidentGroup(incident=incident, group=group) for group in groups
+             ])
+     return incident
++
++
++def build_incident_query_params(incident):
++    params = {'start': incident.date_started, 'end': incident.current_end_date}
++    group_ids = list(IncidentGroup.objects.filter(
++        incident=incident,
++    ).values_list('group_id', flat=True))
++    if group_ids:
++        params['issue.id'] = group_ids
++    project_ids = list(IncidentProject.objects.filter(
++        incident=incident,
++    ).values_list('project_id', flat=True))
++    if project_ids:
++        params['project_id'] = project_ids
++
++    return get_snuba_query_args(incident.query, params)
++
++
++def get_incident_event_stats(incident, data_points=20):
++    kwargs = build_incident_query_params(incident)
++    rollup = max(int(incident.duration.total_seconds() / data_points), 1)
++    return SnubaTSResult(
++        raw_query(
++            aggregations=[
++                ('count()', '', 'count'),
++            ],
++            orderby='time',
++            groupby=['time'],
++            rollup=rollup,
++            referrer='incidents.get_incident_event_stats',
++            limit=10000,
++            **kwargs
++        ),
++        kwargs['start'],
++        kwargs['end'],
++        rollup,
++    )
++
++
++def get_incident_aggregates(incident):
++    kwargs = build_incident_query_params(incident)
++    return raw_query(
++        aggregations=[
++            ('count()', '', 'count'),
++            ('uniq', 'tags[sentry:user]', 'unique_users'),
++        ],
++        referrer='incidents.get_incident_aggregates',
++        limit=10000,
++        **kwargs
++    )['data'][0]
+diff --git a/src/sentry/incidents/models.py b/src/sentry/incidents/models.py
+index e07ab930b1..b0a7b423be 100644
+--- a/src/sentry/incidents/models.py
++++ b/src/sentry/incidents/models.py
+@@ -114,3 +114,15 @@ class Incident(Model):
+         app_label = 'sentry'
+         db_table = 'sentry_incident'
+         unique_together = (('organization', 'identifier'),)
++
++    @property
++    def current_end_date(self):
++        """
++        Returns the current end of the incident. Either the date it was closed,
++        or the current time if it's still open.
++        """
++        return self.date_closed if self.date_closed else timezone.now()
++
++    @property
++    def duration(self):
++        return self.current_end_date - self.date_started
+diff --git a/src/sentry/testutils/factories.py b/src/sentry/testutils/factories.py
+index 55a7027344..9bcf867f2d 100644
+--- a/src/sentry/testutils/factories.py
++++ b/src/sentry/testutils/factories.py
+@@ -22,6 +22,7 @@ from sentry.event_manager import EventManager
+ from sentry.constants import SentryAppStatus
+ from sentry.incidents.models import (
+     Incident,
++    IncidentGroup,
+     IncidentProject,
+ )
+ from sentry.mediators import sentry_apps, sentry_app_installations, service_hooks
+@@ -843,7 +844,7 @@ class Factories(object):
+     def create_incident(
+         organization, projects, detection_uuid=None, status=0,
+         title=None, query='test query', date_started=None, date_detected=None,
+-        date_closed=None,
++        date_closed=None, groups=None,
+     ):
+         if not title:
+             title = petname.Generate(2, ' ', letters=10).title()
+@@ -860,5 +861,8 @@ class Factories(object):
+         )
+         for project in projects:
+             IncidentProject.objects.create(incident=incident, project=project)
++        if groups:
++            for group in groups:
++                IncidentGroup.objects.create(incident=incident, group=group)
+ 
+         return incident
+diff --git a/src/sentry/testutils/fixtures.py b/src/sentry/testutils/fixtures.py
+index 5b9c63adc7..be0671c1ba 100644
+--- a/src/sentry/testutils/fixtures.py
++++ b/src/sentry/testutils/fixtures.py
+@@ -209,7 +209,7 @@ class Fixtures(object):
+     def create_incident(self, organization=None, projects=None, *args, **kwargs):
+         if not organization:
+             organization = self.organization
+-        if not projects:
++        if projects is None:
+             projects = [self.project]
+ 
+         return Factories.create_incident(
+diff --git a/src/sentry/utils/snuba.py b/src/sentry/utils/snuba.py
+index 1caae544d1..ac3138609c 100644
+--- a/src/sentry/utils/snuba.py
++++ b/src/sentry/utils/snuba.py
+@@ -1,6 +1,9 @@
+ from __future__ import absolute_import
+ 
+-from collections import OrderedDict
++from collections import (
++    namedtuple,
++    OrderedDict,
++)
+ from contextlib import contextmanager
+ from datetime import datetime, timedelta
+ from dateutil.parser import parse as parse_datetime
+@@ -183,6 +186,9 @@ class QueryOutsideGroupActivityError(Exception):
+     pass
+ 
+ 
++SnubaTSResult = namedtuple('SnubaTSResult', ('data', 'start', 'end', 'rollup'))
++
++
+ @contextmanager
+ def timer(name, prefix='snuba.client'):
+     t = time.time()
+diff --git a/tests/sentry/api/endpoints/test_organization_incident.py b/tests/sentry/api/endpoints/test_organization_incident.py
+index 352bbbb58e..67c5caaf3d 100644
+--- a/tests/sentry/api/endpoints/test_organization_incident.py
++++ b/tests/sentry/api/endpoints/test_organization_incident.py
+@@ -2,6 +2,7 @@ from __future__ import absolute_import
+ 
+ from django.utils import timezone
+ from exam import fixture
++from freezegun import freeze_time
+ 
+ from sentry.api.serializers import serialize
+ from sentry.incidents.models import Incident
+@@ -38,6 +39,7 @@ class IncidentListEndpointTest(APITestCase):
+         assert resp.status_code == 404
+ 
+ 
++@freeze_time()
+ class IncidentCreateEndpointTest(APITestCase):
+     endpoint = 'sentry-api-0-organization-incident-index'
+     method = 'post'
+@@ -116,7 +118,7 @@ class IncidentCreateEndpointTest(APITestCase):
+                 dateStarted=timezone.now(),
+                 groups=[self.group.id, other_group.id],
+             )
+-            assert resp.status_code == 403
++            assert resp.status_code == 400, resp.content
+ 
+     def test_no_feature(self):
+         self.create_member(
+diff --git a/tests/sentry/api/serializers/test_incident.py b/tests/sentry/api/serializers/test_incident.py
+index 10db1c1237..53c3873929 100644
+--- a/tests/sentry/api/serializers/test_incident.py
++++ b/tests/sentry/api/serializers/test_incident.py
+@@ -2,15 +2,20 @@
+ 
+ from __future__ import absolute_import
+ 
++from datetime import timedelta
++
+ import six
++from django.utils import timezone
++from freezegun import freeze_time
+ 
+ from sentry.api.serializers import serialize
+ from sentry.testutils import TestCase
+ 
+ 
+ class IncidentSerializerTest(TestCase):
++    @freeze_time()
+     def test_simple(self):
+-        incident = self.create_incident()
++        incident = self.create_incident(date_started=timezone.now() - timedelta(minutes=5))
+         result = serialize(incident)
+ 
+         assert result['id'] == six.text_type(incident.id)
+@@ -24,3 +29,7 @@ class IncidentSerializerTest(TestCase):
+         assert result['dateDetected'] == incident.date_detected
+         assert result['dateAdded'] == incident.date_added
+         assert result['dateClosed'] == incident.date_closed
++        assert len(result['eventStats']['data']) == 22
++        assert [data[1] for data in result['eventStats']['data']] == [[]] * 22
++        assert result['totalEvents'] == 0
++        assert result['uniqueUsers'] == 0
+diff --git a/tests/sentry/incidents/test_logic.py b/tests/sentry/incidents/test_logic.py
+index 3085a92c66..6a96c09aca 100644
+--- a/tests/sentry/incidents/test_logic.py
++++ b/tests/sentry/incidents/test_logic.py
+@@ -1,14 +1,25 @@
+ from __future__ import absolute_import
+ 
++from datetime import timedelta
++from uuid import uuid4
++
+ from django.utils import timezone
++from django.utils.functional import cached_property
+ 
+-from sentry.incidents.logic import create_incident
++from sentry.incidents.logic import (
++    create_incident,
++    get_incident_aggregates,
++    get_incident_event_stats,
++)
+ from sentry.incidents.models import (
+     IncidentGroup,
+     IncidentProject,
+     IncidentStatus,
+ )
+-from sentry.testutils import TestCase
++from sentry.testutils import (
++    TestCase,
++    SnubaTestCase,
++)
+ 
+ 
+ class CreateIncidentTest(TestCase):
+@@ -17,6 +28,8 @@ class CreateIncidentTest(TestCase):
+         title = 'hello'
+         query = 'goodbye'
+         date_started = timezone.now()
++        other_project = self.create_project()
++        other_group = self.create_group(project=other_project)
+         incident = create_incident(
+             self.organization,
+             status=status,
+@@ -24,7 +37,7 @@ class CreateIncidentTest(TestCase):
+             query=query,
+             date_started=date_started,
+             projects=[self.project],
+-            groups=[self.group],
++            groups=[self.group, other_group],
+         )
+         assert incident.identifier == 1
+         assert incident.status == status.value
+@@ -32,5 +45,104 @@ class CreateIncidentTest(TestCase):
+         assert incident.query == query
+         assert incident.date_started == date_started
+         assert incident.date_detected == date_started
+-        assert IncidentGroup.objects.filter(incident=incident, group=self.group).exists()
+-        assert IncidentProject.objects.filter(incident=incident, project=self.project).exists()
++        assert IncidentGroup.objects.filter(
++            incident=incident,
++            group__in=[self.group, other_group]
++        ).count() == 2
++        assert IncidentProject.objects.filter(
++            incident=incident,
++            project__in=[self.project, other_project],
++        ).count() == 2
++
++
++class BaseIncidentsTest(SnubaTestCase):
++    def create_event(self, timestamp, fingerprint=None, user=None):
++        event_id = uuid4().hex
++        if fingerprint is None:
++            fingerprint = event_id
++
++        data = {
++            'event_id': event_id,
++            'fingerprint': [fingerprint],
++            'timestamp': timestamp.isoformat()[:19]
++        }
++        if user:
++            data['user'] = user
++        return self.store_event(data=data, project_id=self.project.id)
++
++    @cached_property
++    def now(self):
++        return timezone.now()
++
++
++class GetIncidentEventStatsTest(TestCase, BaseIncidentsTest):
++    def test_project(self):
++        self.create_event(self.now - timedelta(minutes=2))
++        self.create_event(self.now - timedelta(minutes=2))
++        self.create_event(self.now - timedelta(minutes=1))
++
++        incident = self.create_incident(
++            date_started=self.now - timedelta(minutes=5),
++            query='',
++            projects=[self.project]
++        )
++        result = get_incident_event_stats(incident)
++        # Duration of 300s / 20 data points
++        assert result.rollup == 15
++        assert result.start == incident.date_started
++        assert result.end == incident.current_end_date
++        assert len(result.data['data']) == 2
++        assert result.data['data'][0]['count'] == 2
++        assert result.data['data'][1]['count'] == 1
++
++    def test_groups(self):
++        fingerprint = 'group-1'
++        event = self.create_event(self.now - timedelta(minutes=2), fingerprint=fingerprint)
++        self.create_event(self.now - timedelta(minutes=2), fingerprint='other-group')
++        self.create_event(self.now - timedelta(minutes=1), fingerprint=fingerprint)
++
++        incident = self.create_incident(
++            date_started=self.now - timedelta(minutes=5),
++            query='',
++            projects=[],
++            groups=[event.group],
++        )
++        result = get_incident_event_stats(incident)
++        # Duration of 300s / 20 data points
++        assert result.rollup == 15
++        assert result.start == incident.date_started
++        assert result.end == incident.current_end_date
++        assert len(result.data['data']) == 2, result.data
++        assert result.data['data'][0]['count'] == 1
++        assert result.data['data'][1]['count'] == 1
++
++
++class GetIncidentAggregatesTest(TestCase, BaseIncidentsTest):
++    def test_projects(self):
++        incident = self.create_incident(
++            date_started=self.now - timedelta(minutes=5),
++            query='',
++            projects=[self.project]
++        )
++        self.create_event(self.now - timedelta(minutes=1))
++        self.create_event(self.now - timedelta(minutes=2), user={'id': 123})
++        self.create_event(self.now - timedelta(minutes=2), user={'id': 123})
++        self.create_event(self.now - timedelta(minutes=2), user={'id': 124})
++        assert get_incident_aggregates(incident) == {'count': 4, 'unique_users': 2}
++
++    def test_groups(self):
++        fp = 'group'
++        group = self.create_event(self.now - timedelta(minutes=1), fingerprint=fp).group
++        self.create_event(self.now - timedelta(minutes=2), user={'id': 123}, fingerprint=fp)
++        self.create_event(self.now - timedelta(minutes=2), user={'id': 123}, fingerprint=fp)
++        self.create_event(self.now - timedelta(minutes=2), user={'id': 123}, fingerprint='other')
++        self.create_event(self.now - timedelta(minutes=2), user={'id': 124}, fingerprint=fp)
++        self.create_event(self.now - timedelta(minutes=2), user={'id': 124}, fingerprint='other')
++
++        incident = self.create_incident(
++            date_started=self.now - timedelta(minutes=5),
++            query='',
++            projects=[],
++            groups=[group],
++        )
++        assert get_incident_aggregates(incident) == {'count': 4, 'unique_users': 2}
+diff --git a/tests/sentry/incidents/test_models.py b/tests/sentry/incidents/test_models.py
+index 7e01679026..a6e93e5cc3 100644
+--- a/tests/sentry/incidents/test_models.py
++++ b/tests/sentry/incidents/test_models.py
+@@ -1,6 +1,11 @@
+ from __future__ import absolute_import
+ 
++import unittest
++from datetime import timedelta
++
+ from django.db import IntegrityError, transaction
++from django.utils import timezone
++from freezegun import freeze_time
+ from mock import patch
+ 
+ from sentry.db.models.manager import BaseManager
+@@ -125,3 +130,21 @@ class IncidentCreationTest(TestCase):
+             # row inside of a transaction it ends up rolled back. We just want
+             # to verify that it was created successfully.
+             assert incident.identifier == 1
++
++
++@freeze_time()
++class IncidentDurationTest(unittest.TestCase):
++    def test(self):
++        incident = Incident(date_started=timezone.now() - timedelta(minutes=5))
++        assert incident.duration == timedelta(minutes=5)
++        incident.date_closed = incident.date_started + timedelta(minutes=2)
++        assert incident.duration == timedelta(minutes=2)
++
++
++@freeze_time()
++class IncidentCurrentEndDateTest(unittest.TestCase):
++    def test(self):
++        incident = Incident()
++        assert incident.current_end_date == timezone.now()
++        incident.date_closed = timezone.now() - timedelta(minutes=10)
++        assert incident.current_end_date == timezone.now() - timedelta(minutes=10)

@@ -1,0 +1,330 @@
+commit 09360d80da730008a6a89f38f3780bb1d55f9e25
+Author: Jeff Reback <jeff@reback.net>
+Date:   Sun Mar 5 17:09:17 2017 -0500
+
+    PERF: faster unstacking
+    
+    closes #15503
+    
+    Author: Jeff Reback <jeff@reback.net>
+    
+    Closes #15510 from jreback/reshape3 and squashes the following commits:
+    
+    ec29226 [Jeff Reback] PERF: faster unstacking
+
+diff --git a/asv_bench/benchmarks/reshape.py b/asv_bench/benchmarks/reshape.py
+index a3ecfff52..b9346c497 100644
+--- a/asv_bench/benchmarks/reshape.py
++++ b/asv_bench/benchmarks/reshape.py
+@@ -59,6 +59,27 @@ class reshape_unstack_simple(object):
+         self.df.unstack(1)
+ 
+ 
++class reshape_unstack_large_single_dtype(object):
++    goal_time = 0.2
++
++    def setup(self):
++        m = 100
++        n = 1000
++
++        levels = np.arange(m)
++        index = pd.MultiIndex.from_product([levels]*2)
++        columns = np.arange(n)
++        values = np.arange(m*m*n).reshape(m*m, n)
++        self.df = pd.DataFrame(values, index, columns)
++        self.df2 = self.df.iloc[:-1]
++
++    def time_unstack_full_product(self):
++        self.df.unstack()
++
++    def time_unstack_with_mask(self):
++        self.df2.unstack()
++
++
+ class unstack_sparse_keyspace(object):
+     goal_time = 0.2
+ 
+diff --git a/doc/source/whatsnew/v0.20.0.txt b/doc/source/whatsnew/v0.20.0.txt
+index db803e6e7..725dc7fc5 100644
+--- a/doc/source/whatsnew/v0.20.0.txt
++++ b/doc/source/whatsnew/v0.20.0.txt
+@@ -640,7 +640,7 @@ Performance Improvements
+ - Improved performance and reduced memory when indexing with a ``MultiIndex`` (:issue:`15245`)
+ - When reading buffer object in ``read_sas()`` method without specified format, filepath string is inferred rather than buffer object. (:issue:`14947`)
+ - Improved performance of `rank()` for categorical data (:issue:`15498`)
+-
++- Improved performance when using ``.unstack()`` (:issue:`15503`)
+ 
+ 
+ .. _whatsnew_0200.bug_fixes:
+diff --git a/pandas/core/reshape.py b/pandas/core/reshape.py
+index 87cb088c2..7bcd9f2d3 100644
+--- a/pandas/core/reshape.py
++++ b/pandas/core/reshape.py
+@@ -7,7 +7,9 @@ import re
+ 
+ import numpy as np
+ 
+-from pandas.types.common import _ensure_platform_int, is_list_like
++from pandas.types.common import (_ensure_platform_int,
++                                 is_list_like, is_bool_dtype,
++                                 needs_i8_conversion)
+ from pandas.types.cast import _maybe_promote
+ from pandas.types.missing import notnull
+ import pandas.types.concat as _concat
+@@ -25,6 +27,7 @@ from pandas.core.sorting import (get_group_index, compress_group_index,
+ 
+ import pandas.core.algorithms as algos
+ import pandas.algos as _algos
++import pandas._reshape as _reshape
+ 
+ from pandas.core.index import MultiIndex, _get_na_value
+ 
+@@ -182,9 +185,21 @@ class _Unstacker(object):
+         stride = values.shape[1]
+         result_width = width * stride
+         result_shape = (length, result_width)
++        mask = self.mask
++        mask_all = mask.all()
++
++        # we can simply reshape if we don't have a mask
++        if mask_all and len(values):
++            new_values = (self.sorted_values
++                              .reshape(length, width, stride)
++                              .swapaxes(1, 2)
++                              .reshape(result_shape)
++                          )
++            new_mask = np.ones(result_shape, dtype=bool)
++            return new_values, new_mask
+ 
+         # if our mask is all True, then we can use our existing dtype
+-        if self.mask.all():
++        if mask_all:
+             dtype = values.dtype
+             new_values = np.empty(result_shape, dtype=dtype)
+         else:
+@@ -194,13 +209,36 @@ class _Unstacker(object):
+ 
+         new_mask = np.zeros(result_shape, dtype=bool)
+ 
+-        # is there a simpler / faster way of doing this?
+-        for i in range(values.shape[1]):
+-            chunk = new_values[:, i * width:(i + 1) * width]
+-            mask_chunk = new_mask[:, i * width:(i + 1) * width]
+-
+-            chunk.flat[self.mask] = self.sorted_values[:, i]
+-            mask_chunk.flat[self.mask] = True
++        name = np.dtype(dtype).name
++        sorted_values = self.sorted_values
++
++        # we need to convert to a basic dtype
++        # and possibly coerce an input to our output dtype
++        # e.g. ints -> floats
++        if needs_i8_conversion(values):
++            sorted_values = sorted_values.view('i8')
++            new_values = new_values.view('i8')
++            name = 'int64'
++        elif is_bool_dtype(values):
++            sorted_values = sorted_values.astype('object')
++            new_values = new_values.astype('object')
++            name = 'object'
++        else:
++            sorted_values = sorted_values.astype(name, copy=False)
++
++        # fill in our values & mask
++        f = getattr(_reshape, "unstack_{}".format(name))
++        f(sorted_values,
++          mask.view('u1'),
++          stride,
++          length,
++          width,
++          new_values,
++          new_mask.view('u1'))
++
++        # reconstruct dtype if needed
++        if needs_i8_conversion(values):
++            new_values = new_values.view(values.dtype)
+ 
+         return new_values, new_mask
+ 
+diff --git a/pandas/src/reshape.pyx b/pandas/src/reshape.pyx
+new file mode 100644
+index 000000000..82851b7e8
+--- /dev/null
++++ b/pandas/src/reshape.pyx
+@@ -0,0 +1,35 @@
++# cython: profile=False
++
++from numpy cimport *
++cimport numpy as np
++import numpy as np
++
++cimport cython
++
++import_array()
++
++cimport util
++
++from numpy cimport NPY_INT8 as NPY_int8
++from numpy cimport NPY_INT16 as NPY_int16
++from numpy cimport NPY_INT32 as NPY_int32
++from numpy cimport NPY_INT64 as NPY_int64
++from numpy cimport NPY_FLOAT16 as NPY_float16
++from numpy cimport NPY_FLOAT32 as NPY_float32
++from numpy cimport NPY_FLOAT64 as NPY_float64
++
++from numpy cimport (int8_t, int16_t, int32_t, int64_t, uint8_t, uint16_t,
++                    uint32_t, uint64_t, float16_t, float32_t, float64_t)
++
++int8 = np.dtype(np.int8)
++int16 = np.dtype(np.int16)
++int32 = np.dtype(np.int32)
++int64 = np.dtype(np.int64)
++float16 = np.dtype(np.float16)
++float32 = np.dtype(np.float32)
++float64 = np.dtype(np.float64)
++
++cdef double NaN = <double> np.NaN
++cdef double nan = NaN
++
++include "reshape_helper.pxi"
+diff --git a/pandas/src/reshape_helper.pxi.in b/pandas/src/reshape_helper.pxi.in
+new file mode 100644
+index 000000000..bb9a5977f
+--- /dev/null
++++ b/pandas/src/reshape_helper.pxi.in
+@@ -0,0 +1,81 @@
++"""
++Template for each `dtype` helper function for take
++
++WARNING: DO NOT edit .pxi FILE directly, .pxi is generated from .pxi.in
++"""
++
++# ----------------------------------------------------------------------
++# reshape
++# ----------------------------------------------------------------------
++
++{{py:
++
++# name, c_type
++dtypes = [('uint8', 'uint8_t'),
++          ('uint16', 'uint16_t'),
++          ('uint32', 'uint32_t'),
++          ('uint64', 'uint64_t'),
++          ('int8', 'int8_t'),
++          ('int16', 'int16_t'),
++          ('int32', 'int32_t'),
++          ('int64', 'int64_t'),
++          ('float32', 'float32_t'),
++          ('float64', 'float64_t'),
++          ('object', 'object')]
++}}
++
++{{for dtype, c_type in dtypes}}
++
++
++@cython.wraparound(False)
++@cython.boundscheck(False)
++def unstack_{{dtype}}(ndarray[{{c_type}}, ndim=2] values,
++                      ndarray[uint8_t, ndim=1] mask,
++                      Py_ssize_t stride,
++                      Py_ssize_t length,
++                      Py_ssize_t width,
++                      ndarray[{{c_type}}, ndim=2] new_values,
++                      ndarray[uint8_t, ndim=2] new_mask):
++    """
++    transform long sorted_values to wide new_values
++
++    Parameters
++    ----------
++    values : typed ndarray
++    mask : boolean ndarray
++    stride : int
++    length : int
++    width : int
++    new_values : typed ndarray
++        result array
++    new_mask : boolean ndarray
++        result mask
++
++    """
++
++    cdef:
++        Py_ssize_t i, j, w, nulls, s, offset
++
++    {{if dtype == 'object'}}
++    if True:
++    {{else}}
++    with nogil:
++    {{endif}}
++
++        for i in range(stride):
++
++            nulls = 0
++            for j in range(length):
++
++                for w in range(width):
++
++                    offset = j * width + w
++
++                    if mask[offset]:
++                        s = i * width + w
++                        new_values[j, s] = values[offset - nulls, i]
++                        new_mask[j, s] = 1
++                    else:
++                        nulls += 1
++
++{{endfor}}
+diff --git a/pandas/tests/frame/test_reshape.py b/pandas/tests/frame/test_reshape.py
+index 1890b33e3..c8c7313dd 100644
+--- a/pandas/tests/frame/test_reshape.py
++++ b/pandas/tests/frame/test_reshape.py
+@@ -121,19 +121,22 @@ class TestDataFrameReshape(tm.TestCase, TestData):
+         assert_frame_equal(result, expected)
+ 
+     def test_stack_unstack(self):
+-        stacked = self.frame.stack()
++        f = self.frame.copy()
++        f[:] = np.arange(np.prod(f.shape)).reshape(f.shape)
++
++        stacked = f.stack()
+         stacked_df = DataFrame({'foo': stacked, 'bar': stacked})
+ 
+         unstacked = stacked.unstack()
+         unstacked_df = stacked_df.unstack()
+ 
+-        assert_frame_equal(unstacked, self.frame)
+-        assert_frame_equal(unstacked_df['bar'], self.frame)
++        assert_frame_equal(unstacked, f)
++        assert_frame_equal(unstacked_df['bar'], f)
+ 
+         unstacked_cols = stacked.unstack(0)
+         unstacked_cols_df = stacked_df.unstack(0)
+-        assert_frame_equal(unstacked_cols.T, self.frame)
+-        assert_frame_equal(unstacked_cols_df['bar'].T, self.frame)
++        assert_frame_equal(unstacked_cols.T, f)
++        assert_frame_equal(unstacked_cols_df['bar'].T, f)
+ 
+     def test_unstack_fill(self):
+ 
+diff --git a/setup.py b/setup.py
+index cbcadce45..525cbdf60 100755
+--- a/setup.py
++++ b/setup.py
+@@ -113,6 +113,7 @@ _pxipath = pjoin('pandas', 'src')
+ _pxi_dep_template = {
+     'algos': ['algos_common_helper.pxi.in', 'algos_groupby_helper.pxi.in',
+               'algos_take_helper.pxi.in', 'algos_rank_helper.pxi.in'],
++    '_reshape': ['reshape_helper.pxi.in'],
+     '_join': ['join_helper.pxi.in', 'joins_func_helper.pxi.in'],
+     'hashtable': ['hashtable_class_helper.pxi.in',
+                   'hashtable_func_helper.pxi.in'],
+@@ -496,6 +497,8 @@ ext_data = dict(
+     algos={'pyxfile': 'algos',
+            'pxdfiles': ['src/util', 'hashtable'],
+            'depends': _pxi_dep['algos']},
++    _reshape={'pyxfile': 'src/reshape',
++              'depends': _pxi_dep['_reshape']},
+     _join={'pyxfile': 'src/join',
+            'pxdfiles': ['src/util', 'hashtable'],
+            'depends': _pxi_dep['_join']},

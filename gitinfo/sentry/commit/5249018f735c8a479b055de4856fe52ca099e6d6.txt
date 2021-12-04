@@ -1,0 +1,272 @@
+commit 5249018f735c8a479b055de4856fe52ca099e6d6
+Author: Matt Robenolt <matt@ydekproductions.com>
+Date:   Fri Mar 16 13:17:24 2018 -0700
+
+    feat(buffers): Add partitioning to redis implementation (#7652)
+    
+    Right now, a single process_buffer job can become unbearably slow. This
+    single job contains all of the increments that need to be performed. In
+    practice, we are seeing this balloon upwards of 20,000 or more, and the
+    bottleneck is purely fetching all of these keys and fanning out the
+    additional jobs.
+    
+    This changes process_buffer to accept a partition, and increments can be
+    splayed across N partitions so we can process this massive buffer in
+    parallel and keep processing times fast.
+
+diff --git a/src/sentry/buffer/base.py b/src/sentry/buffer/base.py
+index 37eb06c273..52df60df98 100644
+--- a/src/sentry/buffer/base.py
++++ b/src/sentry/buffer/base.py
+@@ -53,7 +53,7 @@ class Buffer(Service):
+             }
+         )
+ 
+-    def process_pending(self):
++    def process_pending(self, partition=None):
+         return []
+ 
+     def process(self, model, columns, filters, extra=None):
+diff --git a/src/sentry/buffer/redis.py b/src/sentry/buffer/redis.py
+index fd81a79860..38072ab173 100644
+--- a/src/sentry/buffer/redis.py
++++ b/src/sentry/buffer/redis.py
+@@ -10,13 +10,14 @@ from __future__ import absolute_import
+ import six
+ 
+ from time import time
++from binascii import crc32
+ 
+ from django.db import models
+ from django.utils.encoding import force_bytes
+ 
+ from sentry.buffer import Buffer
+ from sentry.exceptions import InvalidConfiguration
+-from sentry.tasks.process_buffer import process_incr
++from sentry.tasks.process_buffer import process_incr, process_pending
+ from sentry.utils import metrics
+ from sentry.utils.compat import pickle
+ from sentry.utils.hashlib import md5_text
+@@ -54,10 +55,13 @@ class PendingBuffer(object):
+ class RedisBuffer(Buffer):
+     key_expire = 60 * 60  # 1 hour
+     pending_key = 'b:p'
+-    incr_batch_size = 2
+ 
+-    def __init__(self, **options):
++    def __init__(self, pending_partitions=1, incr_batch_size=2, **options):
+         self.cluster, options = get_cluster_from_options('SENTRY_BUFFER_OPTIONS', options)
++        self.pending_partitions = pending_partitions
++        self.incr_batch_size = incr_batch_size
++        assert self.pending_partitions > 0
++        assert self.incr_batch_size > 0
+ 
+     def validate(self):
+         try:
+@@ -82,6 +86,27 @@ class RedisBuffer(Buffer):
+             ).hexdigest(),
+         )
+ 
++    def _make_pending_key(self, partition=None):
++        """
++        Returns the key to be used for the pending buffer.
++        When partitioning is enabled, there is a key for each
++        partition, without it, there's only the default pending_key
++        """
++        if partition is None:
++            return self.pending_key
++        assert partition >= 0 and partition < self.pending_partitions
++        return '%s:%d' % (self.pending_key, partition)
++
++    def _make_pending_key_from_key(self, key):
++        """
++        Return the pending_key for a given key. This is used
++        to route a key into the correct pending buffer. If partitioning
++        is disabled, route into the no partition buffer.
++        """
++        if self.pending_partitions == 1:
++            return self.pending_key
++        return self._make_pending_key(crc32(key) % self.pending_partitions)
++
+     def _make_lock_key(self, key):
+         return 'l:%s' % (key, )
+ 
+@@ -97,8 +122,9 @@ class RedisBuffer(Buffer):
+         # TODO(dcramer): longer term we'd rather not have to serialize values
+         # here (unless it's to JSON)
+         key = self._make_key(model, filters)
++        pending_key = self._make_pending_key_from_key(key)
+         # We can't use conn.map() due to wanting to support multiple pending
+-        # keys (one per Redis shard)
++        # keys (one per Redis partition)
+         conn = self.cluster.get_local_client_for_key(key)
+ 
+         pipe = conn.pipeline()
+@@ -111,12 +137,22 @@ class RedisBuffer(Buffer):
+             for column, value in six.iteritems(extra):
+                 pipe.hset(key, 'e+' + column, pickle.dumps(value))
+         pipe.expire(key, self.key_expire)
+-        pipe.zadd(self.pending_key, time(), key)
++        pipe.zadd(pending_key, time(), key)
+         pipe.execute()
+ 
+-    def process_pending(self):
++    def process_pending(self, partition=None):
++        if partition is None and self.pending_partitions > 1:
++            # If we're using partitions, this one task fans out into
++            # N subtasks instead.
++            for i in range(self.pending_partitions):
++                process_pending.apply_async(kwargs={'partition': i})
++            # Explicitly also run over the unpartitioned buffer as well
++            # to ease in transition. In practice, this should just be
++            # super fast and is fine to do redundantly.
++
++        pending_key = self._make_pending_key(partition)
+         client = self.cluster.get_routing_client()
+-        lock_key = self._make_lock_key(self.pending_key)
++        lock_key = self._make_lock_key(pending_key)
+         # prevent a stampede due to celerybeat + periodic task
+         if not client.set(lock_key, '1', nx=True, ex=60):
+             return
+@@ -126,7 +162,7 @@ class RedisBuffer(Buffer):
+         try:
+             keycount = 0
+             with self.cluster.all() as conn:
+-                results = conn.zrange(self.pending_key, 0, -1)
++                results = conn.zrange(pending_key, 0, -1)
+ 
+             with self.cluster.all() as conn:
+                 for host_id, keys in six.iteritems(results.value):
+@@ -141,7 +177,7 @@ class RedisBuffer(Buffer):
+                                     'batch_keys': pending_buffer.flush(),
+                                 }
+                             )
+-                    conn.target([host_id]).zrem(self.pending_key, *keys)
++                    conn.target([host_id]).zrem(pending_key, *keys)
+ 
+             # queue up remainder of pending keys
+             if not pending_buffer.empty():
+@@ -173,11 +209,13 @@ class RedisBuffer(Buffer):
+             self.logger.debug('buffer.revoked.locked', extra={'redis_key': key})
+             return
+ 
++        pending_key = self._make_pending_key_from_key(key)
++
+         try:
+             conn = self.cluster.get_local_client_for_key(key)
+             pipe = conn.pipeline()
+             pipe.hgetall(key)
+-            pipe.zrem(self.pending_key, key)
++            pipe.zrem(pending_key, key)
+             pipe.delete(key)
+             values = pipe.execute()[0]
+ 
+diff --git a/src/sentry/tasks/process_buffer.py b/src/sentry/tasks/process_buffer.py
+index 28e1b2bfc8..75b28dfdf5 100644
+--- a/src/sentry/tasks/process_buffer.py
++++ b/src/sentry/tasks/process_buffer.py
+@@ -17,19 +17,25 @@ logger = logging.getLogger(__name__)
+ 
+ 
+ @instrumented_task(name='sentry.tasks.process_buffer.process_pending')
+-def process_pending():
++def process_pending(partition=None):
+     """
+     Process pending buffers.
+     """
+     from sentry import buffer
+     from sentry.app import locks
+ 
+-    lock = locks.get('buffer:process_pending', duration=60)
++    if partition is None:
++        lock_key = 'buffer:process_pending'
++    else:
++        lock_key = 'buffer:process_pending:%d' % partition
++
++    lock = locks.get(lock_key, duration=60)
++
+     try:
+         with lock.acquire():
+-            buffer.process_pending()
++            buffer.process_pending(partition=partition)
+     except UnableToAcquireLock as error:
+-        logger.warning('process_pending.fail', extra={'error': error})
++        logger.warning('process_pending.fail', extra={'error': error, 'partition': partition})
+ 
+ 
+ @instrumented_task(name='sentry.tasks.process_buffer.process_incr')
+diff --git a/tests/sentry/buffer/redis/tests.py b/tests/sentry/buffer/redis/tests.py
+index a840a17be8..b66dbbdc52 100644
+--- a/tests/sentry/buffer/redis/tests.py
++++ b/tests/sentry/buffer/redis/tests.py
+@@ -99,3 +99,55 @@ class RedisBufferTest(TestCase):
+         }
+         pending = client.zrange('b:p', 0, -1)
+         assert pending == ['foo']
++
++    @mock.patch('sentry.buffer.redis.RedisBuffer._make_key', mock.Mock(return_value='foo'))
++    @mock.patch('sentry.buffer.redis.process_incr')
++    @mock.patch('sentry.buffer.redis.process_pending')
++    def test_process_pending_partitions_none(self, process_pending, process_incr):
++        self.buf.pending_partitions = 2
++        with self.buf.cluster.map() as client:
++            client.zadd('b:p:0', 1, 'foo')
++            client.zadd('b:p:1', 1, 'bar')
++            client.zadd('b:p', 1, 'baz')
++
++        # On first pass, we are expecing to do:
++        # * process the buffer that doesn't have a partition (b:p)
++        # * queue up 2 jobs, one for each partition to process.
++        self.buf.process_pending()
++        assert len(process_incr.apply_async.mock_calls) == 1
++        process_incr.apply_async.assert_any_call(kwargs={
++            'batch_keys': ['baz'],
++        })
++        assert len(process_pending.apply_async.mock_calls) == 2
++        process_pending.apply_async.mock_calls == [
++            mock.call(kwargs={'partition': 0}),
++            mock.call(kwargs={'partition': 1}),
++        ]
++
++        # Confirm that we've only processed the unpartitioned buffer
++        client = self.buf.cluster.get_routing_client()
++        assert client.zrange('b:p', 0, -1) == []
++        assert client.zrange('b:p:0', 0, -1) != []
++        assert client.zrange('b:p:1', 0, -1) != []
++
++        # partition 0
++        self.buf.process_pending(partition=0)
++        assert len(process_incr.apply_async.mock_calls) == 2
++        process_incr.apply_async.assert_any_call(kwargs={
++            'batch_keys': ['foo'],
++        })
++        assert client.zrange('b:p:0', 0, -1) == []
++
++        # Make sure we didn't queue up more
++        assert len(process_pending.apply_async.mock_calls) == 2
++
++        # partition 1
++        self.buf.process_pending(partition=1)
++        assert len(process_incr.apply_async.mock_calls) == 3
++        process_incr.apply_async.assert_any_call(kwargs={
++            'batch_keys': ['bar'],
++        })
++        assert client.zrange('b:p:1', 0, -1) == []
++
++        # Make sure we didn't queue up more
++        assert len(process_pending.apply_async.mock_calls) == 2
+diff --git a/tests/sentry/tasks/process_buffer/tests.py b/tests/sentry/tasks/process_buffer/tests.py
+index 21c911945b..d1d6e24daf 100644
+--- a/tests/sentry/tasks/process_buffer/tests.py
++++ b/tests/sentry/tasks/process_buffer/tests.py
+@@ -23,4 +23,9 @@ class ProcessPendingTest(TestCase):
+     def test_nothing(self, mock_process_pending):
+         # this effectively just says "does the code run"
+         process_pending()
+-        mock_process_pending.assert_called_once_with()
++        assert len(mock_process_pending.mock_calls) == 1
++        mock_process_pending.assert_any_call(partition=None)
++
++        process_pending(partition=1)
++        assert len(mock_process_pending.mock_calls) == 2
++        mock_process_pending.assert_any_call(partition=1)

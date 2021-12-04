@@ -1,0 +1,143 @@
+commit 011b79fbf73b45313b47c08b4be1fc07dcb99365
+Author: gfyoung <gfyoung17+GitHub@gmail.com>
+Date:   Mon Nov 12 05:12:59 2018 -0800
+
+    BUG: Don't over-optimize memory with jagged CSV (#23527)
+    
+    With jagged CSV's, we risk being too quick
+    to dump memory that we need to allocate
+    because previous chunks would have
+    indicated much larger rows than we can
+    anticipate in subsequent chunks.
+    
+    Closes gh-23509.
+
+diff --git a/doc/source/whatsnew/v0.24.0.txt b/doc/source/whatsnew/v0.24.0.txt
+index ffde84a23..20496c9fb 100644
+--- a/doc/source/whatsnew/v0.24.0.txt
++++ b/doc/source/whatsnew/v0.24.0.txt
+@@ -1299,6 +1299,7 @@ Notice how we now instead output ``np.nan`` itself instead of a stringified form
+ - :func:`read_excel()` will correctly show the deprecation warning for previously deprecated ``sheetname`` (:issue:`17994`)
+ - :func:`read_csv()` and func:`read_table()` will throw ``UnicodeError`` and not coredump on badly encoded strings (:issue:`22748`)
+ - :func:`read_csv()` will correctly parse timezone-aware datetimes (:issue:`22256`)
++- Bug in :func:`read_csv()` in which memory management was prematurely optimized for the C engine when the data was being read in chunks (:issue:`23509`)
+ - :func:`read_sas()` will parse numbers in sas7bdat-files that have width less than 8 bytes correctly. (:issue:`21616`)
+ - :func:`read_sas()` will correctly parse sas7bdat files with many columns (:issue:`22628`)
+ - :func:`read_sas()` will correctly parse sas7bdat files with data page types having also bit 7 set (so page type is 128 + 256 = 384) (:issue:`16615`)
+diff --git a/pandas/_libs/parsers.pyx b/pandas/_libs/parsers.pyx
+index 3870a55c2..40aa03caa 100644
+--- a/pandas/_libs/parsers.pyx
++++ b/pandas/_libs/parsers.pyx
+@@ -132,6 +132,7 @@ cdef extern from "parser/tokenizer.h":
+         int64_t *word_starts  # where we are in the stream
+         int64_t words_len
+         int64_t words_cap
++        int64_t max_words_cap    # maximum word cap encountered
+ 
+         char *pword_start        # pointer to stream start of current field
+         int64_t word_start       # position start of current field
+diff --git a/pandas/_libs/src/parser/tokenizer.c b/pandas/_libs/src/parser/tokenizer.c
+index 2fce24102..e46e1e85f 100644
+--- a/pandas/_libs/src/parser/tokenizer.c
++++ b/pandas/_libs/src/parser/tokenizer.c
+@@ -197,6 +197,7 @@ int parser_init(parser_t *self) {
+     sz = sz ? sz : 1;
+     self->words = (char **)malloc(sz * sizeof(char *));
+     self->word_starts = (int64_t *)malloc(sz * sizeof(int64_t));
++    self->max_words_cap = sz;
+     self->words_cap = sz;
+     self->words_len = 0;
+ 
+@@ -247,7 +248,7 @@ void parser_del(parser_t *self) {
+ }
+ 
+ static int make_stream_space(parser_t *self, size_t nbytes) {
+-    int64_t i, cap;
++    int64_t i, cap, length;
+     int status;
+     void *orig_ptr, *newptr;
+ 
+@@ -287,8 +288,23 @@ static int make_stream_space(parser_t *self, size_t nbytes) {
+     */
+ 
+     cap = self->words_cap;
++
++    /**
++     * If we are reading in chunks, we need to be aware of the maximum number
++     * of words we have seen in previous chunks (self->max_words_cap), so
++     * that way, we can properly allocate when reading subsequent ones.
++     *
++     * Otherwise, we risk a buffer overflow if we mistakenly under-allocate
++     * just because a recent chunk did not have as many words.
++     */
++    if (self->words_len + nbytes < self->max_words_cap) {
++        length = self->max_words_cap - nbytes;
++    } else {
++        length = self->words_len;
++    }
++
+     self->words =
+-        (char **)grow_buffer((void *)self->words, self->words_len,
++        (char **)grow_buffer((void *)self->words, length,
+                              (int64_t*)&self->words_cap, nbytes,
+                              sizeof(char *), &status);
+     TRACE(
+@@ -1241,6 +1257,19 @@ int parser_trim_buffers(parser_t *self) {
+ 
+     int64_t i;
+ 
++    /**
++     * Before we free up space and trim, we should
++     * save how many words we saw when parsing, if
++     * it exceeds the maximum number we saw before.
++     *
++     * This is important for when we read in chunks,
++     * so that we can inform subsequent chunk parsing
++     * as to how many words we could possibly see.
++     */
++    if (self->words_cap > self->max_words_cap) {
++        self->max_words_cap = self->words_cap;
++    }
++
+     /* trim words, word_starts */
+     new_cap = _next_pow2(self->words_len) + 1;
+     if (new_cap < self->words_cap) {
+diff --git a/pandas/_libs/src/parser/tokenizer.h b/pandas/_libs/src/parser/tokenizer.h
+index 9fc3593aa..c32c061c7 100644
+--- a/pandas/_libs/src/parser/tokenizer.h
++++ b/pandas/_libs/src/parser/tokenizer.h
+@@ -142,6 +142,7 @@ typedef struct parser_t {
+     int64_t *word_starts;   // where we are in the stream
+     int64_t words_len;
+     int64_t words_cap;
++    int64_t max_words_cap;  // maximum word cap encountered
+ 
+     char *pword_start;      // pointer to stream start of current field
+     int64_t word_start;     // position start of current field
+diff --git a/pandas/tests/io/parser/common.py b/pandas/tests/io/parser/common.py
+index 18690a18f..67a3bd6f9 100644
+--- a/pandas/tests/io/parser/common.py
++++ b/pandas/tests/io/parser/common.py
+@@ -458,6 +458,22 @@ bar,foo"""
+ 
+         tm.assert_frame_equal(pd.concat(reader), df)
+ 
++    def test_read_chunksize_jagged_names(self):
++        # see gh-23509
++        data = "\n".join(["0"] * 7 + [",".join(["0"] * 10)])
++        reader = self.read_csv(StringIO(data), names=range(10), chunksize=4)
++
++        expected = DataFrame()
++
++        for i in range(10):
++            if i == 0:
++                expected[i] = [0] * 8
++            else:
++                expected[i] = [np.nan] * 7 + [0]
++
++        result = pd.concat(reader)
++        tm.assert_frame_equal(result, expected)
++
+     def test_read_text_list(self):
+         data = """A,B,C\nfoo,1,2,3\nbar,4,5,6"""
+         as_list = [['A', 'B', 'C'], ['foo', '1', '2', '3'], ['bar',

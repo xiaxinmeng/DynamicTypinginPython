@@ -1,0 +1,1096 @@
+commit 1699dca5b6e927e5753daff46ce85d53dd8bba58
+Author: Evan Purkhiser <evanpurkhiser@gmail.com>
+Date:   Wed Aug 21 18:16:42 2019 -0700
+
+    ref(ui): Move Accept Organization Invite to react (#14281)
+
+diff --git a/src/sentry/api/endpoints/accept_organization_invite.py b/src/sentry/api/endpoints/accept_organization_invite.py
+new file mode 100644
+index 0000000000..762f9f6f4b
+--- /dev/null
++++ b/src/sentry/api/endpoints/accept_organization_invite.py
+@@ -0,0 +1,93 @@
++from __future__ import absolute_import
++
++from rest_framework import status
++from rest_framework.response import Response
++from django.core.urlresolvers import reverse
++
++from sentry.utils import auth
++from sentry.api.base import Endpoint
++from sentry.models import OrganizationMember, AuthProvider
++from sentry.api.invite_helper import ApiInviteHelper
++
++
++class AcceptOrganizationInvite(Endpoint):
++    # Disable authentication and permission requirements.
++    permission_classes = []
++
++    def respond_invalid(self, request):
++        return Response(status=status.HTTP_400_BAD_REQUEST, data={"details": "Invalid invite code"})
++
++    def get_helper(self, request, member_id, token):
++        return ApiInviteHelper(instance=self, request=request, member_id=member_id, token=token)
++
++    def get(self, request, member_id, token):
++        try:
++            helper = self.get_helper(request, member_id, token)
++        except OrganizationMember.DoesNotExist:
++            return self.respond_invalid(request)
++
++        if not helper.member_pending or not helper.valid_token:
++            return self.respond_invalid(request)
++
++        om = helper.om
++        organization = om.organization
++
++        # Keep track of the invite email for when we land back on the login page
++        request.session["invite_email"] = om.email
++
++        try:
++            auth_provider = AuthProvider.objects.get(organization=organization)
++        except AuthProvider.DoesNotExist:
++            auth_provider = None
++
++        data = {
++            "orgSlug": organization.slug,
++            "needsAuthentication": not helper.user_authenticated,
++            "needs2fa": helper.needs_2fa,
++            "needsSso": auth_provider is not None,
++            # If they're already a member of the organization its likely
++            # they're using a shared account and either previewing this invite
++            # or are incorrectly expecting this to create a new account.
++            "existingMember": helper.member_already_exists,
++        }
++
++        if auth_provider is not None:
++            provider = auth_provider.get_provider()
++            data["ssoProvider"] = provider.name
++
++        # Allow users to register an account when accepting an invite
++        if not helper.user_authenticated:
++            url = reverse("sentry-accept-invite", args=[member_id, token])
++            auth.initiate_login(self.request, next_url=url)
++            request.session["can_register"] = True
++
++        response = Response(data)
++
++        if helper.needs_2fa:
++            helper.add_invite_cookie(request, response, member_id, token)
++
++        return response
++
++    def post(self, request, member_id, token):
++        try:
++            helper = self.get_helper(request, member_id, token)
++        except OrganizationMember.DoesNotExist:
++            return self.respond_invalid(request)
++
++        if not helper.valid_request:
++            return Response(
++                status=status.HTTP_400_BAD_REQUEST,
++                data={"details": "unable to accept organization invite"},
++            )
++
++        if helper.member_already_exists:
++            response = Response(
++                status=status.HTTP_400_BAD_REQUEST, data={"details": "member already exists"}
++            )
++        else:
++            response = Response(status=status.HTTP_204_NO_CONTENT)
++
++        helper.accept_invite()
++        helper.remove_invite_cookie(response)
++
++        return response
+diff --git a/src/sentry/api/endpoints/user_authenticator_enroll.py b/src/sentry/api/endpoints/user_authenticator_enroll.py
+index 631e5636aa..ed69893641 100644
+--- a/src/sentry/api/endpoints/user_authenticator_enroll.py
++++ b/src/sentry/api/endpoints/user_authenticator_enroll.py
+@@ -12,7 +12,7 @@ from sentry.api.decorators import sudo_required
+ from sentry.api.serializers import serialize
+ from sentry.models import Authenticator, OrganizationMember
+ from sentry.security import capture_security_activity
+-from sentry.web.frontend.accept_organization_invite import ApiInviteHelper
++from sentry.api.invite_helper import ApiInviteHelper
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -246,7 +246,7 @@ class UserAuthenticatorEnrollEndpoint(UserEndpoint):
+                 except OrganizationMember.DoesNotExist:
+                     logger.error("Failed to accept pending org invite", exc_info=True)
+                 else:
+-                    if helper.valid_request():
++                    if helper.valid_request:
+                         helper.accept_invite()
+ 
+                         response = Response(status=status.HTTP_204_NO_CONTENT)
+diff --git a/src/sentry/api/invite_helper.py b/src/sentry/api/invite_helper.py
+new file mode 100644
+index 0000000000..1af96de755
+--- /dev/null
++++ b/src/sentry/api/invite_helper.py
+@@ -0,0 +1,105 @@
++from __future__ import absolute_import
++
++from django.utils.crypto import constant_time_compare
++from django.core.urlresolvers import reverse
++from sentry.utils import metrics
++
++from sentry.models import AuditLogEntryEvent, Authenticator, OrganizationMember
++from sentry.signals import member_joined
++
++PENDING_INVITE = "pending-invite"
++COOKIE_MAX_AGE = 60 * 60 * 24 * 7  # 7 days
++
++
++class ApiInviteHelper(object):
++    def __init__(self, instance, request, member_id, token, logger=None):
++        self.request = request
++        self.instance = instance
++        self.member_id = member_id
++        self.token = token
++        self.logger = logger
++        self.om = self.get_organization_member()
++
++    def handle_success(self):
++        member_joined.send_robust(
++            member=self.om, organization=self.om.organization, sender=self.instance
++        )
++
++    def handle_member_already_exists(self):
++        if self.logger:
++            self.logger.info(
++                "Pending org invite not accepted - User already org member",
++                extra={"organization_id": self.om.organization.id, "user_id": self.request.user.id},
++            )
++
++    def get_organization_member(self):
++        return OrganizationMember.objects.select_related("organization").get(pk=self.member_id)
++
++    @property
++    def member_pending(self):
++        return self.om.is_pending
++
++    @property
++    def valid_token(self):
++        if self.om.token_expired:
++            return False
++        return constant_time_compare(self.om.token or self.om.legacy_token, self.token)
++
++    @property
++    def user_authenticated(self):
++        return self.request.user.is_authenticated()
++
++    @property
++    def needs_2fa(self):
++        org_requires_2fa = self.om.organization.flags.require_2fa.is_set
++        user_has_2fa = Authenticator.objects.user_has_2fa(self.request.user.id)
++        return org_requires_2fa and not user_has_2fa
++
++    @property
++    def member_already_exists(self):
++        if not self.user_authenticated:
++            return False
++
++        return OrganizationMember.objects.filter(
++            organization=self.om.organization, user=self.request.user
++        ).exists()
++
++    @property
++    def valid_request(self):
++        return (
++            self.member_pending
++            and self.valid_token
++            and self.user_authenticated
++            and not self.needs_2fa
++        )
++
++    def accept_invite(self):
++        om = self.om
++
++        if self.member_already_exists:
++            self.handle_member_already_exists()
++            om.delete()
++        else:
++            om.set_user(self.request.user)
++            om.save()
++
++            self.instance.create_audit_entry(
++                self.request,
++                organization=om.organization,
++                target_object=om.id,
++                target_user=self.request.user,
++                event=AuditLogEntryEvent.MEMBER_ACCEPT,
++                data=om.get_audit_log_data(),
++            )
++
++            self.handle_success()
++            metrics.incr("organization.invite-accepted", sample_rate=1.0)
++
++    def add_invite_cookie(self, request, response, member_id, token):
++        url = reverse("sentry-accept-invite", args=[member_id, token])
++        response.set_cookie(PENDING_INVITE, url, max_age=COOKIE_MAX_AGE)
++
++    def remove_invite_cookie(self, response):
++        if PENDING_INVITE in self.request.COOKIES:
++            response.delete_cookie(PENDING_INVITE)
++        return response
+diff --git a/src/sentry/api/urls.py b/src/sentry/api/urls.py
+index 0307087fcf..526b53023f 100644
+--- a/src/sentry/api/urls.py
++++ b/src/sentry/api/urls.py
+@@ -8,6 +8,7 @@ from .endpoints.api_applications import ApiApplicationsEndpoint
+ from .endpoints.api_authorizations import ApiAuthorizationsEndpoint
+ from .endpoints.api_tokens import ApiTokensEndpoint
+ from .endpoints.assistant import AssistantEndpoint
++from .endpoints.accept_organization_invite import AcceptOrganizationInvite
+ from .endpoints.auth_index import AuthIndexEndpoint
+ from .endpoints.auth_config import AuthConfigEndpoint
+ from .endpoints.auth_login import AuthLoginEndpoint
+@@ -399,6 +400,12 @@ urlpatterns = patterns(
+         AcceptProjectTransferEndpoint.as_view(),
+         name="sentry-api-0-accept-project-transfer",
+     ),
++    # Organization invite
++    url(
++        r"^accept-invite/(?P<member_id>[^\/]+)/(?P<token>[^\/]+)/$",
++        AcceptOrganizationInvite.as_view(),
++        name="sentry-api-0-accept-organization-invite",
++    ),
+     # Monitors
+     url(
+         r"^monitors/",
+diff --git a/src/sentry/static/sentry/app/routes.jsx b/src/sentry/static/sentry/app/routes.jsx
+index 04f3058d14..13db8d066e 100644
+--- a/src/sentry/static/sentry/app/routes.jsx
++++ b/src/sentry/static/sentry/app/routes.jsx
+@@ -674,6 +674,13 @@ function routes() {
+ 
+   return (
+     <Route path="/" component={errorHandler(App)}>
++      <Route
++        path="/accept/:memberId/:token/"
++        componentPromise={() =>
++          import(/* webpackChunkName: "AcceptOrganizationInvite" */ 'app/views/acceptOrganizationInvite')
++        }
++        component={errorHandler(LazyLoad)}
++      />
+       <Route
+         path="/accept-transfer/"
+         componentPromise={() =>
+diff --git a/src/sentry/static/sentry/app/views/acceptOrganizationInvite.tsx b/src/sentry/static/sentry/app/views/acceptOrganizationInvite.tsx
+new file mode 100644
+index 0000000000..e0e5437fb3
+--- /dev/null
++++ b/src/sentry/static/sentry/app/views/acceptOrganizationInvite.tsx
+@@ -0,0 +1,219 @@
++import React, {MouseEvent} from 'react';
++import styled from 'react-emotion';
++import {browserHistory} from 'react-router';
++
++import {logout} from 'app/actionCreators/account';
++import {t, tct} from 'app/locale';
++import {urlEncode} from '@sentry/utils';
++import Alert from 'app/components/alert';
++import AsyncView, {AsyncViewProps, AsyncViewState} from 'app/views/asyncView';
++import Button from 'app/components/button';
++import ConfigStore from 'app/stores/configStore';
++import Link from 'app/components/links/link';
++import NarrowLayout from 'app/components/narrowLayout';
++import SettingsPageHeader from 'app/views/settings/components/settingsPageHeader';
++import space from 'app/styles/space';
++
++type InviteDetails = {
++  orgSlug: string;
++  needsAuthentication: boolean;
++  needs2fa: boolean;
++  needsSso: boolean;
++  existingMember: boolean;
++  ssoProvider?: string;
++};
++
++type State = AsyncViewState & {
++  inviteDetails: InviteDetails;
++  accepting: boolean | undefined;
++  acceptError: boolean | undefined;
++};
++
++class AcceptOrganizationInvite extends AsyncView<AsyncViewProps, State> {
++  getEndpoints(): [string, string][] {
++    const {memberId, token} = this.props.params;
++    return [['inviteDetails', `/accept-invite/${memberId}/${token}/`]];
++  }
++
++  getTitle() {
++    return t('Accept Organization Invite');
++  }
++
++  makeNextUrl(path: string) {
++    return `${path}?${urlEncode({next: window.location.pathname})}`;
++  }
++
++  handleLogout = async (e: MouseEvent) => {
++    e.preventDefault();
++    await logout(this.api);
++    window.location.replace(this.makeNextUrl('/auth/login/'));
++  };
++
++  handleAcceptInvite = async () => {
++    const {memberId, token} = this.props.params;
++
++    this.setState({accepting: true});
++    try {
++      await this.api.requestPromise(`/accept-invite/${memberId}/${token}/`, {
++        method: 'POST',
++      });
++      browserHistory.replace(`/${this.state.inviteDetails.orgSlug}/`);
++    } catch {
++      this.setState({acceptError: true});
++    }
++    this.setState({accepting: false});
++  };
++
++  get existingMemberAlert() {
++    const user = ConfigStore.get('user');
++
++    return (
++      <Alert type="warning" data-test-id="existing-member">
++        {tct(
++          'Your account ([email]) is already a member of this organization. [switchLink:Switch accounts]?',
++          {
++            email: user.email,
++            switchLink: <Link href="#" onClick={this.handleLogout} />,
++          }
++        )}
++      </Alert>
++    );
++  }
++
++  get authenticationActions() {
++    const {inviteDetails} = this.state;
++
++    return (
++      <React.Fragment>
++        <p>
++          {t(
++            `To continue, you must either login to an existing Sentry account,
++             or create a new account.`
++          )}
++        </p>
++        {inviteDetails.needsSso && (
++          <p data-test-id="suggests-sso">
++            {tct(
++              `Note that [orgSlug] has enabled Single-Sign-On (SSO) using
++               [authProvider]. You may create an account by authenticating with
++               the organizations SSO provider.`,
++              {
++                orgSlug: inviteDetails.orgSlug,
++                authProvider: inviteDetails.ssoProvider,
++              }
++            )}
++          </p>
++        )}
++
++        <Actions>
++          {inviteDetails.needsSso ? (
++            <Button
++              label="sso-login"
++              priority="primary"
++              href={this.makeNextUrl(`/auth/login/${inviteDetails.orgSlug}/`)}
++            >
++              {t('Login with %s', inviteDetails.ssoProvider)}
++            </Button>
++          ) : (
++            <Button
++              label="create-account"
++              priority="primary"
++              href={this.makeNextUrl('/auth/register/')}
++            >
++              {t('Create a new account')}
++            </Button>
++          )}
++          <Link href={this.makeNextUrl('/auth/login/')}>
++            {t('Login using an existing account')}
++          </Link>
++        </Actions>
++      </React.Fragment>
++    );
++  }
++
++  get warning2fa() {
++    const {inviteDetails} = this.state;
++
++    return (
++      <React.Fragment>
++        <p data-test-id="2fa-warning">
++          {tct(
++            'To continue, [orgSlug] requires all members to configure two-factor authentication.',
++            {orgSlug: inviteDetails.orgSlug}
++          )}
++        </p>
++        <Actions>
++          <Button priority="primary" to="/settings/account/security/">
++            {t('Configure Two-Factor Auth')}
++          </Button>
++        </Actions>
++      </React.Fragment>
++    );
++  }
++
++  get acceptActions() {
++    const {inviteDetails, accepting} = this.state;
++
++    return (
++      <Actions>
++        <Button
++          label="join-organization"
++          priority="primary"
++          disabled={accepting}
++          onClick={this.handleAcceptInvite}
++        >
++          {t('Join the %s organization', inviteDetails.orgSlug)}
++        </Button>
++      </Actions>
++    );
++  }
++
++  renderError() {
++    return (
++      <NarrowLayout>
++        <Alert type="warning">
++          {t('This organization invite link is no longer valid.')}
++        </Alert>
++      </NarrowLayout>
++    );
++  }
++
++  renderBody() {
++    const {inviteDetails, acceptError} = this.state;
++
++    return (
++      <NarrowLayout>
++        <SettingsPageHeader title={t('Accept organization invite')} />
++        {acceptError && (
++          <Alert type="error">
++            {t('Failed to join this organization. Please try again')}
++          </Alert>
++        )}
++        <InviteDescription data-test-id="accept-invite">
++          {tct('[orgSlug] is using Sentry to track and debug errors.', {
++            orgSlug: <strong>{inviteDetails.orgSlug}</strong>,
++          })}
++        </InviteDescription>
++        {inviteDetails.needsAuthentication
++          ? this.authenticationActions
++          : inviteDetails.existingMember
++          ? this.existingMemberAlert
++          : inviteDetails.needs2fa
++          ? this.warning2fa
++          : this.acceptActions}
++      </NarrowLayout>
++    );
++  }
++}
++
++const Actions = styled('div')`
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  margin-bottom: ${space(3)};
++`;
++
++const InviteDescription = styled('p')`
++  font-size: 1.2em;
++`;
++export default AcceptOrganizationInvite;
+diff --git a/src/sentry/static/sentry/app/views/app.jsx b/src/sentry/static/sentry/app/views/app.jsx
+index 7c41840e0c..2fe64e5a2e 100644
+--- a/src/sentry/static/sentry/app/views/app.jsx
++++ b/src/sentry/static/sentry/app/views/app.jsx
+@@ -30,7 +30,7 @@ import withApi from 'app/utils/withApi';
+ import withConfig from 'app/utils/withConfig';
+ 
+ // TODO: Need better way of identifying anonymous pages that don't trigger redirect
+-const ALLOWED_ANON_PAGES = [/^\/share\//, /^\/auth\/login\//];
++const ALLOWED_ANON_PAGES = [/^\/accept\//, /^\/share\//, /^\/auth\/login\//];
+ 
+ function getAlertTypeForProblem(problem) {
+   switch (problem.severity) {
+diff --git a/src/sentry/templates/sentry/accept-organization-invite.html b/src/sentry/templates/sentry/accept-organization-invite.html
+deleted file mode 100644
+index 681adb1d1a..0000000000
+--- a/src/sentry/templates/sentry/accept-organization-invite.html
++++ /dev/null
+@@ -1,68 +0,0 @@
+-{% extends "sentry/bases/modal.html" %}
+-
+-{% load i18n %}
+-
+-{% block title %}{% trans "Organization Invite" %} | {{ block.super }}{% endblock %}
+-
+-{% block page_header_block %}{% endblock %}
+-{% block bodyclass %}{% endblock %}
+-
+-{% block main %}
+-  <section class="body">
+-    <div class="row">
+-      <div class="span7">
+-        <div class="page-header">
+-          <h2>{% trans "Organization Invite" %}</h2>
+-        </div>
+-
+-        <p style="font-size: 1.3em;">
+-          {% blocktrans %}<strong>{{ org_name }}</strong> is using Sentry to track and debug errors.{% endblocktrans %}
+-        </p>
+-
+-        {% if existing_member %}
+-          <div class="alert alert-block">
+-            <p>Your account (<strong>{{ request.user.username }}</strong>) is already a member of this organization.</p>
+-
+-            <p>Did you want to <a href="#" onclick="document.logoutForm.submit()">switch accounts</a>?</p>
+-
+-            <form action="{{ logout_url }}" method="POST" name="logoutForm" style="display:none;">
+-              {% csrf_token %}
+-            </form>
+-          </div>
+-        {% endif %}
+-
+-        <p>{% blocktrans %}You have been invited to join this organization.{% endblocktrans %}</p>
+-
+-        {% if needs_authentication %}
+-          <p>{% trans "To continue, you must either login to your existing account, or create a new one." %}</p>
+-
+-          <fieldset class="form-actions">
+-            <div class="pull-right" style="margin-top: 5px;">
+-              <a href="{{ login_url }}">{% trans "Login as an existing user" %}</a>
+-            </div>
+-            <a href="{{ register_url }}" class="btn btn-primary" data-test-id="create-account">{% trans "Create a new account" %}</a>
+-          </fieldset>
+-
+-        {% elif needs_2fa %}
+-          <p>{% blocktrans %}To continue, <strong>{{ org_name }}</strong> requires all members to setup two-factor authentication.{% endblocktrans %}</p>
+-
+-          <p class="form-actions">
+-            <a href="{% url 'sentry-account-settings-security' %}" class="btn btn-primary" data-test-id="setup-2fa">
+-              {% trans "Setup Two-Factor Authentication" %}
+-            </a>
+-          </p>
+-
+-        {% else %}
+-          <form method="POST">
+-            {% csrf_token %}
+-            <p>
+-              <button type="submit" class="btn btn-primary" data-test-id="join-organization">
+-                {% blocktrans %}Join the {{ org_name }} organization{% endblocktrans %}
+-              </button>
+-            </p>
+-          </form>
+-        {% endif %}
+-      </div>
+-    </div>
+-  </section>
+-{% endblock %}
+diff --git a/src/sentry/web/urls.py b/src/sentry/web/urls.py
+index 88281787de..e77d7085a5 100644
+--- a/src/sentry/web/urls.py
++++ b/src/sentry/web/urls.py
+@@ -7,7 +7,6 @@ from django.views.generic import RedirectView
+ 
+ from sentry.web import api
+ from sentry.web.frontend import accounts, generic
+-from sentry.web.frontend.accept_organization_invite import AcceptOrganizationInviteView
+ from sentry.web.frontend.auth_login import AuthLoginView
+ from sentry.web.frontend.twofactor import TwoFactorAuthView, u2f_appid
+ from sentry.web.frontend.auth_logout import AuthLogoutView
+@@ -372,6 +371,11 @@ urlpatterns += patterns(
+     url(r"^api/[^0]+/", RedirectView.as_view(pattern_name="sentry-api", permanent=False)),
+     url(r"^out/$", OutView.as_view()),
+     url(r"^accept-transfer/$", react_page_view, name="sentry-accept-project-transfer"),
++    url(
++        r"^accept/(?P<member_id>\d+)/(?P<token>\w+)/$",
++        GenericReactPageView.as_view(auth_required=False),
++        name="sentry-accept-invite",
++    ),
+     # User settings use generic_react_page_view, while any view acting on
+     # behalf of an organization should use react_page_view
+     url(
+@@ -563,11 +567,6 @@ urlpatterns += patterns(
+             ]
+         ),
+     ),
+-    url(
+-        r"^accept/(?P<member_id>\d+)/(?P<token>\w+)/$",
+-        AcceptOrganizationInviteView.as_view(),
+-        name="sentry-accept-invite",
+-    ),
+     # Settings - Projects
+     url(
+         r"^(?P<organization_slug>[\w_-]+)/(?P<project_slug>[\w_-]+)/settings/$",
+diff --git a/tests/acceptance/test_accept_organization_invite.py b/tests/acceptance/test_accept_organization_invite.py
+index 581395ab99..94d2c8f366 100644
+--- a/tests/acceptance/test_accept_organization_invite.py
++++ b/tests/acceptance/test_accept_organization_invite.py
+@@ -3,7 +3,7 @@ from __future__ import absolute_import
+ from django.db.models import F
+ 
+ from sentry.testutils import AcceptanceTestCase
+-from sentry.models import Organization
++from sentry.models import Organization, AuthProvider
+ 
+ 
+ class AcceptOrganizationInviteTest(AcceptanceTestCase):
+@@ -23,15 +23,30 @@ class AcceptOrganizationInviteTest(AcceptanceTestCase):
+     def test_invite_simple(self):
+         self.login_as(self.user)
+         self.browser.get(self.member.get_invite_link().split("/", 3)[-1])
++        self.browser.wait_until('[data-test-id="accept-invite"]')
+         self.browser.snapshot(name="accept organization invite")
+-        assert self.browser.element_exists_by_test_id("join-organization")
++        assert self.browser.element_exists('[aria-label="join-organization"]')
+ 
+     def test_invite_not_authenticated(self):
+         self.browser.get(self.member.get_invite_link().split("/", 3)[-1])
+-        assert self.browser.element_exists_by_test_id("create-account")
++        self.browser.wait_until('[data-test-id="accept-invite"]')
++        assert self.browser.element_exists('[aria-label="create-account"]')
+ 
+     def test_invite_2fa_enforced_org(self):
++        self.org.update(flags=F("flags").bitor(Organization.flags.require_2fa))
++        self.browser.get(self.member.get_invite_link().split("/", 3)[-1])
++        self.browser.wait_until('[data-test-id="accept-invite"]')
++        assert not self.browser.element_exists_by_test_id("2fa-warning")
++
+         self.login_as(self.user)
+         self.org.update(flags=F("flags").bitor(Organization.flags.require_2fa))
+         self.browser.get(self.member.get_invite_link().split("/", 3)[-1])
+-        assert self.browser.element_exists_by_test_id("setup-2fa")
++        self.browser.wait_until('[data-test-id="accept-invite"]')
++        assert self.browser.element_exists_by_test_id("2fa-warning")
++
++    def test_invite_sso_org(self):
++        AuthProvider.objects.create(organization=self.org, provider="google")
++        self.browser.get(self.member.get_invite_link().split("/", 3)[-1])
++        self.browser.wait_until('[data-test-id="accept-invite"]')
++        assert self.browser.element_exists_by_test_id("suggests-sso")
++        assert self.browser.element_exists('[aria-label="sso-login"]')
+diff --git a/tests/js/spec/views/acceptOrganizationInvite.spec.jsx b/tests/js/spec/views/acceptOrganizationInvite.spec.jsx
+new file mode 100644
+index 0000000000..452c099850
+--- /dev/null
++++ b/tests/js/spec/views/acceptOrganizationInvite.spec.jsx
+@@ -0,0 +1,137 @@
++import {browserHistory} from 'react-router';
++import {mount} from 'enzyme';
++import {logout} from 'app/actionCreators/account';
++import React from 'react';
++
++import AcceptOrganizationInvite from 'app/views/acceptOrganizationInvite';
++
++jest.mock('app/actionCreators/account');
++
++const addMock = body =>
++  MockApiClient.addMockResponse({
++    url: '/accept-invite/1/abc/',
++    method: 'GET',
++    body,
++  });
++
++describe('AcceptOrganizationInvite', function() {
++  it('can accept invitation', async function() {
++    addMock({
++      orgSlug: 'test-org',
++      needsAuthentication: false,
++      needs2fa: false,
++      needsSso: false,
++      existingMember: false,
++    });
++
++    const wrapper = mount(
++      <AcceptOrganizationInvite params={{memberId: '1', token: 'abc'}} />,
++      TestStubs.routerContext()
++    );
++
++    const joinButton = wrapper.find('Button[label="join-organization"]');
++
++    expect(joinButton.exists()).toBe(true);
++    expect(joinButton.text()).toBe('Join the test-org organization');
++
++    const acceptMock = MockApiClient.addMockResponse({
++      url: '/accept-invite/1/abc/',
++      method: 'POST',
++    });
++
++    joinButton.simulate('click');
++    expect(acceptMock).toHaveBeenCalled();
++    expect(wrapper.find('Button[label="join-organization"]').props().disabled).toBe(true);
++
++    await tick();
++    expect(browserHistory.replace).toHaveBeenCalledWith('/test-org/');
++  });
++
++  it('requires authentication to join', function() {
++    addMock({
++      orgSlug: 'test-org',
++      needsAuthentication: true,
++      needs2fa: false,
++      needsSso: false,
++      existingMember: false,
++    });
++
++    const wrapper = mount(
++      <AcceptOrganizationInvite params={{memberId: '1', token: 'abc'}} />,
++      TestStubs.routerContext()
++    );
++
++    const joinButton = wrapper.find('Button[label="join-organization"]');
++    expect(joinButton.exists()).toBe(false);
++
++    expect(wrapper.find('Button[label="create-account"]').exists()).toBe(true);
++  });
++
++  it('suggests sso authentication to login', function() {
++    addMock({
++      orgSlug: 'test-org',
++      needsAuthentication: true,
++      needs2fa: false,
++      needsSso: true,
++      existingMember: false,
++    });
++
++    const wrapper = mount(
++      <AcceptOrganizationInvite params={{memberId: '1', token: 'abc'}} />,
++      TestStubs.routerContext()
++    );
++
++    const joinButton = wrapper.find('Button[label="join-organization"]');
++    expect(joinButton.exists()).toBe(false);
++
++    expect(wrapper.find('Button[label="create-account"]').exists()).toBe(false);
++
++    expect(wrapper.find('[data-test-id="suggests-sso"]').exists()).toBe(true);
++    expect(wrapper.find('Button[label="sso-login"]').exists()).toBe(true);
++  });
++
++  it('shows a logout button for existing members', async function() {
++    addMock({
++      orgSlug: 'test-org',
++      needsAuthentication: false,
++      needs2fa: false,
++      needsSso: false,
++      existingMember: true,
++    });
++
++    const wrapper = mount(
++      <AcceptOrganizationInvite params={{memberId: '1', token: 'abc'}} />,
++      TestStubs.routerContext()
++    );
++
++    const existingMember = wrapper.find('[data-test-id="existing-member"]');
++    expect(existingMember.exists()).toBe(true);
++
++    const {replace} = window.location;
++    window.location.replace = jest.fn();
++
++    existingMember.find('Link').simulate('click');
++    expect(logout).toHaveBeenCalled();
++    await tick();
++    expect(window.location.replace).toHaveBeenCalled();
++
++    window.location.replace = replace;
++  });
++
++  it('shows 2fa warning', function() {
++    addMock({
++      orgSlug: 'test-org',
++      needsAuthentication: false,
++      needs2fa: true,
++      needsSso: false,
++      existingMember: false,
++    });
++
++    const wrapper = mount(
++      <AcceptOrganizationInvite params={{memberId: '1', token: 'abc'}} />,
++      TestStubs.routerContext()
++    );
++
++    expect(wrapper.find('[data-test-id="2fa-warning"]').exists()).toBe(true);
++  });
++});
+diff --git a/tests/sentry/web/frontend/test_accept_organization_invite.py b/tests/sentry/api/endpoints/test_accept_organization_invite.py
+similarity index 65%
+rename from tests/sentry/web/frontend/test_accept_organization_invite.py
+rename to tests/sentry/api/endpoints/test_accept_organization_invite.py
+index 529f96b442..ee8d7cdc95 100644
+--- a/tests/sentry/web/frontend/test_accept_organization_invite.py
++++ b/tests/sentry/api/endpoints/test_accept_organization_invite.py
+@@ -11,6 +11,7 @@ from sentry.models import (
+     Organization,
+     OrganizationMember,
+     TotpInterface,
++    AuthProvider,
+ )
+ from sentry.testutils import TestCase
+ 
+@@ -23,12 +24,7 @@ class AcceptInviteTest(TestCase):
+ 
+     def _require_2fa_for_organization(self):
+         self.organization.update(flags=F("flags").bitor(Organization.flags.require_2fa))
+-        self.assertTrue(self.organization.flags.require_2fa.is_set)
+-
+-    def _enroll_user_in_2fa(self):
+-        interface = TotpInterface()
+-        interface.enroll(self.user)
+-        self.assertTrue(Authenticator.objects.user_has_2fa(self.user))
++        assert self.organization.flags.require_2fa.is_set
+ 
+     def _assert_2fa_cookie_set(self, response, om):
+         invite_link = om.get_invite_link()
+@@ -37,54 +33,62 @@ class AcceptInviteTest(TestCase):
+     def _assert_2fa_cookie_not_set(self, response):
+         self.assertNotIn("pending-invite", response.client.cookies)
+ 
++    def _enroll_user_in_2fa(self):
++        interface = TotpInterface()
++        interface.enroll(self.user)
++        assert Authenticator.objects.user_has_2fa(self.user)
++
+     def test_invalid_member_id(self):
+-        resp = self.client.get(reverse("sentry-accept-invite", args=[1, 2]))
+-        assert resp.status_code == 302
++        resp = self.client.get(reverse("sentry-api-0-accept-organization-invite", args=[1, 2]))
++        assert resp.status_code == 400
+ 
+     def test_invalid_token(self):
+         om = OrganizationMember.objects.create(
+             email="newuser@example.com", token="abc", organization=self.organization
+         )
+-        resp = self.client.get(reverse("sentry-accept-invite", args=[om.id, 2]))
+-        assert resp.status_code == 302
++        resp = self.client.get(reverse("sentry-api-0-accept-organization-invite", args=[om.id, 2]))
++        assert resp.status_code == 400
+ 
+-    def test_renders_unauthenticated_template(self):
++    def test_needs_authentication(self):
+         om = OrganizationMember.objects.create(
+             email="newuser@example.com", token="abc", organization=self.organization
+         )
+-        resp = self.client.get(reverse("sentry-accept-invite", args=[om.id, om.token]))
++        resp = self.client.get(
++            reverse("sentry-api-0-accept-organization-invite", args=[om.id, om.token])
++        )
+         assert resp.status_code == 200
+-        self.assertTemplateUsed(resp, "sentry/accept-organization-invite.html")
+-        assert resp.context["needs_authentication"]
++        assert resp.data["needsAuthentication"]
+ 
+-    def test_renders_authenticated_template(self):
++    def test_not_needs_authentication(self):
+         self.login_as(self.user)
+ 
+         om = OrganizationMember.objects.create(
+             email="newuser@example.com", token="abc", organization=self.organization
+         )
+-        resp = self.client.get(reverse("sentry-accept-invite", args=[om.id, om.token]))
++        resp = self.client.get(
++            reverse("sentry-api-0-accept-organization-invite", args=[om.id, om.token])
++        )
+         assert resp.status_code == 200
+-        self.assertTemplateUsed(resp, "sentry/accept-organization-invite.html")
+-        assert not resp.context["needs_authentication"]
++        assert not resp.data["needsAuthentication"]
+ 
+-    def test_renders_user_needs_2fa_template(self):
++    def test_user_needs_2fa(self):
+         self._require_2fa_for_organization()
+-        self.assertFalse(Authenticator.objects.user_has_2fa(self.user))
++        assert not Authenticator.objects.user_has_2fa(self.user)
+ 
+         self.login_as(self.user)
+ 
+         om = OrganizationMember.objects.create(
+             email="newuser@example.com", token="abc", organization=self.organization
+         )
+-        resp = self.client.get(reverse("sentry-accept-invite", args=[om.id, om.token]))
++        resp = self.client.get(
++            reverse("sentry-api-0-accept-organization-invite", args=[om.id, om.token])
++        )
+         assert resp.status_code == 200
+-        self.assertTemplateUsed(resp, "sentry/accept-organization-invite.html")
+-        assert resp.context["needs_2fa"]
++        assert resp.data["needs2fa"]
+ 
+         self._assert_2fa_cookie_set(resp, om)
+ 
+-    def test_renders_user_has_2fa_template(self):
++    def test_user_has_2fa(self):
+         self._require_2fa_for_organization()
+         self._enroll_user_in_2fa()
+ 
+@@ -93,21 +97,38 @@ class AcceptInviteTest(TestCase):
+         om = OrganizationMember.objects.create(
+             email="newuser@example.com", token="abc", organization=self.organization
+         )
+-        resp = self.client.get(reverse("sentry-accept-invite", args=[om.id, om.token]))
++        resp = self.client.get(
++            reverse("sentry-api-0-accept-organization-invite", args=[om.id, om.token])
++        )
+         assert resp.status_code == 200
+-        self.assertTemplateUsed(resp, "sentry/accept-organization-invite.html")
+-        assert not resp.context["needs_2fa"]
++        assert not resp.data["needs2fa"]
+ 
+         self._assert_2fa_cookie_not_set(resp)
+ 
++    def test_user_can_use_sso(self):
++        AuthProvider.objects.create(organization=self.organization, provider="google")
++        self.login_as(self.user)
++
++        om = OrganizationMember.objects.create(
++            email="newuser@example.com", token="abc", organization=self.organization
++        )
++        resp = self.client.get(
++            reverse("sentry-api-0-accept-organization-invite", args=[om.id, om.token])
++        )
++        assert resp.status_code == 200
++        assert resp.data["needsSso"]
++        assert resp.data["ssoProvider"] == "Google"
++
+     def test_can_accept_while_authenticated(self):
+         self.login_as(self.user)
+ 
+         om = OrganizationMember.objects.create(
+             email="newuser@example.com", role="member", token="abc", organization=self.organization
+         )
+-        resp = self.client.post(reverse("sentry-accept-invite", args=[om.id, om.token]))
+-        assert resp.status_code == 302
++        resp = self.client.post(
++            reverse("sentry-api-0-accept-organization-invite", args=[om.id, om.token])
++        )
++        assert resp.status_code == 204
+ 
+         om = OrganizationMember.objects.get(id=om.id)
+         assert om.email is None
+@@ -122,14 +143,6 @@ class AcceptInviteTest(TestCase):
+         assert ale.target_user == self.user
+         assert ale.data
+ 
+-    def test_cannot_accept_while_unauthenticated(self):
+-        om = OrganizationMember.objects.create(
+-            email="newuser@example.com", role="member", token="abc", organization=self.organization
+-        )
+-        resp = self.client.post(reverse("sentry-accept-invite", args=[om.id, om.token]))
+-        assert resp.status_code == 200
+-        self.assertTemplateUsed(resp, "sentry/accept-organization-invite.html")
+-
+     def test_cannot_accept_expired(self):
+         self.login_as(self.user)
+ 
+@@ -139,8 +152,10 @@ class AcceptInviteTest(TestCase):
+         OrganizationMember.objects.filter(id=om.id).update(
+             token_expires_at=om.token_expires_at - timedelta(days=31)
+         )
+-        resp = self.client.post(reverse("sentry-accept-invite", args=[om.id, om.token]))
+-        assert resp.status_code == 302
++        resp = self.client.post(
++            reverse("sentry-api-0-accept-organization-invite", args=[om.id, om.token])
++        )
++        assert resp.status_code == 400
+ 
+         om = OrganizationMember.objects.get(id=om.id)
+         assert om.is_pending, "should not have been accepted"
+@@ -152,8 +167,10 @@ class AcceptInviteTest(TestCase):
+         om = OrganizationMember.objects.create(
+             email="newuser@example.com", role="member", token="abc", organization=self.organization
+         )
+-        resp = self.client.post(reverse("sentry-accept-invite", args=[om.id, om.token]))
+-        assert resp.status_code == 302
++        resp = self.client.post(
++            reverse("sentry-api-0-accept-organization-invite", args=[om.id, om.token])
++        )
++        assert resp.status_code == 204
+ 
+         om = OrganizationMember.objects.get(id=om.id)
+         assert om.email is None
+@@ -165,8 +182,10 @@ class AcceptInviteTest(TestCase):
+             token="abcd",
+             organization=self.organization,
+         )
+-        resp = self.client.post(reverse("sentry-accept-invite", args=[om2.id, om2.token]))
+-        assert resp.status_code == 302
++        resp = self.client.post(
++            reverse("sentry-api-0-accept-organization-invite", args=[om2.id, om2.token])
++        )
++        assert resp.status_code == 400
+         assert not OrganizationMember.objects.filter(id=om2.id).exists()
+ 
+     def test_can_accept_when_user_has_2fa(self):
+@@ -179,8 +198,10 @@ class AcceptInviteTest(TestCase):
+             email="newuser@example.com", role="member", token="abc", organization=self.organization
+         )
+ 
+-        resp = self.client.post(reverse("sentry-accept-invite", args=[om.id, om.token]))
+-        assert resp.status_code == 302
++        resp = self.client.post(
++            reverse("sentry-api-0-accept-organization-invite", args=[om.id, om.token])
++        )
++        assert resp.status_code == 204
+ 
+         self._assert_2fa_cookie_not_set(resp)
+ 
+@@ -206,11 +227,10 @@ class AcceptInviteTest(TestCase):
+         om = OrganizationMember.objects.create(
+             email="newuser@example.com", role="member", token="abc", organization=self.organization
+         )
+-        resp = self.client.post(reverse("sentry-accept-invite", args=[om.id, om.token]))
+-        assert resp.status_code == 200
+-        self.assertTemplateUsed(resp, "sentry/accept-organization-invite.html")
+-
+-        self._assert_2fa_cookie_set(resp, om)
++        resp = self.client.post(
++            reverse("sentry-api-0-accept-organization-invite", args=[om.id, om.token])
++        )
++        assert resp.status_code == 400
+ 
+     def test_2fa_cookie_deleted_after_accept(self):
+         self._require_2fa_for_organization()
+@@ -221,14 +241,17 @@ class AcceptInviteTest(TestCase):
+         om = OrganizationMember.objects.create(
+             email="newuser@example.com", role="member", token="abc", organization=self.organization
+         )
+-        resp = self.client.post(reverse("sentry-accept-invite", args=[om.id, om.token]))
++        resp = self.client.get(
++            reverse("sentry-api-0-accept-organization-invite", args=[om.id, om.token])
++        )
+         assert resp.status_code == 200
+-        self.assertTemplateUsed(resp, "sentry/accept-organization-invite.html")
+         self._assert_2fa_cookie_set(resp, om)
+ 
+         self._enroll_user_in_2fa()
+-        resp = self.client.post(reverse("sentry-accept-invite", args=[om.id, om.token]))
+-        assert resp.status_code == 302
++        resp = self.client.post(
++            reverse("sentry-api-0-accept-organization-invite", args=[om.id, om.token])
++        )
++        assert resp.status_code == 204
+ 
+         # value set to empty string on deletion
+-        self.assertFalse(resp.client.cookies["pending-invite"].value)
++        assert not resp.client.cookies["pending-invite"].value
+diff --git a/tests/sentry/api/endpoints/test_user_authenticator_enroll.py b/tests/sentry/api/endpoints/test_user_authenticator_enroll.py
+index 5229f22351..d1c8c6fd84 100644
+--- a/tests/sentry/api/endpoints/test_user_authenticator_enroll.py
++++ b/tests/sentry/api/endpoints/test_user_authenticator_enroll.py
+@@ -187,9 +187,10 @@ class AcceptOrganizationInviteTest(APITestCase):
+             email="newuser@example.com", role="member", token="abc", organization=self.organization
+         )
+ 
+-        resp = self.client.post(reverse("sentry-accept-invite", args=[om.id, om.token]))
++        resp = self.client.get(
++            reverse("sentry-api-0-accept-organization-invite", args=[om.id, om.token])
++        )
+         assert resp.status_code == 200
+-        self.assertTemplateUsed(resp, "sentry/accept-organization-invite.html")
+         self.assert_2fa_cookie_set(resp, om)
+ 
+         return om

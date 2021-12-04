@@ -1,0 +1,546 @@
+commit 75f35398aa78ac610a3d9f1d5989830695970fec
+Author: Dan Fuller <dfuller@sentry.io>
+Date:   Wed Jun 5 14:13:48 2019 -0700
+
+    feat(api): Support user/team mentions in incident comments (SEN-652)
+    
+    This follows the same general pattern from issue comments. Users in comments should be sent like
+    `**@<name>**`, and a list of mentions should be passed in format `user:1234` or `team:1234`. When a
+    user is mentioned they're automatically subscribed to the incident, and receive notifications like
+    other subscribers.
+
+diff --git a/src/sentry/api/endpoints/group_notes.py b/src/sentry/api/endpoints/group_notes.py
+index fa556241e3..52dfb98f52 100644
+--- a/src/sentry/api/endpoints/group_notes.py
++++ b/src/sentry/api/endpoints/group_notes.py
+@@ -8,12 +8,11 @@ from rest_framework.response import Response
+ from sentry.api.base import DocSection
+ from sentry.api.bases.group import GroupEndpoint
+ from sentry.api.serializers import serialize
+-from sentry.api.serializers.rest_framework.group_notes import NoteSerializer, seperate_resolved_actors
+-
+-from sentry.api.fields.actor import Actor
++from sentry.api.serializers.rest_framework.group_notes import NoteSerializer
++from sentry.api.serializers.rest_framework.mentions import extract_user_ids_from_mentions
+ 
+ from sentry.models import (
+-    Activity, GroupSubscription, GroupSubscriptionReason, User
++    Activity, GroupSubscription, GroupSubscriptionReason
+ )
+ 
+ from sentry.utils.functional import extract_lazy_object
+@@ -37,7 +36,13 @@ class GroupNotesEndpoint(GroupEndpoint):
+         )
+ 
+     def post(self, request, group):
+-        serializer = NoteSerializer(data=request.DATA, context={'group': group})
++        serializer = NoteSerializer(
++            data=request.DATA,
++            context={
++                'organization_id': group.organization.id,
++                'projects': [group.project],
++            },
++        )
+ 
+         if not serializer.is_valid():
+             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+@@ -64,31 +69,16 @@ class GroupNotesEndpoint(GroupEndpoint):
+             reason=GroupSubscriptionReason.comment,
+         )
+ 
+-        actors = Actor.resolve_many(mentions)
+-        actor_mentions = seperate_resolved_actors(actors)
+-
+-        for user in actor_mentions.get('users'):
+-            GroupSubscription.objects.subscribe(
+-                group=group,
+-                user=user,
+-                reason=GroupSubscriptionReason.mentioned,
+-            )
+-
+-        mentioned_teams = actor_mentions.get('teams')
+-
+-        mentioned_team_users = list(
+-            User.objects.filter(
+-                sentry_orgmember_set__organization_id=group.project.organization_id,
+-                sentry_orgmember_set__organizationmemberteam__team__in=mentioned_teams,
+-                sentry_orgmember_set__organizationmemberteam__is_active=True,
+-                is_active=True,
+-            ).exclude(id__in={u.id for u in actor_mentions.get('users')})
+-            .values_list('id', flat=True)
++        mentioned_users = extract_user_ids_from_mentions(group.organization.id, mentions)
++        GroupSubscription.objects.bulk_subscribe(
++            group=group,
++            user_ids=mentioned_users['users'],
++            reason=GroupSubscriptionReason.mentioned,
+         )
+ 
+         GroupSubscription.objects.bulk_subscribe(
+             group=group,
+-            user_ids=mentioned_team_users,
++            user_ids=mentioned_users['team_users'],
+             reason=GroupSubscriptionReason.team_mentioned,
+         )
+ 
+diff --git a/src/sentry/api/endpoints/organization_incident_comment_index.py b/src/sentry/api/endpoints/organization_incident_comment_index.py
+index fe989280e7..69ce361a88 100644
+--- a/src/sentry/api/endpoints/organization_incident_comment_index.py
++++ b/src/sentry/api/endpoints/organization_incident_comment_index.py
+@@ -4,26 +4,43 @@ from rest_framework import serializers
+ from rest_framework.response import Response
+ 
+ from sentry.api.bases.incident import IncidentPermission, IncidentEndpoint
++from sentry.api.fields.actor import ActorField
+ from sentry.api.serializers import serialize
++from sentry.api.serializers.rest_framework.list import ListField
++from sentry.api.serializers.rest_framework.mentions import (
++    extract_user_ids_from_mentions,
++    MentionsMixin,
++)
+ from sentry.incidents.logic import create_incident_activity
+ from sentry.incidents.models import IncidentActivityType
+ 
+ 
+-class CommentSerializer(serializers.Serializer):
++class CommentSerializer(serializers.Serializer, MentionsMixin):
+     comment = serializers.CharField(required=True)
++    mentions = ListField(child=ActorField(), required=False)
++    external_id = serializers.CharField(allow_none=True, required=False)
+ 
+ 
+ class OrganizationIncidentCommentIndexEndpoint(IncidentEndpoint):
+     permission_classes = (IncidentPermission, )
+ 
+     def post(self, request, organization, incident):
+-        serializer = CommentSerializer(data=request.DATA)
++        serializer = CommentSerializer(
++            data=request.DATA,
++            context={'projects': incident.projects.all(), 'organization_id': organization.id},
++        )
+         if serializer.is_valid():
++            mentions = extract_user_ids_from_mentions(
++                organization.id,
++                serializer.object.get('mentions', []),
++            )
++            mentioned_user_ids = mentions['users'] | mentions['team_users']
+             activity = create_incident_activity(
+                 incident,
+                 IncidentActivityType.COMMENT,
+                 user=request.user,
+-                comment=serializer.object['comment']
++                comment=serializer.object['comment'],
++                mentioned_user_ids=mentioned_user_ids,
+             )
+             return Response(serialize(activity, request.user), status=201)
+         return Response(serializer.errors, status=400)
+diff --git a/src/sentry/api/serializers/rest_framework/group_notes.py b/src/sentry/api/serializers/rest_framework/group_notes.py
+index 8341385031..454682331a 100644
+--- a/src/sentry/api/serializers/rest_framework/group_notes.py
++++ b/src/sentry/api/serializers/rest_framework/group_notes.py
+@@ -4,56 +4,10 @@ from rest_framework import serializers
+ 
+ from .list import ListField
+ from sentry.api.fields.actor import ActorField
++from sentry.api.serializers.rest_framework.mentions import MentionsMixin
+ 
+-from sentry.models import User, Team
+ 
+-
+-def seperate_actors(actors):
+-    users = [actor for actor in actors if actor.type is User]
+-    teams = [actor for actor in actors if actor.type is Team]
+-
+-    return {'users': users, 'teams': teams}
+-
+-
+-def seperate_resolved_actors(actors):
+-    users = [actor for actor in actors if isinstance(actor, User)]
+-    teams = [actor for actor in actors if isinstance(actor, Team)]
+-
+-    return {'users': users, 'teams': teams}
+-
+-
+-class NoteSerializer(serializers.Serializer):
++class NoteSerializer(serializers.Serializer, MentionsMixin):
+     text = serializers.CharField()
+     mentions = ListField(child=ActorField(), required=False)
+     external_id = serializers.CharField(allow_none=True, required=False)
+-
+-    def validate_mentions(self, attrs, source):
+-        if source in attrs and 'group' in self.context:
+-
+-            mentions = attrs[source]
+-            seperated_actors = seperate_actors(mentions)
+-            # Validate that all mentioned users exist and are on the project.
+-            users = seperated_actors['users']
+-
+-            mentioned_user_ids = {user.id for user in users}
+-
+-            project = self.context['group'].project
+-
+-            user_ids = set(
+-                project.member_set.filter(user_id__in=mentioned_user_ids)
+-                .values_list('user_id', flat=True)
+-            )
+-
+-            if len(mentioned_user_ids) > len(user_ids):
+-                raise serializers.ValidationError('Cannot mention a non team member')
+-
+-            # Validate that all mentioned teams exist and are on the project.
+-            teams = seperated_actors['teams']
+-            mentioned_team_ids = {team.id for team in teams}
+-
+-            if len(mentioned_team_ids) > project.teams.filter(
+-                    id__in={t.id for t in teams}).count():
+-                raise serializers.ValidationError(
+-                    'Mentioned team not found or not associated with project')
+-
+-        return attrs
+diff --git a/src/sentry/api/serializers/rest_framework/mentions.py b/src/sentry/api/serializers/rest_framework/mentions.py
+new file mode 100644
+index 0000000000..1378a052e6
+--- /dev/null
++++ b/src/sentry/api/serializers/rest_framework/mentions.py
+@@ -0,0 +1,82 @@
++from __future__ import absolute_import
++
++from rest_framework import serializers
++
++from sentry.api.fields.actor import Actor
++from sentry.models import (
++    Team,
++    User,
++)
++
++
++def extract_user_ids_from_mentions(organization_id, mentions):
++    """
++    Extracts user ids from a set of mentions. Mentions should be a list of
++    `Actor` instances. Returns a dictionary with 'users' and 'team_users' keys.
++    'users' is the user ids for all explicitly mentioned users, and 'team_users'
++    is all user ids from explicitly mentioned teams, excluding any already
++    mentioned users.
++    """
++    actors = Actor.resolve_many(mentions)
++    actor_mentions = seperate_resolved_actors(actors)
++
++    mentioned_team_users = list(
++        User.objects.get_from_teams(
++            organization_id,
++            actor_mentions['teams'],
++        ).exclude(id__in={u.id for u in actor_mentions['users']}).values_list(
++            'id',
++            flat=True,
++        )
++    )
++
++    return {
++        'users': set([user.id for user in actor_mentions['users']]),
++        'team_users': set(mentioned_team_users),
++    }
++
++
++def seperate_actors(actors):
++    users = [actor for actor in actors if actor.type is User]
++    teams = [actor for actor in actors if actor.type is Team]
++
++    return {'users': users, 'teams': teams}
++
++
++def seperate_resolved_actors(actors):
++    users = [actor for actor in actors if isinstance(actor, User)]
++    teams = [actor for actor in actors if isinstance(actor, Team)]
++
++    return {'users': users, 'teams': teams}
++
++
++class MentionsMixin(object):
++    def validate_mentions(self, attrs, source):
++        if source in attrs and 'projects' in self.context:
++
++            mentions = attrs[source]
++            seperated_actors = seperate_actors(mentions)
++            # Validate that all mentioned users exist and are on the project.
++            users = seperated_actors['users']
++
++            mentioned_user_ids = {user.id for user in users}
++
++            projects = self.context['projects']
++            organization_id = self.context['organization_id']
++            users = User.objects.get_from_projects(organization_id, projects)
++            user_ids = users.filter(id__in=mentioned_user_ids).values_list('id', flat=True)
++
++            if len(mentioned_user_ids) > len(user_ids):
++                raise serializers.ValidationError('Cannot mention a non team member')
++
++            # Validate that all mentioned teams exist and are on the project.
++            teams = seperated_actors['teams']
++            mentioned_team_ids = {team.id for team in teams}
++            if len(mentioned_team_ids) > Team.objects.filter(
++                id__in=mentioned_team_ids,
++                projectteam__project__in=projects,
++            ).count():
++                raise serializers.ValidationError(
++                    'Mentioned team not found or not associated with project')
++
++        return attrs
+diff --git a/src/sentry/incidents/logic.py b/src/sentry/incidents/logic.py
+index d13c7471f8..8e483d8e17 100644
+--- a/src/sentry/incidents/logic.py
++++ b/src/sentry/incidents/logic.py
+@@ -168,6 +168,7 @@ def create_incident_activity(
+     previous_value=None,
+     comment=None,
+     event_stats_snapshot=None,
++    mentioned_user_ids=None,
+ ):
+     if activity_type == IncidentActivityType.COMMENT and user:
+         subscribe_to_incident(incident, user)
+@@ -182,6 +183,12 @@ def create_incident_activity(
+         comment=comment,
+         event_stats_snapshot=event_stats_snapshot,
+     )
++
++    if mentioned_user_ids:
++        IncidentSubscription.objects.bulk_create([
++            IncidentSubscription(incident=incident, user_id=mentioned_user_id)
++            for mentioned_user_id in mentioned_user_ids
++        ])
+     send_subscriber_notifications.apply_async(
+         kwargs={'activity_id': activity.id},
+         countdown=10,
+diff --git a/src/sentry/models/user.py b/src/sentry/models/user.py
+index 88dfbaff07..19fc990546 100644
+--- a/src/sentry/models/user.py
++++ b/src/sentry/models/user.py
+@@ -25,7 +25,24 @@ audit_logger = logging.getLogger('sentry.audit.user')
+ 
+ 
+ class UserManager(BaseManager, UserManager):
+-    pass
++    def get_from_teams(self, organization_id, teams):
++        return User.objects.filter(
++            sentry_orgmember_set__organization_id=organization_id,
++            sentry_orgmember_set__organizationmemberteam__team__in=teams,
++            sentry_orgmember_set__organizationmemberteam__is_active=True,
++            is_active=True,
++        )
++
++    def get_from_projects(self, organization_id, projects):
++        """
++        Returns users associated with a project based on their teams.
++        """
++        return User.objects.filter(
++            sentry_orgmember_set__organization_id=organization_id,
++            sentry_orgmember_set__organizationmemberteam__team__projectteam__project__in=projects,
++            sentry_orgmember_set__organizationmemberteam__is_active=True,
++            is_active=True,
++        )
+ 
+ 
+ class User(BaseModel, AbstractBaseUser):
+diff --git a/tests/sentry/api/endpoints/test_organization_incident_comment_index.py b/tests/sentry/api/endpoints/test_organization_incident_comment_index.py
+index 65268953b4..4504b77663 100644
+--- a/tests/sentry/api/endpoints/test_organization_incident_comment_index.py
++++ b/tests/sentry/api/endpoints/test_organization_incident_comment_index.py
+@@ -6,6 +6,7 @@ from sentry.api.serializers import serialize
+ from sentry.incidents.models import (
+     IncidentActivity,
+     IncidentActivityType,
++    IncidentSubscription,
+ )
+ from sentry.testutils import APITestCase
+ 
+@@ -49,6 +50,41 @@ class OrganizationIncidentCommentCreateEndpointTest(APITestCase):
+         assert activity.comment == comment
+         assert resp.data == serialize([activity], self.user)[0]
+ 
++    def test_mentions(self):
++        self.create_member(
++            user=self.user,
++            organization=self.organization,
++            role='owner',
++            teams=[self.team],
++        )
++        mentioned_member = self.create_user()
++        self.create_member(
++            user=mentioned_member,
++            organization=self.organization,
++            role='owner',
++            teams=[self.team],
++        )
++        self.login_as(self.user)
++        comment = 'hello **@%s**' % mentioned_member.username
++        incident = self.create_incident()
++        with self.feature('organizations:incidents'):
++            resp = self.get_valid_response(
++                self.organization.slug,
++                incident.identifier,
++                comment=comment,
++                mentions=['user:%s' % mentioned_member.id],
++                status_code=201,
++            )
++        activity = IncidentActivity.objects.get(id=resp.data['id'])
++        assert activity.type == IncidentActivityType.COMMENT.value
++        assert activity.user == self.user
++        assert activity.comment == comment
++        assert resp.data == serialize([activity], self.user)[0]
++        assert IncidentSubscription.objects.filter(
++            user=mentioned_member,
++            incident=incident,
++        ).exists()
++
+     def test_access(self):
+         other_user = self.create_user()
+         self.login_as(other_user)
+diff --git a/tests/sentry/api/serializers/rest_framework/test_mentions.py b/tests/sentry/api/serializers/rest_framework/test_mentions.py
+new file mode 100644
+index 0000000000..e1a4bf6d2c
+--- /dev/null
++++ b/tests/sentry/api/serializers/rest_framework/test_mentions.py
+@@ -0,0 +1,52 @@
++from __future__ import absolute_import
++
++from sentry.api.fields.actor import Actor
++from sentry.api.serializers.rest_framework.mentions import extract_user_ids_from_mentions
++from sentry.models import (
++    Team,
++    User,
++)
++from sentry.testutils import TestCase
++
++
++class ExtractUserIdsFromMentionsTest(TestCase):
++    def test_users(self):
++        actor = Actor(self.user.id, User)
++        result = extract_user_ids_from_mentions(
++            self.organization.id,
++            [actor]
++        )
++        assert result['users'] == set([self.user.id])
++        assert result['team_users'] == set()
++
++        other_user = self.create_user()
++        result = extract_user_ids_from_mentions(
++            self.organization.id,
++            [actor, Actor(other_user.id, User)]
++        )
++        assert result['users'] == set([self.user.id, other_user.id])
++        assert result['team_users'] == set()
++
++    def test_teams(self):
++        member_user = self.create_user()
++        self.create_member(
++            user=member_user,
++            organization=self.organization,
++            role='member',
++            teams=[self.team],
++        )
++        actor = Actor(self.team.id, Team)
++        result = extract_user_ids_from_mentions(
++            self.organization.id,
++            [actor]
++        )
++        assert result['users'] == set()
++        assert result['team_users'] == set([self.user.id, member_user.id])
++
++        # Explicitly mentioned users shouldn't be included in team_users
++        result = extract_user_ids_from_mentions(
++            self.organization.id,
++            [Actor(member_user.id, User), actor]
++        )
++        assert result['users'] == set([member_user.id])
++        assert result['team_users'] == set([self.user.id])
+diff --git a/tests/sentry/incidents/test_logic.py b/tests/sentry/incidents/test_logic.py
+index 2a4ed8a436..0ee365c979 100644
+--- a/tests/sentry/incidents/test_logic.py
++++ b/tests/sentry/incidents/test_logic.py
+@@ -333,6 +333,33 @@ class CreateIncidentActivityTest(TestCase, BaseIncidentsTest):
+         assert activity.previous_value is None
+         self.assert_notifications_sent(activity)
+ 
++    def test_mentioned_user_ids(self):
++        incident = self.create_incident()
++        mentioned_member = self.create_user()
++        comment = 'hello **@%s**' % mentioned_member.username
++        with self.assertChanges(
++            lambda: IncidentSubscription.objects.filter(
++                incident=incident,
++                user=mentioned_member,
++            ).exists(),
++            before=False,
++            after=True,
++        ):
++            activity = create_incident_activity(
++                incident,
++                IncidentActivityType.COMMENT,
++                user=self.user,
++                comment=comment,
++                mentioned_user_ids=[mentioned_member.id],
++            )
++        assert activity.incident == incident
++        assert activity.type == IncidentActivityType.COMMENT.value
++        assert activity.user == self.user
++        assert activity.comment == comment
++        assert activity.value is None
++        assert activity.previous_value is None
++        self.assert_notifications_sent(activity)
++
+ 
+ @freeze_time()
+ class CreateInitialEventStatsSnapshotTest(TestCase, BaseIncidentsTest):
+diff --git a/tests/sentry/models/test_user.py b/tests/sentry/models/test_user.py
+index 528442d6ab..3a3c7584a5 100644
+--- a/tests/sentry/models/test_user.py
++++ b/tests/sentry/models/test_user.py
+@@ -92,3 +92,50 @@ class UserMergeToTest(TestCase):
+ 
+         assert member.role == 'owner'
+         assert list(member.teams.all().order_by('pk')) == [team_1, team_2, team_3]
++
++
++class GetUsersFromTeamsTest(TestCase):
++    def test(self):
++        user = self.create_user()
++        org = self.create_organization(name='foo', owner=user)
++        team = self.create_team(organization=org)
++        org2 = self.create_organization(name='bar', owner=None)
++        team2 = self.create_team(organization=org2)
++        user2 = self.create_user('foo@example.com')
++        self.create_member(user=user2, organization=org, role='admin', teams=[team])
++
++        assert list(User.objects.get_from_teams(org, [team])) == [user2]
++        user3 = self.create_user('bar@example.com')
++        self.create_member(
++            user=user3,
++            organization=org,
++            role='admin',
++            teams=[team],
++        )
++        assert set(list(User.objects.get_from_teams(org, [team]))) == set([user2, user3])
++        assert list(User.objects.get_from_teams(org2, [team])) == []
++        assert list(User.objects.get_from_teams(org2, [team2])) == []
++        self.create_member(user=user, organization=org2, role='member', teams=[team2])
++        assert list(User.objects.get_from_teams(org2, [team2])) == [user]
++
++
++class GetUsersFromProjectsTest(TestCase):
++    def test(self):
++        user = self.create_user()
++        org = self.create_organization(name='foo', owner=user)
++        team = self.create_team(organization=org)
++        project = self.create_project(organization=org, teams=[team])
++        org2 = self.create_organization(name='bar', owner=None)
++        team2 = self.create_team(organization=org2)
++        user2 = self.create_user('foo@example.com')
++        project2 = self.create_project(organization=org2, teams=[team2])
++        self.create_member(user=user2, organization=org, role='admin', teams=[team])
++
++        assert list(User.objects.get_from_projects(org, [project])) == [user2]
++        user3 = self.create_user('bar@example.com')
++        self.create_member(user=user3, organization=org, role='admin', teams=[team])
++        assert set(list(User.objects.get_from_projects(org, [project]))) == set([user2, user3])
++        assert list(User.objects.get_from_projects(org2, [project])) == []
++        assert list(User.objects.get_from_projects(org2, [project2])) == []
++        self.create_member(user=user, organization=org2, role='member', teams=[team2])
++        assert list(User.objects.get_from_projects(org2, [project2])) == [user]

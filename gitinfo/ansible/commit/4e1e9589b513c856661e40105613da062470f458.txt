@@ -1,0 +1,842 @@
+commit 4e1e9589b513c856661e40105613da062470f458
+Author: Will Thames <will@thames.id.au>
+Date:   Tue Nov 13 22:50:15 2018 +1000
+
+    Add wait functionality to k8s module (#47493)
+    
+    Provide wait and wait_timeout parameters and wait for certain
+    resource kinds to become available.
+
+diff --git a/changelogs/fragments/k8s_wait.yml b/changelogs/fragments/k8s_wait.yml
+new file mode 100644
+index 0000000000..c9f4111a97
+--- /dev/null
++++ b/changelogs/fragments/k8s_wait.yml
+@@ -0,0 +1,2 @@
++minor_changes:
++  - k8s - add ability to wait for some kinds of Kubernetes resources to be in the desired state
+diff --git a/lib/ansible/module_utils/k8s/raw.py b/lib/ansible/module_utils/k8s/raw.py
+index 7cad777bea..a32e4b6121 100644
+--- a/lib/ansible/module_utils/k8s/raw.py
++++ b/lib/ansible/module_utils/k8s/raw.py
+@@ -19,6 +19,10 @@
+ from __future__ import absolute_import, division, print_function
+ 
+ import copy
++from datetime import datetime
++import time
++import sys
++
+ from ansible.module_utils.k8s.common import AUTH_ARG_SPEC, COMMON_ARG_SPEC
+ from ansible.module_utils.six import string_types
+ from ansible.module_utils.k8s.common import KubernetesAnsibleModule
+@@ -40,6 +44,8 @@ class KubernetesRawModule(KubernetesAnsibleModule):
+         argument_spec = copy.deepcopy(COMMON_ARG_SPEC)
+         argument_spec.update(copy.deepcopy(AUTH_ARG_SPEC))
+         argument_spec['merge_type'] = dict(type='list', choices=['json', 'merge', 'strategic-merge'])
++        argument_spec['wait'] = dict(type='bool', default=False)
++        argument_spec['wait_timeout'] = dict(type='int', default=120)
+         return argument_spec
+ 
+     def __init__(self, *args, **kwargs):
+@@ -127,6 +133,8 @@ class KubernetesRawModule(KubernetesAnsibleModule):
+         name = definition['metadata'].get('name')
+         namespace = definition['metadata'].get('namespace')
+         existing = None
++        wait = self.params['wait']
++        wait_timeout = self.params['wait_timeout']
+ 
+         self.remove_aliases()
+ 
+@@ -139,7 +147,12 @@ class KubernetesRawModule(KubernetesAnsibleModule):
+         try:
+             existing = resource.get(name=name, namespace=namespace)
+         except NotFoundError:
+-            pass
++            # Remove traceback so that it doesn't show up in later failures
++            try:
++                sys.exc_clear()
++            except AttributeError:
++                # no sys.exc_clear on python3
++                pass
+         except ForbiddenError as exc:
+             if definition['kind'] in ['Project', 'ProjectRequest'] and state != 'absent':
+                 return self.create_project_request(definition)
+@@ -164,6 +177,11 @@ class KubernetesRawModule(KubernetesAnsibleModule):
+                         self.fail_json(msg="Failed to delete object: {0}".format(exc.body),
+                                        error=exc.status, status=exc.status, reason=exc.reason)
+                 result['changed'] = True
++                if wait:
++                    success, resource, duration = self.wait(resource, definition, wait_timeout, 'absent')
++                    result['duration'] = duration
++                    if not success:
++                        self.fail_json(msg="Resource deletion timed out", **result)
+                 return result
+         else:
+             if not existing:
+@@ -181,10 +199,15 @@ class KubernetesRawModule(KubernetesAnsibleModule):
+                         return result
+                     except DynamicApiError as exc:
+                         self.fail_json(msg="Failed to create object: {0}".format(exc.body),
+-                                       error=exc.status, status=exc.status, reason=exc.reason)
++                                       error=exc.status, status=exc.status, reason=exc.reason, definition=definition)
++                success = True
+                 result['result'] = k8s_obj
++                if wait:
++                    success, result['result'], result['duration'] = self.wait(resource, definition, wait_timeout)
+                 result['changed'] = True
+                 result['method'] = 'create'
++                if not success:
++                    self.fail_json(msg="Resource creation timed out", **result)
+                 return result
+ 
+             match = False
+@@ -199,11 +222,16 @@ class KubernetesRawModule(KubernetesAnsibleModule):
+                     except DynamicApiError as exc:
+                         self.fail_json(msg="Failed to replace object: {0}".format(exc.body),
+                                        error=exc.status, status=exc.status, reason=exc.reason)
+-                match, diffs = self.diff_objects(existing.to_dict(), k8s_obj)
++                success = True
+                 result['result'] = k8s_obj
++                if wait:
++                    success, result['result'], result['duration'] = self.wait(resource, definition, wait_timeout)
++                match, diffs = self.diff_objects(existing.to_dict(), result['result'].to_dict())
+                 result['changed'] = not match
+                 result['method'] = 'replace'
+                 result['diff'] = diffs
++                if not success:
++                    self.fail_json(msg="Resource replacement timed out", **result)
+                 return result
+ 
+             # Differences exist between the existing obj and requested params
+@@ -226,11 +254,18 @@ class KubernetesRawModule(KubernetesAnsibleModule):
+                 if error:
+                     self.fail_json(**error)
+ 
+-            match, diffs = self.diff_objects(existing.to_dict(), k8s_obj)
++            success = True
++            result['result'] = k8s_obj
++            if wait:
++                success, result['result'], result['duration'] = self.wait(resource, definition, wait_timeout)
++            match, diffs = self.diff_objects(existing.to_dict(), result['result'])
+             result['result'] = k8s_obj
+             result['changed'] = not match
+             result['method'] = 'patch'
+             result['diff'] = diffs
++
++            if not success:
++                self.fail_json(msg="Resource update timed out", **result)
+             return result
+ 
+     def patch_resource(self, resource, definition, existing, name, namespace, merge_type=None):
+@@ -261,3 +296,56 @@ class KubernetesRawModule(KubernetesAnsibleModule):
+         result['changed'] = True
+         result['method'] = 'create'
+         return result
++
++    def _wait_for(self, resource, name, namespace, predicate, timeout, state):
++        start = datetime.now()
++
++        def _wait_for_elapsed():
++            return (datetime.now() - start).seconds
++
++        response = None
++        while _wait_for_elapsed() < timeout:
++            try:
++                response = resource.get(name=name, namespace=namespace)
++                if predicate(response):
++                    return True, response.to_dict(), _wait_for_elapsed()
++                time.sleep(timeout // 20)
++            except NotFoundError:
++                if state == 'absent':
++                    return True, response.to_dict(), _wait_for_elapsed()
++        if response:
++            response = response.to_dict()
++        return False, response, _wait_for_elapsed()
++
++    def wait(self, resource, definition, timeout, state='present'):
++
++        def _deployment_ready(deployment):
++            # FIXME: frustratingly bool(deployment.status) is True even if status is empty
++            # Furthermore deployment.status.availableReplicas == deployment.status.replicas == None if status is empty
++            return (deployment.status and deployment.status.replicas is not None and
++                    deployment.status.availableReplicas == deployment.status.replicas and
++                    deployment.status.observedGeneration == deployment.metadata.generation)
++
++        def _pod_ready(pod):
++            return (pod.status and pod.status.containerStatuses is not None and
++                    all([container.ready for container in pod.status.containerStatuses]))
++
++        def _daemonset_ready(daemonset):
++            return (daemonset.status and daemonset.status.desiredNumberScheduled is not None and
++                    daemonset.status.numberReady == daemonset.status.desiredNumberScheduled and
++                    daemonset.status.observedGeneration == daemonset.metadata.generation)
++
++        def _resource_absent(resource):
++            return not resource
++
++        waiter = dict(
++            Deployment=_deployment_ready,
++            DaemonSet=_daemonset_ready,
++            Pod=_pod_ready
++        )
++        kind = definition['kind']
++        if state == 'present':
++            predicate = waiter.get(kind, lambda x: True)
++        else:
++            predicate = _resource_absent
++        return self._wait_for(resource, definition['metadata']['name'], definition['metadata']['namespace'], predicate, timeout, state)
+diff --git a/lib/ansible/modules/clustering/k8s/k8s.py b/lib/ansible/modules/clustering/k8s/k8s.py
+index 6c4616a27f..3fd2d3d316 100644
+--- a/lib/ansible/modules/clustering/k8s/k8s.py
++++ b/lib/ansible/modules/clustering/k8s/k8s.py
+@@ -59,6 +59,20 @@ options:
+     - strategic-merge
+     type: list
+     version_added: "2.7"
++  wait:
++    description:
++    - Whether to wait for certain resource kinds to end up in the desired state. By default the module exits once Kubernetes has
++      received the request
++    - Implemented for C(state=present) for C(Deployment), C(DaemonSet) and C(Pod), and for C(state=absent) for all resource kinds.
++    - For resource kinds without an implementation, C(wait) returns immediately.
++    default: no
++    type: bool
++    version_added: "2.8"
++  wait_timeout:
++    description:
++    - How long in seconds to wait for the resource to end up in the desired state. Ignored if C(wait) is not set.
++    default: 120
++    version_added: "2.8"
+ 
+ requirements:
+   - "python >= 2.7"
+@@ -160,6 +174,11 @@ result:
+        description: Returned only when multiple yaml documents are passed to src or resource_definition
+        returned: when resource_definition or src contains list of objects
+        type: list
++     duration:
++       description: elapsed time of task in seconds
++       returned: when C(wait) is true
++       type: int
++       sample: 48
+ '''
+ 
+ from ansible.module_utils.k8s.raw import KubernetesRawModule
+diff --git a/test/integration/targets/k8s/README.md b/test/integration/targets/k8s/README.md
+new file mode 100644
+index 0000000000..7cb72b16e2
+--- /dev/null
++++ b/test/integration/targets/k8s/README.md
+@@ -0,0 +1,23 @@
++Wait tests
++----------
++
++wait tests require at least one node, and don't work on the normal k8s
++openshift-origin container as provided by ansible-test --docker -v k8s
++
++minikube, Kubernetes from Docker or any other Kubernetes service will
++suffice.
++
++If kubectl is already using the right config file and context, you can
++just do
++
++```
++cd test/integration/targets/k8s
++./runme.sh -vv
++```
++
++otherwise set one or both of `K8S_AUTH_KUBECONFIG` and `K8S_AUTH_CONTEXT`
++and use the same command
++
++
++
++
+diff --git a/test/integration/targets/k8s/playbooks/roles/k8s/defaults/main.yml b/test/integration/targets/k8s/playbooks/roles/k8s/defaults/main.yml
+index 13e29e6892..dcb712be0b 100644
+--- a/test/integration/targets/k8s/playbooks/roles/k8s/defaults/main.yml
++++ b/test/integration/targets/k8s/playbooks/roles/k8s/defaults/main.yml
+@@ -1 +1,32 @@
+ recreate_crd_default_merge_expectation: recreate_crd is not failed
++
++wait_pod_metadata:
++  labels:
++    app: "{{ wait_pod_name }}"
++
++wait_pod_spec:
++  containers:
++    - image: "{{ wait_pod_image }}"
++      imagePullPolicy: Always
++      name: "{{ wait_pod_name }}"
++      command: "{{ wait_pod_command }}"
++      readinessProbe:
++        initialDelaySeconds: 15
++        exec:
++          command:
++            - /bin/true
++      resources:
++        limits:
++          cpu: "100m"
++          memory: "100Mi"
++      ports: "{{ wait_pod_ports }}"
++
++wait_pod_command: []
++
++wait_pod_ports: []
++
++wait_pod_template:
++  metadata: "{{ wait_pod_metadata }}"
++  spec: "{{ wait_pod_spec }}"
++
++k8s_openshift: yes
+diff --git a/test/integration/targets/k8s/playbooks/roles/k8s/tasks/crd.yml b/test/integration/targets/k8s/playbooks/roles/k8s/tasks/crd.yml
+index 57dfb23ce5..d08beb2349 100644
+--- a/test/integration/targets/k8s/playbooks/roles/k8s/tasks/crd.yml
++++ b/test/integration/targets/k8s/playbooks/roles/k8s/tasks/crd.yml
+@@ -7,7 +7,7 @@
+ - block:
+     - name: Create a namespace
+       k8s:
+-        name: testing
++        name: crd
+         kind: namespace
+ 
+     - name: install custom resource definitions
+@@ -17,13 +17,13 @@
+     - name: create custom resource definition
+       k8s:
+         definition: "{{ lookup('file', role_path + '/files/crd-resource.yml') }}"
+-        namespace: testing
++        namespace: crd
+       register: create_crd
+ 
+     - name: patch custom resource definition
+       k8s:
+         definition: "{{ lookup('file', role_path + '/files/crd-resource.yml') }}"
+-        namespace: testing
++        namespace: crd
+       register: recreate_crd
+       ignore_errors: yes
+ 
+@@ -37,7 +37,7 @@
+           k8s:
+             definition: "{{ lookup('file', role_path + '/files/crd-resource.yml') }}"
+             merge_type: merge
+-            namespace: testing
++            namespace: crd
+           register: recreate_crd_with_merge
+ 
+         - name: recreate custom resource definition with merge_type list
+@@ -46,7 +46,7 @@
+             merge_type:
+               - strategic-merge
+               - merge
+-            namespace: testing
++            namespace: crd
+           register: recreate_crd_with_merge_list
+       when: recreate_crd is successful
+ 
+@@ -54,23 +54,13 @@
+     - name: remove crd
+       k8s:
+         definition: "{{ lookup('file', role_path + '/files/crd-resource.yml') }}"
+-        namespace: testing
++        namespace: crd
+         state: absent
+ 
+   always:
+-    - name: remove crd
+-      k8s:
+-        definition: "{{ lookup('file', role_path + '/files/crd-resource.yml') }}"
+-        namespace: testing
+-        state: absent
+-      ignore_errors: yes
+-
+-    - name: Delete all namespaces
++    - name: remove crd namespace
+       k8s:
++        kind: Namespace
++        name: crd
+         state: absent
+-        definition:
+-          - kind: Namespace
+-            apiVersion: v1
+-            metadata:
+-              name: testing1
+       ignore_errors: yes
+diff --git a/test/integration/targets/k8s/playbooks/roles/k8s/tasks/main.yml b/test/integration/targets/k8s/playbooks/roles/k8s/tasks/main.yml
+index 13ef50fdc4..1c7253d69a 100644
+--- a/test/integration/targets/k8s/playbooks/roles/k8s/tasks/main.yml
++++ b/test/integration/targets/k8s/playbooks/roles/k8s/tasks/main.yml
+@@ -4,6 +4,8 @@
+ 
+ # Kubernetes resources
+ 
++- include_tasks: waiter.yml
++
+ - block:
+     - name: Create a namespace
+       k8s:
+@@ -143,66 +145,11 @@
+       assert:
+         that: not output.changed
+ 
+-    # OpenShift Resources
+-    - name: Create a project
+-      k8s:
+-        name: testing
+-        kind: project
+-        api_version: v1
+-      register: output
++    - debug:
++        var: k8s_openshift
+ 
+-    - name: show output
+-      debug:
+-        var: output
+-
+-    - name: Create deployment config
+-      k8s:
+-        state: present
+-        inline: &dc
+-          apiVersion: v1
+-          kind: DeploymentConfig
+-          metadata:
+-            name: elastic
+-            labels:
+-              app: galaxy
+-              service: elastic
+-            namespace: testing
+-          spec:
+-            template:
+-              metadata:
+-                labels:
+-                  app: galaxy
+-                  service: elastic
+-              spec:
+-                containers:
+-                  - name: elastic
+-                    volumeMounts:
+-                    - mountPath: /usr/share/elasticsearch/data
+-                      name: elastic-volume
+-                    command: ['elasticsearch']
+-                    image: 'ansible/galaxy-elasticsearch:2.4.6'
+-                volumes:
+-                - name: elastic-volume
+-                  persistentVolumeClaim:
+-                    claimName: elastic-volume
+-            replicas: 1
+-            strategy:
+-              type: Rolling
+-      register: output
+-
+-    - name: Show output
+-      debug:
+-        var: output
+-
+-    - name: Create deployment config again
+-      k8s:
+-        state: present
+-        inline: *dc
+-      register: output
+-
+-    - name: DC creation should be idempotent
+-      assert:
+-        that: not output.changed
++    - include: openshift.yml
++      when: k8s_openshift | bool
+ 
+     ### Type tests
+     - name: Create a namespace from a string
+@@ -336,12 +283,18 @@
+         that: not item.resources or item.resources[0].status.phase == "Terminating"
+       loop: "{{ k8s_facts.results }}"
+ 
++    - include_tasks: crd.yml
++
+   always:
+ 
+     - name: Delete all namespaces
+       k8s:
+         state: absent
+         definition:
++          - kind: Namespace
++            apiVersion: v1
++            metadata:
++              name: testing
+           - kind: Namespace
+             apiVersion: v1
+             metadata:
+@@ -363,5 +316,3 @@
+             metadata:
+               name: testing5
+       ignore_errors: yes
+-
+-- include_tasks: crd.yml
+diff --git a/test/integration/targets/k8s/playbooks/roles/k8s/tasks/openshift.yml b/test/integration/targets/k8s/playbooks/roles/k8s/tasks/openshift.yml
+new file mode 100644
+index 0000000000..cb688db150
+--- /dev/null
++++ b/test/integration/targets/k8s/playbooks/roles/k8s/tasks/openshift.yml
+@@ -0,0 +1,60 @@
++# OpenShift Resources
++- name: Create a project
++  k8s:
++    name: testing
++    kind: project
++    api_version: v1
++  register: output
++
++- name: show output
++  debug:
++    var: output
++
++- name: Create deployment config
++  k8s:
++    state: present
++    inline: &dc
++      apiVersion: v1
++      kind: DeploymentConfig
++      metadata:
++        name: elastic
++        labels:
++          app: galaxy
++          service: elastic
++        namespace: testing
++      spec:
++        template:
++          metadata:
++            labels:
++              app: galaxy
++              service: elastic
++          spec:
++            containers:
++              - name: elastic
++                volumeMounts:
++                - mountPath: /usr/share/elasticsearch/data
++                  name: elastic-volume
++                command: ['elasticsearch']
++                image: 'ansible/galaxy-elasticsearch:2.4.6'
++            volumes:
++            - name: elastic-volume
++              persistentVolumeClaim:
++                claimName: elastic-volume
++        replicas: 1
++        strategy:
++          type: Rolling
++  register: output
++
++- name: Show output
++  debug:
++    var: output
++
++- name: Create deployment config again
++  k8s:
++    state: present
++    inline: *dc
++  register: output
++
++- name: DC creation should be idempotent
++  assert:
++    that: not output.changed
+diff --git a/test/integration/targets/k8s/playbooks/roles/k8s/tasks/waiter.yml b/test/integration/targets/k8s/playbooks/roles/k8s/tasks/waiter.yml
+new file mode 100644
+index 0000000000..ecc8223614
+--- /dev/null
++++ b/test/integration/targets/k8s/playbooks/roles/k8s/tasks/waiter.yml
+@@ -0,0 +1,295 @@
++- name: ensure that there are actually some nodes
++  k8s_facts:
++    kind: Node
++  register: nodes
++
++- block:
++    - set_fact:
++        wait_namespace: wait
++    - name: ensure namespace exists
++      k8s:
++        definition:
++          apiVersion: v1
++          kind: Namespace
++          metadata:
++            name: "{{ wait_namespace }}"
++
++    - name: add a simple pod
++      k8s:
++        definition:
++          apiVersion: v1
++          kind: Pod
++          metadata:
++            name: "{{ wait_pod_name }}"
++            namespace: "{{ wait_namespace }}"
++          spec: "{{ wait_pod_spec }}"
++        wait: yes
++      vars:
++        wait_pod_name: wait-pod
++        wait_pod_image: alpine:3.8
++        wait_pod_command:
++          - sleep
++          - "10000"
++      register: wait_pod
++      ignore_errors: yes
++
++    - name: assert that pod creation succeeded
++      assert:
++        that:
++          - wait_pod is successful
++
++    - name: add a daemonset
++      k8s:
++        definition:
++          apiVersion: extensions/v1beta1
++          kind: DaemonSet
++          metadata:
++            name: wait-daemonset
++            namespace: "{{ wait_namespace }}"
++          spec:
++            selector:
++              matchLabels:
++                app: "{{ wait_pod_name }}"
++            template: "{{ wait_pod_template }}"
++        wait: yes
++        wait_timeout: 180
++      vars:
++        wait_pod_name: wait-ds
++        wait_pod_image: gcr.io/kuar-demo/kuard-amd64:1
++      register: ds
++
++    - name: check that daemonset wait worked
++      assert:
++        that:
++          - ds.result.status.currentNumberScheduled == ds.result.status.desiredNumberScheduled
++
++    - name: update a daemonset
++      k8s:
++        definition:
++          apiVersion: extensions/v1beta1
++          kind: DaemonSet
++          metadata:
++            name: wait-daemonset
++            namespace: "{{ wait_namespace }}"
++          spec:
++            selector:
++              matchLabels:
++                app: "{{ wait_pod_name }}"
++            updateStrategy:
++              type: RollingUpdate
++            template: "{{ wait_pod_template }}"
++        wait: yes
++        wait_timeout: 180
++      vars:
++        wait_pod_name: wait-ds
++        wait_pod_image: gcr.io/kuar-demo/kuard-amd64:2
++      register: ds
++
++    - name: get updated pods
++      k8s_facts:
++        api_version: v1
++        kind: Pod
++        namespace: "{{ wait_namespace }}"
++        label_selectors:
++          - app=wait-ds
++      register: updated_ds_pods
++
++    - name: check that daemonset wait worked
++      assert:
++        that:
++          - ds.result.status.currentNumberScheduled == ds.result.status.desiredNumberScheduled
++          - updated_ds_pods.resources[0].spec.containers[0].image.endswith(":2")
++
++    - name: add a crashing pod
++      k8s:
++        definition:
++          apiVersion: v1
++          kind: Pod
++          metadata:
++            name: "{{ wait_pod_name }}"
++            namespace: "{{ wait_namespace }}"
++          spec: "{{ wait_pod_spec }}"
++        wait: yes
++        wait_timeout: 30
++      vars:
++        wait_pod_name: wait-crash-pod
++        wait_pod_image: alpine:3.8
++        wait_pod_command:
++          - /bin/false
++      register: crash_pod
++      ignore_errors: yes
++
++    - name: check that task failed
++      assert:
++        that:
++          - crash_pod is failed
++
++    - name: use a non-existent image
++      k8s:
++        definition:
++          apiVersion: v1
++          kind: Pod
++          metadata:
++            name: "{{ wait_pod_name }}"
++            namespace: "{{ wait_namespace }}"
++          spec: "{{ wait_pod_spec }}"
++        wait: yes
++        wait_timeout: 30
++      vars:
++        wait_pod_name: wait-no-image-pod
++        wait_pod_image: i_made_this_up:and_this_too
++      register: no_image_pod
++      ignore_errors: yes
++
++    - name: check that task failed
++      assert:
++        that:
++          - no_image_pod is failed
++
++    - name: add a deployment
++      k8s:
++        definition:
++          apiVersion: extensions/v1beta1
++          kind: Deployment
++          metadata:
++            name: wait-deploy
++            namespace: "{{ wait_namespace }}"
++          spec:
++            replicas: 3
++            selector:
++              matchLabels:
++                app: "{{ wait_pod_name }}"
++            template: "{{ wait_pod_template }}"
++        wait: yes
++      vars:
++        wait_pod_name: wait-deploy
++        wait_pod_image: gcr.io/kuar-demo/kuard-amd64:1
++        wait_pod_ports:
++          - containerPort: 8080
++            name: http
++            protocol: TCP
++
++      register: deploy
++
++    - name: check that deployment wait worked
++      assert:
++        that:
++          - deploy.result.status.availableReplicas == deploy.result.status.replicas
++
++    - name: update a deployment
++      k8s:
++        definition:
++          apiVersion: extensions/v1beta1
++          kind: Deployment
++          metadata:
++            name: wait-deploy
++            namespace: "{{ wait_namespace }}"
++          spec:
++            replicas: 3
++            selector:
++              matchLabels:
++                app: "{{ wait_pod_name }}"
++            template: "{{ wait_pod_template }}"
++        wait: yes
++      vars:
++        wait_pod_name: wait-deploy
++        wait_pod_image: gcr.io/kuar-demo/kuard-amd64:2
++        wait_pod_ports:
++          - containerPort: 8080
++            name: http
++            protocol: TCP
++      register: update_deploy
++
++    - name: get updated pods
++      k8s_facts:
++        api_version: v1
++        kind: Pod
++        namespace: "{{ wait_namespace }}"
++        label_selectors:
++          - app=wait-deploy
++      register: updated_deploy_pods
++
++    - name: check that deployment wait worked
++      assert:
++        that:
++          - deploy.result.status.availableReplicas == deploy.result.status.replicas
++          - updated_deploy_pods.resources[0].spec.containers[0].image.endswith(":2")
++
++    - name: add a service based on the deployment
++      k8s:
++        definition:
++          apiVersion: v1
++          kind: Service
++          metadata:
++            name: wait-svc
++            namespace: "{{ wait_namespace }}"
++          spec:
++            selector:
++              app: "{{ wait_pod_name }}"
++            ports:
++              - port: 8080
++                targetPort: 8080
++                protocol: TCP
++        wait: yes
++      vars:
++        wait_pod_name: wait-deploy
++      register: service
++
++    - name: assert that waiting for service works
++      assert:
++        that:
++          - service is successful
++
++    - name: add a crashing deployment
++      k8s:
++        definition:
++          apiVersion: extensions/v1beta1
++          kind: Deployment
++          metadata:
++            name: wait-crash-deploy
++            namespace: "{{ wait_namespace }}"
++          spec:
++            replicas: 3
++            selector:
++              matchLabels:
++                app: "{{ wait_pod_name }}"
++            template: "{{ wait_pod_template }}"
++        wait: yes
++      vars:
++        wait_pod_name: wait-crash-deploy
++        wait_pod_image: alpine:3.8
++        wait_pod_command:
++          - /bin/false
++      register: wait_crash_deploy
++      ignore_errors: yes
++
++    - name: check that task failed
++      assert:
++        that:
++          - wait_crash_deploy is failed
++
++    - name: remove Pod with very short timeout
++      k8s:
++        api_version: v1
++        kind: Pod
++        name: wait-pod
++        namespace: "{{ wait_namespace }}"
++        state: absent
++        wait: yes
++        wait_timeout: 5
++      ignore_errors: yes
++      register: short_wait_remove_pod
++
++    - name: check that task failed
++      assert:
++        that:
++          - short_wait_remove_pod is failed
++
++  always:
++    - name: remove namespace
++      k8s:
++        kind: Namespace
++        name: "{{ wait_namespace }}"
++        state: absent
++
++  when: (nodes.resources | length) > 0

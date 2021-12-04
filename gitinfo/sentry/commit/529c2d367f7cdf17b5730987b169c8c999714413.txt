@@ -1,0 +1,4587 @@
+commit 529c2d367f7cdf17b5730987b169c8c999714413
+Author: Jan Michael Auer <account@jauer.org>
+Date:   Tue Oct 30 20:58:18 2018 +0100
+
+    feat(minidump): Support CFI for minidumps (#9344)
+    
+    * ref(minidump): Move minidump logic to its own module
+    
+    * ref: Add a constant for the minidump attachment type
+    
+    * feat(minidump): Expand the merge_minidump_event interface
+    
+    * feat(minidump): Add a util to detect minidump events
+    
+    * feat: Add an event enhancer hook to Plugin v2
+    
+    * feat: Optionally pass CFI to minidump processing
+    
+    * ref: Move hashing helper from stacktraces to utils.hashlib
+    
+    * feat: Add an optional stackframe trust
+    
+    * feat: Emit the stackframe trust for minidump events
+    
+    * fix: Add frame trust to schema
+    
+    * feat(native): Reprocess minidumps with CFI
+    
+    * meta: Add more description and comments to CFI processing
+    
+    * fix: Fix a doc code example
+    
+    * feat: Show scanned frames in the UI
+    
+    * feat: Refactor event cache keys into a function
+    
+    * fix: Correctly detect outdated CFI caches
+    
+    * fix: Correctly detect unchanged stacktraces
+    
+    * test: Add tests for CFI reprocessing
+    
+    * build: Bump symbolic to 5.5.3
+    
+    * meta: Add suggested comment
+
+diff --git a/requirements-base.txt b/requirements-base.txt
+index be39844db4..3100569a30 100644
+--- a/requirements-base.txt
++++ b/requirements-base.txt
+@@ -62,7 +62,7 @@ sqlparse>=0.1.16,<0.2.0
+ statsd>=3.1.0,<3.2.0
+ strict-rfc3339>=0.7
+ structlog==16.1.0
+-symbolic>=5.5.0,<6.0.0
++symbolic>=5.5.3,<6.0.0
+ toronado>=0.0.11,<0.1.0
+ ua-parser>=0.6.1,<0.8.0
+ # for bitbucket client
+diff --git a/src/sentry/coreapi.py b/src/sentry/coreapi.py
+index e3a95c2f16..2d38491279 100644
+--- a/src/sentry/coreapi.py
++++ b/src/sentry/coreapi.py
+@@ -200,7 +200,7 @@ class ClientApiHelper(object):
+             data = dict(data.items())
+ 
+         cache_timeout = 3600
+-        cache_key = u'e:{1}:{0}'.format(data['project'], data['event_id'])
++        cache_key = cache_key_for_event(data)
+         default_cache.set(cache_key, data, cache_timeout)
+ 
+         # Attachments will be empty or None if the "event-attachments" feature
+@@ -257,6 +257,10 @@ class SecurityApiHelper(ClientApiHelper):
+         return auth
+ 
+ 
++def cache_key_for_event(data):
++    return u'e:{1}:{0}'.format(data['project'], data['event_id'])
++
++
+ def decompress_deflate(encoded_data):
+     try:
+         return zlib.decompress(encoded_data).decode("utf-8")
+diff --git a/src/sentry/interfaces/schemas.py b/src/sentry/interfaces/schemas.py
+index 6f19fe4beb..cbfe463fdb 100644
+--- a/src/sentry/interfaces/schemas.py
++++ b/src/sentry/interfaces/schemas.py
+@@ -109,6 +109,7 @@ FRAME_INTERFACE_SCHEMA = {
+         'in_app': {'type': 'boolean', 'default': False},
+         'instruction_addr': {},
+         'instruction_offset': {},
++        'trust': {'type': 'string'},
+         'lineno': {'type': ['number', 'string']},
+         'module': {
+             'type': 'string',
+diff --git a/src/sentry/interfaces/stacktrace.py b/src/sentry/interfaces/stacktrace.py
+index 4b1929d3f8..be7478152e 100644
+--- a/src/sentry/interfaces/stacktrace.py
++++ b/src/sentry/interfaces/stacktrace.py
+@@ -372,6 +372,7 @@ class Frame(Interface):
+             'symbol': trim(symbol, 256),
+             'symbol_addr': to_hex_addr(data.get('symbol_addr')),
+             'instruction_addr': to_hex_addr(data.get('instruction_addr')),
++            'trust': trim(data.get('trust'), 16),
+             'in_app': in_app,
+             'context_line': context_line,
+             # TODO(dcramer): trim pre/post_context
+@@ -477,6 +478,7 @@ class Frame(Interface):
+             'lineNo': self.lineno,
+             'colNo': self.colno,
+             'inApp': self.in_app,
++            'trust': self.trust,
+             'errors': self.errors,
+         }
+         if not is_public:
+@@ -522,6 +524,7 @@ class Frame(Interface):
+             'lineNo': meta.get('lineno'),
+             'colNo': meta.get('colno'),
+             'inApp': meta.get('in_app'),
++            'trust': meta.get('trust'),
+             'errors': meta.get('errors'),
+         }
+ 
+diff --git a/src/sentry/lang/native/cfi.py b/src/sentry/lang/native/cfi.py
+new file mode 100644
+index 0000000000..e44b17602b
+--- /dev/null
++++ b/src/sentry/lang/native/cfi.py
+@@ -0,0 +1,270 @@
++from __future__ import absolute_import
++
++import logging
++import six
++
++from symbolic import FrameInfoMap, FrameTrust, ObjectLookup
++
++from sentry.attachments import attachment_cache
++from sentry.coreapi import cache_key_for_event
++from sentry.lang.native.minidump import process_minidump, frames_from_minidump_thread, \
++    MINIDUMP_ATTACHMENT_TYPE
++from sentry.lang.native.utils import rebase_addr
++from sentry.models import Project, ProjectDebugFile
++from sentry.utils.cache import cache
++from sentry.utils.hashlib import hash_values
++
++
++logger = logging.getLogger(__name__)
++
++# Frame trust values achieved through the use of CFI
++CFI_TRUSTS = ('cfi', 'cfi-scan')
++
++# Minimum frame trust value that we require to omit CFI reprocessing
++MIN_TRUST = FrameTrust.fp
++
++# Placeholder used to indicate that no CFI could be used to stackwalk a thread
++NO_CFI_PLACEHOLDER = '__no_cfi__'
++
++
++class ThreadRef(object):
++    """Cacheable and mutable reference to stack frames of an event thread."""
++
++    def __init__(self, frames, modules):
++        self.raw_frames = frames
++        self.modules = modules
++        self.resolved_frames = None
++
++    def _get_frame_key(self, frame):
++        module = self.modules.find_object(frame['instruction_addr'])
++
++        # If we cannot resolve a module for this frame, this means we're dealing
++        # with an absolute address here. Since this address changes with every
++        # crash and would poison our cache, we skip it for the key calculation.
++        if not module:
++            return None
++
++        return (
++            module.id,
++            rebase_addr(frame['instruction_addr'], module)
++        )
++
++    @property
++    def _cache_key(self):
++        values = [self._get_frame_key(f) for f in self.raw_frames]
++        # XXX: The seed is hard coded for a future refactor
++        return 'st:%s' % hash_values(values, seed='MinidumpCfiProcessor')
++
++    def _frame_from_cache(self, entry):
++        debug_id, offset, trust = entry[:3]
++        module = self.modules.get_object(debug_id)
++
++        # The debug_id can be None or refer to a missing module. If the module
++        # was missing, the stored offset was absolute as well. Otherwise, we
++        # have no choice but to assume an absolute address. In practice, the
++        # latter hopefully never happens.
++        addr = module.addr + offset if module else offset
++
++        return module, {
++            'instruction_addr': '0x%x' % addr,
++            'function': '<unknown>',  # Required by interface
++            'module': module.name if module else None,
++            'trust': trust,
++        }
++
++    def load_from_cache(self):
++        """Attempts to load the reprocessed stack trace from the cache. The
++        return value is ``True`` for a cache hit, and ``False`` for a miss.
++        The loaded addresses are rebased to the provided code modules.
++        """
++
++        cached = cache.get(self._cache_key)
++        if cached is None:
++            return False
++
++        if cached == NO_CFI_PLACEHOLDER:
++            self.resolved_frames = NO_CFI_PLACEHOLDER
++        else:
++            self.resolved_frames = [self._frame_from_cache(c) for c in cached]
++
++        return True
++
++    def save_to_cache(self):
++        """Stores the reprocessed stack trace to the cache. For frames with
++        known code modules only relative offsets are stored, otherwise the
++        absolute address as fallback."""
++        if self.resolved_frames is None:
++            raise RuntimeError('save_to_cache called before resolving frames')
++
++        if self.resolved_frames == NO_CFI_PLACEHOLDER:
++            cache.set(self._cache_key, NO_CFI_PLACEHOLDER)
++            return
++
++        values = []
++        for module, frame in self.resolved_frames:
++            module_id = module and module.id
++            addr = frame['instruction_addr']
++            if module:
++                addr = '0x%x' % rebase_addr(addr, module)
++            values.append((module_id, addr, frame['trust']))
++
++        cache.set(self._cache_key, values)
++
++    def load_from_minidump(self, thread):
++        """Loads the stack trace from a minidump process state thread."""
++
++        # Convert the entire thread into frames conforming to the `Frame`
++        # interface. Note that this is done with the same function as the
++        # initial ingestion to avoid normalization conflicts.
++        frames = frames_from_minidump_thread(thread)
++
++        # Filter out stack traces that did not improve during reprocessing. For
++        # these cases we only store a marker. This also prevents us from
++        # destroying absolute addresses when restoring from the cache. Stack
++        # traces containing CFI frames are mapped to their modules and stored.
++        if any(frame['trust'] in CFI_TRUSTS for frame in frames):
++            self.resolved_frames = [(self.modules.find_object(f['instruction_addr']), f)
++                                    for f in frames]
++        else:
++            self.resolved_frames = NO_CFI_PLACEHOLDER
++
++    def apply_to_event(self):
++        """Writes the loaded stack trace back to the event's payload. Returns
++        ``True`` if the payload was changed, otherwise ``False``."""
++        if self.resolved_frames is None:
++            raise RuntimeError('apply_to_event called before resolving frames')
++
++        if self.resolved_frames == NO_CFI_PLACEHOLDER:
++            return False
++
++        self.raw_frames[:] = [frame for module, frame in self.resolved_frames]
++        return True
++
++    @property
++    def needs_cfi(self):
++        """Indicates whether this thread requires reprocessing with CFI due to
++        scanned stack frames."""
++        return any(
++            getattr(FrameTrust, f.get('trust', ''), 0) < MIN_TRUST
++            for f in self.raw_frames
++        )
++
++
++class ThreadProcessingHandle(object):
++    """Helper object for processing all event threads.
++
++    This class offers a view on all threads in the given event payload,
++    including the crashing exception thread. Use ``iter_threads`` to iterate
++    pointers to the original threads' stack traces. Likewise, ``iter_modules``
++    returns references to all modules (images) loaded into the process.
++
++    The handle keeps track of changes to the original data. To signal mutation,
++    call ``indicate_change``. Finally, ``result`` returns the changed data or
++    None if it was not changed.
++    """
++
++    def __init__(self, data):
++        self.data = data
++        self.modules = self._get_modules()
++        self.changed = False
++
++    def _get_modules(self):
++        modules = self.data.get('debug_meta', {}).get('images', [])
++        return ObjectLookup(modules)
++
++    def iter_modules(self):
++        """Returns an iterator over all code modules (images) loaded by the
++        process at the time of the crash. The values are of type ``ObjectRef``.
++        """
++        return self.modules.iter_objects()
++
++    def iter_threads(self):
++        """Returns an iterator over all threads of the process at the time of
++        the crash, including the crashing thread. The values are of type
++        ``ThreadRef``."""
++        for thread in self.data.get('threads', {}).get('values', []):
++            if thread.get('crashed'):
++                # XXX: Assumes that the full list of threads is present in the
++                # original crash report. This is guaranteed by KSCrash and our
++                # minidump utility.
++                exceptions = self.data.get('exception', {}).get('values', [])
++                exception = exceptions[0] if exceptions else {}
++                frames = exception.get('stacktrace', {}).get('frames')
++            else:
++                frames = thread.get('stacktrace', {}).get('frames')
++
++            tid = thread.get('id')
++            if tid and frames:
++                yield tid, ThreadRef(frames, self.modules)
++
++    def indicate_change(self):
++        """Signals mutation of the data."""
++        self.changed = True
++
++    def result(self):
++        """Returns ``data`` if ``indicate_change`` was called, otherwise None.
++        """
++        if self.changed:
++            return self.data
++
++
++def reprocess_minidump_with_cfi(data):
++    """Reprocesses a minidump event if CFI(call frame information) is available
++    and viable. The event is only processed if there are stack traces that
++    contain scanned frames.
++    """
++
++    handle = ThreadProcessingHandle(data)
++
++    # Check stacktrace caches first and skip all that do not need CFI. This is
++    # either if a thread is trusted (i.e. it does not contain scanned frames) or
++    # since it can be fetched from the cache.
++    threads = {}
++    for tid, thread in handle.iter_threads():
++        if not thread.needs_cfi:
++            continue
++
++        if thread.load_from_cache():
++            if thread.apply_to_event():
++                handle.indicate_change()
++            continue
++
++        threads[tid] = thread
++
++    if not threads:
++        return handle.result()
++
++    # Check if we have a minidump to reprocess
++    cache_key = cache_key_for_event(data)
++    attachments = attachment_cache.get(cache_key) or []
++    minidump = next((a for a in attachments if a.type == MINIDUMP_ATTACHMENT_TYPE), None)
++    if not minidump:
++        return handle.result()
++
++    # Determine modules loaded into the process during the crash
++    debug_ids = [module.id for module in handle.iter_modules()]
++    if not debug_ids:
++        return handle.result()
++
++    # Load CFI caches for all loaded modules (even unreferenced ones)
++    project = Project.objects.get_from_cache(id=data['project'])
++    cficaches = ProjectDebugFile.difcache.get_cficaches(project, debug_ids)
++    if not cficaches:
++        return handle.result()
++
++    # Reprocess the minidump with CFI
++    cfi_map = FrameInfoMap.new()
++    for debug_id, cficache in six.iteritems(cficaches):
++        cfi_map.add(debug_id, cficache)
++    state = process_minidump(minidump.data, cfi=cfi_map)
++
++    # Merge existing stack traces with new ones from the minidump
++    for minidump_thread in state.threads():
++        thread = threads.get(minidump_thread.thread_id)
++        if thread:
++            thread.load_from_minidump(minidump_thread)
++            thread.save_to_cache()
++            if thread.apply_to_event():
++                handle.indicate_change()
++
++    return handle.result()
+diff --git a/src/sentry/lang/native/minidump.py b/src/sentry/lang/native/minidump.py
+new file mode 100644
+index 0000000000..d25b4eda66
+--- /dev/null
++++ b/src/sentry/lang/native/minidump.py
+@@ -0,0 +1,111 @@
++from __future__ import absolute_import
++
++import six
++from django.core.files.uploadedfile import InMemoryUploadedFile, TemporaryUploadedFile
++
++from symbolic import arch_from_breakpad, ProcessState, id_from_breakpad
++
++# Attachment type used for minidump files
++MINIDUMP_ATTACHMENT_TYPE = 'event.minidump'
++
++# Mapping of well-known minidump OS constants to our internal names
++MINIDUMP_OS_TYPES = {
++    'Mac OS X': 'macOS',
++    'Windows NT': 'Windows',
++}
++
++
++def is_minidump_event(data):
++    exceptions = data.get('exception', {}).get('values', [])
++    if not exceptions:
++        return False
++
++    return exceptions[0].get('mechanism', {}).get('type') == 'minidump'
++
++
++def process_minidump(minidump, cfi=None):
++    if isinstance(minidump, InMemoryUploadedFile):
++        minidump.open()  # seek to start
++        return ProcessState.from_minidump_buffer(minidump.read(), cfi)
++    elif isinstance(minidump, TemporaryUploadedFile):
++        return ProcessState.from_minidump(minidump.temporary_file_path(), cfi)
++    elif isinstance(minidump, six.binary_type) and minidump.startswith('MDMP'):
++        return ProcessState.from_minidump_buffer(minidump, cfi)
++    else:
++        return ProcessState.from_minidump(minidump, cfi)
++
++
++def merge_minidump_event(data, minidump, cfi=None):
++    state = process_minidump(minidump, cfi=cfi)
++
++    data['platform'] = 'native'
++    data['level'] = 'fatal' if state.crashed else 'info'
++    data['message'] = 'Assertion Error: %s' % state.assertion if state.assertion \
++        else 'Fatal Error: %s' % state.crash_reason
++
++    if state.timestamp:
++        data['timestamp'] = float(state.timestamp)
++
++    # Extract as much context information as we can.
++    info = state.system_info
++    context = data.setdefault('contexts', {})
++    os = context.setdefault('os', {})
++    device = context.setdefault('device', {})
++    os['type'] = 'os'  # Required by "get_sdk_from_event"
++    os['name'] = MINIDUMP_OS_TYPES.get(info.os_name, info.os_name)
++    os['version'] = info.os_version
++    os['build'] = info.os_build
++    device['arch'] = arch_from_breakpad(info.cpu_family)
++
++    # We can extract stack traces here already but since CFI is not
++    # available yet (without debug symbols), the stackwalker will
++    # resort to stack scanning which yields low-quality results. If
++    # the user provides us with debug symbols, we reprocess this
++    # minidump and add improved stacktraces later.
++    data['threads'] = [{
++        'id': thread.thread_id,
++        'crashed': False,
++        'stacktrace': {
++            'frames': frames_from_minidump_thread(thread),
++            'registers': thread.get_frame(0).registers if thread.frame_count else None,
++        },
++    } for thread in state.threads()]
++
++    # Mark the crashed thread and add its stacktrace to the exception
++    crashed_thread = data['threads'][state.requesting_thread]
++    crashed_thread['crashed'] = True
++
++    # Extract the crash reason and infos
++    data['exception'] = {
++        'value': data['message'],
++        'thread_id': crashed_thread['id'],
++        'type': state.crash_reason,
++        # Move stacktrace here from crashed_thread (mutating!)
++        'stacktrace': crashed_thread.pop('stacktrace'),
++        'mechanism': {
++            'type': 'minidump',
++            'handled': False,
++            # We cannot extract exception codes or signals with the breakpad
++            # extractor just yet. Once these capabilities are added to symbolic,
++            # these values should go in the mechanism here.
++        }
++    }
++
++    # Extract referenced (not all loaded) images
++    images = [{
++        'type': 'symbolic',
++        'id': id_from_breakpad(module.id),
++        'image_addr': '0x%x' % module.addr,
++        'image_size': module.size,
++        'name': module.name,
++    } for module in state.modules()]
++    data.setdefault('debug_meta', {})['images'] = images
++
++
++def frames_from_minidump_thread(thread):
++    return [{
++        'instruction_addr': '0x%x' % frame.return_address,
++        'function': '<unknown>',  # Required by interface
++        'module': frame.module.name if frame.module else None,
++        'trust': frame.trust,
++    } for frame in reversed(list(thread.frames()))]
+diff --git a/src/sentry/lang/native/plugin.py b/src/sentry/lang/native/plugin.py
+index e5628b46d6..099ef9e248 100644
+--- a/src/sentry/lang/native/plugin.py
++++ b/src/sentry/lang/native/plugin.py
+@@ -9,6 +9,8 @@ from symbolic import parse_addr, find_best_instruction, arch_get_ip_reg_name, \
+ 
+ from sentry import options
+ from sentry.plugins import Plugin2
++from sentry.lang.native.cfi import reprocess_minidump_with_cfi
++from sentry.lang.native.minidump import is_minidump_event
+ from sentry.lang.native.symbolizer import Symbolizer, SymbolicationFailed
+ from sentry.lang.native.utils import get_sdk_from_event, cpu_name_from_data, \
+     rebase_addr
+@@ -274,6 +276,10 @@ class NativeStacktraceProcessor(StacktraceProcessor):
+ class NativePlugin(Plugin2):
+     can_disable = False
+ 
++    def get_event_enhancers(self, data):
++        if is_minidump_event(data):
++            return [reprocess_minidump_with_cfi]
++
+     def get_stacktrace_processors(self, data, stacktrace_infos, platforms, **kwargs):
+         if any(platform in NativeStacktraceProcessor.supported_platforms for platform in platforms):
+             return [NativeStacktraceProcessor]
+diff --git a/src/sentry/lang/native/utils.py b/src/sentry/lang/native/utils.py
+index c920d9727f..105798efb4 100644
+--- a/src/sentry/lang/native/utils.py
++++ b/src/sentry/lang/native/utils.py
+@@ -5,8 +5,7 @@ import six
+ import logging
+ 
+ from collections import namedtuple
+-from django.core.files.uploadedfile import InMemoryUploadedFile, TemporaryUploadedFile
+-from symbolic import parse_addr, arch_from_breakpad, arch_from_macho, arch_is_known, ProcessState, id_from_breakpad
++from symbolic import parse_addr, arch_from_macho, arch_is_known
+ 
+ from sentry.interfaces.contexts import DeviceContextType
+ 
+@@ -18,12 +17,6 @@ VERSION_RE = re.compile(r'(\d+\.\d+\.\d+)\s+(.*)')
+ # Regular expression to guess whether we're dealing with Windows or Unix paths
+ WINDOWS_PATH_RE = re.compile(r'^[a-z]:\\', re.IGNORECASE)
+ 
+-# Mapping of well-known minidump OS constants to our internal names
+-MINIDUMP_OS_TYPES = {
+-    'Mac OS X': 'macOS',
+-    'Windows NT': 'Windows',
+-}
+-
+ AppInfo = namedtuple('AppInfo', ['id', 'version', 'build', 'name'])
+ 
+ 
+@@ -136,80 +129,3 @@ def sdk_info_to_sdk_id(sdk_info):
+     if build is not None:
+         rv = '%s_%s' % (rv, build)
+     return rv
+-
+-
+-def merge_minidump_event(data, minidump):
+-    if isinstance(minidump, InMemoryUploadedFile):
+-        minidump.open()  # seek to start
+-        state = ProcessState.from_minidump_buffer(minidump.read())
+-    elif isinstance(minidump, TemporaryUploadedFile):
+-        state = ProcessState.from_minidump(minidump.temporary_file_path())
+-    else:
+-        state = ProcessState.from_minidump(minidump)
+-
+-    data['platform'] = 'native'
+-    data['level'] = 'fatal' if state.crashed else 'info'
+-    data['message'] = 'Assertion Error: %s' % state.assertion if state.assertion \
+-        else 'Fatal Error: %s' % state.crash_reason
+-
+-    if state.timestamp:
+-        data['timestamp'] = float(state.timestamp)
+-
+-    # Extract as much context information as we can.
+-    info = state.system_info
+-    context = data.setdefault('contexts', {})
+-    os = context.setdefault('os', {})
+-    device = context.setdefault('device', {})
+-    os['type'] = 'os'  # Required by "get_sdk_from_event"
+-    os['name'] = MINIDUMP_OS_TYPES.get(info.os_name, info.os_name)
+-    os['version'] = info.os_version
+-    os['build'] = info.os_build
+-    device['arch'] = arch_from_breakpad(info.cpu_family)
+-
+-    # We can extract stack traces here already but since CFI is not
+-    # available yet (without debug symbols), the stackwalker will
+-    # resort to stack scanning which yields low-quality results. If
+-    # the user provides us with debug symbols, we could reprocess this
+-    # minidump and add improved stacktraces later.
+-    data['threads'] = [{
+-        'id': thread.thread_id,
+-        'crashed': False,
+-        'stacktrace': {
+-            'frames': [{
+-                'instruction_addr': '0x%x' % frame.return_address,
+-                'function': '<unknown>',  # Required by interface
+-                'package': frame.module.name if frame.module else None,
+-            } for frame in reversed(list(thread.frames()))],
+-            'registers': thread.get_frame(0).registers if thread.frame_count else None,
+-        },
+-    } for thread in state.threads()]
+-
+-    # Mark the crashed thread and add its stacktrace to the exception
+-    crashed_thread = data['threads'][state.requesting_thread]
+-    crashed_thread['crashed'] = True
+-
+-    # Extract the crash reason and infos
+-    data['exception'] = {
+-        'value': data['message'],
+-        'thread_id': crashed_thread['id'],
+-        'type': state.crash_reason,
+-        # Move stacktrace here from crashed_thread (mutating!)
+-        'stacktrace': crashed_thread.pop('stacktrace'),
+-        'mechanism': {
+-            'type': 'minidump',
+-            'handled': False,
+-            # We cannot extract exception codes or signals with the breakpad
+-            # extractor just yet. Once these capabilities are added to symbolic,
+-            # these values should go in the mechanism here.
+-        }
+-    }
+-
+-    # Extract referenced (not all loaded) images
+-    images = [{
+-        'type': 'symbolic',
+-        'id': id_from_breakpad(module.id),
+-        'image_addr': '0x%x' % module.addr,
+-        'image_size': module.size,
+-        'name': module.name,
+-    } for module in state.modules()]
+-    data.setdefault('debug_meta', {})['images'] = images
+diff --git a/src/sentry/models/debugfile.py b/src/sentry/models/debugfile.py
+index d87bcef479..f60640e599 100644
+--- a/src/sentry/models/debugfile.py
++++ b/src/sentry/models/debugfile.py
+@@ -25,7 +25,8 @@ from django.db.models.fields.related import OneToOneRel
+ 
+ from symbolic import FatObject, SymbolicError, ObjectErrorUnsupportedObject, \
+     SYMCACHE_LATEST_VERSION, SymCache, SymCacheErrorMissingDebugInfo, \
+-    SymCacheErrorMissingDebugSection, CfiCache, CfiErrorMissingDebugInfo
++    SymCacheErrorMissingDebugSection, CfiCache, CfiErrorMissingDebugInfo, \
++    CFICACHE_LATEST_VERSION
+ 
+ from sentry import options
+ from sentry.cache import default_cache
+@@ -288,6 +289,12 @@ class ProjectCacheFile(Model):
+         """Indicates whether the cache can be computed from the given DIF."""
+         return set(cls.required_features) <= debug_file.features
+ 
++    @property
++    def outdated(self):
++        """Indicates whether this cache is outdated and needs to be recomputed.
++        """
++        raise NotImplemented
++
+     def delete(self, *args, **kwargs):
+         super(ProjectCacheFile, self).delete(*args, **kwargs)
+         self.cache_file.delete()
+@@ -318,6 +325,10 @@ class ProjectSymCacheFile(ProjectCacheFile):
+             return debug_file.dif_type in ('breakpad', 'macho', 'elf')
+         return super(ProjectSymCacheFile, cls).computes_from(debug_file)
+ 
++    @property
++    def outdated(self):
++        return self.version != SYMCACHE_LATEST_VERSION
++
+ 
+ class ProjectCfiCacheFile(ProjectCacheFile):
+     """Cache for stack unwinding information: CfiCache."""
+@@ -337,6 +348,10 @@ class ProjectCfiCacheFile(ProjectCacheFile):
+     def cache_cls(cls):
+         return CfiCache
+ 
++    @property
++    def outdated(self):
++        return self.version != CFICACHE_LATEST_VERSION
++
+ 
+ def clean_redundant_difs(project, debug_id):
+     """Deletes redundant debug files from the database and file storage. A debug
+@@ -650,12 +665,12 @@ class DIFCache(object):
+         caches = []
+         to_update = debug_files.copy()
+         for cache_file in existing_caches:
+-            if cache_file.version == SYMCACHE_LATEST_VERSION:
++            if cache_file.outdated:
++                cache_file.delete()
++            else:
+                 debug_id = cache_file.debug_file.debug_id
+                 to_update.pop(debug_id, None)
+                 caches.append((debug_id, cache_file, None))
+-            else:
+-                cache_file.delete()
+ 
+         # If any cache files need to be updated, do that now
+         if to_update:
+diff --git a/src/sentry/plugins/base/v2.py b/src/sentry/plugins/base/v2.py
+index e02d968d82..e0cf423d6b 100644
+--- a/src/sentry/plugins/base/v2.py
++++ b/src/sentry/plugins/base/v2.py
+@@ -391,6 +391,26 @@ class IPlugin2(local, PluginConfigMixin, PluginStatusMixin):
+                     return [CocoaProcessor(data, stacktrace_infos)]
+         """
+ 
++    def get_event_enhancers(self, data, **kwargs):
++        """
++        Return a list of enhancers to apply to the given event.
++
++        An enhancer is a function that takes the normalized data blob as an
++        input and returns modified data as output. If no changes to the data are
++        made it is safe to return ``None``.
++
++        As opposed to event (pre)processors, enhancers run **before** stacktrace
++        processing and can be used to perform more extensive event normalization
++        or add additional data before stackframes are symbolicated.
++
++        Enhancers should not be returned if there is nothing to do with the
++        event data.
++
++        >>> def get_event_enhancers(self, data, **kwargs):
++        >>>     return [lambda x: x]
++        """
++        return []
++
+     def get_feature_hooks(self, **kwargs):
+         """
+         Return a list of callables to check for feature status.
+diff --git a/src/sentry/stacktraces.py b/src/sentry/stacktraces.py
+index 88818ee428..4a7853a29f 100644
+--- a/src/sentry/stacktraces.py
++++ b/src/sentry/stacktraces.py
+@@ -1,7 +1,7 @@
+ from __future__ import absolute_import
+ 
++import six
+ import logging
+-import hashlib
+ from datetime import datetime
+ 
+ from collections import namedtuple
+@@ -9,9 +9,8 @@ from collections import namedtuple
+ from sentry.models import Project, Release
+ from sentry.utils.safe import safe_execute
+ from sentry.utils.cache import cache
++from sentry.utils.hashlib import hash_values
+ 
+-import six
+-from six import integer_types, text_type
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -69,38 +68,8 @@ class ProcessableFrame(object):
+             self.cache_key = None
+             return
+ 
+-        h = hashlib.md5()
+-        h.update((u'%s\xff' % self.processor.__class__.__name__).encode('utf-8'))
+-
+-        def _hash_value(value):
+-            if value is None:
+-                h.update(b'\x00')
+-            elif value is True:
+-                h.update(b'\x01')
+-            elif value is False:
+-                h.update(b'\x02')
+-            elif isinstance(value, integer_types):
+-                h.update(b'\x03' + text_type(value).encode('ascii') + b'\x00')
+-            elif isinstance(value, (tuple, list)):
+-                h.update(b'\x04' + text_type(len(value)).encode('utf-8'))
+-                for item in value:
+-                    _hash_value(item)
+-            elif isinstance(value, dict):
+-                h.update(b'\x05' + text_type(len(value)).encode('utf-8'))
+-                for k, v in six.iteritems(value):
+-                    _hash_value(k)
+-                    _hash_value(v)
+-            elif isinstance(value, bytes):
+-                h.update(b'\x06' + value + b'\x00')
+-            elif isinstance(value, text_type):
+-                h.update(b'\x07' + value.encode('utf-8') + b'\x00')
+-            else:
+-                raise TypeError('Invalid value for frame cache')
+-
+-        for value in values:
+-            _hash_value(value)
+-
+-        self.cache_key = rv = 'pf:%s' % h.hexdigest()
++        h = hash_values(values, seed=self.processor.__class__.__name__)
++        self.cache_key = rv = 'pf:%s' % h
+         return rv
+ 
+ 
+diff --git a/src/sentry/static/sentry/app/components/events/interfaces/frame.jsx b/src/sentry/static/sentry/app/components/events/interfaces/frame.jsx
+index 00b13cdad9..94f7225a16 100644
+--- a/src/sentry/static/sentry/app/components/events/interfaces/frame.jsx
++++ b/src/sentry/static/sentry/app/components/events/interfaces/frame.jsx
+@@ -319,6 +319,9 @@ const Frame = createReactClass({
+     if (this.isInlineFrame()) {
+       return t('Inlined frame');
+     }
++    if (this.props.data.trust === 'scan') {
++      return t('Found by stack scanning');
++    }
+     if (this.getPlatform() == 'cocoa') {
+       let func = this.props.data.function || '<unknown>';
+       if (func.match(/^@objc\s/)) {
+diff --git a/src/sentry/tasks/store.py b/src/sentry/tasks/store.py
+index a47ceda850..547473d3d8 100644
+--- a/src/sentry/tasks/store.py
++++ b/src/sentry/tasks/store.py
+@@ -133,7 +133,16 @@ def _do_process_event(cache_key, start_time, event_id, process_task):
+     # Fetch the reprocessing revision
+     reprocessing_rev = reprocessing.get_reprocessing_revision(project)
+ 
+-    # Stacktrace based event processors.  These run before anything else.
++    # Event enhancers.  These run before anything else.
++    for plugin in plugins.all(version=2):
++        enhancers = safe_execute(plugin.get_event_enhancers, data=data)
++        for enhancer in (enhancers or ()):
++            enhanced = safe_execute(enhancer, data)
++            if enhanced:
++                data = enhanced
++                has_changed = True
++
++    # Stacktrace based event processors.
+     new_data = process_stacktraces(data)
+     if new_data is not None:
+         has_changed = True
+diff --git a/src/sentry/utils/hashlib.py b/src/sentry/utils/hashlib.py
+index fbc9787dc0..a5dcf22ae9 100644
+--- a/src/sentry/utils/hashlib.py
++++ b/src/sentry/utils/hashlib.py
+@@ -7,6 +7,7 @@ sentry.utils.hashlib
+ """
+ from __future__ import absolute_import
+ 
++import six
+ from hashlib import md5 as _md5
+ from hashlib import sha1 as _sha1
+ 
+@@ -25,3 +26,38 @@ def sha1_text(*args):
+     for x in args:
+         m.update(force_bytes(x, errors='replace'))
+     return m
++
++
++def hash_value(h, value):
++    if value is None:
++        h.update(b'\x00')
++    elif value is True:
++        h.update(b'\x01')
++    elif value is False:
++        h.update(b'\x02')
++    elif isinstance(value, six.integer_types):
++        h.update(b'\x03' + six.text_type(value).encode('ascii') + b'\x00')
++    elif isinstance(value, (tuple, list)):
++        h.update(b'\x04' + six.text_type(len(value)).encode('utf-8'))
++        for item in value:
++            hash_value(item)
++    elif isinstance(value, dict):
++        h.update(b'\x05' + six.text_type(len(value)).encode('utf-8'))
++        for k, v in six.iteritems(value):
++            hash_value(k)
++            hash_value(v)
++    elif isinstance(value, bytes):
++        h.update(b'\x06' + value + b'\x00')
++    elif isinstance(value, six.text_type):
++        h.update(b'\x07' + value.encode('utf-8') + b'\x00')
++    else:
++        raise TypeError('Invalid hash value')
++
++
++def hash_values(values, seed=None, algorithm=_md5):
++    h = _md5()
++    if seed is not None:
++        h.update((u'%s\xff' % seed).encode('utf-8'))
++    for value in values:
++        hash_value(h, value)
++    return h.hexdigest()
+diff --git a/src/sentry/web/api.py b/src/sentry/web/api.py
+index 1b65dd8d33..46fd61f023 100644
+--- a/src/sentry/web/api.py
++++ b/src/sentry/web/api.py
+@@ -36,7 +36,7 @@ from sentry.coreapi import (
+ from sentry.event_manager import EventManager
+ from sentry.interfaces import schemas
+ from sentry.interfaces.base import get_interface
+-from sentry.lang.native.utils import merge_minidump_event
++from sentry.lang.native.minidump import merge_minidump_event, MINIDUMP_ATTACHMENT_TYPE
+ from sentry.models import Project, OrganizationOption, Organization
+ from sentry.signals import (
+     event_accepted, event_dropped, event_filtered, event_received)
+@@ -672,7 +672,7 @@ class MinidumpView(StoreView):
+         # allow us to stack walk again with CFI once symbols are loaded.
+         attachments = []
+         minidump.seek(0)
+-        attachments.append(CachedAttachment.from_upload(minidump, type='event.minidump'))
++        attachments.append(CachedAttachment.from_upload(minidump, type=MINIDUMP_ATTACHMENT_TYPE))
+ 
+         # Append all other files as generic attachments. We can skip this if the
+         # feature is disabled since they won't be saved.
+diff --git a/tests/sentry/lang/native/fixtures/linux.cficache b/tests/sentry/lang/native/fixtures/linux.cficache
+new file mode 100644
+index 0000000000..c2324052de
+--- /dev/null
++++ b/tests/sentry/lang/native/fixtures/linux.cficache
+@@ -0,0 +1,1498 @@
++STACK CFI INIT 1dc0 2a .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI INIT 1580 370 .cfa: $rsp 16 + .ra: .cfa -8 + ^
++STACK CFI 1586 .cfa: $rsp 24 +
++STACK CFI INIT 1ec0 3b .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 1ec3 $rbx: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 1edd .cfa: $rsp 8 +
++STACK CFI 1ee0 .cfa: $rsp 16 +
++STACK CFI 1efa .cfa: $rsp 8 +
++STACK CFI INIT 1f00 32 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 1f01 $rbx: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 1f24 .cfa: $rsp 8 +
++STACK CFI 1f30 .cfa: $rsp 16 +
++STACK CFI 1f31 .cfa: $rsp 8 +
++STACK CFI INIT 1c70 14c .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 1c71 $rbp: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 1c86 .cfa: $rbp 16 +
++STACK CFI 1c89 $r14: .cfa -24 + ^ $rbx: .cfa -32 + ^
++STACK CFI 1da3 .cfa: $rsp 8 +
++STACK CFI 1da4 .cfa: $rbp 16 +
++STACK CFI INIT 1f40 122 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 1f42 $r14: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 1f44 $r13: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 1f46 $r12: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 1f47 $rbp: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 1f48 $rbx: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI 1f4f .cfa: $rsp 208 +
++STACK CFI 2054 .cfa: $rsp 48 +
++STACK CFI 2055 .cfa: $rsp 40 +
++STACK CFI 2056 .cfa: $rsp 32 +
++STACK CFI 2058 .cfa: $rsp 24 +
++STACK CFI 205a .cfa: $rsp 16 +
++STACK CFI 205c .cfa: $rsp 8 +
++STACK CFI 205d .cfa: $rsp 208 +
++STACK CFI INIT 2070 7c .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 207b $r13: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 207d $r12: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 2085 $rbp: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 2086 $rbx: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 2098 .cfa: $rsp 48 +
++STACK CFI 20d1 .cfa: $rsp 40 +
++STACK CFI 20d2 $rbx: $rbx .cfa: $rsp 32 +
++STACK CFI 20d3 $rbp: $rbp .cfa: $rsp 24 +
++STACK CFI 20d5 $r12: $r12 .cfa: $rsp 16 +
++STACK CFI 20d7 $r13: $r13 .cfa: $rsp 8 +
++STACK CFI 20e0 $r12: .cfa -24 + ^ $r13: .cfa -16 + ^ $rbp: .cfa -32 + ^ $rbx: .cfa -40 + ^ .cfa: $rsp 48 +
++STACK CFI INIT 20f0 341 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 20f2 $r12: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 20f3 $rbp: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 20f4 $rbx: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 2102 .cfa: $rsp 96 +
++STACK CFI 22b3 .cfa: $rsp 32 +
++STACK CFI 22b4 .cfa: $rsp 24 +
++STACK CFI 22b5 .cfa: $rsp 16 +
++STACK CFI 22b7 .cfa: $rsp 8 +
++STACK CFI 22c0 .cfa: $rsp 96 +
++STACK CFI INIT 2440 d1 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 2442 $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 2444 $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 2449 $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 244b $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 2453 $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI 2454 $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI 2463 .cfa: $rsp 64 +
++STACK CFI 248e .cfa: $rsp 56 +
++STACK CFI 248f .cfa: $rsp 48 +
++STACK CFI 2490 .cfa: $rsp 40 +
++STACK CFI 2492 .cfa: $rsp 32 +
++STACK CFI 2494 .cfa: $rsp 24 +
++STACK CFI 2496 .cfa: $rsp 16 +
++STACK CFI 2498 .cfa: $rsp 8 +
++STACK CFI 24a0 .cfa: $rsp 64 +
++STACK CFI 24ec .cfa: $rsp 56 +
++STACK CFI 24f9 .cfa: $rsp 48 +
++STACK CFI 24fa .cfa: $rsp 40 +
++STACK CFI 24fc .cfa: $rsp 32 +
++STACK CFI 24fe .cfa: $rsp 24 +
++STACK CFI 2500 .cfa: $rsp 16 +
++STACK CFI 2502 .cfa: $rsp 8 +
++STACK CFI 2507 .cfa: $rsp 64 +
++STACK CFI INIT 2520 4c6 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 2522 $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 2524 $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 2526 $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 2528 $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 2529 $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI 252a $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI 2534 .cfa: $rsp 144 +
++STACK CFI 2574 .cfa: $rsp 56 +
++STACK CFI 2575 .cfa: $rsp 48 +
++STACK CFI 2576 .cfa: $rsp 40 +
++STACK CFI 2578 .cfa: $rsp 32 +
++STACK CFI 257a .cfa: $rsp 24 +
++STACK CFI 257c .cfa: $rsp 16 +
++STACK CFI 257e .cfa: $rsp 8 +
++STACK CFI 2580 .cfa: $rsp 144 +
++STACK CFI INIT 29f0 1da .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 29f2 $r13: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 29f4 $r12: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 29f8 $rbp: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 29f9 $rbx: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 2a03 .cfa: $rsp 48 +
++STACK CFI 2a19 .cfa: $rsp 40 +
++STACK CFI 2a1a .cfa: $rsp 32 +
++STACK CFI 2a1b .cfa: $rsp 24 +
++STACK CFI 2a1d .cfa: $rsp 16 +
++STACK CFI 2a1f .cfa: $rsp 8 +
++STACK CFI 2a20 .cfa: $rsp 48 +
++STACK CFI 2b8d .cfa: $rsp 40 +
++STACK CFI 2b98 .cfa: $rsp 32 +
++STACK CFI 2b99 .cfa: $rsp 24 +
++STACK CFI 2b9b .cfa: $rsp 16 +
++STACK CFI 2b9d .cfa: $rsp 8 +
++STACK CFI 2ba8 .cfa: $rsp 48 +
++STACK CFI INIT 2bd0 1ef .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 2bd2 $r14: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 2bd4 $r13: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 2bd9 $r12: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 2bda $rbp: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 2bde $rbx: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI 2be8 .cfa: $rsp 208 +
++STACK CFI 2c2b .cfa: $rsp 48 +
++STACK CFI 2c2c .cfa: $rsp 40 +
++STACK CFI 2c2d .cfa: $rsp 32 +
++STACK CFI 2c2f .cfa: $rsp 24 +
++STACK CFI 2c31 .cfa: $rsp 16 +
++STACK CFI 2c33 .cfa: $rsp 8 +
++STACK CFI 2c38 .cfa: $rsp 208 +
++STACK CFI INIT 2dc0 7f .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 2dc7 .cfa: $rsp 1104 +
++STACK CFI 2e39 .cfa: $rsp 8 +
++STACK CFI 2e3a .cfa: $rsp 1104 +
++STACK CFI INIT 2e40 e5 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 2e42 $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 2e44 $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 2e49 $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 2e4b $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 2e4f $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI 2e50 $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI 2e59 .cfa: $rsp 80 +
++STACK CFI 2eaa .cfa: $rsp 56 +
++STACK CFI 2eab .cfa: $rsp 48 +
++STACK CFI 2eac .cfa: $rsp 40 +
++STACK CFI 2eae .cfa: $rsp 32 +
++STACK CFI 2eb0 .cfa: $rsp 24 +
++STACK CFI 2eb2 .cfa: $rsp 16 +
++STACK CFI 2eb4 .cfa: $rsp 8 +
++STACK CFI 2eb8 .cfa: $rsp 80 +
++STACK CFI INIT 2f30 ac .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 2f31 $rbx: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 2f6f .cfa: $rsp 24 +
++STACK CFI 2f71 .cfa: $rsp 32 +
++STACK CFI 2f7a .cfa: $rsp 40 +
++STACK CFI 2f7b .cfa: $rsp 48 +
++STACK CFI 2f8d .cfa: $rsp 16 +
++STACK CFI 2f8e .cfa: $rsp 8 +
++STACK CFI 2f90 .cfa: $rsp 16 +
++STACK CFI 2fa1 .cfa: $rsp 24 +
++STACK CFI 2fa3 .cfa: $rsp 32 +
++STACK CFI 2fac .cfa: $rsp 24 +
++STACK CFI 2fad .cfa: $rsp 16 +
++STACK CFI 2fae .cfa: $rsp 8 +
++STACK CFI 2fb0 .cfa: $rsp 16 +
++STACK CFI 2fbc .cfa: $rsp 24 +
++STACK CFI 2fbe .cfa: $rsp 32 +
++STACK CFI 2fc7 .cfa: $rsp 40 +
++STACK CFI 2fc8 .cfa: $rsp 48 +
++STACK CFI 2fda .cfa: $rsp 16 +
++STACK CFI 2fdb .cfa: $rsp 8 +
++STACK CFI INIT 2fe0 82 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 2fe1 $rbp: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 2fe2 $rbx: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 2fee .cfa: $rsp 32 +
++STACK CFI 3059 .cfa: $rsp 24 +
++STACK CFI 3060 .cfa: $rsp 16 +
++STACK CFI 3061 .cfa: $rsp 8 +
++STACK CFI INIT 3070 195 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 3071 $rbx: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 3078 .cfa: $rsp 1632 +
++STACK CFI 3109 .cfa: $rsp 16 +
++STACK CFI 310a .cfa: $rsp 8 +
++STACK CFI 3110 .cfa: $rsp 1632 +
++STACK CFI INIT 3210 e3 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 3212 $r14: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 3214 $r13: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 3218 $rbp: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 3219 $rbx: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 3228 .cfa: $rsp 672 +
++STACK CFI 32e7 .cfa: $rsp 40 +
++STACK CFI 32e8 .cfa: $rsp 32 +
++STACK CFI 32e9 .cfa: $rsp 24 +
++STACK CFI 32eb .cfa: $rsp 16 +
++STACK CFI 32ed .cfa: $rsp 8 +
++STACK CFI 32ee .cfa: $rsp 672 +
++STACK CFI INIT 3300 91 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 3302 $r13: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 3304 $r12: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 3305 $rbp: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 3306 $rbx: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 3311 .cfa: $rsp 48 +
++STACK CFI 333a .cfa: $rsp 40 +
++STACK CFI 333b .cfa: $rsp 32 +
++STACK CFI 333c .cfa: $rsp 24 +
++STACK CFI 333e .cfa: $rsp 16 +
++STACK CFI 3340 .cfa: $rsp 8 +
++STACK CFI 3348 .cfa: $rsp 48 +
++STACK CFI 338a .cfa: $rsp 40 +
++STACK CFI 338b .cfa: $rsp 32 +
++STACK CFI 338c .cfa: $rsp 24 +
++STACK CFI 338e .cfa: $rsp 16 +
++STACK CFI 3390 .cfa: $rsp 8 +
++STACK CFI INIT 33a0 52 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 33a1 $rbx: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 33e2 .cfa: $rsp 8 +
++STACK CFI 33f0 .cfa: $rsp 16 +
++STACK CFI 33f1 .cfa: $rsp 8 +
++STACK CFI INIT 3400 257 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 3402 $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 3404 $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 3409 $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 340b $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 340f $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI 3410 $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI 3420 .cfa: $rsp 240 +
++STACK CFI 359d .cfa: $rsp 56 +
++STACK CFI 359e .cfa: $rsp 48 +
++STACK CFI 359f .cfa: $rsp 40 +
++STACK CFI 35a1 .cfa: $rsp 32 +
++STACK CFI 35a3 .cfa: $rsp 24 +
++STACK CFI 35a5 .cfa: $rsp 16 +
++STACK CFI 35a7 .cfa: $rsp 8 +
++STACK CFI 35b0 .cfa: $rsp 240 +
++STACK CFI INIT 3660 8 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI INIT 3cb0 ea .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 3cb2 $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 3cb4 $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 3cb9 $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 3cbb $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 3cbf $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI 3cc0 $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI 3cc4 .cfa: $rsp 64 +
++STACK CFI 3d4a .cfa: $rsp 56 +
++STACK CFI 3d4b .cfa: $rsp 48 +
++STACK CFI 3d4c .cfa: $rsp 40 +
++STACK CFI 3d4e .cfa: $rsp 32 +
++STACK CFI 3d50 .cfa: $rsp 24 +
++STACK CFI 3d52 .cfa: $rsp 16 +
++STACK CFI 3d54 .cfa: $rsp 8 +
++STACK CFI 3d58 .cfa: $rsp 64 +
++STACK CFI INIT 3670 396 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 3672 $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 3674 $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 3679 $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 367f $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 3680 $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI 3681 $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI 3688 .cfa: $rsp 80 +
++STACK CFI 37d0 .cfa: $rsp 56 +
++STACK CFI 37d1 .cfa: $rsp 48 +
++STACK CFI 37d2 .cfa: $rsp 40 +
++STACK CFI 37d4 .cfa: $rsp 32 +
++STACK CFI 37d6 .cfa: $rsp 24 +
++STACK CFI 37d8 .cfa: $rsp 16 +
++STACK CFI 37da .cfa: $rsp 8 +
++STACK CFI 37e0 .cfa: $rsp 80 +
++STACK CFI INIT 3a10 292 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 3a11 $rbp: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 3a14 .cfa: $rbp 16 +
++STACK CFI 3a1c $r12: .cfa -48 + ^ $r13: .cfa -40 + ^ $r14: .cfa -32 + ^ $r15: .cfa -24 + ^
++STACK CFI 3a20 $rbx: .cfa -56 + ^
++STACK CFI 3be0 .cfa: $rsp 8 +
++STACK CFI 3be8 .cfa: $rbp 16 +
++STACK CFI INIT 3da0 17c .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 3da2 $r13: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 3da4 $r12: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 3da5 $rbp: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 3da6 $rbx: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 3db4 .cfa: $rsp 64 +
++STACK CFI 3ea0 .cfa: $rsp 40 +
++STACK CFI 3ea1 .cfa: $rsp 32 +
++STACK CFI 3ea2 .cfa: $rsp 24 +
++STACK CFI 3ea4 .cfa: $rsp 16 +
++STACK CFI 3ea6 .cfa: $rsp 8 +
++STACK CFI 3eb0 .cfa: $rsp 64 +
++STACK CFI INIT 3f20 3c7 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 3f22 $r14: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 3f24 $r13: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 3f26 $r12: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 3f27 $rbp: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 3f28 $rbx: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI 3f2f .cfa: $rsp 224 +
++STACK CFI 41c8 .cfa: $rsp 48 +
++STACK CFI 41c9 .cfa: $rsp 40 +
++STACK CFI 41ca .cfa: $rsp 32 +
++STACK CFI 41cc .cfa: $rsp 24 +
++STACK CFI 41ce .cfa: $rsp 16 +
++STACK CFI 41d0 .cfa: $rsp 8 +
++STACK CFI 41d8 .cfa: $rsp 224 +
++STACK CFI INIT 42f0 c2 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 42f1 $rbp: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 42f2 $rbx: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 42f6 .cfa: $rsp 32 +
++STACK CFI 438d .cfa: $rsp 24 +
++STACK CFI 4391 .cfa: $rsp 16 +
++STACK CFI 4392 .cfa: $rsp 8 +
++STACK CFI 4393 .cfa: $rsp 32 +
++STACK CFI INIT 43c0 33 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 43cc $rbx: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 43f2 .cfa: $rsp 8 +
++STACK CFI INIT 6e10 3de .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 6e1b $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 6e1d $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 6e22 $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 6e24 $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 6e28 $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI 6e29 $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI 6e39 .cfa: $rsp 96 +
++STACK CFI 6eac .cfa: $rsp 56 +
++STACK CFI 6ead $rbx: $rbx .cfa: $rsp 48 +
++STACK CFI 6eae $rbp: $rbp .cfa: $rsp 40 +
++STACK CFI 6eb0 $r12: $r12 .cfa: $rsp 32 +
++STACK CFI 6eb2 $r13: $r13 .cfa: $rsp 24 +
++STACK CFI 6eb4 $r14: $r14 .cfa: $rsp 16 +
++STACK CFI 6eb6 $r15: $r15 .cfa: $rsp 8 +
++STACK CFI 6ec0 $r12: .cfa -40 + ^ $r13: .cfa -32 + ^ $r14: .cfa -24 + ^ $r15: .cfa -16 + ^ $rbp: .cfa -48 + ^ $rbx: .cfa -56 + ^ .cfa: $rsp 96 +
++STACK CFI 6f30 .cfa: $rsp 56 +
++STACK CFI 6f37 $rbx: $rbx .cfa: $rsp 48 +
++STACK CFI 6f38 $rbp: $rbp .cfa: $rsp 40 +
++STACK CFI 6f3a $r12: $r12 .cfa: $rsp 32 +
++STACK CFI 6f3c $r13: $r13 .cfa: $rsp 24 +
++STACK CFI 6f3e $r14: $r14 .cfa: $rsp 16 +
++STACK CFI 6f40 $r15: $r15 .cfa: $rsp 8 +
++STACK CFI 6f48 $r12: .cfa -40 + ^ $r13: .cfa -32 + ^ $r14: .cfa -24 + ^ $r15: .cfa -16 + ^ $rbp: .cfa -48 + ^ $rbx: .cfa -56 + ^ .cfa: $rsp 96 +
++STACK CFI 702d .cfa: $rsp 56 +
++STACK CFI 702e $rbx: $rbx .cfa: $rsp 48 +
++STACK CFI 702f $rbp: $rbp .cfa: $rsp 40 +
++STACK CFI 7031 $r12: $r12 .cfa: $rsp 32 +
++STACK CFI 7033 $r13: $r13 .cfa: $rsp 24 +
++STACK CFI 7035 $r14: $r14 .cfa: $rsp 16 +
++STACK CFI 7037 $r15: $r15 .cfa: $rsp 8 +
++STACK CFI 7040 $r12: .cfa -40 + ^ $r13: .cfa -32 + ^ $r14: .cfa -24 + ^ $r15: .cfa -16 + ^ $rbp: .cfa -48 + ^ $rbx: .cfa -56 + ^ .cfa: $rsp 96 +
++STACK CFI INIT 4400 2a01 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 4401 $rbp: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 4404 .cfa: $rbp 16 +
++STACK CFI 440c $r12: .cfa -48 + ^ $r13: .cfa -40 + ^ $r14: .cfa -32 + ^ $r15: .cfa -24 + ^
++STACK CFI 441f $rbx: .cfa -56 + ^
++STACK CFI 44c0 .cfa: $rsp 8 +
++STACK CFI 44c8 .cfa: $rbp 16 +
++STACK CFI INIT 71f0 6 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI INIT 9350 143 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 935b $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 935d $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 935f $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 9361 $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 9362 $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI 9363 $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI 936a .cfa: $rsp 64 +
++STACK CFI 939c .cfa: $rsp 56 +
++STACK CFI 939d $rbx: $rbx .cfa: $rsp 48 +
++STACK CFI 939e $rbp: $rbp .cfa: $rsp 40 +
++STACK CFI 93a0 $r12: $r12 .cfa: $rsp 32 +
++STACK CFI 93a2 $r13: $r13 .cfa: $rsp 24 +
++STACK CFI 93a4 $r14: $r14 .cfa: $rsp 16 +
++STACK CFI 93a6 $r15: $r15 .cfa: $rsp 8 +
++STACK CFI 93b0 $r12: .cfa -40 + ^ $r13: .cfa -32 + ^ $r14: .cfa -24 + ^ $r15: .cfa -16 + ^ $rbp: .cfa -48 + ^ $rbx: .cfa -56 + ^ .cfa: $rsp 64 +
++STACK CFI 945f .cfa: $rsp 56 +
++STACK CFI 9464 $rbx: $rbx .cfa: $rsp 48 +
++STACK CFI 9465 $rbp: $rbp .cfa: $rsp 40 +
++STACK CFI 9467 $r12: $r12 .cfa: $rsp 32 +
++STACK CFI 9469 $r13: $r13 .cfa: $rsp 24 +
++STACK CFI 946b $r14: $r14 .cfa: $rsp 16 +
++STACK CFI 946d $r15: $r15 .cfa: $rsp 8 +
++STACK CFI 9470 $r12: .cfa -40 + ^ $r13: .cfa -32 + ^ $r14: .cfa -24 + ^ $r15: .cfa -16 + ^ $rbp: .cfa -48 + ^ $rbx: .cfa -56 + ^ .cfa: $rsp 64 +
++STACK CFI 9484 .cfa: $rsp 56 +
++STACK CFI 9485 $rbx: $rbx .cfa: $rsp 48 +
++STACK CFI 9486 $rbp: $rbp .cfa: $rsp 40 +
++STACK CFI 9488 $r12: $r12 .cfa: $rsp 32 +
++STACK CFI 948a $r13: $r13 .cfa: $rsp 24 +
++STACK CFI 948c $r14: $r14 .cfa: $rsp 16 +
++STACK CFI 948e $r15: $r15 .cfa: $rsp 8 +
++STACK CFI INIT 7200 8b2 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 7202 $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 7204 $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 720d $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 720f $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 7213 $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI 7214 $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI 721b .cfa: $rsp 448 +
++STACK CFI 7412 .cfa: $rsp 56 +
++STACK CFI 7413 .cfa: $rsp 48 +
++STACK CFI 7414 .cfa: $rsp 40 +
++STACK CFI 7416 .cfa: $rsp 32 +
++STACK CFI 7418 .cfa: $rsp 24 +
++STACK CFI 741a .cfa: $rsp 16 +
++STACK CFI 741c .cfa: $rsp 8 +
++STACK CFI 741d .cfa: $rsp 448 +
++STACK CFI INIT 7ac0 835 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 7ac2 $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 7ac4 $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 7acd $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 7acf $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 7ad6 $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI 7ad7 $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI 7ae2 .cfa: $rsp 80 +
++STACK CFI 7d35 .cfa: $rsp 56 +
++STACK CFI 7d36 .cfa: $rsp 48 +
++STACK CFI 7d37 .cfa: $rsp 40 +
++STACK CFI 7d39 .cfa: $rsp 32 +
++STACK CFI 7d3b .cfa: $rsp 24 +
++STACK CFI 7d3d .cfa: $rsp 16 +
++STACK CFI 7d3f .cfa: $rsp 8 +
++STACK CFI 7d40 .cfa: $rsp 80 +
++STACK CFI INIT 8300 67 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 8302 $r13: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 8304 $r12: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 8308 $rbp: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 8309 $rbx: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 8312 .cfa: $rsp 48 +
++STACK CFI 8360 .cfa: $rsp 40 +
++STACK CFI 8361 .cfa: $rsp 32 +
++STACK CFI 8362 .cfa: $rsp 24 +
++STACK CFI 8364 .cfa: $rsp 16 +
++STACK CFI 8366 .cfa: $rsp 8 +
++STACK CFI INIT 8370 12 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 8371 $rbx: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 837d .cfa: $rsp 8 +
++STACK CFI INIT 8390 1f8 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI INIT 8590 4a .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 8591 $rbp: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 8592 $rbx: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 85a1 .cfa: $rsp 32 +
++STACK CFI 85d5 .cfa: $rsp 24 +
++STACK CFI 85d8 .cfa: $rsp 16 +
++STACK CFI 85d9 .cfa: $rsp 8 +
++STACK CFI INIT 85e0 18b .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 85e2 $r14: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 85e4 $r13: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 85e9 $r12: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 85ea $rbp: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 85ef $rbx: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI 860b .cfa: $rsp 4208 +
++STACK CFI 8649 .cfa: $rsp 48 +
++STACK CFI 864a .cfa: $rsp 40 +
++STACK CFI 864b .cfa: $rsp 32 +
++STACK CFI 864d .cfa: $rsp 24 +
++STACK CFI 864f .cfa: $rsp 16 +
++STACK CFI 8651 .cfa: $rsp 8 +
++STACK CFI 8658 .cfa: $rsp 4208 +
++STACK CFI INIT 8770 1a7 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 8772 $r14: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 8774 $r13: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 877d $r12: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 877e $rbp: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 8782 $rbx: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI 878c .cfa: $rsp 5008 +
++STACK CFI 87d9 .cfa: $rsp 48 +
++STACK CFI 87da .cfa: $rsp 40 +
++STACK CFI 87db .cfa: $rsp 32 +
++STACK CFI 87dd .cfa: $rsp 24 +
++STACK CFI 87df .cfa: $rsp 16 +
++STACK CFI 87e1 .cfa: $rsp 8 +
++STACK CFI 87e8 .cfa: $rsp 5008 +
++STACK CFI INIT 8920 e6 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 8922 $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 8924 $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 8929 $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 892b $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 892f $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI 8930 $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI 8941 .cfa: $rsp 64 +
++STACK CFI 897b .cfa: $rsp 56 +
++STACK CFI 8982 .cfa: $rsp 48 +
++STACK CFI 8983 .cfa: $rsp 40 +
++STACK CFI 8985 .cfa: $rsp 32 +
++STACK CFI 8987 .cfa: $rsp 24 +
++STACK CFI 8989 .cfa: $rsp 16 +
++STACK CFI 898b .cfa: $rsp 8 +
++STACK CFI 8990 .cfa: $rsp 64 +
++STACK CFI 89c6 .cfa: $rsp 56 +
++STACK CFI 89c7 .cfa: $rsp 48 +
++STACK CFI 89c8 .cfa: $rsp 40 +
++STACK CFI 89ca .cfa: $rsp 32 +
++STACK CFI 89cc .cfa: $rsp 24 +
++STACK CFI 89ce .cfa: $rsp 16 +
++STACK CFI 89d0 .cfa: $rsp 8 +
++STACK CFI 89d8 .cfa: $rsp 64 +
++STACK CFI 89ee .cfa: $rsp 56 +
++STACK CFI 89f8 .cfa: $rsp 48 +
++STACK CFI 89f9 .cfa: $rsp 40 +
++STACK CFI 89fb .cfa: $rsp 32 +
++STACK CFI 89fd .cfa: $rsp 24 +
++STACK CFI 89ff .cfa: $rsp 16 +
++STACK CFI 8a01 .cfa: $rsp 8 +
++STACK CFI INIT 8a10 119 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 8a12 $r13: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 8a14 $r12: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 8a18 $rbp: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 8a19 $rbx: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 8a27 .cfa: $rsp 336 +
++STACK CFI 8ae9 .cfa: $rsp 40 +
++STACK CFI 8aea .cfa: $rsp 32 +
++STACK CFI 8aeb .cfa: $rsp 24 +
++STACK CFI 8aed .cfa: $rsp 16 +
++STACK CFI 8aef .cfa: $rsp 8 +
++STACK CFI 8af0 .cfa: $rsp 336 +
++STACK CFI INIT 8b30 32 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 8b31 $rbx: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 8b40 .cfa: $rsp 8 +
++STACK CFI 8b48 .cfa: $rsp 16 +
++STACK CFI 8b5c .cfa: $rsp 8 +
++STACK CFI INIT 8b70 68 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI INIT 8be0 4b .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI INIT 8c30 7d .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 8c32 $r13: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 8c34 $r12: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 8c38 $rbp: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 8c39 $rbx: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 8c46 .cfa: $rsp 48 +
++STACK CFI 8c90 .cfa: $rsp 40 +
++STACK CFI 8c91 .cfa: $rsp 32 +
++STACK CFI 8c92 .cfa: $rsp 24 +
++STACK CFI 8c94 .cfa: $rsp 16 +
++STACK CFI 8c96 .cfa: $rsp 8 +
++STACK CFI 8ca0 .cfa: $rsp 48 +
++STACK CFI 8ca4 .cfa: $rsp 40 +
++STACK CFI 8ca7 .cfa: $rsp 32 +
++STACK CFI 8ca8 .cfa: $rsp 24 +
++STACK CFI 8caa .cfa: $rsp 16 +
++STACK CFI 8cac .cfa: $rsp 8 +
++STACK CFI INIT 8cb0 43 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI INIT 8d00 293 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 8d02 $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 8d04 $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 8d06 $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 8d08 $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 8d0c $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI 8d0d $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI 8d20 .cfa: $rsp 352 +
++STACK CFI 8eb2 .cfa: $rsp 56 +
++STACK CFI 8eb3 .cfa: $rsp 48 +
++STACK CFI 8eb4 .cfa: $rsp 40 +
++STACK CFI 8eb6 .cfa: $rsp 32 +
++STACK CFI 8eb8 .cfa: $rsp 24 +
++STACK CFI 8eba .cfa: $rsp 16 +
++STACK CFI 8ebc .cfa: $rsp 8 +
++STACK CFI 8ebd .cfa: $rsp 352 +
++STACK CFI INIT 8fa0 53 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 8fa1 $rbp: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 8fa2 $rbx: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 8faf .cfa: $rsp 32 +
++STACK CFI 8fbe .cfa: $rsp 24 +
++STACK CFI 8fc1 .cfa: $rsp 16 +
++STACK CFI 8fc2 .cfa: $rsp 8 +
++STACK CFI 8fc8 .cfa: $rsp 32 +
++STACK CFI 8fe6 .cfa: $rsp 24 +
++STACK CFI 8fed .cfa: $rsp 16 +
++STACK CFI 8fee .cfa: $rsp 8 +
++STACK CFI INIT 9000 34b .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 9002 $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 9004 $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 9009 $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 900b $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 900f $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI 9010 $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI 901f .cfa: $rsp 4208 +
++STACK CFI 9093 .cfa: $rsp 56 +
++STACK CFI 9094 .cfa: $rsp 48 +
++STACK CFI 9095 .cfa: $rsp 40 +
++STACK CFI 9097 .cfa: $rsp 32 +
++STACK CFI 9099 .cfa: $rsp 24 +
++STACK CFI 909b .cfa: $rsp 16 +
++STACK CFI 909d .cfa: $rsp 8 +
++STACK CFI 90a0 .cfa: $rsp 4208 +
++STACK CFI INIT 94a0 3 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI INIT 94b0 187 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 94b2 $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 94b4 $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 94b6 $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 94b8 $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 94b9 $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI 94ba $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI 94be .cfa: $rsp 112 +
++STACK CFI 95a5 .cfa: $rsp 56 +
++STACK CFI 95a6 .cfa: $rsp 48 +
++STACK CFI 95a7 .cfa: $rsp 40 +
++STACK CFI 95a9 .cfa: $rsp 32 +
++STACK CFI 95ab .cfa: $rsp 24 +
++STACK CFI 95ad .cfa: $rsp 16 +
++STACK CFI 95af .cfa: $rsp 8 +
++STACK CFI 95b0 .cfa: $rsp 112 +
++STACK CFI INIT a8f0 13 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI INIT a910 20 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI a918 $rbx: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI a92b .cfa: $rsp 8 +
++STACK CFI INIT 9640 bc .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 9651 $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 9653 $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 965b $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 965d $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 9661 $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI 9662 $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI 9666 .cfa: $rsp 64 +
++STACK CFI 96ed .cfa: $rsp 56 +
++STACK CFI 96f1 $rbx: $rbx .cfa: $rsp 48 +
++STACK CFI 96f2 $rbp: $rbp .cfa: $rsp 40 +
++STACK CFI 96f4 $r12: $r12 .cfa: $rsp 32 +
++STACK CFI 96f6 $r13: $r13 .cfa: $rsp 24 +
++STACK CFI 96f8 $r14: $r14 .cfa: $rsp 16 +
++STACK CFI 96fa $r15: $r15 .cfa: $rsp 8 +
++STACK CFI INIT 9700 bb .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 9718 $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 971a $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 971f $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 9721 $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 9725 $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI 9726 $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI 9730 .cfa: $rsp 64 +
++STACK CFI 9743 .cfa: $rsp 56 +
++STACK CFI 9744 $rbx: $rbx .cfa: $rsp 48 +
++STACK CFI 9745 $rbp: $rbp .cfa: $rsp 40 +
++STACK CFI 9747 $r12: $r12 .cfa: $rsp 32 +
++STACK CFI 9749 $r13: $r13 .cfa: $rsp 24 +
++STACK CFI 974b $r14: $r14 .cfa: $rsp 16 +
++STACK CFI 974d $r15: $r15 .cfa: $rsp 8 +
++STACK CFI 9758 $r12: .cfa -40 + ^ $r13: .cfa -32 + ^ $r14: .cfa -24 + ^ $r15: .cfa -16 + ^ $rbp: .cfa -48 + ^ $rbx: .cfa -56 + ^ .cfa: $rsp 64 +
++STACK CFI INIT 97c0 685 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 97c2 $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 97c4 $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 97cd $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 97cf $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 97d3 $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI 97d4 $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI 97db .cfa: $rsp 416 +
++STACK CFI 9883 .cfa: $rsp 56 +
++STACK CFI 9884 .cfa: $rsp 48 +
++STACK CFI 9885 .cfa: $rsp 40 +
++STACK CFI 9887 .cfa: $rsp 32 +
++STACK CFI 9889 .cfa: $rsp 24 +
++STACK CFI 988b .cfa: $rsp 16 +
++STACK CFI 988d .cfa: $rsp 8 +
++STACK CFI 9890 .cfa: $rsp 416 +
++STACK CFI INIT 9e50 27 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 9e51 $rbx: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 9e76 .cfa: $rsp 8 +
++STACK CFI INIT 9e80 e3 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 9e82 $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 9e84 $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 9e89 $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 9e8b $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 9e8f $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI 9e90 $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI 9ea2 .cfa: $rsp 112 +
++STACK CFI 9f0e .cfa: $rsp 56 +
++STACK CFI 9f0f .cfa: $rsp 48 +
++STACK CFI 9f10 .cfa: $rsp 40 +
++STACK CFI 9f12 .cfa: $rsp 32 +
++STACK CFI 9f14 .cfa: $rsp 24 +
++STACK CFI 9f16 .cfa: $rsp 16 +
++STACK CFI 9f18 .cfa: $rsp 8 +
++STACK CFI 9f20 .cfa: $rsp 112 +
++STACK CFI INIT 9f70 d1 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 9f72 $r14: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 9f74 $r13: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 9f79 $r12: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 9f7a $rbp: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 9f7e $rbx: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI 9f8f .cfa: $rsp 80 +
++STACK CFI 9fec .cfa: $rsp 48 +
++STACK CFI 9fed .cfa: $rsp 40 +
++STACK CFI 9fee .cfa: $rsp 32 +
++STACK CFI 9ff0 .cfa: $rsp 24 +
++STACK CFI 9ff2 .cfa: $rsp 16 +
++STACK CFI 9ff4 .cfa: $rsp 8 +
++STACK CFI 9ff8 .cfa: $rsp 80 +
++STACK CFI INIT a050 638 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI a052 $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI a054 $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI a056 $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI a058 $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI a05c $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI a05d $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI a064 .cfa: $rsp 368 +
++STACK CFI a120 .cfa: $rsp 56 +
++STACK CFI a121 .cfa: $rsp 48 +
++STACK CFI a122 .cfa: $rsp 40 +
++STACK CFI a124 .cfa: $rsp 32 +
++STACK CFI a126 .cfa: $rsp 24 +
++STACK CFI a128 .cfa: $rsp 16 +
++STACK CFI a12a .cfa: $rsp 8 +
++STACK CFI a12b .cfa: $rsp 368 +
++STACK CFI INIT a930 288 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI a982 $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI a984 $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI a989 $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI a98b $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI a996 $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI a997 $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI a9a4 .cfa: $rsp 80 +
++STACK CFI aa69 .cfa: $rsp 56 +
++STACK CFI aa6a $rbx: $rbx .cfa: $rsp 48 +
++STACK CFI aa6b $rbp: $rbp .cfa: $rsp 40 +
++STACK CFI aa6d $r12: $r12 .cfa: $rsp 32 +
++STACK CFI aa6f $r13: $r13 .cfa: $rsp 24 +
++STACK CFI aa71 $r14: $r14 .cfa: $rsp 16 +
++STACK CFI aa73 $r15: $r15 .cfa: $rsp 8 +
++STACK CFI aa75 $r12: .cfa -40 + ^ $r13: .cfa -32 + ^ $r14: .cfa -24 + ^ $r15: .cfa -16 + ^ $rbp: .cfa -48 + ^ $rbx: .cfa -56 + ^ .cfa: $rsp 80 +
++STACK CFI INIT a690 251 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI a692 $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI a694 $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI a696 $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI a698 $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI a699 $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI a69a $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI a6a1 .cfa: $rsp 304 +
++STACK CFI a815 .cfa: $rsp 56 +
++STACK CFI a816 .cfa: $rsp 48 +
++STACK CFI a817 .cfa: $rsp 40 +
++STACK CFI a819 .cfa: $rsp 32 +
++STACK CFI a81b .cfa: $rsp 24 +
++STACK CFI a81d .cfa: $rsp 16 +
++STACK CFI a81f .cfa: $rsp 8 +
++STACK CFI a820 .cfa: $rsp 304 +
++STACK CFI INIT 1900 4a .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 1902 $r13: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 1904 $r12: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 1908 $rbp: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 1909 $rbx: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 190d .cfa: $rsp 48 +
++STACK CFI 1943 .cfa: $rsp 40 +
++STACK CFI 1944 .cfa: $rsp 32 +
++STACK CFI 1945 .cfa: $rsp 24 +
++STACK CFI 1947 .cfa: $rsp 16 +
++STACK CFI 1949 .cfa: $rsp 8 +
++STACK CFI INIT 194a 20 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 1952 .cfa: $rsp 16 +
++STACK CFI INIT 196a 20 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 1972 .cfa: $rsp 16 +
++STACK CFI INIT 198a 1d .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 1990 .cfa: $rsp 16 +
++STACK CFI 1995 .cfa: $rsp 8 +
++STACK CFI INIT 19a8 20 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 19b0 .cfa: $rsp 16 +
++STACK CFI INIT 19c8 20 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 19d0 .cfa: $rsp 16 +
++STACK CFI INIT 19e8 2c .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 19e9 $rbp: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 19ea $rbx: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 19ef .cfa: $rsp 32 +
++STACK CFI 1a0a .cfa: $rsp 24 +
++STACK CFI 1a0e .cfa: $rsp 16 +
++STACK CFI 1a0f .cfa: $rsp 8 +
++STACK CFI INIT 1a14 1ec .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 1a16 $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 1a18 $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 1a1a $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 1a1c $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 1a20 $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI 1a21 $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI 1a2a .cfa: $rsp 112 +
++STACK CFI 1bf5 .cfa: $rsp 56 +
++STACK CFI 1bf6 .cfa: $rsp 48 +
++STACK CFI 1bf7 .cfa: $rsp 40 +
++STACK CFI 1bf9 .cfa: $rsp 32 +
++STACK CFI 1bfb .cfa: $rsp 24 +
++STACK CFI 1bfd .cfa: $rsp 16 +
++STACK CFI 1bff .cfa: $rsp 8 +
++STACK CFI INIT 1c00 67 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 1c02 $r12: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 1c03 $rbp: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 1c07 $rbx: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 1c11 .cfa: $rsp 304 +
++STACK CFI 1c62 .cfa: $rsp 32 +
++STACK CFI 1c63 .cfa: $rsp 24 +
++STACK CFI 1c64 .cfa: $rsp 16 +
++STACK CFI 1c66 .cfa: $rsp 8 +
++STACK CFI INIT f400 259 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI f402 $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI f404 $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI f40a $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI f40c $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI f410 $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI f411 $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI f418 .cfa: $rsp 64 +
++STACK CFI f47d .cfa: $rsp 56 +
++STACK CFI f480 .cfa: $rsp 48 +
++STACK CFI f481 .cfa: $rsp 40 +
++STACK CFI f483 .cfa: $rsp 32 +
++STACK CFI f485 .cfa: $rsp 24 +
++STACK CFI f487 .cfa: $rsp 16 +
++STACK CFI f489 .cfa: $rsp 8 +
++STACK CFI f490 .cfa: $rsp 64 +
++STACK CFI f563 .cfa: $rsp 56 +
++STACK CFI f564 .cfa: $rsp 48 +
++STACK CFI f56a .cfa: $rsp 40 +
++STACK CFI f56c .cfa: $rsp 32 +
++STACK CFI f56e .cfa: $rsp 24 +
++STACK CFI f570 .cfa: $rsp 16 +
++STACK CFI f572 .cfa: $rsp 8 +
++STACK CFI f578 .cfa: $rsp 64 +
++STACK CFI f62d .cfa: $rsp 56 +
++STACK CFI f630 .cfa: $rsp 48 +
++STACK CFI f631 .cfa: $rsp 40 +
++STACK CFI f633 .cfa: $rsp 32 +
++STACK CFI f635 .cfa: $rsp 24 +
++STACK CFI f637 .cfa: $rsp 16 +
++STACK CFI f639 .cfa: $rsp 8 +
++STACK CFI f63a .cfa: $rsp 64 +
++STACK CFI INIT f660 257 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI f682 $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI f684 $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI f686 $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI f688 $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI f689 $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI f68a $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI f691 .cfa: $rsp 80 +
++STACK CFI f6c1 .cfa: $rsp 56 +
++STACK CFI f6c2 $rbx: $rbx .cfa: $rsp 48 +
++STACK CFI f6c3 $rbp: $rbp .cfa: $rsp 40 +
++STACK CFI f6c5 $r12: $r12 .cfa: $rsp 32 +
++STACK CFI f6c7 $r13: $r13 .cfa: $rsp 24 +
++STACK CFI f6c9 $r14: $r14 .cfa: $rsp 16 +
++STACK CFI f6cb $r15: $r15 .cfa: $rsp 8 +
++STACK CFI f6d0 $r12: .cfa -40 + ^ $r13: .cfa -32 + ^ $r14: .cfa -24 + ^ $r15: .cfa -16 + ^ $rbp: .cfa -48 + ^ $rbx: .cfa -56 + ^ .cfa: $rsp 80 +
++STACK CFI INIT f8c0 250 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI f8c2 $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI f8c4 $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI f8c6 $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI f8c8 $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI f8cc $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI f8cd $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI f8d4 .cfa: $rsp 80 +
++STACK CFI f980 .cfa: $rsp 56 +
++STACK CFI f981 .cfa: $rsp 48 +
++STACK CFI f982 .cfa: $rsp 40 +
++STACK CFI f984 .cfa: $rsp 32 +
++STACK CFI f986 .cfa: $rsp 24 +
++STACK CFI f988 .cfa: $rsp 16 +
++STACK CFI f98a .cfa: $rsp 8 +
++STACK CFI f990 .cfa: $rsp 80 +
++STACK CFI INIT abc0 fbb .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI abc2 $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI abc4 $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI abc6 $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI abc8 $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI abc9 $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI abca $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI abd1 .cfa: $rsp 2464 +
++STACK CFI af7b .cfa: $rsp 56 +
++STACK CFI af7c .cfa: $rsp 48 +
++STACK CFI af7d .cfa: $rsp 40 +
++STACK CFI af7f .cfa: $rsp 32 +
++STACK CFI af81 .cfa: $rsp 24 +
++STACK CFI af83 .cfa: $rsp 16 +
++STACK CFI af85 .cfa: $rsp 8 +
++STACK CFI af86 .cfa: $rsp 2464 +
++STACK CFI INIT bb80 227f .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI bb81 $rbp: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI bb89 .cfa: $rbp 16 +
++STACK CFI bb91 $r12: .cfa -48 + ^ $r13: .cfa -40 + ^ $r14: .cfa -32 + ^ $r15: .cfa -24 + ^
++STACK CFI bb96 $rbx: .cfa -56 + ^
++STACK CFI bcdf .cfa: $rsp 8 +
++STACK CFI bce0 .cfa: $rbp 16 +
++STACK CFI INIT de00 566 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI de02 $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI de04 $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI de09 $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI de0b $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI de0c $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI de0d $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI de17 .cfa: $rsp 288 +
++STACK CFI dfb2 .cfa: $rsp 56 +
++STACK CFI dfb3 .cfa: $rsp 48 +
++STACK CFI dfb4 .cfa: $rsp 40 +
++STACK CFI dfb6 .cfa: $rsp 32 +
++STACK CFI dfb8 .cfa: $rsp 24 +
++STACK CFI dfba .cfa: $rsp 16 +
++STACK CFI dfbc .cfa: $rsp 8 +
++STACK CFI dfc0 .cfa: $rsp 288 +
++STACK CFI INIT e370 6ba .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI e372 $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI e374 $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI e379 $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI e37b $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI e37c $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI e37d $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI e386 .cfa: $rsp 576 +
++STACK CFI e5ed .cfa: $rsp 56 +
++STACK CFI e5ee .cfa: $rsp 48 +
++STACK CFI e5ef .cfa: $rsp 40 +
++STACK CFI e5f1 .cfa: $rsp 32 +
++STACK CFI e5f3 .cfa: $rsp 24 +
++STACK CFI e5f5 .cfa: $rsp 16 +
++STACK CFI e5f7 .cfa: $rsp 8 +
++STACK CFI e5f8 .cfa: $rsp 576 +
++STACK CFI INIT ea30 690 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI ea32 $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI ea34 $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI ea39 $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI ea3b $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI ea3f $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI ea40 $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI ea4c .cfa: $rsp 544 +
++STACK CFI eaff .cfa: $rsp 56 +
++STACK CFI eb00 .cfa: $rsp 48 +
++STACK CFI eb01 .cfa: $rsp 40 +
++STACK CFI eb03 .cfa: $rsp 32 +
++STACK CFI eb05 .cfa: $rsp 24 +
++STACK CFI eb07 .cfa: $rsp 16 +
++STACK CFI eb09 .cfa: $rsp 8 +
++STACK CFI eb10 .cfa: $rsp 544 +
++STACK CFI INIT f0c0 119 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI f0c1 $rbp: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI f0c8 .cfa: $rbp 16 +
++STACK CFI f0cf $r12: .cfa -40 + ^ $r13: .cfa -32 + ^ $r14: .cfa -24 + ^ $rbx: .cfa -48 + ^
++STACK CFI f196 .cfa: $rsp 8 +
++STACK CFI f197 .cfa: $rbp 16 +
++STACK CFI INIT f1e0 119 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI f1e1 $rbp: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI f1e8 .cfa: $rbp 16 +
++STACK CFI f1ef $r12: .cfa -40 + ^ $r13: .cfa -32 + ^ $r14: .cfa -24 + ^ $rbx: .cfa -48 + ^
++STACK CFI f2b6 .cfa: $rsp 8 +
++STACK CFI f2b7 .cfa: $rbp 16 +
++STACK CFI INIT f300 36 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI f304 .cfa: $rsp 24 +
++STACK CFI f30a .cfa: $rsp 32 +
++STACK CFI f30e .cfa: $rsp 40 +
++STACK CFI f314 .cfa: $rsp 48 +
++STACK CFI f316 .cfa: $rsp 56 +
++STACK CFI f31b .cfa: $rsp 64 +
++STACK CFI f335 .cfa: $rsp 8 +
++STACK CFI INIT f340 35 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI f344 .cfa: $rsp 24 +
++STACK CFI f34a .cfa: $rsp 32 +
++STACK CFI f34e .cfa: $rsp 40 +
++STACK CFI f354 .cfa: $rsp 48 +
++STACK CFI f356 .cfa: $rsp 56 +
++STACK CFI f35b .cfa: $rsp 64 +
++STACK CFI f374 .cfa: $rsp 8 +
++STACK CFI INIT f380 34 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI f384 .cfa: $rsp 24 +
++STACK CFI f38a .cfa: $rsp 32 +
++STACK CFI f38e .cfa: $rsp 40 +
++STACK CFI f394 .cfa: $rsp 48 +
++STACK CFI f398 .cfa: $rsp 56 +
++STACK CFI f39a .cfa: $rsp 64 +
++STACK CFI f3b3 .cfa: $rsp 8 +
++STACK CFI INIT f3c0 33 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI f3c4 .cfa: $rsp 24 +
++STACK CFI f3ca .cfa: $rsp 32 +
++STACK CFI f3ce .cfa: $rsp 40 +
++STACK CFI f3d4 .cfa: $rsp 48 +
++STACK CFI f3d8 .cfa: $rsp 56 +
++STACK CFI f3da .cfa: $rsp 64 +
++STACK CFI f3f2 .cfa: $rsp 8 +
++STACK CFI INIT fb10 23 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI fb29 .cfa: $rsp 16 +
++STACK CFI INIT fb40 1a .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI INIT fb60 78 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI fb62 $r12: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI fb63 $rbp: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI fb67 $rbx: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI fb9f .cfa: $rsp 24 +
++STACK CFI fba0 .cfa: $rsp 16 +
++STACK CFI fba2 .cfa: $rsp 8 +
++STACK CFI fba8 .cfa: $rsp 32 +
++STACK CFI fbb5 .cfa: $rsp 24 +
++STACK CFI fbb6 .cfa: $rsp 16 +
++STACK CFI fbb8 .cfa: $rsp 8 +
++STACK CFI fbb9 .cfa: $rsp 32 +
++STACK CFI INIT fbe0 2c .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI fbf4 .cfa: $rsp 16 +
++STACK CFI INIT fc10 5d .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI fc12 $r12: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI fc16 $rbp: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI fc17 $rbx: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI fc5a .cfa: $rsp 24 +
++STACK CFI fc5b .cfa: $rsp 16 +
++STACK CFI fc5d .cfa: $rsp 8 +
++STACK CFI fc60 .cfa: $rsp 32 +
++STACK CFI INIT fc70 15 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI INIT fc90 b6 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI fc92 $r13: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI fc94 $r12: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI fc95 $rbp: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI fc96 $rbx: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI fc9a .cfa: $rsp 48 +
++STACK CFI fcce .cfa: $rsp 40 +
++STACK CFI fccf .cfa: $rsp 32 +
++STACK CFI fcd0 .cfa: $rsp 24 +
++STACK CFI fcd2 .cfa: $rsp 16 +
++STACK CFI fcd4 .cfa: $rsp 8 +
++STACK CFI fcd8 .cfa: $rsp 48 +
++STACK CFI INIT fd50 ff .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI fd51 $rbp: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI fd52 $rbx: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI fd56 .cfa: $rsp 32 +
++STACK CFI fdd9 .cfa: $rsp 24 +
++STACK CFI fdda .cfa: $rsp 16 +
++STACK CFI fddb .cfa: $rsp 8 +
++STACK CFI fde0 .cfa: $rsp 32 +
++STACK CFI fded .cfa: $rsp 24 +
++STACK CFI fdf0 .cfa: $rsp 16 +
++STACK CFI fdf1 .cfa: $rsp 8 +
++STACK CFI fdf2 .cfa: $rsp 32 +
++STACK CFI INIT fe50 fc .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI fe52 $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI fe54 $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI fe56 $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI fe58 $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI fe59 $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI fe5a $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI fe5e .cfa: $rsp 80 +
++STACK CFI ff16 .cfa: $rsp 56 +
++STACK CFI ff17 .cfa: $rsp 48 +
++STACK CFI ff18 .cfa: $rsp 40 +
++STACK CFI ff1a .cfa: $rsp 32 +
++STACK CFI ff1c .cfa: $rsp 24 +
++STACK CFI ff1e .cfa: $rsp 16 +
++STACK CFI ff20 .cfa: $rsp 8 +
++STACK CFI ff21 .cfa: $rsp 80 +
++STACK CFI INIT ff50 fb .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI ff52 $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI ff54 $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI ff56 $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI ff58 $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI ff59 $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI ff5a $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI ff5e .cfa: $rsp 80 +
++STACK CFI 10015 .cfa: $rsp 56 +
++STACK CFI 10016 .cfa: $rsp 48 +
++STACK CFI 10017 .cfa: $rsp 40 +
++STACK CFI 10019 .cfa: $rsp 32 +
++STACK CFI 1001b .cfa: $rsp 24 +
++STACK CFI 1001d .cfa: $rsp 16 +
++STACK CFI 1001f .cfa: $rsp 8 +
++STACK CFI 10020 .cfa: $rsp 80 +
++STACK CFI INIT 10050 41 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 10051 $rbx: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 10071 .cfa: $rsp 8 +
++STACK CFI 10072 .cfa: $rsp 16 +
++STACK CFI INIT 100a0 238 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 100a2 $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 100a4 $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 100a6 $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 100a8 $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 100a9 $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI 100aa $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI 100ae .cfa: $rsp 128 +
++STACK CFI 101a5 .cfa: $rsp 56 +
++STACK CFI 101a6 .cfa: $rsp 48 +
++STACK CFI 101a7 .cfa: $rsp 40 +
++STACK CFI 101a9 .cfa: $rsp 32 +
++STACK CFI 101ab .cfa: $rsp 24 +
++STACK CFI 101ad .cfa: $rsp 16 +
++STACK CFI 101af .cfa: $rsp 8 +
++STACK CFI 101b0 .cfa: $rsp 128 +
++STACK CFI INIT 102e0 238 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 102e2 $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 102e4 $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 102e6 $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 102e8 $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 102e9 $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI 102ea $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI 102ee .cfa: $rsp 128 +
++STACK CFI 103dc .cfa: $rsp 56 +
++STACK CFI 103dd .cfa: $rsp 48 +
++STACK CFI 103de .cfa: $rsp 40 +
++STACK CFI 103e0 .cfa: $rsp 32 +
++STACK CFI 103e2 .cfa: $rsp 24 +
++STACK CFI 103e4 .cfa: $rsp 16 +
++STACK CFI 103e6 .cfa: $rsp 8 +
++STACK CFI 103f0 .cfa: $rsp 128 +
++STACK CFI INIT 10520 89 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 10524 .cfa: $rsp 16 +
++STACK CFI 10547 .cfa: $rsp 8 +
++STACK CFI 1054c .cfa: $rsp 16 +
++STACK CFI INIT 105b0 df .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 105b2 $r12: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 105b3 $rbp: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 105b4 $rbx: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 105b8 .cfa: $rsp 64 +
++STACK CFI 10615 .cfa: $rsp 32 +
++STACK CFI 10616 .cfa: $rsp 24 +
++STACK CFI 10617 .cfa: $rsp 16 +
++STACK CFI 10619 .cfa: $rsp 8 +
++STACK CFI 10620 .cfa: $rsp 64 +
++STACK CFI INIT 10690 b1 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 10692 $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 10694 $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 10698 $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 1069a $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 1069e $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI 1069f $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI 106b2 .cfa: $rsp 96 +
++STACK CFI 10729 .cfa: $rsp 56 +
++STACK CFI 1072a .cfa: $rsp 48 +
++STACK CFI 1072b .cfa: $rsp 40 +
++STACK CFI 1072d .cfa: $rsp 32 +
++STACK CFI 1072f .cfa: $rsp 24 +
++STACK CFI 10731 .cfa: $rsp 16 +
++STACK CFI 10733 .cfa: $rsp 8 +
++STACK CFI 10738 .cfa: $rsp 96 +
++STACK CFI INIT 10750 7b .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 10751 $rbx: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 1075d .cfa: $rsp 64 +
++STACK CFI 107c4 .cfa: $rsp 16 +
++STACK CFI 107c5 .cfa: $rsp 8 +
++STACK CFI 107c6 .cfa: $rsp 64 +
++STACK CFI INIT 107d0 509 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 107d2 $r14: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 107d4 $r13: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 107d6 $r12: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 107d7 $rbp: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 107db $rbx: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI 107e2 .cfa: $rsp 80 +
++STACK CFI 10b78 .cfa: $rsp 48 +
++STACK CFI 10b79 .cfa: $rsp 40 +
++STACK CFI 10b7a .cfa: $rsp 32 +
++STACK CFI 10b7c .cfa: $rsp 24 +
++STACK CFI 10b7e .cfa: $rsp 16 +
++STACK CFI 10b80 .cfa: $rsp 8 +
++STACK CFI 10b88 .cfa: $rsp 80 +
++STACK CFI INIT 110a0 153 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 110a7 $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 110a9 $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 110ab $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 110ad $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 110b1 $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI 110b2 $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI 110b9 .cfa: $rsp 64 +
++STACK CFI 110e8 .cfa: $rsp 56 +
++STACK CFI 110e9 $rbx: $rbx .cfa: $rsp 48 +
++STACK CFI 110ea $rbp: $rbp .cfa: $rsp 40 +
++STACK CFI 110ec $r12: $r12 .cfa: $rsp 32 +
++STACK CFI 110ee $r13: $r13 .cfa: $rsp 24 +
++STACK CFI 110f0 $r14: $r14 .cfa: $rsp 16 +
++STACK CFI 110f2 $r15: $r15 .cfa: $rsp 8 +
++STACK CFI 110f8 $r12: .cfa -40 + ^ $r13: .cfa -32 + ^ $r14: .cfa -24 + ^ $r15: .cfa -16 + ^ $rbp: .cfa -48 + ^ $rbx: .cfa -56 + ^ .cfa: $rsp 64 +
++STACK CFI INIT 10ce0 1dc .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 10ce2 $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 10ce4 $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 10ce9 $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 10ceb $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 10cec $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI 10ced $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI 10cf4 .cfa: $rsp 112 +
++STACK CFI 10dba .cfa: $rsp 56 +
++STACK CFI 10dbb .cfa: $rsp 48 +
++STACK CFI 10dbc .cfa: $rsp 40 +
++STACK CFI 10dbe .cfa: $rsp 32 +
++STACK CFI 10dc0 .cfa: $rsp 24 +
++STACK CFI 10dc2 .cfa: $rsp 16 +
++STACK CFI 10dc4 .cfa: $rsp 8 +
++STACK CFI 10dc8 .cfa: $rsp 112 +
++STACK CFI INIT 10ec0 1dc .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 10ec2 $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 10ec4 $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 10ec9 $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 10ecb $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 10ecf $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI 10ed0 $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI 10ed4 .cfa: $rsp 112 +
++STACK CFI 10f99 .cfa: $rsp 56 +
++STACK CFI 10f9a .cfa: $rsp 48 +
++STACK CFI 10f9b .cfa: $rsp 40 +
++STACK CFI 10f9d .cfa: $rsp 32 +
++STACK CFI 10f9f .cfa: $rsp 24 +
++STACK CFI 10fa1 .cfa: $rsp 16 +
++STACK CFI 10fa3 .cfa: $rsp 8 +
++STACK CFI 10fa8 .cfa: $rsp 112 +
++STACK CFI INIT 11200 1f .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 1120b .cfa: $rsp 16 +
++STACK CFI 1121e .cfa: $rsp 8 +
++STACK CFI INIT 11220 5 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI INIT 11230 461 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 11232 $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 11234 $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 11236 $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 11238 $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 11239 $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI 1123a $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI 1123e .cfa: $rsp 96 +
++STACK CFI 11283 .cfa: $rsp 56 +
++STACK CFI 11286 .cfa: $rsp 48 +
++STACK CFI 11287 .cfa: $rsp 40 +
++STACK CFI 11289 .cfa: $rsp 32 +
++STACK CFI 1128b .cfa: $rsp 24 +
++STACK CFI 1128d .cfa: $rsp 16 +
++STACK CFI 1128f .cfa: $rsp 8 +
++STACK CFI 11290 .cfa: $rsp 96 +
++STACK CFI 113ce .cfa: $rsp 56 +
++STACK CFI 113cf .cfa: $rsp 48 +
++STACK CFI 113d0 .cfa: $rsp 40 +
++STACK CFI 113d2 .cfa: $rsp 32 +
++STACK CFI 113d4 .cfa: $rsp 24 +
++STACK CFI 113d6 .cfa: $rsp 16 +
++STACK CFI 113d8 .cfa: $rsp 8 +
++STACK CFI 113e0 .cfa: $rsp 96 +
++STACK CFI INIT 11990 250 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 11992 $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 11994 $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 11996 $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 11998 $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 1199c $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI 1199d $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI 119a4 .cfa: $rsp 80 +
++STACK CFI 11a50 .cfa: $rsp 56 +
++STACK CFI 11a51 .cfa: $rsp 48 +
++STACK CFI 11a52 .cfa: $rsp 40 +
++STACK CFI 11a54 .cfa: $rsp 32 +
++STACK CFI 11a56 .cfa: $rsp 24 +
++STACK CFI 11a58 .cfa: $rsp 16 +
++STACK CFI 11a5a .cfa: $rsp 8 +
++STACK CFI 11a60 .cfa: $rsp 80 +
++STACK CFI INIT 116a0 2e6 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 116a2 $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 116a4 $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 116a6 $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 116a8 $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 116a9 $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI 116aa $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI 116ae .cfa: $rsp 112 +
++STACK CFI 11700 .cfa: $rsp 56 +
++STACK CFI 11701 .cfa: $rsp 48 +
++STACK CFI 11702 .cfa: $rsp 40 +
++STACK CFI 11704 .cfa: $rsp 32 +
++STACK CFI 11706 .cfa: $rsp 24 +
++STACK CFI 11708 .cfa: $rsp 16 +
++STACK CFI 1170a .cfa: $rsp 8 +
++STACK CFI 11710 .cfa: $rsp 112 +
++STACK CFI INIT 11be0 da .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 11be2 $r13: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 11be4 $r12: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 11be9 $rbp: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 11bea $rbx: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 11bee .cfa: $rsp 64 +
++STACK CFI 11c52 .cfa: $rsp 40 +
++STACK CFI 11c53 .cfa: $rsp 32 +
++STACK CFI 11c54 .cfa: $rsp 24 +
++STACK CFI 11c56 .cfa: $rsp 16 +
++STACK CFI 11c58 .cfa: $rsp 8 +
++STACK CFI 11c60 .cfa: $rsp 64 +
++STACK CFI INIT 11cc0 1ab .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 11cc2 $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 11cc4 $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 11cc6 $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 11cc8 $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 11ccc $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI 11ccd $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI 11cd1 .cfa: $rsp 112 +
++STACK CFI 11e07 .cfa: $rsp 56 +
++STACK CFI 11e08 .cfa: $rsp 48 +
++STACK CFI 11e09 .cfa: $rsp 40 +
++STACK CFI 11e0b .cfa: $rsp 32 +
++STACK CFI 11e0d .cfa: $rsp 24 +
++STACK CFI 11e0f .cfa: $rsp 16 +
++STACK CFI 11e11 .cfa: $rsp 8 +
++STACK CFI 11e18 .cfa: $rsp 112 +
++STACK CFI INIT 11e70 135 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 11e72 $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 11e74 $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 11e76 $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 11e78 $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 11e7c $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI 11e7d $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI 11e81 .cfa: $rsp 96 +
++STACK CFI 11f6e .cfa: $rsp 56 +
++STACK CFI 11f6f .cfa: $rsp 48 +
++STACK CFI 11f70 .cfa: $rsp 40 +
++STACK CFI 11f72 .cfa: $rsp 32 +
++STACK CFI 11f74 .cfa: $rsp 24 +
++STACK CFI 11f76 .cfa: $rsp 16 +
++STACK CFI 11f78 .cfa: $rsp 8 +
++STACK CFI 11f79 .cfa: $rsp 96 +
++STACK CFI INIT 11fb0 c01 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 11fb1 $rbp: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 11fb4 .cfa: $rbp 16 +
++STACK CFI 11fbc $r12: .cfa -48 + ^ $r13: .cfa -40 + ^ $r14: .cfa -32 + ^ $r15: .cfa -24 + ^
++STACK CFI 11fc0 $rbx: .cfa -56 + ^
++STACK CFI 121ce .cfa: $rsp 8 +
++STACK CFI 121cf .cfa: $rbp 16 +
++STACK CFI INIT 12bc0 7c .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 12bc1 $rbp: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 12bc2 $rbx: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 12bcb .cfa: $rsp 64 +
++STACK CFI 12c1a .cfa: $rsp 24 +
++STACK CFI 12c1b .cfa: $rsp 16 +
++STACK CFI 12c1c .cfa: $rsp 8 +
++STACK CFI 12c20 .cfa: $rsp 64 +
++STACK CFI INIT 12d80 21 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 12d84 .cfa: $rsp 16 +
++STACK CFI 12d96 .cfa: $rsp 8 +
++STACK CFI INIT 12c40 bb .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 12c42 $r12: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 12c43 $rbp: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 12c47 $rbx: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 12cbb .cfa: $rsp 24 +
++STACK CFI 12cbc .cfa: $rsp 16 +
++STACK CFI 12cbe .cfa: $rsp 8 +
++STACK CFI 12cc0 .cfa: $rsp 32 +
++STACK CFI INIT 12d00 75 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 12d04 $rbx: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 12d23 .cfa: $rsp 24 +
++STACK CFI 12d27 .cfa: $rsp 32 +
++STACK CFI 12d2c .cfa: $rsp 40 +
++STACK CFI 12d31 .cfa: $rsp 48 +
++STACK CFI 12d42 .cfa: $rsp 16 +
++STACK CFI 12d55 .cfa: $rsp 8 +
++STACK CFI 12d56 .cfa: $rsp 16 +
++STACK CFI INIT 12db0 1e .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI INIT 12dd0 46 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI INIT 12e20 56 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI INIT 12e80 4c .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI INIT 12ed0 39 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI INIT 12f10 3c .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI INIT 12f50 34 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI INIT 12f90 26 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI INIT 12fc0 34 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI INIT 13000 7c .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI INIT 13080 3a .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI INIT 130c0 12 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI INIT 130e0 38 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI INIT 13120 3b .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 13126 $rbx: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 13143 $rbx: $rbx .cfa: $rsp 8 +
++STACK CFI 13148 $rbx: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 13157 $rbx: $rbx .cfa: $rsp 8 +
++STACK CFI INIT 13160 a4 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 13164 .cfa: $rsp 32 +
++STACK CFI 131f1 .cfa: $rsp 8 +
++STACK CFI 131f8 .cfa: $rsp 32 +
++STACK CFI INIT 13210 10 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI INIT 13220 4b .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 13221 $rbp: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 13222 $rbx: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 13229 .cfa: $rsp 32 +
++STACK CFI 1325c .cfa: $rsp 24 +
++STACK CFI 1325d .cfa: $rsp 16 +
++STACK CFI 1325e .cfa: $rsp 8 +
++STACK CFI 13260 .cfa: $rsp 32 +
++STACK CFI INIT 13270 5 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI INIT 13280 1af .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 13282 $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 13284 $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 13286 $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 13288 $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 1328c $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI 1328d $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI 1329c .cfa: $rsp 224 +
++STACK CFI 1338d .cfa: $rsp 56 +
++STACK CFI 1338e .cfa: $rsp 48 +
++STACK CFI 1338f .cfa: $rsp 40 +
++STACK CFI 13391 .cfa: $rsp 32 +
++STACK CFI 13393 .cfa: $rsp 24 +
++STACK CFI 13395 .cfa: $rsp 16 +
++STACK CFI 13397 .cfa: $rsp 8 +
++STACK CFI 133a0 .cfa: $rsp 224 +
++STACK CFI INIT 13430 14 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI INIT 13450 40 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 13456 $rbx: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 13471 .cfa: $rsp 8 +
++STACK CFI 13478 .cfa: $rsp 16 +
++STACK CFI 1348f .cfa: $rsp 8 +
++STACK CFI INIT 13490 2 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI INIT 134a0 213 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 134a2 $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 134a4 $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 134ab $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 134ad $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 134ae $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI 134af $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI 134b9 .cfa: $rsp 208 +
++STACK CFI 13647 .cfa: $rsp 56 +
++STACK CFI 13648 .cfa: $rsp 48 +
++STACK CFI 13649 .cfa: $rsp 40 +
++STACK CFI 1364b .cfa: $rsp 32 +
++STACK CFI 1364d .cfa: $rsp 24 +
++STACK CFI 1364f .cfa: $rsp 16 +
++STACK CFI 13651 .cfa: $rsp 8 +
++STACK CFI 13658 .cfa: $rsp 208 +
++STACK CFI INIT 136c0 5 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI INIT 136d0 23 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 136d5 $rbx: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 136ef $rbx: $rbx .cfa: $rsp 8 +
++STACK CFI INIT 13700 8 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI INIT 13710 2fc .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI INIT 13a10 44 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 13a3c .cfa: $rsp 16 +
++STACK CFI INIT 13a60 47 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 13a8f .cfa: $rsp 16 +
++STACK CFI INIT 13ab0 8 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI INIT 13ac0 8 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI INIT 13ad0 25c .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI INIT 13d30 17d .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 13dff $rbx: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 13e95 $rbx: $rbx .cfa: $rsp 8 +
++STACK CFI 13e96 $rbx: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 13ea2 $rbx: $rbx .cfa: $rsp 8 +
++STACK CFI 13ea3 $rbx: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI INIT 13eb0 19c .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 13ece $r13: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 13ed3 $r12: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 13ed8 $rbp: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 13ed9 $rbx: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 13f58 $r12: $r12 $r13: $r13 $rbp: $rbp $rbx: $rbx .cfa: $rsp 8 +
++STACK CFI 13ff0 $r12: .cfa -24 + ^ $r13: .cfa -16 + ^ $rbp: .cfa -32 + ^ $rbx: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 1400f $rbx: $rbx .cfa: $rsp 32 +
++STACK CFI 14010 $rbp: $rbp .cfa: $rsp 24 +
++STACK CFI 14018 $r12: $r12 .cfa: $rsp 16 +
++STACK CFI 1401a $r13: $r13 .cfa: $rsp 8 +
++STACK CFI 14030 $r12: .cfa -24 + ^ $r13: .cfa -16 + ^ $rbp: .cfa -32 + ^ $rbx: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 1403b $r12: $r12 $r13: $r13 $rbp: $rbp $rbx: $rbx .cfa: $rsp 8 +
++STACK CFI 14047 $r12: .cfa -24 + ^ $r13: .cfa -16 + ^ $rbp: .cfa -32 + ^ $rbx: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI INIT 14050 1ff .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 14052 $r13: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 14054 $r12: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 14055 $rbp: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 14056 $rbx: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 14172 .cfa: $rsp 32 +
++STACK CFI 14173 .cfa: $rsp 24 +
++STACK CFI 14178 .cfa: $rsp 16 +
++STACK CFI 1417a .cfa: $rsp 8 +
++STACK CFI 14180 .cfa: $rsp 40 +
++STACK CFI 14195 .cfa: $rsp 32 +
++STACK CFI 14196 .cfa: $rsp 24 +
++STACK CFI 14198 .cfa: $rsp 16 +
++STACK CFI 1419a .cfa: $rsp 8 +
++STACK CFI 141a0 .cfa: $rsp 40 +
++STACK CFI 141c5 .cfa: $rsp 32 +
++STACK CFI 141c6 .cfa: $rsp 24 +
++STACK CFI 141c8 .cfa: $rsp 16 +
++STACK CFI 141ca .cfa: $rsp 8 +
++STACK CFI 141d0 .cfa: $rsp 40 +
++STACK CFI 141f9 .cfa: $rsp 32 +
++STACK CFI 141fa .cfa: $rsp 24 +
++STACK CFI 141fc .cfa: $rsp 16 +
++STACK CFI 141fe .cfa: $rsp 8 +
++STACK CFI 141ff .cfa: $rsp 40 +
++STACK CFI INIT 14250 d7 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI INIT 14330 330 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 14335 $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 14337 $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 14339 $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 1433b $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 1433c $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI 14340 $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI 1440c .cfa: $rsp 48 +
++STACK CFI 1440d .cfa: $rsp 40 +
++STACK CFI 1440f .cfa: $rsp 32 +
++STACK CFI 14411 .cfa: $rsp 24 +
++STACK CFI 14413 .cfa: $rsp 16 +
++STACK CFI 14415 .cfa: $rsp 8 +
++STACK CFI 14420 .cfa: $rsp 56 +
++STACK CFI INIT 14660 2b8 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 14662 $r12: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 14663 $rbp: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 14666 $rbx: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 1477d .cfa: $rsp 24 +
++STACK CFI 1477e .cfa: $rsp 16 +
++STACK CFI 14780 .cfa: $rsp 8 +
++STACK CFI 14788 .cfa: $rsp 32 +
++STACK CFI 147b6 .cfa: $rsp 24 +
++STACK CFI 147b7 .cfa: $rsp 16 +
++STACK CFI 147b9 .cfa: $rsp 8 +
++STACK CFI 147c0 .cfa: $rsp 32 +
++STACK CFI 148fc .cfa: $rsp 24 +
++STACK CFI 148fd .cfa: $rsp 16 +
++STACK CFI 148ff .cfa: $rsp 8 +
++STACK CFI 14900 .cfa: $rsp 32 +
++STACK CFI INIT 14920 307 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 14922 $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 14924 $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 14926 $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 14928 $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 14929 $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI 1492a $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI 14a16 .cfa: $rsp 48 +
++STACK CFI 14a17 .cfa: $rsp 40 +
++STACK CFI 14a19 .cfa: $rsp 32 +
++STACK CFI 14a1b .cfa: $rsp 24 +
++STACK CFI 14a1d .cfa: $rsp 16 +
++STACK CFI 14a1f .cfa: $rsp 8 +
++STACK CFI 14a20 .cfa: $rsp 56 +
++STACK CFI INIT 14c30 65 .cfa: $rsp 8 + .ra: .cfa -8 + ^
++STACK CFI 14c32 $r15: .cfa -16 + ^ .cfa: $rsp 16 +
++STACK CFI 14c34 $r14: .cfa -24 + ^ .cfa: $rsp 24 +
++STACK CFI 14c39 $r13: .cfa -32 + ^ .cfa: $rsp 32 +
++STACK CFI 14c3b $r12: .cfa -40 + ^ .cfa: $rsp 40 +
++STACK CFI 14c43 $rbp: .cfa -48 + ^ .cfa: $rsp 48 +
++STACK CFI 14c4b $rbx: .cfa -56 + ^ .cfa: $rsp 56 +
++STACK CFI 14c58 .cfa: $rsp 64 +
++STACK CFI 14c8a .cfa: $rsp 56 +
++STACK CFI 14c8b .cfa: $rsp 48 +
++STACK CFI 14c8c .cfa: $rsp 40 +
++STACK CFI 14c8e .cfa: $rsp 32 +
++STACK CFI 14c90 .cfa: $rsp 24 +
++STACK CFI 14c92 .cfa: $rsp 16 +
++STACK CFI 14c94 .cfa: $rsp 8 +
++STACK CFI INIT 14ca0 2 .cfa: $rsp 8 + .ra: .cfa -8 + ^
+diff --git a/tests/sentry/lang/native/test_cfi.py b/tests/sentry/lang/native/test_cfi.py
+new file mode 100644
+index 0000000000..124dac9266
+--- /dev/null
++++ b/tests/sentry/lang/native/test_cfi.py
+@@ -0,0 +1,210 @@
++from __future__ import absolute_import
++
++import copy
++import mock
++import os
++
++from symbolic import CFICACHE_LATEST_VERSION
++
++from sentry.attachments import CachedAttachment
++from sentry.lang.native.cfi import reprocess_minidump_with_cfi
++from sentry.lang.native.minidump import MINIDUMP_ATTACHMENT_TYPE
++from sentry.models import ProjectCfiCacheFile
++from sentry.testutils import TestCase
++
++RAW_STACKTRACE = [
++    {
++        'function': '<unknown>',
++        'instruction_addr': '0x7f51401e4800',
++        'module': u'/lib/x86_64-linux-gnu/libc-2.23.so',
++        'trust': 'scan',
++    },
++    {
++        'function': '<unknown>',
++        'instruction_addr': '0x7f514025002e',
++        'module': u'/lib/x86_64-linux-gnu/libc-2.23.so',
++        'trust': 'scan',
++    },
++    {
++        'function': '<unknown>',
++        'instruction_addr': '0x401d72',
++        'module': u'/work/linux/build/crash',
++        'trust': 'context',
++    }
++]
++
++CFI_STACKTRACE = [
++    {
++        'function': "<unknown>",
++        'instruction_addr': "0x7f5140cdc000",
++        'module': None,
++        'trust': "scan",
++    },
++    {
++        'function': "<unknown>",
++        'instruction_addr': "0x7fff5aef1000",
++        'module': None,
++        'trust': "scan",
++    },
++    {
++        'function': "<unknown>",
++        'instruction_addr': "0x7f514017d830",
++        'module': "/lib/x86_64-linux-gnu/libc-2.23.so",
++        'trust': "cfi",
++    },
++    {
++        'function': "<unknown>",
++        'instruction_addr': "0x401d72",
++        'module': "/work/linux/build/crash",
++        'trust': "context",
++    },
++]
++
++
++class CfiReprocessingTest(TestCase):
++    def mock_attachments(self):
++        path = os.path.join(os.path.dirname(__file__), 'fixtures', 'linux.dmp')
++        with open(path, 'rb') as minidump:
++            data = minidump.read()
++
++        return [CachedAttachment(data=data, type=MINIDUMP_ATTACHMENT_TYPE)]
++
++    def get_mock_event(self, reprocessed=False):
++        stacktrace = CFI_STACKTRACE if reprocessed else RAW_STACKTRACE
++        return {
++            'event_id': '9dac1e3a7ea043818ba6f0685e258c09',
++            'project': self.project.id,
++            'platform': 'native',
++            'debug_meta': {
++                'images': [
++                    {
++                        'id': u'c0bcc3f1-9827-fe65-3058-404b2831d9e6',
++                        'image_addr': '0x400000',
++                        'image_size': 106496,
++                        'name': u'/work/linux/build/crash',
++                        'type': 'symbolic'
++                    },
++                    {
++                        'id': u'451a38b5-0679-79d2-0738-22a5ceb24c4b',
++                        'image_addr': '0x7f514015d000',
++                        'image_size': 1835008,
++                        'name': u'/lib/x86_64-linux-gnu/libc-2.23.so',
++                        'type': 'symbolic'
++                    },
++                ]
++            },
++            'exception': {
++                'values': [
++                    {
++                        'mechanism': {
++                            'type': 'minidump',
++                            'handled': False
++                        },
++                        'stacktrace': {
++                            'frames': stacktrace,
++                        },
++                        'thread_id': 1304,
++                    }
++                ]
++            },
++            'threads': {
++                'values': [
++                    {
++                        'crashed': True,
++                        'id': 1304
++                    }
++                ]
++            },
++        }
++
++    @mock.patch('sentry.attachments.base.BaseAttachmentCache.get', return_value=None)
++    @mock.patch('sentry.utils.cache.cache.get', return_value=None)
++    def test_cfi_reprocessing_no_minidump(self, mock_cache_get, mock_attachment_get):
++        data = self.get_mock_event(reprocessed=False)
++        result = reprocess_minidump_with_cfi(data)
++
++        # mock_cache_get.assert_called_with('st:86e3a22f05a287eeeca681ecbeef3067')
++        cache_key = 'e:9dac1e3a7ea043818ba6f0685e258c09:%s' % self.project.id
++        mock_attachment_get.assert_called_once_with(cache_key)
++        assert result is None
++
++    @mock.patch('sentry.attachments.base.BaseAttachmentCache.get')
++    def test_cfi_reprocessing_no_cfi_caches(self, mock_attachment_get):
++        mock_attachment_get.return_value = self.mock_attachments()
++
++        data = self.get_mock_event(reprocessed=False)
++        result = reprocess_minidump_with_cfi(data)
++
++        assert result is None
++
++    @mock.patch('sentry.attachments.base.BaseAttachmentCache.get', return_value=None)
++    @mock.patch('sentry.utils.cache.cache.get', return_value=None)
++    def test_cfi_reprocessing_no_scanned_frames(self, mock_cache_get, mock_attachment_get):
++        data = copy.deepcopy(self.get_mock_event(reprocessed=False))
++        for frame in data['exception']['values'][0]['stacktrace']['frames']:
++            if frame['trust'] == 'scan':
++                frame['trust'] = 'cfi'
++        result = reprocess_minidump_with_cfi(data)
++
++        assert mock_cache_get.call_count == 0
++        assert mock_attachment_get.call_count == 0
++        assert result is None
++
++    @mock.patch('sentry.attachments.base.BaseAttachmentCache.get', return_value=None)
++    @mock.patch('sentry.utils.cache.cache.get', return_value=None)
++    def test_cfi_reprocessing_cached(self, mock_cache_get, mock_attachment_get):
++        mock_cache_get.return_value = [
++            (None, 0x7f5140cdc000, 'scan'),
++            (None, 0x7fff5aef1000, 'scan'),
++            ('451a38b5-0679-79d2-0738-22a5ceb24c4b', 0x20830, 'cfi'),
++            ('c0bcc3f1-9827-fe65-3058-404b2831d9e6', 0x1d72, 'context'),
++        ]
++
++        data = self.get_mock_event(reprocessed=False)
++        result = reprocess_minidump_with_cfi(data)
++
++        mock_cache_get.assert_called_once_with('st:80d8fdd07a3fb9639403afa33b0e930e')
++        assert mock_attachment_get.call_count == 0
++        assert result == self.get_mock_event(reprocessed=True)
++
++    @mock.patch('sentry.attachments.base.BaseAttachmentCache.get', return_value=None)
++    @mock.patch('sentry.utils.cache.cache.get', return_value=None)
++    def test_cfi_unchanged(self, mock_cache_get, mock_attachment_get):
++        mock_cache_get.return_value = '__no_cfi__'
++
++        data = self.get_mock_event(reprocessed=False)
++        result = reprocess_minidump_with_cfi(data)
++
++        mock_cache_get.assert_called_once_with('st:80d8fdd07a3fb9639403afa33b0e930e')
++        assert mock_attachment_get.call_count == 0
++        assert result is None
++
++    @mock.patch('sentry.attachments.base.BaseAttachmentCache.get', return_value=None)
++    @mock.patch('sentry.utils.cache.cache.get', return_value=None)
++    def test_cfi_reprocessing(self, mock_cache_get, mock_attachment_get):
++        dif = self.create_dif_file(
++            debug_id='c0bcc3f1-9827-fe65-3058-404b2831d9e6',
++            features=['unwind']
++        )
++
++        cache_file = self.create_file_from_path(
++            path=os.path.join(os.path.dirname(__file__), 'fixtures', 'linux.cficache'),
++            type='project.cficache'
++        )
++
++        ProjectCfiCacheFile.objects.create(
++            project=self.project,
++            cache_file=cache_file,
++            debug_file=dif,
++            checksum=dif.file.checksum,
++            version=CFICACHE_LATEST_VERSION,
++        )
++
++        mock_attachment_get.return_value = self.mock_attachments()
++        data = self.get_mock_event(reprocessed=False)
++        result = reprocess_minidump_with_cfi(data)
++
++        cache_key = 'e:9dac1e3a7ea043818ba6f0685e258c09:%s' % self.project.id
++        mock_attachment_get.assert_called_once_with(cache_key)
++
++        assert result == self.get_mock_event(reprocessed=True)
+diff --git a/tests/sentry/lang/native/test_minidump.py b/tests/sentry/lang/native/test_minidump.py
+new file mode 100644
+index 0000000000..fe47b12b05
+--- /dev/null
++++ b/tests/sentry/lang/native/test_minidump.py
+@@ -0,0 +1,986 @@
++from __future__ import absolute_import
++import os
++
++from sentry.lang.native.minidump import merge_minidump_event
++
++
++def test_minidump_linux():
++    event = {'release': 'test-1.0.0'}
++    minidump = os.path.join(os.path.dirname(__file__), 'fixtures', 'linux.dmp')
++    merge_minidump_event(event, minidump)
++
++    assert event == {
++        'contexts': {
++            'device': {
++                'arch': 'x86_64'
++            },
++            'os': {
++                'build': u'#1 SMP Mon Nov 6 16:00:12 UTC 2017',
++                'name': u'Linux',
++                'type': 'os',
++                'version': u'4.9.60-linuxkit-aufs'
++            }
++        },
++        'debug_meta': {
++            'images': [
++                {
++                    'id': u'c0bcc3f1-9827-fe65-3058-404b2831d9e6',
++                    'image_addr': '0x400000',
++                    'image_size': 106496,
++                    'name': u'/work/linux/build/crash',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'e45db8df-af2d-09fd-640c-8fe377d572de',
++                    'image_addr': '0x7f513fe54000',
++                    'image_size': 1081344,
++                    'name': u'/lib/x86_64-linux-gnu/libm-2.23.so',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'451a38b5-0679-79d2-0738-22a5ceb24c4b',
++                    'image_addr': '0x7f514015d000',
++                    'image_size': 1835008,
++                    'name': u'/lib/x86_64-linux-gnu/libc-2.23.so',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'e20a2268-5dc6-c165-b6aa-a12fa6765a6e',
++                    'image_addr': '0x7f5140527000',
++                    'image_size': 90112,
++                    'name': u'/lib/x86_64-linux-gnu/libgcc_s.so.1',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'81c893cb-9b92-3c52-01ac-ef171b52d526',
++                    'image_addr': '0x7f514073d000',
++                    'image_size': 1515520,
++                    'name': u'/usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.21',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'23e017ce-2254-fc65-11d9-bc8f534bb4f0',
++                    'image_addr': '0x7f5140abf000',
++                    'image_size': 98304,
++                    'name': u'/lib/x86_64-linux-gnu/libpthread-2.23.so',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'59627b5d-2255-a375-c17b-d4c3fd05f5a6',
++                    'image_addr': '0x7f5140cdc000',
++                    'image_size': 155648,
++                    'name': u'/lib/x86_64-linux-gnu/ld-2.23.so',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'75185f6c-04b9-b48f-b8df-d832e74ad31a',
++                    'image_addr': '0x7fff5aef1000',
++                    'image_size': 8192,
++                    'name': u'linux-gate.so',
++                    'type': 'symbolic'
++                }
++            ]
++        },
++        'exception': {
++            'mechanism': {
++                'type': 'minidump',
++                'handled': False
++            },
++            'stacktrace': {
++                'frames': [
++                    {
++                        'function': '<unknown>',
++                        'instruction_addr': '0x401dc0',
++                        'module': u'/work/linux/build/crash',
++                        'trust': 'scan',
++                    },
++                    {
++                        'function': '<unknown>',
++                        'instruction_addr': '0x7f5140cdc000',
++                        'module': None,
++                        'trust': 'scan',
++                    },
++                    {
++                        'function': '<unknown>',
++                        'instruction_addr': '0x400040',
++                        'module': u'/work/linux/build/crash',
++                        'trust': 'scan',
++                    },
++                    {
++                        'function': '<unknown>',
++                        'instruction_addr': '0x7fff5aef1000',
++                        'module': None,
++                        'trust': 'scan',
++                    },
++                    {
++                        'function': '<unknown>',
++                        'instruction_addr': '0x401de9',
++                        'module': u'/work/linux/build/crash',
++                        'trust': 'scan',
++                    },
++                    {
++                        'function': '<unknown>',
++                        'instruction_addr': '0x401dc0',
++                        'module': u'/work/linux/build/crash',
++                        'trust': 'scan',
++                    },
++                    {
++                        'function': '<unknown>',
++                        'instruction_addr': '0x414ca0',
++                        'module': u'/work/linux/build/crash',
++                        'trust': 'scan',
++                    },
++                    {
++                        'function': '<unknown>',
++                        'instruction_addr': '0x401c70',
++                        'module': u'/work/linux/build/crash',
++                        'trust': 'scan',
++                    },
++                    {
++                        'function': '<unknown>',
++                        'instruction_addr': '0x401dc0',
++                        'module': u'/work/linux/build/crash',
++                        'trust': 'scan',
++                    },
++                    {
++                        'function': '<unknown>',
++                        'instruction_addr': '0x401c70',
++                        'module': u'/work/linux/build/crash',
++                        'trust': 'scan',
++                    },
++                    {
++                        'function': '<unknown>',
++                        'instruction_addr': '0x7f514017d830',
++                        'module': u'/lib/x86_64-linux-gnu/libc-2.23.so',
++                        'trust': 'scan',
++                    },
++                    {
++                        'function': '<unknown>',
++                        'instruction_addr': '0x414c30',
++                        'module': u'/work/linux/build/crash',
++                        'trust': 'scan',
++                    },
++                    {
++                        'function': '<unknown>',
++                        'instruction_addr': '0x401ec0',
++                        'module': u'/work/linux/build/crash',
++                        'trust': 'scan',
++                    },
++                    {
++                        'function': '<unknown>',
++                        'instruction_addr': '0x7f5140cebac6',
++                        'module': u'/lib/x86_64-linux-gnu/ld-2.23.so',
++                        'trust': 'scan',
++                    },
++                    {
++                        'function': '<unknown>',
++                        'instruction_addr': '0x400000',
++                        'module': None,
++                        'trust': 'scan',
++                    },
++                    {
++                        'function': '<unknown>',
++                        'instruction_addr': '0x7f51401e4800',
++                        'module': u'/lib/x86_64-linux-gnu/libc-2.23.so',
++                        'trust': 'scan',
++                    },
++                    {
++                        'function': '<unknown>',
++                        'instruction_addr': '0x7f514025002e',
++                        'module': u'/lib/x86_64-linux-gnu/libc-2.23.so',
++                        'trust': 'scan',
++                    },
++                    {
++                        'function': '<unknown>',
++                        'instruction_addr': '0x401d72',
++                        'module': u'/work/linux/build/crash',
++                        'trust': 'context',
++                    }
++                ],
++                'registers': {
++                    u'r10': u'0x0000000000000131',
++                    u'r11': u'0x00007f5140aca4c0',
++                    u'r12': u'0x0000000000401dc0',
++                    u'r13': u'0x00007fff5ae4ac90',
++                    u'r14': u'0x00007fff5ae4aab0',
++                    u'r15': u'0x0000000000000000',
++                    u'r8': u'0x0000000000000000',
++                    u'r9': u'0x0000000000000000',
++                    u'rax': u'0xffffffffffffffff',
++                    u'rbp': u'0x00007fff5ae4abb0',
++                    u'rbx': u'0x00007fff5ae4aa20',
++                    u'rcx': u'0x00007f5140521b20',
++                    u'rdi': u'0x00007fff5ae4aab0',
++                    u'rdx': u'0x00007f5140efc000',
++                    u'rip': u'0x0000000000401d72',
++                    u'rsi': u'0x0000000000000000',
++                    u'rsp': u'0x00007fff5ae4aa20'
++                }
++            },
++            'thread_id': 1304,
++            'type': u'SIGSEGV',
++            'value': u'Fatal Error: SIGSEGV'
++        },
++        'level': 'fatal',
++        'message': u'Fatal Error: SIGSEGV',
++        'platform': 'native',
++        'release': 'test-1.0.0',
++        'threads': [
++            {
++                'crashed': True,
++                'id': 1304
++            }
++        ],
++        'timestamp': 1522061032.0
++    }
++
++
++def test_minidump_macos():
++    event = {'release': 'test-1.0.0'}
++    minidump = os.path.join(os.path.dirname(__file__), 'fixtures', 'macos.dmp')
++    merge_minidump_event(event, minidump)
++
++    assert event == {
++        'contexts': {
++            'device': {
++                'arch': 'x86_64'
++            },
++            'os': {
++                'build': u'16G29',
++                'name': 'macOS',
++                'type': 'os',
++                'version': u'10.12.6'
++            }
++        },
++        'debug_meta': {
++            'images': [
++                {
++                    'id': u'67e9247c-814e-392b-a027-dbde6748fcbf',
++                    'image_addr': '0x109b9b000',
++                    'image_size': 69632,
++                    'name': u'/Users/travis/build/getsentry/breakpad-tools/macos/build/./crash',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'36385a3a-60d3-32db-bf55-c6d8931a7aa6',
++                    'image_addr': '0x7fffd229c000',
++                    'image_size': 4800512,
++                    'name': u'/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'84a04d24-0e60-3810-a8c0-90a65e2df61a',
++                    'image_addr': '0x7fffe668e000',
++                    'image_size': 8192,
++                    'name': u'/usr/lib/libDiagnosticMessagesClient.dylib',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'f18ac1e7-c6f1-34b1-8069-be571b3231d4',
++                    'image_addr': '0x7fffe68cd000',
++                    'image_size': 8192,
++                    'name': u'/usr/lib/libSystem.B.dylib',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'0b43bb5d-e6eb-3464-8de9-b41ac8ed9d1c',
++                    'image_addr': '0x7fffe6a80000',
++                    'image_size': 356352,
++                    'name': u'/usr/lib/libc++.1.dylib',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'bc271ad3-831b-362a-9da7-e8c51f285fe4',
++                    'image_addr': '0x7fffe6ad7000',
++                    'image_size': 172032,
++                    'name': u'/usr/lib/libc++abi.dylib',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'ccd2ed24-3071-383b-925d-8d763bb12a6f',
++                    'image_addr': '0x7fffe7041000',
++                    'image_size': 2252800,
++                    'name': u'/usr/lib/libicucore.A.dylib',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'4df3c25c-52c2-3f01-a3ef-0d9d53a73c1c',
++                    'image_addr': '0x7fffe75f5000',
++                    'image_size': 4022272,
++                    'name': u'/usr/lib/libobjc.A.dylib',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'46e3ffa2-4328-327a-8d34-a03e20bffb8e',
++                    'image_addr': '0x7fffe7def000',
++                    'image_size': 73728,
++                    'name': u'/usr/lib/libz.1.dylib',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'093a4dab-8385-3d47-a350-e20cb7ccf7bf',
++                    'image_addr': '0x7fffe7e0f000',
++                    'image_size': 20480,
++                    'name': u'/usr/lib/system/libcache.dylib',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'8a64d1b0-c70e-385c-92f0-e669079fda90',
++                    'image_addr': '0x7fffe7e14000',
++                    'image_size': 45056,
++                    'name': u'/usr/lib/system/libcommonCrypto.dylib',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'55d47421-772a-32ab-b529-1a46c2f43b4d',
++                    'image_addr': '0x7fffe7e1f000',
++                    'image_size': 32768,
++                    'name': u'/usr/lib/system/libcompiler_rt.dylib',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'819bea3c-df11-3e3d-a1a1-5a51c5bf1961',
++                    'image_addr': '0x7fffe7e27000',
++                    'image_size': 36864,
++                    'name': u'/usr/lib/system/libcopyfile.dylib',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'65d7165e-2e71-335d-a2d6-33f78e2df0c1',
++                    'image_addr': '0x7fffe7e30000',
++                    'image_size': 540672,
++                    'name': u'/usr/lib/system/libcorecrypto.dylib',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'6582bad6-ed27-3b30-b620-90b1c5a4ae3c',
++                    'image_addr': '0x7fffe7eb4000',
++                    'image_size': 204800,
++                    'name': u'/usr/lib/system/libdispatch.dylib',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'9b2ac56d-107c-3541-a127-9094a751f2c9',
++                    'image_addr': '0x7fffe7ee6000',
++                    'image_size': 24576,
++                    'name': u'/usr/lib/system/libdyld.dylib',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'7aa011a9-dc21-3488-bf73-3b5b14d1fdd6',
++                    'image_addr': '0x7fffe7eec000',
++                    'image_size': 4096,
++                    'name': u'/usr/lib/system/libkeymgr.dylib',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'b856abd2-896e-3de0-b2c8-146a6af8e2a7',
++                    'image_addr': '0x7fffe7efa000',
++                    'image_size': 4096,
++                    'name': u'/usr/lib/system/liblaunch.dylib',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'17d5d855-f6c3-3b04-b680-e9bf02ef8aed',
++                    'image_addr': '0x7fffe7efb000',
++                    'image_size': 24576,
++                    'name': u'/usr/lib/system/libmacho.dylib',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'12448cc2-378e-35f3-be33-9dc395a5b970',
++                    'image_addr': '0x7fffe7f01000',
++                    'image_size': 12288,
++                    'name': u'/usr/lib/system/libquarantine.dylib',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'38d4cb9c-10cd-30d3-8b7b-a515ec75fe85',
++                    'image_addr': '0x7fffe7f04000',
++                    'image_size': 8192,
++                    'name': u'/usr/lib/system/libremovefile.dylib',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'096e4228-3b7c-30a6-8b13-ec909a64499a',
++                    'image_addr': '0x7fffe7f06000',
++                    'image_size': 102400,
++                    'name': u'/usr/lib/system/libsystem_asl.dylib',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'10dc5404-73ab-35b3-a277-a8afecb476eb',
++                    'image_addr': '0x7fffe7f1f000',
++                    'image_size': 4096,
++                    'name': u'/usr/lib/system/libsystem_blocks.dylib',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'e5ae5244-7d0c-36ac-8bb6-c7ae7ea52a4b',
++                    'image_addr': '0x7fffe7f20000',
++                    'image_size': 581632,
++                    'name': u'/usr/lib/system/libsystem_c.dylib',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'becc01a2-ca8d-31e6-bcdf-d452965fa976',
++                    'image_addr': '0x7fffe7fae000',
++                    'image_size': 16384,
++                    'name': u'/usr/lib/system/libsystem_configuration.dylib',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'7d26de79-b424-3450-85e1-f7fab32714ab',
++                    'image_addr': '0x7fffe7fb2000',
++                    'image_size': 16384,
++                    'name': u'/usr/lib/system/libsystem_coreservices.dylib',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'ec6fcf07-dcfb-3a03-9cc9-6dd3709974c6',
++                    'image_addr': '0x7fffe7fb6000',
++                    'image_size': 102400,
++                    'name': u'/usr/lib/system/libsystem_coretls.dylib',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'cc960215-0b1b-3822-a13a-3dde96fa796f',
++                    'image_addr': '0x7fffe7fcf000',
++                    'image_size': 28672,
++                    'name': u'/usr/lib/system/libsystem_dnssd.dylib',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'611db84c-bf70-3f92-8702-b9f28a900920',
++                    'image_addr': '0x7fffe7fd6000',
++                    'image_size': 172032,
++                    'name': u'/usr/lib/system/libsystem_info.dylib',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'34b1f16c-bc9c-3c5f-9045-0cae91cb5914',
++                    'image_addr': '0x7fffe8000000',
++                    'image_size': 143360,
++                    'name': u'/usr/lib/system/libsystem_kernel.dylib',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'86d499b5-bbdc-3d3b-8a4e-97ae8e6672a4',
++                    'image_addr': '0x7fffe8023000',
++                    'image_size': 294912,
++                    'name': u'/usr/lib/system/libsystem_m.dylib',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'a3d15f17-99a6-3367-8c7e-4280e8619c95',
++                    'image_addr': '0x7fffe806b000',
++                    'image_size': 126976,
++                    'name': u'/usr/lib/system/libsystem_malloc.dylib',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'369d0221-56ca-3c3e-9ede-94b41cae77b7',
++                    'image_addr': '0x7fffe808a000',
++                    'image_size': 368640,
++                    'name': u'/usr/lib/system/libsystem_network.dylib',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'b021f2b3-8a75-3633-abb0-fc012b8e9b0c',
++                    'image_addr': '0x7fffe80e4000',
++                    'image_size': 40960,
++                    'name': u'/usr/lib/system/libsystem_networkextension.dylib',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'b8160190-a069-3b3a-bdf6-2aa408221fae',
++                    'image_addr': '0x7fffe80ee000',
++                    'image_size': 40960,
++                    'name': u'/usr/lib/system/libsystem_notify.dylib',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'897462fd-b318-321b-a554-e61982630f7e',
++                    'image_addr': '0x7fffe80f8000',
++                    'image_size': 36864,
++                    'name': u'/usr/lib/system/libsystem_platform.dylib',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'b8fb5e20-3295-39e2-b5eb-b464d1d4b104',
++                    'image_addr': '0x7fffe8101000',
++                    'image_size': 45056,
++                    'name': u'/usr/lib/system/libsystem_pthread.dylib',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'4b92ec49-acd0-36ae-b07a-a2b8152eaf9d',
++                    'image_addr': '0x7fffe810c000',
++                    'image_size': 16384,
++                    'name': u'/usr/lib/system/libsystem_sandbox.dylib',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'f78b847b-3565-3e4b-98a6-f7ad40392e2d',
++                    'image_addr': '0x7fffe8110000',
++                    'image_size': 8192,
++                    'name': u'/usr/lib/system/libsystem_secinit.dylib',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'3390e07c-c1ce-348f-adbd-2c5440b45eaa',
++                    'image_addr': '0x7fffe8112000',
++                    'image_size': 32768,
++                    'name': u'/usr/lib/system/libsystem_symptoms.dylib',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'ac63a7fe-50d9-3a30-96e6-f6b7ff16e465',
++                    'image_addr': '0x7fffe811a000',
++                    'image_size': 81920,
++                    'name': u'/usr/lib/system/libsystem_trace.dylib',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'3d50d8a8-c460-334d-a519-2da841102c6b',
++                    'image_addr': '0x7fffe812e000',
++                    'image_size': 24576,
++                    'name': u'/usr/lib/system/libunwind.dylib',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'bf896df0-d8e9-31a8-a4b3-01120bfeee52',
++                    'image_addr': '0x7fffe8134000',
++                    'image_size': 172032,
++                    'name': u'/usr/lib/system/libxpc.dylib',
++                    'type': 'symbolic'
++                }
++            ]
++        },
++        'exception': {
++            'mechanism': {
++                'type': 'minidump',
++                'handled': False
++            },
++            'stacktrace': {
++                'frames': [
++                    {
++                        'function': '<unknown>',
++                        'instruction_addr': '0x7fffe7eeb235',
++                        'module': u'/usr/lib/system/libdyld.dylib',
++                        'trust': 'scan',
++                    },
++                    {
++                        'function': '<unknown>',
++                        'instruction_addr': '0x7fffe7eeb235',
++                        'module': u'/usr/lib/system/libdyld.dylib',
++                        'trust': 'scan',
++                    },
++                    {
++                        'function': '<unknown>',
++                        'instruction_addr': '0x109ba8c70',
++                        'module': u'/Users/travis/build/getsentry/breakpad-tools/macos/build/./crash',
++                        'trust': 'scan',
++                    },
++                    {
++                        'function': '<unknown>',
++                        'instruction_addr': '0x109ba8c15',
++                        'module': u'/Users/travis/build/getsentry/breakpad-tools/macos/build/./crash',
++                        'trust': 'context',
++                    }
++                ],
++                'registers': {
++                    u'r10': u'0x000000000000002e',
++                    u'r11': u'0x00007fffe8105171',
++                    u'r12': u'0x0000000000000000',
++                    u'r13': u'0x0000000000000000',
++                    u'r14': u'0x0000000000000000',
++                    u'r15': u'0x0000000000000000',
++                    u'r8': u'0x000000000c0008ff',
++                    u'r9': u'0x0000000000000000',
++                    u'rax': u'0x0000000000000001',
++                    u'rbp': u'0x00007fff56064258',
++                    u'rbx': u'0x00007fff56064120',
++                    u'rcx': u'0x0000000000000000',
++                    u'rdi': u'0x00007fff56064120',
++                    u'rdx': u'0x0000000000000000',
++                    u'rip': u'0x0000000109ba8c15',
++                    u'rsi': u'0x00007fff56064140',
++                    u'rsp': u'0x00007fff56064110'
++                }
++            },
++            'thread_id': 775,
++            'type': u'EXC_BAD_ACCESS / KERN_INVALID_ADDRESS',
++            'value': u'Fatal Error: EXC_BAD_ACCESS / KERN_INVALID_ADDRESS'
++        },
++        'level': 'fatal',
++        'message': u'Fatal Error: EXC_BAD_ACCESS / KERN_INVALID_ADDRESS',
++        'platform': 'native',
++        'release': 'test-1.0.0',
++        'threads': [
++            {
++                'crashed': True,
++                'id': 775
++            }
++        ],
++        'timestamp': 1521713398.0
++    }
++
++
++def test_minidump_windows():
++    event = {'release': 'test-1.0.0'}
++    minidump = os.path.join(os.path.dirname(__file__), 'fixtures', 'windows.dmp')
++    merge_minidump_event(event, minidump)
++
++    assert event == {
++        'contexts': {
++            'device': {
++                'arch': 'x86'
++            },
++            'os': {
++                'build': u'',
++                'name': 'Windows',
++                'type': 'os',
++                'version': u'10.0.14393'
++            }
++        },
++        'debug_meta': {
++            'images': [
++                {
++                    'id': u'3249d99d-0c40-4931-8610-f4e4fb0b6936-1',
++                    'image_addr': '0x2a0000',
++                    'image_size': 36864,
++                    'name': u'C:\\projects\\breakpad-tools\\windows\\Release\\crash.exe',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'9c2a902b-6fdf-40ad-8308-588a41d572a0-1',
++                    'image_addr': '0x70850000',
++                    'image_size': 1331200,
++                    'name': u'C:\\Windows\\System32\\dbghelp.dll',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'bf5257f7-8c26-43dd-9bb7-901625e1136a-1',
++                    'image_addr': '0x709a0000',
++                    'image_size': 442368,
++                    'name': u'C:\\Windows\\System32\\msvcp140.dll',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'8daf7773-372f-460a-af38-944e193f7e33-1',
++                    'image_addr': '0x70a10000',
++                    'image_size': 598016,
++                    'name': u'C:\\Windows\\System32\\apphelp.dll',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'aec7ef2f-df4b-4642-a471-4c3e5fe8760a-1',
++                    'image_addr': '0x70b70000',
++                    'image_size': 151552,
++                    'name': u'C:\\Windows\\System32\\dbgcore.dll',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'0ed80a50-ecda-472b-86a4-eb6c833f8e1b-1',
++                    'image_addr': '0x70c60000',
++                    'image_size': 81920,
++                    'name': u'C:\\Windows\\System32\\VCRUNTIME140.dll',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'147c51fb-7ca1-408f-85b5-285f2ad6f9c5-1',
++                    'image_addr': '0x73ba0000',
++                    'image_size': 40960,
++                    'name': u'C:\\Windows\\System32\\CRYPTBASE.dll',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'51e432b1-0450-4b19-8ed1-6d4335f9f543-1',
++                    'image_addr': '0x73bb0000',
++                    'image_size': 126976,
++                    'name': u'C:\\Windows\\System32\\sspicli.dll',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'0c799483-b549-417d-8433-4331852031fe-1',
++                    'image_addr': '0x73c70000',
++                    'image_size': 487424,
++                    'name': u'C:\\Windows\\System32\\advapi32.dll',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'6f6409b3-d520-43c7-9b2f-62e00bfe761c-1',
++                    'image_addr': '0x73cf0000',
++                    'image_size': 778240,
++                    'name': u'C:\\Windows\\System32\\msvcrt.dll',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'6f6a05dd-0a80-478b-a419-9b88703bf75b-1',
++                    'image_addr': '0x74450000',
++                    'image_size': 266240,
++                    'name': u'C:\\Windows\\System32\\sechost.dll',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'd3474559-96f7-47d6-bf43-c176b2171e68-1',
++                    'image_addr': '0x75050000',
++                    'image_size': 917504,
++                    'name': u'C:\\Windows\\System32\\kernel32.dll',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'287b19c3-9209-4a2b-bb8f-bcc37f411b11-1',
++                    'image_addr': '0x75130000',
++                    'image_size': 368640,
++                    'name': u'C:\\Windows\\System32\\bcryptPrimitives.dll',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'ae131c67-27a7-4fa1-9916-b5a4aef41190-1',
++                    'image_addr': '0x75810000',
++                    'image_size': 790528,
++                    'name': u'C:\\Windows\\System32\\rpcrt4.dll',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'6bedcbce-0a3a-40e9-8040-81c2c8c6cc2f-1',
++                    'image_addr': '0x758f0000',
++                    'image_size': 917504,
++                    'name': u'C:\\Windows\\System32\\ucrtbase.dll',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'8462294a-c645-402d-ac82-a4e95f61ddf9-1',
++                    'image_addr': '0x76db0000',
++                    'image_size': 1708032,
++                    'name': u'C:\\Windows\\System32\\KERNELBASE.dll',
++                    'type': 'symbolic'
++                },
++                {
++                    'id': u'971f98e5-ce60-41ff-b2d7-235bbeb34578-1',
++                    'image_addr': '0x77170000',
++                    'image_size': 1585152,
++                    'name': u'C:\\Windows\\System32\\ntdll.dll',
++                    'type': 'symbolic'
++                }
++            ]
++        },
++        'exception': {
++            'mechanism': {
++                'type': 'minidump',
++                'handled': False
++            },
++            'stacktrace': {
++                'frames': [
++                    {
++                        'function': '<unknown>',
++                        'instruction_addr': '0x771d0f44',
++                        'module': u'C:\\Windows\\System32\\ntdll.dll',
++                        'trust': 'fp',
++                    },
++                    {
++                        'function': '<unknown>',
++                        'instruction_addr': '0x771d0f79',
++                        'module': u'C:\\Windows\\System32\\ntdll.dll',
++                        'trust': 'fp',
++                    },
++                    {
++                        'function': '<unknown>',
++                        'instruction_addr': '0x750662c4',
++                        'module': u'C:\\Windows\\System32\\kernel32.dll',
++                        'trust': 'fp',
++                    },
++                    {
++                        'function': '<unknown>',
++                        'instruction_addr': '0x2a2d97',
++                        'module': u'C:\\projects\\breakpad-tools\\windows\\Release\\crash.exe',
++                        'trust': 'scan',
++                    },
++                    {
++                        'function': '<unknown>',
++                        'instruction_addr': '0x2a3435',
++                        'module': u'C:\\projects\\breakpad-tools\\windows\\Release\\crash.exe',
++                        'trust': 'scan',
++                    },
++                    {
++                        'function': '<unknown>',
++                        'instruction_addr': '0x7584e9c0',
++                        'module': u'C:\\Windows\\System32\\rpcrt4.dll',
++                        'trust': 'scan',
++                    },
++                    {
++                        'function': '<unknown>',
++                        'instruction_addr': '0x75810000',
++                        'module': None,
++                        'trust': 'scan',
++                    },
++                    {
++                        'function': '<unknown>',
++                        'instruction_addr': '0x70b7ae40',
++                        'module': u'C:\\Windows\\System32\\dbgcore.dll',
++                        'trust': 'scan',
++                    },
++                    {
++                        'function': '<unknown>',
++                        'instruction_addr': '0x70850000',
++                        'module': None,
++                        'trust': 'scan',
++                    },
++                    {
++                        'function': '<unknown>',
++                        'instruction_addr': '0x7584e9c0',
++                        'module': u'C:\\Windows\\System32\\rpcrt4.dll',
++                        'trust': 'scan',
++                    },
++                    {
++                        'function': '<unknown>',
++                        'instruction_addr': '0x2a28d0',
++                        'module': u'C:\\projects\\breakpad-tools\\windows\\Release\\crash.exe',
++                        'trust': 'fp',
++                    },
++                    {
++                        'function': '<unknown>',
++                        'instruction_addr': '0x2a2a3d',
++                        'module': u'C:\\projects\\breakpad-tools\\windows\\Release\\crash.exe',
++                        'trust': 'context',
++                    }
++                ],
++                'registers': {
++                    u'eax': u'0x00000000',
++                    u'ebp': u'0x010ff670',
++                    u'ebx': u'0x00fe5000',
++                    u'ecx': u'0x010ff670',
++                    u'edi': u'0x013bfd78',
++                    u'edx': u'0x00000007',
++                    u'eflags': u'0x00010246',
++                    u'eip': u'0x002a2a3d',
++                    u'esi': u'0x759c6314',
++                    u'esp': u'0x010ff644'
++                }
++            },
++            'thread_id': 1636,
++            'type': u'EXCEPTION_ACCESS_VIOLATION_WRITE',
++            'value': u'Fatal Error: EXCEPTION_ACCESS_VIOLATION_WRITE'
++        },
++        'level': 'fatal',
++        'message': u'Fatal Error: EXCEPTION_ACCESS_VIOLATION_WRITE',
++        'platform': 'native',
++        'release': 'test-1.0.0',
++        'threads': [
++            {
++                'crashed': True,
++                'id': 1636
++            },
++            {
++                'crashed': False,
++                'id': 3580,
++                'stacktrace': {
++                    'frames': [{
++                        'function': '<unknown>',
++                        'instruction_addr': '0x771d0f44',
++                        'module': u'C:\\Windows\\System32\\ntdll.dll',
++                        'trust': 'fp',
++                    },
++                        {
++                        'function': '<unknown>',
++                        'instruction_addr': '0x771d0f79',
++                        'module': u'C:\\Windows\\System32\\ntdll.dll',
++                        'trust': 'fp',
++                    },
++                        {
++                        'function': '<unknown>',
++                        'instruction_addr': '0x750662c4',
++                        'module': u'C:\\Windows\\System32\\kernel32.dll',
++                        'trust': 'fp',
++                    },
++                        {
++                        'function': '<unknown>',
++                        'instruction_addr': '0x771e016c',
++                        'module': u'C:\\Windows\\System32\\ntdll.dll',
++                        'trust': 'context',
++                    }],
++                    'registers': {
++                        u'eax': u'0x00000000',
++                        u'ebp': u'0x0159faa4',
++                        u'ebx': u'0x013b0990',
++                        u'ecx': u'0x00000000',
++                        u'edi': u'0x013b4af0',
++                        u'edx': u'0x00000000',
++                        u'eflags': u'0x00000216',
++                        u'eip': u'0x771e016c',
++                        u'esi': u'0x013b4930',
++                        u'esp': u'0x0159f900'
++                    }
++                }
++            },
++            {
++                'crashed': False,
++                'id': 2600,
++                'stacktrace': {
++                    'frames': [{
++                        'function': '<unknown>',
++                        'instruction_addr': '0x771d0f44',
++                        'module': u'C:\\Windows\\System32\\ntdll.dll',
++                        'trust': 'fp',
++                    },
++                        {
++                        'function': '<unknown>',
++                        'instruction_addr': '0x771d0f79',
++                        'module': u'C:\\Windows\\System32\\ntdll.dll',
++                        'trust': 'fp',
++                    },
++                        {
++                        'function': '<unknown>',
++                        'instruction_addr': '0x750662c4',
++                        'module': u'C:\\Windows\\System32\\kernel32.dll',
++                        'trust': 'fp',
++                    },
++                        {
++                        'function': '<unknown>',
++                        'instruction_addr': '0x771e016c',
++                        'module': u'C:\\Windows\\System32\\ntdll.dll',
++                        'trust': 'context',
++                    }],
++                    'registers': {
++                        u'eax': u'0x00000000',
++                        u'ebp': u'0x0169fb98',
++                        u'ebx': u'0x013b0990',
++                        u'ecx': u'0x00000000',
++                        u'edi': u'0x013b7c28',
++                        u'edx': u'0x00000000',
++                        u'eflags': u'0x00000202',
++                        u'eip': u'0x771e016c',
++                        u'esi': u'0x013b7a68',
++                        u'esp': u'0x0169f9f4'
++                    }
++                }
++            },
++            {
++                'crashed': False,
++                'id': 2920,
++                'stacktrace': {
++                    'frames': [{
++                        'function': '<unknown>',
++                        'instruction_addr': '0x771df3dc',
++                        'module': u'C:\\Windows\\System32\\ntdll.dll',
++                        'trust': 'context',
++                    }],
++                    'registers': {
++                        u'eax': u'0x00000000',
++                        u'ebp': u'0x0179f2b8',
++                        u'ebx': u'0x017b1aa0',
++                        u'ecx': u'0x00000000',
++                        u'edi': u'0x017b1a90',
++                        u'edx': u'0x00000000',
++                        u'eflags': u'0x00000206',
++                        u'eip': u'0x771df3dc',
++                        u'esi': u'0x000002cc',
++                        u'esp': u'0x0179f2ac'
++                    }
++                }
++            }
++        ],
++        'timestamp': 1521713273.0
++    }
+diff --git a/tests/sentry/lang/native/test_utils.py b/tests/sentry/lang/native/test_utils.py
+index 196b48df5c..358c1c3a07 100644
+--- a/tests/sentry/lang/native/test_utils.py
++++ b/tests/sentry/lang/native/test_utils.py
+@@ -1,8 +1,6 @@
+ from __future__ import absolute_import
+-import os
+ 
+-from sentry.lang.native.utils import get_sdk_from_event, cpu_name_from_data, \
+-    merge_minidump_event
++from sentry.lang.native.utils import get_sdk_from_event, cpu_name_from_data
+ 
+ 
+ def test_get_sdk_from_event():
+@@ -73,942 +71,3 @@ def test_cpu_name_from_data_inferred_type():
+     )
+ 
+     assert cpu_name == 'arm64'
+-
+-
+-def test_minidump_linux():
+-    event = {'release': 'test-1.0.0'}
+-    minidump = os.path.join(os.path.dirname(__file__), 'fixtures', 'linux.dmp')
+-    merge_minidump_event(event, minidump)
+-
+-    assert event == {
+-        'contexts': {
+-            'device': {
+-                'arch': 'x86_64'
+-            },
+-            'os': {
+-                'build': u'#1 SMP Mon Nov 6 16:00:12 UTC 2017',
+-                'name': u'Linux',
+-                'type': 'os',
+-                'version': u'4.9.60-linuxkit-aufs'
+-            }
+-        },
+-        'debug_meta': {
+-            'images': [
+-                {
+-                    'id': u'c0bcc3f1-9827-fe65-3058-404b2831d9e6',
+-                    'image_addr': '0x400000',
+-                    'image_size': 106496,
+-                    'name': u'/work/linux/build/crash',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'e45db8df-af2d-09fd-640c-8fe377d572de',
+-                    'image_addr': '0x7f513fe54000',
+-                    'image_size': 1081344,
+-                    'name': u'/lib/x86_64-linux-gnu/libm-2.23.so',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'451a38b5-0679-79d2-0738-22a5ceb24c4b',
+-                    'image_addr': '0x7f514015d000',
+-                    'image_size': 1835008,
+-                    'name': u'/lib/x86_64-linux-gnu/libc-2.23.so',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'e20a2268-5dc6-c165-b6aa-a12fa6765a6e',
+-                    'image_addr': '0x7f5140527000',
+-                    'image_size': 90112,
+-                    'name': u'/lib/x86_64-linux-gnu/libgcc_s.so.1',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'81c893cb-9b92-3c52-01ac-ef171b52d526',
+-                    'image_addr': '0x7f514073d000',
+-                    'image_size': 1515520,
+-                    'name': u'/usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.21',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'23e017ce-2254-fc65-11d9-bc8f534bb4f0',
+-                    'image_addr': '0x7f5140abf000',
+-                    'image_size': 98304,
+-                    'name': u'/lib/x86_64-linux-gnu/libpthread-2.23.so',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'59627b5d-2255-a375-c17b-d4c3fd05f5a6',
+-                    'image_addr': '0x7f5140cdc000',
+-                    'image_size': 155648,
+-                    'name': u'/lib/x86_64-linux-gnu/ld-2.23.so',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'75185f6c-04b9-b48f-b8df-d832e74ad31a',
+-                    'image_addr': '0x7fff5aef1000',
+-                    'image_size': 8192,
+-                    'name': u'linux-gate.so',
+-                    'type': 'symbolic'
+-                }
+-            ]
+-        },
+-        'exception': {
+-            'mechanism': {
+-                'type': 'minidump',
+-                'handled': False
+-            },
+-            'stacktrace': {
+-                'frames': [
+-                    {
+-                        'function': '<unknown>',
+-                        'instruction_addr': '0x401dc0',
+-                        'package': u'/work/linux/build/crash'
+-                    },
+-                    {
+-                        'function': '<unknown>',
+-                        'instruction_addr': '0x7f5140cdc000',
+-                        'package': None
+-                    },
+-                    {
+-                        'function': '<unknown>',
+-                        'instruction_addr': '0x400040',
+-                        'package': u'/work/linux/build/crash'
+-                    },
+-                    {
+-                        'function': '<unknown>',
+-                        'instruction_addr': '0x7fff5aef1000',
+-                        'package': None
+-                    },
+-                    {
+-                        'function': '<unknown>',
+-                        'instruction_addr': '0x401de9',
+-                        'package': u'/work/linux/build/crash'
+-                    },
+-                    {
+-                        'function': '<unknown>',
+-                        'instruction_addr': '0x401dc0',
+-                        'package': u'/work/linux/build/crash'
+-                    },
+-                    {
+-                        'function': '<unknown>',
+-                        'instruction_addr': '0x414ca0',
+-                        'package': u'/work/linux/build/crash'
+-                    },
+-                    {
+-                        'function': '<unknown>',
+-                        'instruction_addr': '0x401c70',
+-                        'package': u'/work/linux/build/crash'
+-                    },
+-                    {
+-                        'function': '<unknown>',
+-                        'instruction_addr': '0x401dc0',
+-                        'package': u'/work/linux/build/crash'
+-                    },
+-                    {
+-                        'function': '<unknown>',
+-                        'instruction_addr': '0x401c70',
+-                        'package': u'/work/linux/build/crash'
+-                    },
+-                    {
+-                        'function': '<unknown>',
+-                        'instruction_addr': '0x7f514017d830',
+-                        'package': u'/lib/x86_64-linux-gnu/libc-2.23.so'
+-                    },
+-                    {
+-                        'function': '<unknown>',
+-                        'instruction_addr': '0x414c30',
+-                        'package': u'/work/linux/build/crash'
+-                    },
+-                    {
+-                        'function': '<unknown>',
+-                        'instruction_addr': '0x401ec0',
+-                        'package': u'/work/linux/build/crash'
+-                    },
+-                    {
+-                        'function': '<unknown>',
+-                        'instruction_addr': '0x7f5140cebac6',
+-                        'package': u'/lib/x86_64-linux-gnu/ld-2.23.so'
+-                    },
+-                    {
+-                        'function': '<unknown>',
+-                        'instruction_addr': '0x400000',
+-                        'package': None
+-                    },
+-                    {
+-                        'function': '<unknown>',
+-                        'instruction_addr': '0x7f51401e4800',
+-                        'package': u'/lib/x86_64-linux-gnu/libc-2.23.so'
+-                    },
+-                    {
+-                        'function': '<unknown>',
+-                        'instruction_addr': '0x7f514025002e',
+-                        'package': u'/lib/x86_64-linux-gnu/libc-2.23.so'
+-                    },
+-                    {
+-                        'function': '<unknown>',
+-                        'instruction_addr': '0x401d72',
+-                        'package': u'/work/linux/build/crash'
+-                    }
+-                ],
+-                'registers': {
+-                    u'r10': u'0x0000000000000131',
+-                    u'r11': u'0x00007f5140aca4c0',
+-                    u'r12': u'0x0000000000401dc0',
+-                    u'r13': u'0x00007fff5ae4ac90',
+-                    u'r14': u'0x00007fff5ae4aab0',
+-                    u'r15': u'0x0000000000000000',
+-                    u'r8': u'0x0000000000000000',
+-                    u'r9': u'0x0000000000000000',
+-                    u'rax': u'0xffffffffffffffff',
+-                    u'rbp': u'0x00007fff5ae4abb0',
+-                    u'rbx': u'0x00007fff5ae4aa20',
+-                    u'rcx': u'0x00007f5140521b20',
+-                    u'rdi': u'0x00007fff5ae4aab0',
+-                    u'rdx': u'0x00007f5140efc000',
+-                    u'rip': u'0x0000000000401d72',
+-                    u'rsi': u'0x0000000000000000',
+-                    u'rsp': u'0x00007fff5ae4aa20'
+-                }
+-            },
+-            'thread_id': 1304,
+-            'type': u'SIGSEGV',
+-            'value': u'Fatal Error: SIGSEGV'
+-        },
+-        'level': 'fatal',
+-        'message': u'Fatal Error: SIGSEGV',
+-        'platform': 'native',
+-        'release': 'test-1.0.0',
+-        'threads': [
+-            {
+-                'crashed': True,
+-                'id': 1304
+-            }
+-        ],
+-        'timestamp': 1522061032.0
+-    }
+-
+-
+-def test_minidump_macos():
+-    event = {'release': 'test-1.0.0'}
+-    minidump = os.path.join(os.path.dirname(__file__), 'fixtures', 'macos.dmp')
+-    merge_minidump_event(event, minidump)
+-
+-    assert event == {
+-        'contexts': {
+-            'device': {
+-                'arch': 'x86_64'
+-            },
+-            'os': {
+-                'build': u'16G29',
+-                'name': 'macOS',
+-                'type': 'os',
+-                'version': u'10.12.6'
+-            }
+-        },
+-        'debug_meta': {
+-            'images': [
+-                {
+-                    'id': u'67e9247c-814e-392b-a027-dbde6748fcbf',
+-                    'image_addr': '0x109b9b000',
+-                    'image_size': 69632,
+-                    'name': u'/Users/travis/build/getsentry/breakpad-tools/macos/build/./crash',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'36385a3a-60d3-32db-bf55-c6d8931a7aa6',
+-                    'image_addr': '0x7fffd229c000',
+-                    'image_size': 4800512,
+-                    'name': u'/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'84a04d24-0e60-3810-a8c0-90a65e2df61a',
+-                    'image_addr': '0x7fffe668e000',
+-                    'image_size': 8192,
+-                    'name': u'/usr/lib/libDiagnosticMessagesClient.dylib',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'f18ac1e7-c6f1-34b1-8069-be571b3231d4',
+-                    'image_addr': '0x7fffe68cd000',
+-                    'image_size': 8192,
+-                    'name': u'/usr/lib/libSystem.B.dylib',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'0b43bb5d-e6eb-3464-8de9-b41ac8ed9d1c',
+-                    'image_addr': '0x7fffe6a80000',
+-                    'image_size': 356352,
+-                    'name': u'/usr/lib/libc++.1.dylib',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'bc271ad3-831b-362a-9da7-e8c51f285fe4',
+-                    'image_addr': '0x7fffe6ad7000',
+-                    'image_size': 172032,
+-                    'name': u'/usr/lib/libc++abi.dylib',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'ccd2ed24-3071-383b-925d-8d763bb12a6f',
+-                    'image_addr': '0x7fffe7041000',
+-                    'image_size': 2252800,
+-                    'name': u'/usr/lib/libicucore.A.dylib',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'4df3c25c-52c2-3f01-a3ef-0d9d53a73c1c',
+-                    'image_addr': '0x7fffe75f5000',
+-                    'image_size': 4022272,
+-                    'name': u'/usr/lib/libobjc.A.dylib',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'46e3ffa2-4328-327a-8d34-a03e20bffb8e',
+-                    'image_addr': '0x7fffe7def000',
+-                    'image_size': 73728,
+-                    'name': u'/usr/lib/libz.1.dylib',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'093a4dab-8385-3d47-a350-e20cb7ccf7bf',
+-                    'image_addr': '0x7fffe7e0f000',
+-                    'image_size': 20480,
+-                    'name': u'/usr/lib/system/libcache.dylib',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'8a64d1b0-c70e-385c-92f0-e669079fda90',
+-                    'image_addr': '0x7fffe7e14000',
+-                    'image_size': 45056,
+-                    'name': u'/usr/lib/system/libcommonCrypto.dylib',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'55d47421-772a-32ab-b529-1a46c2f43b4d',
+-                    'image_addr': '0x7fffe7e1f000',
+-                    'image_size': 32768,
+-                    'name': u'/usr/lib/system/libcompiler_rt.dylib',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'819bea3c-df11-3e3d-a1a1-5a51c5bf1961',
+-                    'image_addr': '0x7fffe7e27000',
+-                    'image_size': 36864,
+-                    'name': u'/usr/lib/system/libcopyfile.dylib',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'65d7165e-2e71-335d-a2d6-33f78e2df0c1',
+-                    'image_addr': '0x7fffe7e30000',
+-                    'image_size': 540672,
+-                    'name': u'/usr/lib/system/libcorecrypto.dylib',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'6582bad6-ed27-3b30-b620-90b1c5a4ae3c',
+-                    'image_addr': '0x7fffe7eb4000',
+-                    'image_size': 204800,
+-                    'name': u'/usr/lib/system/libdispatch.dylib',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'9b2ac56d-107c-3541-a127-9094a751f2c9',
+-                    'image_addr': '0x7fffe7ee6000',
+-                    'image_size': 24576,
+-                    'name': u'/usr/lib/system/libdyld.dylib',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'7aa011a9-dc21-3488-bf73-3b5b14d1fdd6',
+-                    'image_addr': '0x7fffe7eec000',
+-                    'image_size': 4096,
+-                    'name': u'/usr/lib/system/libkeymgr.dylib',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'b856abd2-896e-3de0-b2c8-146a6af8e2a7',
+-                    'image_addr': '0x7fffe7efa000',
+-                    'image_size': 4096,
+-                    'name': u'/usr/lib/system/liblaunch.dylib',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'17d5d855-f6c3-3b04-b680-e9bf02ef8aed',
+-                    'image_addr': '0x7fffe7efb000',
+-                    'image_size': 24576,
+-                    'name': u'/usr/lib/system/libmacho.dylib',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'12448cc2-378e-35f3-be33-9dc395a5b970',
+-                    'image_addr': '0x7fffe7f01000',
+-                    'image_size': 12288,
+-                    'name': u'/usr/lib/system/libquarantine.dylib',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'38d4cb9c-10cd-30d3-8b7b-a515ec75fe85',
+-                    'image_addr': '0x7fffe7f04000',
+-                    'image_size': 8192,
+-                    'name': u'/usr/lib/system/libremovefile.dylib',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'096e4228-3b7c-30a6-8b13-ec909a64499a',
+-                    'image_addr': '0x7fffe7f06000',
+-                    'image_size': 102400,
+-                    'name': u'/usr/lib/system/libsystem_asl.dylib',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'10dc5404-73ab-35b3-a277-a8afecb476eb',
+-                    'image_addr': '0x7fffe7f1f000',
+-                    'image_size': 4096,
+-                    'name': u'/usr/lib/system/libsystem_blocks.dylib',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'e5ae5244-7d0c-36ac-8bb6-c7ae7ea52a4b',
+-                    'image_addr': '0x7fffe7f20000',
+-                    'image_size': 581632,
+-                    'name': u'/usr/lib/system/libsystem_c.dylib',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'becc01a2-ca8d-31e6-bcdf-d452965fa976',
+-                    'image_addr': '0x7fffe7fae000',
+-                    'image_size': 16384,
+-                    'name': u'/usr/lib/system/libsystem_configuration.dylib',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'7d26de79-b424-3450-85e1-f7fab32714ab',
+-                    'image_addr': '0x7fffe7fb2000',
+-                    'image_size': 16384,
+-                    'name': u'/usr/lib/system/libsystem_coreservices.dylib',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'ec6fcf07-dcfb-3a03-9cc9-6dd3709974c6',
+-                    'image_addr': '0x7fffe7fb6000',
+-                    'image_size': 102400,
+-                    'name': u'/usr/lib/system/libsystem_coretls.dylib',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'cc960215-0b1b-3822-a13a-3dde96fa796f',
+-                    'image_addr': '0x7fffe7fcf000',
+-                    'image_size': 28672,
+-                    'name': u'/usr/lib/system/libsystem_dnssd.dylib',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'611db84c-bf70-3f92-8702-b9f28a900920',
+-                    'image_addr': '0x7fffe7fd6000',
+-                    'image_size': 172032,
+-                    'name': u'/usr/lib/system/libsystem_info.dylib',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'34b1f16c-bc9c-3c5f-9045-0cae91cb5914',
+-                    'image_addr': '0x7fffe8000000',
+-                    'image_size': 143360,
+-                    'name': u'/usr/lib/system/libsystem_kernel.dylib',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'86d499b5-bbdc-3d3b-8a4e-97ae8e6672a4',
+-                    'image_addr': '0x7fffe8023000',
+-                    'image_size': 294912,
+-                    'name': u'/usr/lib/system/libsystem_m.dylib',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'a3d15f17-99a6-3367-8c7e-4280e8619c95',
+-                    'image_addr': '0x7fffe806b000',
+-                    'image_size': 126976,
+-                    'name': u'/usr/lib/system/libsystem_malloc.dylib',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'369d0221-56ca-3c3e-9ede-94b41cae77b7',
+-                    'image_addr': '0x7fffe808a000',
+-                    'image_size': 368640,
+-                    'name': u'/usr/lib/system/libsystem_network.dylib',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'b021f2b3-8a75-3633-abb0-fc012b8e9b0c',
+-                    'image_addr': '0x7fffe80e4000',
+-                    'image_size': 40960,
+-                    'name': u'/usr/lib/system/libsystem_networkextension.dylib',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'b8160190-a069-3b3a-bdf6-2aa408221fae',
+-                    'image_addr': '0x7fffe80ee000',
+-                    'image_size': 40960,
+-                    'name': u'/usr/lib/system/libsystem_notify.dylib',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'897462fd-b318-321b-a554-e61982630f7e',
+-                    'image_addr': '0x7fffe80f8000',
+-                    'image_size': 36864,
+-                    'name': u'/usr/lib/system/libsystem_platform.dylib',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'b8fb5e20-3295-39e2-b5eb-b464d1d4b104',
+-                    'image_addr': '0x7fffe8101000',
+-                    'image_size': 45056,
+-                    'name': u'/usr/lib/system/libsystem_pthread.dylib',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'4b92ec49-acd0-36ae-b07a-a2b8152eaf9d',
+-                    'image_addr': '0x7fffe810c000',
+-                    'image_size': 16384,
+-                    'name': u'/usr/lib/system/libsystem_sandbox.dylib',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'f78b847b-3565-3e4b-98a6-f7ad40392e2d',
+-                    'image_addr': '0x7fffe8110000',
+-                    'image_size': 8192,
+-                    'name': u'/usr/lib/system/libsystem_secinit.dylib',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'3390e07c-c1ce-348f-adbd-2c5440b45eaa',
+-                    'image_addr': '0x7fffe8112000',
+-                    'image_size': 32768,
+-                    'name': u'/usr/lib/system/libsystem_symptoms.dylib',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'ac63a7fe-50d9-3a30-96e6-f6b7ff16e465',
+-                    'image_addr': '0x7fffe811a000',
+-                    'image_size': 81920,
+-                    'name': u'/usr/lib/system/libsystem_trace.dylib',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'3d50d8a8-c460-334d-a519-2da841102c6b',
+-                    'image_addr': '0x7fffe812e000',
+-                    'image_size': 24576,
+-                    'name': u'/usr/lib/system/libunwind.dylib',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'bf896df0-d8e9-31a8-a4b3-01120bfeee52',
+-                    'image_addr': '0x7fffe8134000',
+-                    'image_size': 172032,
+-                    'name': u'/usr/lib/system/libxpc.dylib',
+-                    'type': 'symbolic'
+-                }
+-            ]
+-        },
+-        'exception': {
+-            'mechanism': {
+-                'type': 'minidump',
+-                'handled': False
+-            },
+-            'stacktrace': {
+-                'frames': [
+-                    {
+-                        'function': '<unknown>',
+-                        'instruction_addr': '0x7fffe7eeb235',
+-                        'package': u'/usr/lib/system/libdyld.dylib'
+-                    },
+-                    {
+-                        'function': '<unknown>',
+-                        'instruction_addr': '0x7fffe7eeb235',
+-                        'package': u'/usr/lib/system/libdyld.dylib'
+-                    },
+-                    {
+-                        'function': '<unknown>',
+-                        'instruction_addr': '0x109ba8c70',
+-                        'package': u'/Users/travis/build/getsentry/breakpad-tools/macos/build/./crash'
+-                    },
+-                    {
+-                        'function': '<unknown>',
+-                        'instruction_addr': '0x109ba8c15',
+-                        'package': u'/Users/travis/build/getsentry/breakpad-tools/macos/build/./crash'
+-                    }
+-                ],
+-                'registers': {
+-                    u'r10': u'0x000000000000002e',
+-                    u'r11': u'0x00007fffe8105171',
+-                    u'r12': u'0x0000000000000000',
+-                    u'r13': u'0x0000000000000000',
+-                    u'r14': u'0x0000000000000000',
+-                    u'r15': u'0x0000000000000000',
+-                    u'r8': u'0x000000000c0008ff',
+-                    u'r9': u'0x0000000000000000',
+-                    u'rax': u'0x0000000000000001',
+-                    u'rbp': u'0x00007fff56064258',
+-                    u'rbx': u'0x00007fff56064120',
+-                    u'rcx': u'0x0000000000000000',
+-                    u'rdi': u'0x00007fff56064120',
+-                    u'rdx': u'0x0000000000000000',
+-                    u'rip': u'0x0000000109ba8c15',
+-                    u'rsi': u'0x00007fff56064140',
+-                    u'rsp': u'0x00007fff56064110'
+-                }
+-            },
+-            'thread_id': 775,
+-            'type': u'EXC_BAD_ACCESS / KERN_INVALID_ADDRESS',
+-            'value': u'Fatal Error: EXC_BAD_ACCESS / KERN_INVALID_ADDRESS'
+-        },
+-        'level': 'fatal',
+-        'message': u'Fatal Error: EXC_BAD_ACCESS / KERN_INVALID_ADDRESS',
+-        'platform': 'native',
+-        'release': 'test-1.0.0',
+-        'threads': [
+-            {
+-                'crashed': True,
+-                'id': 775
+-            }
+-        ],
+-        'timestamp': 1521713398.0
+-    }
+-
+-
+-def test_minidump_windows():
+-    event = {'release': 'test-1.0.0'}
+-    minidump = os.path.join(os.path.dirname(__file__), 'fixtures', 'windows.dmp')
+-    merge_minidump_event(event, minidump)
+-
+-    assert event == {
+-        'contexts': {
+-            'device': {
+-                'arch': 'x86'
+-            },
+-            'os': {
+-                'build': u'',
+-                'name': 'Windows',
+-                'type': 'os',
+-                'version': u'10.0.14393'
+-            }
+-        },
+-        'debug_meta': {
+-            'images': [
+-                {
+-                    'id': u'3249d99d-0c40-4931-8610-f4e4fb0b6936-1',
+-                    'image_addr': '0x2a0000',
+-                    'image_size': 36864,
+-                    'name': u'C:\\projects\\breakpad-tools\\windows\\Release\\crash.exe',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'9c2a902b-6fdf-40ad-8308-588a41d572a0-1',
+-                    'image_addr': '0x70850000',
+-                    'image_size': 1331200,
+-                    'name': u'C:\\Windows\\System32\\dbghelp.dll',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'bf5257f7-8c26-43dd-9bb7-901625e1136a-1',
+-                    'image_addr': '0x709a0000',
+-                    'image_size': 442368,
+-                    'name': u'C:\\Windows\\System32\\msvcp140.dll',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'8daf7773-372f-460a-af38-944e193f7e33-1',
+-                    'image_addr': '0x70a10000',
+-                    'image_size': 598016,
+-                    'name': u'C:\\Windows\\System32\\apphelp.dll',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'aec7ef2f-df4b-4642-a471-4c3e5fe8760a-1',
+-                    'image_addr': '0x70b70000',
+-                    'image_size': 151552,
+-                    'name': u'C:\\Windows\\System32\\dbgcore.dll',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'0ed80a50-ecda-472b-86a4-eb6c833f8e1b-1',
+-                    'image_addr': '0x70c60000',
+-                    'image_size': 81920,
+-                    'name': u'C:\\Windows\\System32\\VCRUNTIME140.dll',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'147c51fb-7ca1-408f-85b5-285f2ad6f9c5-1',
+-                    'image_addr': '0x73ba0000',
+-                    'image_size': 40960,
+-                    'name': u'C:\\Windows\\System32\\CRYPTBASE.dll',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'51e432b1-0450-4b19-8ed1-6d4335f9f543-1',
+-                    'image_addr': '0x73bb0000',
+-                    'image_size': 126976,
+-                    'name': u'C:\\Windows\\System32\\sspicli.dll',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'0c799483-b549-417d-8433-4331852031fe-1',
+-                    'image_addr': '0x73c70000',
+-                    'image_size': 487424,
+-                    'name': u'C:\\Windows\\System32\\advapi32.dll',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'6f6409b3-d520-43c7-9b2f-62e00bfe761c-1',
+-                    'image_addr': '0x73cf0000',
+-                    'image_size': 778240,
+-                    'name': u'C:\\Windows\\System32\\msvcrt.dll',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'6f6a05dd-0a80-478b-a419-9b88703bf75b-1',
+-                    'image_addr': '0x74450000',
+-                    'image_size': 266240,
+-                    'name': u'C:\\Windows\\System32\\sechost.dll',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'd3474559-96f7-47d6-bf43-c176b2171e68-1',
+-                    'image_addr': '0x75050000',
+-                    'image_size': 917504,
+-                    'name': u'C:\\Windows\\System32\\kernel32.dll',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'287b19c3-9209-4a2b-bb8f-bcc37f411b11-1',
+-                    'image_addr': '0x75130000',
+-                    'image_size': 368640,
+-                    'name': u'C:\\Windows\\System32\\bcryptPrimitives.dll',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'ae131c67-27a7-4fa1-9916-b5a4aef41190-1',
+-                    'image_addr': '0x75810000',
+-                    'image_size': 790528,
+-                    'name': u'C:\\Windows\\System32\\rpcrt4.dll',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'6bedcbce-0a3a-40e9-8040-81c2c8c6cc2f-1',
+-                    'image_addr': '0x758f0000',
+-                    'image_size': 917504,
+-                    'name': u'C:\\Windows\\System32\\ucrtbase.dll',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'8462294a-c645-402d-ac82-a4e95f61ddf9-1',
+-                    'image_addr': '0x76db0000',
+-                    'image_size': 1708032,
+-                    'name': u'C:\\Windows\\System32\\KERNELBASE.dll',
+-                    'type': 'symbolic'
+-                },
+-                {
+-                    'id': u'971f98e5-ce60-41ff-b2d7-235bbeb34578-1',
+-                    'image_addr': '0x77170000',
+-                    'image_size': 1585152,
+-                    'name': u'C:\\Windows\\System32\\ntdll.dll',
+-                    'type': 'symbolic'
+-                }
+-            ]
+-        },
+-        'exception': {
+-            'mechanism': {
+-                'type': 'minidump',
+-                'handled': False
+-            },
+-            'stacktrace': {
+-                'frames': [
+-                    {
+-                        'function': '<unknown>',
+-                        'instruction_addr': '0x771d0f44',
+-                        'package': u'C:\\Windows\\System32\\ntdll.dll'
+-                    },
+-                    {
+-                        'function': '<unknown>',
+-                        'instruction_addr': '0x771d0f79',
+-                        'package': u'C:\\Windows\\System32\\ntdll.dll'
+-                    },
+-                    {
+-                        'function': '<unknown>',
+-                        'instruction_addr': '0x750662c4',
+-                        'package': u'C:\\Windows\\System32\\kernel32.dll'
+-                    },
+-                    {
+-                        'function': '<unknown>',
+-                        'instruction_addr': '0x2a2d97',
+-                        'package': u'C:\\projects\\breakpad-tools\\windows\\Release\\crash.exe'
+-                    },
+-                    {
+-                        'function': '<unknown>',
+-                        'instruction_addr': '0x2a3435',
+-                        'package': u'C:\\projects\\breakpad-tools\\windows\\Release\\crash.exe'
+-                    },
+-                    {
+-                        'function': '<unknown>',
+-                        'instruction_addr': '0x7584e9c0',
+-                        'package': u'C:\\Windows\\System32\\rpcrt4.dll'
+-                    },
+-                    {
+-                        'function': '<unknown>',
+-                        'instruction_addr': '0x75810000',
+-                        'package': None
+-                    },
+-                    {
+-                        'function': '<unknown>',
+-                        'instruction_addr': '0x70b7ae40',
+-                        'package': u'C:\\Windows\\System32\\dbgcore.dll'
+-                    },
+-                    {
+-                        'function': '<unknown>',
+-                        'instruction_addr': '0x70850000',
+-                        'package': None
+-                    },
+-                    {
+-                        'function': '<unknown>',
+-                        'instruction_addr': '0x7584e9c0',
+-                        'package': u'C:\\Windows\\System32\\rpcrt4.dll'
+-                    },
+-                    {
+-                        'function': '<unknown>',
+-                        'instruction_addr': '0x2a28d0',
+-                        'package': u'C:\\projects\\breakpad-tools\\windows\\Release\\crash.exe'
+-                    },
+-                    {
+-                        'function': '<unknown>',
+-                        'instruction_addr': '0x2a2a3d',
+-                        'package': u'C:\\projects\\breakpad-tools\\windows\\Release\\crash.exe'
+-                    }
+-                ],
+-                'registers': {
+-                    u'eax': u'0x00000000',
+-                    u'ebp': u'0x010ff670',
+-                    u'ebx': u'0x00fe5000',
+-                    u'ecx': u'0x010ff670',
+-                    u'edi': u'0x013bfd78',
+-                    u'edx': u'0x00000007',
+-                    u'eflags': u'0x00010246',
+-                    u'eip': u'0x002a2a3d',
+-                    u'esi': u'0x759c6314',
+-                    u'esp': u'0x010ff644'
+-                }
+-            },
+-            'thread_id': 1636,
+-            'type': u'EXCEPTION_ACCESS_VIOLATION_WRITE',
+-            'value': u'Fatal Error: EXCEPTION_ACCESS_VIOLATION_WRITE'
+-        },
+-        'level': 'fatal',
+-        'message': u'Fatal Error: EXCEPTION_ACCESS_VIOLATION_WRITE',
+-        'platform': 'native',
+-        'release': 'test-1.0.0',
+-        'threads': [
+-            {
+-                'crashed': True,
+-                'id': 1636
+-            },
+-            {
+-                'crashed': False,
+-                'id': 3580,
+-                'stacktrace': {
+-                    'frames': [{
+-                        'function': '<unknown>',
+-                        'instruction_addr': '0x771d0f44',
+-                        'package': u'C:\\Windows\\System32\\ntdll.dll'
+-                    },
+-                        {
+-                        'function': '<unknown>',
+-                        'instruction_addr': '0x771d0f79',
+-                        'package': u'C:\\Windows\\System32\\ntdll.dll'
+-                    },
+-                        {
+-                        'function': '<unknown>',
+-                        'instruction_addr': '0x750662c4',
+-                        'package': u'C:\\Windows\\System32\\kernel32.dll'
+-                    },
+-                        {
+-                        'function': '<unknown>',
+-                        'instruction_addr': '0x771e016c',
+-                        'package': u'C:\\Windows\\System32\\ntdll.dll'
+-                    }],
+-                    'registers': {
+-                        u'eax': u'0x00000000',
+-                        u'ebp': u'0x0159faa4',
+-                        u'ebx': u'0x013b0990',
+-                        u'ecx': u'0x00000000',
+-                        u'edi': u'0x013b4af0',
+-                        u'edx': u'0x00000000',
+-                        u'eflags': u'0x00000216',
+-                        u'eip': u'0x771e016c',
+-                        u'esi': u'0x013b4930',
+-                        u'esp': u'0x0159f900'
+-                    }
+-                }
+-            },
+-            {
+-                'crashed': False,
+-                'id': 2600,
+-                'stacktrace': {
+-                    'frames': [{
+-                        'function': '<unknown>',
+-                        'instruction_addr': '0x771d0f44',
+-                        'package': u'C:\\Windows\\System32\\ntdll.dll'
+-                    },
+-                        {
+-                        'function': '<unknown>',
+-                        'instruction_addr': '0x771d0f79',
+-                        'package': u'C:\\Windows\\System32\\ntdll.dll'
+-                    },
+-                        {
+-                        'function': '<unknown>',
+-                        'instruction_addr': '0x750662c4',
+-                        'package': u'C:\\Windows\\System32\\kernel32.dll'
+-                    },
+-                        {
+-                        'function': '<unknown>',
+-                        'instruction_addr': '0x771e016c',
+-                        'package': u'C:\\Windows\\System32\\ntdll.dll'
+-                    }],
+-                    'registers': {
+-                        u'eax': u'0x00000000',
+-                        u'ebp': u'0x0169fb98',
+-                        u'ebx': u'0x013b0990',
+-                        u'ecx': u'0x00000000',
+-                        u'edi': u'0x013b7c28',
+-                        u'edx': u'0x00000000',
+-                        u'eflags': u'0x00000202',
+-                        u'eip': u'0x771e016c',
+-                        u'esi': u'0x013b7a68',
+-                        u'esp': u'0x0169f9f4'
+-                    }
+-                }
+-            },
+-            {
+-                'crashed': False,
+-                'id': 2920,
+-                'stacktrace': {
+-                    'frames': [{
+-                        'function': '<unknown>',
+-                        'instruction_addr': '0x771df3dc',
+-                        'package': u'C:\\Windows\\System32\\ntdll.dll'
+-                    }],
+-                    'registers': {
+-                        u'eax': u'0x00000000',
+-                        u'ebp': u'0x0179f2b8',
+-                        u'ebx': u'0x017b1aa0',
+-                        u'ecx': u'0x00000000',
+-                        u'edi': u'0x017b1a90',
+-                        u'edx': u'0x00000000',
+-                        u'eflags': u'0x00000206',
+-                        u'eip': u'0x771df3dc',
+-                        u'esi': u'0x000002cc',
+-                        u'esp': u'0x0179f2ac'
+-                    }
+-                }
+-            }
+-        ],
+-        'timestamp': 1521713273.0
+-    }

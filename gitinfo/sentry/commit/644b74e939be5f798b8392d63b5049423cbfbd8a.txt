@@ -1,0 +1,197 @@
+commit 644b74e939be5f798b8392d63b5049423cbfbd8a
+Author: Matt Robenolt <matt@ydekproductions.com>
+Date:   Tue Mar 27 13:53:08 2018 -0700
+
+    perf(tagstore): Optimize TagKey and TagValue creation to be done in bulk
+    
+    TagValue isn't able to be optimized as much as TagKey, but this should
+    reduce a good chunk of queries for each event.
+
+diff --git a/src/sentry/tagstore/v2/backend.py b/src/sentry/tagstore/v2/backend.py
+index 6688d089e7..9dbd87d178 100644
+--- a/src/sentry/tagstore/v2/backend.py
++++ b/src/sentry/tagstore/v2/backend.py
+@@ -191,6 +191,21 @@ class V2TagStorage(TagStorage):
+             **kwargs
+         )
+ 
++    def get_or_create_tag_keys_bulk(self, project_id, environment_id, keys):
++        assert environment_id is not None
++
++        return TagKey.get_or_create_bulk(
++            project_id=project_id,
++            environment_id=environment_id,
++            keys=keys,
++        )
++
++    def get_or_create_tag_values_bulk(self, project_id, tags):
++        return TagValue.get_or_create_bulk(
++            project_id=project_id,
++            tags=tags,
++        )
++
+     def get_or_create_tag_key(self, project_id, environment_id, key, **kwargs):
+         assert environment_id is not None
+ 
+@@ -344,12 +359,10 @@ class V2TagStorage(TagStorage):
+         if date_added is None:
+             date_added = timezone.now()
+ 
+-        tag_ids = []
+-        for key, value in tags:
+-            tagkey, _ = self.get_or_create_tag_key(project_id, environment_id, key)
+-            tagvalue, _ = self.get_or_create_tag_value(
+-                project_id, environment_id, key, value, key_id=tagkey.id)
+-            tag_ids.append((tagkey.id, tagvalue.id))
++        tagkeys = self.get_or_create_tag_keys_bulk(project_id, environment_id, [t[0] for t in tags])
++        tagvalues = self.get_or_create_tag_values_bulk(
++            project_id, [(tagkeys[t[0]], t[1]) for t in tags])
++        tag_ids = [(tk.id, tv.id) for (tk, _), tv in tagvalues.items()]
+ 
+         try:
+             # don't let a duplicate break the outer transaction
+diff --git a/src/sentry/tagstore/v2/models/tagkey.py b/src/sentry/tagstore/v2/models/tagkey.py
+index 7a045405f0..00386bf6aa 100644
+--- a/src/sentry/tagstore/v2/models/tagkey.py
++++ b/src/sentry/tagstore/v2/models/tagkey.py
+@@ -10,7 +10,7 @@ from __future__ import absolute_import, print_function
+ 
+ import six
+ 
+-from django.db import models, router, connections
++from django.db import models, router, connections, transaction, IntegrityError
+ from django.utils.translation import ugettext_lazy as _
+ 
+ from sentry.api.serializers import Serializer, register
+@@ -91,6 +91,88 @@ class TagKey(Model):
+ 
+         return rv, created
+ 
++    @classmethod
++    def get_or_create_bulk(cls, project_id, environment_id, keys):
++        # Attempt to create a bunch of models in one big batch with as few
++        # queries and cache calls as possible.
++        # In best case, this is all done in 1 cache get.
++        # In ideal case, we'll do 3 queries total instead of N.
++        # Absolute worst case, we still just do O(n) queries, but this should be rare.
++        key_to_model = {key: None for key in keys}
++        remaining_keys = set(keys)
++
++        # First attempt to hit from cache, which in theory is the hot case
++        cache_key_to_key = {cls.get_cache_key(project_id, environment_id, key): key for key in keys}
++        cache_key_to_models = cache.get_many(cache_key_to_key.keys())
++        for model in cache_key_to_models.values():
++            key_to_model[model.key] = model
++            remaining_keys.remove(model.key)
++
++        if not remaining_keys:
++            # 100% cache hit on all items, good work team
++            return key_to_model
++
++        # If we have some misses, we want to first check if
++        # all of the misses actually exist in the database
++        # already in one bulk query.
++        to_cache = {}
++        for model in cls.objects.filter(
++            project_id=project_id,
++            environment_id=environment_id,
++            key__in=remaining_keys,
++        ):
++            key_to_model[model.key] = to_cache[cls.get_cache_key(
++                project_id, environment_id, model.key)] = model
++            remaining_keys.remove(model.key)
++
++        # If we have found them all, cache all these misses
++        # and return all the hits.
++        if not remaining_keys:
++            cache.set_many(to_cache, 3600)
++            return key_to_model
++
++        # At this point, we need to create all of our keys, since they
++        # don't exist in cache or the database.
++
++        # First attempt to create them all in one bulk query
++        try:
++            with transaction.atomic():
++                cls.objects.bulk_create([
++                    cls(
++                        project_id=project_id,
++                        environment_id=environment_id,
++                        key=key,
++                    )
++                    for key in remaining_keys
++                ])
++        except IntegrityError:
++            pass
++        else:
++            # If we succeed, the shitty part is we need one
++            # more query to get back the actual rows with their ids.
++            for model in cls.objects.filter(
++                project_id=project_id,
++                environment_id=environment_id,
++                key__in=remaining_keys
++            ):
++                key_to_model[model.key] = to_cache[cls.get_cache_key(
++                    project_id, environment_id, model.key)] = model
++                remaining_keys.remove(model.key)
++
++            cache.set_many(to_cache, 3600)
++
++            # Not clear if this could actually happen, but if it does,
++            # guard ourselves against returning bad data.
++            if not remaining_keys:
++                return key_to_model
++
++        # Fall back to just doing it manually
++        # This case will only ever happen in a race condition.
++        for key in remaining_keys:
++            key_to_model[key] = cls.get_or_create(project_id, environment_id, key)[0]
++
++        return key_to_model
++
+ 
+ @register(TagKey)
+ class TagKeySerializer(Serializer):
+diff --git a/src/sentry/tagstore/v2/models/tagvalue.py b/src/sentry/tagstore/v2/models/tagvalue.py
+index 7c16fc54bc..b869e1c8af 100644
+--- a/src/sentry/tagstore/v2/models/tagvalue.py
++++ b/src/sentry/tagstore/v2/models/tagvalue.py
+@@ -110,6 +110,38 @@ class TagValue(Model):
+ 
+         return rv, created
+ 
++    @classmethod
++    def get_or_create_bulk(cls, project_id, tags):
++        # Attempt to create a bunch of models in one big batch with as few
++        # queries and cache calls as possible.
++        # In best case, this is all done in 1 cache get.
++        # If we miss cache hit here, we have to fall back to old behavior.
++        key_to_model = {tag: None for tag in tags}
++        tags_by_key_id = {tag[0].id: tag for tag in tags}
++        remaining_keys = set(tags)
++
++        # First attempt to hit from cache, which in theory is the hot case
++        cache_key_to_key = {cls.get_cache_key(project_id, tk.id, v): (tk, v) for tk, v in tags}
++        cache_key_to_models = cache.get_many(cache_key_to_key.keys())
++        for model in cache_key_to_models.values():
++            key_to_model[tags_by_key_id[model._key_id]] = model
++            remaining_keys.remove(tags_by_key_id[model._key_id])
++
++        if not remaining_keys:
++            # 100% cache hit on all items, good work team
++            return key_to_model
++
++        # Fall back to just doing it manually
++        # Further optimizations start to become not so great.
++        # For some reason, when trying to do a bulk SELECT with all of the
++        # key value pairs in big OR ends up using the wrong index and ultimating
++        # generating a significantly less efficient query. The only alternative is to
++        # splice this up a bit and do all of the SELECTs, then do a bulk INSERT for remaining
++        for key in remaining_keys:
++            key_to_model[key] = cls.get_or_create(project_id, key[0].id, key[1])[0]
++
++        return key_to_model
++
+ 
+ @register(TagValue)
+ class TagValueSerializer(Serializer):

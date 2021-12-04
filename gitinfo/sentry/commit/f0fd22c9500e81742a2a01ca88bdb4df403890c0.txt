@@ -1,0 +1,496 @@
+commit f0fd22c9500e81742a2a01ca88bdb4df403890c0
+Author: Brett Hoerner <brett@bretthoerner.com>
+Date:   Tue Oct 23 10:50:25 2018 -0700
+
+    ref: Add merge_groups task (#10219)
+    
+    Adds the `merge_groups` task and replaces the previous
+    `merge_group` task. By serializing the merge work we can fire off an
+    `end_merge` eventstream message when *all* groups from the merge batch
+    have been merged.
+
+diff --git a/src/sentry/api/endpoints/project_group_index.py b/src/sentry/api/endpoints/project_group_index.py
+index d4d281bb2a..86d5b435e4 100644
+--- a/src/sentry/api/endpoints/project_group_index.py
++++ b/src/sentry/api/endpoints/project_group_index.py
+@@ -33,7 +33,7 @@ from sentry.search.utils import InvalidQuery, parse_query
+ from sentry.signals import advanced_search, issue_ignored, issue_resolved_in_release, issue_deleted
+ from sentry.tasks.deletion import delete_groups
+ from sentry.tasks.integrations import kick_off_status_syncs
+-from sentry.tasks.merge import merge_group
++from sentry.tasks.merge import merge_groups
+ from sentry.utils.apidocs import attach_scenarios, scenario
+ from sentry.utils.cursors import Cursor, CursorResult
+ from sentry.utils.functional import extract_lazy_object
+@@ -852,24 +852,33 @@ class ProjectGroupIndexEndpoint(ProjectEndpoint, EnvironmentMixin):
+         # XXX(dcramer): this feels a bit shady like it should be its own
+         # endpoint
+         if result.get('merge') and len(group_list) > 1:
+-            group_list_by_times_seen = sorted(group_list, key=lambda x: x.times_seen, reverse=True)
++            group_list_by_times_seen = sorted(
++                group_list,
++                key=lambda g: (g.times_seen, g.id),
++                reverse=True,
++            )
+             primary_group, groups_to_merge = group_list_by_times_seen[0], group_list_by_times_seen[1:]
+ 
++            group_ids_to_merge = [g.id for g in groups_to_merge]
+             eventstream_state = eventstream.start_merge(
+                 primary_group.project_id,
+-                [g.id for g in groups_to_merge],
++                group_ids_to_merge,
+                 primary_group.id
+             )
+ 
++            Group.objects.filter(
++                id__in=group_ids_to_merge
++            ).update(
++                status=GroupStatus.PENDING_MERGE
++            )
++
+             transaction_id = uuid4().hex
+-            for group in groups_to_merge:
+-                group.update(status=GroupStatus.PENDING_MERGE)
+-                merge_group.delay(
+-                    from_object_id=group.id,
+-                    to_object_id=primary_group.id,
+-                    transaction_id=transaction_id,
+-                    eventstream_state=eventstream_state,
+-                )
++            merge_groups.delay(
++                from_object_ids=group_ids_to_merge,
++                to_object_id=primary_group.id,
++                transaction_id=transaction_id,
++                eventstream_state=eventstream_state,
++            )
+ 
+             Activity.objects.create(
+                 project=primary_group.project,
+diff --git a/src/sentry/tasks/merge.py b/src/sentry/tasks/merge.py
+index 9164d121bd..a9758b3441 100644
+--- a/src/sentry/tasks/merge.py
++++ b/src/sentry/tasks/merge.py
+@@ -34,6 +34,26 @@ EXTRA_MERGE_MODELS = []
+ def merge_group(
+     from_object_id=None, to_object_id=None, transaction_id=None,
+     recursed=False, eventstream_state=None, **kwargs
++):
++    merge_groups(
++        from_object_ids=[from_object_id],
++        to_object_id=to_object_id,
++        transaction_id=transaction_id,
++        recursed=recursed,
++        eventstream_state=eventstream_state,
++        **kwargs
++    )
++
++
++@instrumented_task(
++    name='sentry.tasks.merge.merge_groups',
++    queue='merge',
++    default_retry_delay=60 * 5,
++    max_retries=None
++)
++def merge_groups(
++    from_object_ids=None, to_object_id=None, transaction_id=None,
++    recursed=False, eventstream_state=None, **kwargs
+ ):
+     # TODO(mattrobenolt): Write tests for all of this
+     from sentry.models import (
+@@ -50,9 +70,10 @@ def merge_group(
+         UserReport,
+         GroupRedirect,
+         GroupMeta,
++        get_group_with_redirect,
+     )
+ 
+-    if not (from_object_id and to_object_id):
++    if not (from_object_ids and to_object_id):
+         logger.error(
+             'group.malformed.missing_params', extra={
+                 'transaction_id': transaction_id,
+@@ -60,26 +81,18 @@ def merge_group(
+         )
+         return
+ 
+-    try:
+-        group = Group.objects.get(id=from_object_id)
+-    except Group.DoesNotExist:
+-        logger.warn(
+-            'group.malformed.invalid_id',
+-            extra={
+-                'transaction_id': transaction_id,
+-                'old_object_id': from_object_id,
+-            }
+-        )
+-        return
++    # Operate on one "from" group per task iteration. The task is recursed
++    # until each group has been merged.
++    from_object_id = from_object_ids[0]
+ 
+     try:
+-        new_group = Group.objects.get(id=to_object_id)
++        new_group, _ = get_group_with_redirect(to_object_id)
+     except Group.DoesNotExist:
+         logger.warn(
+             'group.malformed.invalid_id',
+             extra={
+                 'transaction_id': transaction_id,
+-                'old_object_id': from_object_id,
++                'old_object_ids': from_object_ids,
+             }
+         )
+         return
+@@ -90,7 +103,7 @@ def merge_group(
+             extra={
+                 'transaction_id': transaction_id,
+                 'new_group_id': new_group.id,
+-                'old_group_id': group.id,
++                'old_group_ids': from_object_ids,
+                 # TODO(jtcunning): figure out why these are full seq scans and/or alternative solution
+                 # 'new_event_id': getattr(new_group.event_set.order_by('-id').first(), 'id', None),
+                 # 'old_event_id': getattr(group.event_set.order_by('-id').first(), 'id', None),
+@@ -99,99 +112,121 @@ def merge_group(
+             }
+         )
+ 
+-    model_list = tuple(EXTRA_MERGE_MODELS) + (
+-        Activity, GroupAssignee, GroupEnvironment, GroupHash, GroupRuleStatus,
+-        GroupSubscription, EventMapping, Event, UserReport, GroupRedirect,
+-        GroupMeta,
+-    )
+-
+-    has_more = merge_objects(
+-        model_list,
+-        group,
+-        new_group,
+-        logger=logger,
+-        transaction_id=transaction_id,
+-    )
++    try:
++        group = Group.objects.get(id=from_object_id)
++    except Group.DoesNotExist:
++        from_object_ids.remove(from_object_id)
+ 
+-    if has_more:
+-        merge_group.delay(
+-            from_object_id=from_object_id,
+-            to_object_id=to_object_id,
+-            transaction_id=transaction_id,
+-            recursed=True,
+-            eventstream_state=eventstream_state,
++        logger.warn(
++            'group.malformed.invalid_id',
++            extra={
++                'transaction_id': transaction_id,
++                'old_object_id': from_object_id,
++            }
+         )
+-        return
+-
+-    features.merge(new_group, [group], allow_unsafe=True)
+-
+-    environment_ids = list(
+-        Environment.objects.filter(
+-            projects=group.project
+-        ).values_list('id', flat=True)
+-    )
+-
+-    for model in [tsdb.models.group]:
+-        tsdb.merge(
+-            model,
+-            new_group.id,
+-            [group.id],
+-            environment_ids=environment_ids if model in tsdb.models_with_environment_support else None
++    else:
++        model_list = tuple(EXTRA_MERGE_MODELS) + (
++            Activity, GroupAssignee, GroupEnvironment, GroupHash, GroupRuleStatus,
++            GroupSubscription, EventMapping, Event, UserReport, GroupRedirect,
++            GroupMeta,
+         )
+ 
+-    for model in [tsdb.models.users_affected_by_group]:
+-        tsdb.merge_distinct_counts(
+-            model,
+-            new_group.id,
+-            [group.id],
+-            environment_ids=environment_ids if model in tsdb.models_with_environment_support else None,
++        has_more = merge_objects(
++            model_list,
++            group,
++            new_group,
++            logger=logger,
++            transaction_id=transaction_id,
+         )
+ 
+-    for model in [
+-        tsdb.models.frequent_releases_by_group, tsdb.models.frequent_environments_by_group
+-    ]:
+-        tsdb.merge_frequencies(
+-            model,
+-            new_group.id,
+-            [group.id],
+-            environment_ids=environment_ids if model in tsdb.models_with_environment_support else None,
+-        )
++        if not has_more:
++            # There are no more objects to merge for *this* "from" group, remove it
++            # from the list of "from" groups that are being merged, and finish the
++            # work for this group.
++            from_object_ids.remove(from_object_id)
+ 
+-    previous_group_id = group.id
++            features.merge(new_group, [group], allow_unsafe=True)
+ 
+-    group.delete()
+-    delete_logger.info(
+-        'object.delete.executed',
+-        extra={
+-            'object_id': previous_group_id,
+-            'transaction_id': transaction_id,
+-            'model': Group.__name__,
+-        }
+-    )
++            environment_ids = list(
++                Environment.objects.filter(
++                    projects=group.project
++                ).values_list('id', flat=True)
++            )
+ 
+-    try:
+-        with transaction.atomic():
+-            GroupRedirect.objects.create(
+-                group_id=new_group.id,
+-                previous_group_id=previous_group_id,
++            for model in [tsdb.models.group]:
++                tsdb.merge(
++                    model,
++                    new_group.id,
++                    [group.id],
++                    environment_ids=environment_ids if model in tsdb.models_with_environment_support else None
++                )
++
++            for model in [tsdb.models.users_affected_by_group]:
++                tsdb.merge_distinct_counts(
++                    model,
++                    new_group.id,
++                    [group.id],
++                    environment_ids=environment_ids if model in tsdb.models_with_environment_support else None,
++                )
++
++            for model in [
++                tsdb.models.frequent_releases_by_group, tsdb.models.frequent_environments_by_group
++            ]:
++                tsdb.merge_frequencies(
++                    model,
++                    new_group.id,
++                    [group.id],
++                    environment_ids=environment_ids if model in tsdb.models_with_environment_support else None,
++                )
++
++            previous_group_id = group.id
++
++            group.delete()
++            delete_logger.info(
++                'object.delete.executed',
++                extra={
++                    'object_id': previous_group_id,
++                    'transaction_id': transaction_id,
++                    'model': Group.__name__,
++                }
+             )
+-    except IntegrityError:
+-        pass
+ 
+-    new_group.update(
+-        # TODO(dcramer): ideally these would be SQL clauses
+-        first_seen=min(group.first_seen, new_group.first_seen),
+-        last_seen=max(group.last_seen, new_group.last_seen),
+-    )
+-    try:
+-        # it's possible to hit an out of range value for counters
+-        new_group.update(
+-            times_seen=F('times_seen') + group.times_seen,
+-            num_comments=F('num_comments') + group.num_comments,
++            try:
++                with transaction.atomic():
++                    GroupRedirect.objects.create(
++                        group_id=new_group.id,
++                        previous_group_id=previous_group_id,
++                    )
++            except IntegrityError:
++                pass
++
++            new_group.update(
++                # TODO(dcramer): ideally these would be SQL clauses
++                first_seen=min(group.first_seen, new_group.first_seen),
++                last_seen=max(group.last_seen, new_group.last_seen),
++            )
++            try:
++                # it's possible to hit an out of range value for counters
++                new_group.update(
++                    times_seen=F('times_seen') + group.times_seen,
++                    num_comments=F('num_comments') + group.num_comments,
++                )
++            except DataError:
++                pass
++
++    if from_object_ids:
++        # This task is recursed until `from_object_ids` is empty and all
++        # "from" groups have merged into the `to_group_id`.
++        merge_groups.delay(
++            from_object_ids=from_object_ids,
++            to_object_id=to_object_id,
++            transaction_id=transaction_id,
++            recursed=True,
++            eventstream_state=eventstream_state,
+         )
+-    except DataError:
+-        pass
++        return
+ 
++    # All `from_object_ids` have been merged!
+     if eventstream_state:
+         eventstream.end_merge(eventstream_state)
+ 
+diff --git a/tests/sentry/api/endpoints/test_project_group_index.py b/tests/sentry/api/endpoints/test_project_group_index.py
+index 0cd3b2ac42..484f5e19f8 100644
+--- a/tests/sentry/api/endpoints/test_project_group_index.py
++++ b/tests/sentry/api/endpoints/test_project_group_index.py
+@@ -1382,9 +1382,9 @@ class GroupUpdateTest(APITestCase):
+         assert not r4.exists()
+ 
+     @patch('sentry.api.endpoints.project_group_index.uuid4')
+-    @patch('sentry.api.endpoints.project_group_index.merge_group')
++    @patch('sentry.api.endpoints.project_group_index.merge_groups')
+     @patch('sentry.api.endpoints.project_group_index.eventstream')
+-    def test_merge(self, mock_eventstream, merge_group, mock_uuid4):
++    def test_merge(self, mock_eventstream, merge_groups, mock_uuid4):
+         eventstream_state = object()
+         mock_eventstream.start_merge = Mock(return_value=eventstream_state)
+ 
+@@ -1421,15 +1421,9 @@ class GroupUpdateTest(APITestCase):
+         mock_eventstream.start_merge.assert_called_once_with(
+             group1.project_id, [group3.id, group1.id], group2.id)
+ 
+-        assert len(merge_group.mock_calls) == 2
+-        merge_group.delay.assert_any_call(
+-            from_object_id=group1.id,
+-            to_object_id=group2.id,
+-            transaction_id='abc123',
+-            eventstream_state=eventstream_state,
+-        )
+-        merge_group.delay.assert_any_call(
+-            from_object_id=group3.id,
++        assert len(merge_groups.mock_calls) == 1
++        merge_groups.delay.assert_any_call(
++            from_object_ids=[group3.id, group1.id],
+             to_object_id=group2.id,
+             transaction_id='abc123',
+             eventstream_state=eventstream_state,
+diff --git a/tests/sentry/tasks/post_process/tests.py b/tests/sentry/tasks/post_process/tests.py
+index 8ad8c273b2..03fc83083a 100644
+--- a/tests/sentry/tasks/post_process/tests.py
++++ b/tests/sentry/tasks/post_process/tests.py
+@@ -9,7 +9,7 @@ from mock import Mock, patch
+ from sentry import tagstore
+ from sentry.models import Group, GroupSnooze, GroupStatus, ServiceHook
+ from sentry.testutils import TestCase
+-from sentry.tasks.merge import merge_group
++from sentry.tasks.merge import merge_groups
+ from sentry.tasks.post_process import index_event_tags, post_process_group
+ 
+ 
+@@ -49,7 +49,7 @@ class PostProcessGroupTest(TestCase):
+         assert event.group == group1
+ 
+         with self.tasks():
+-            merge_group(group1.id, group2.id)
++            merge_groups([group1.id], group2.id)
+ 
+         mock_callback = Mock()
+         mock_futures = [Mock()]
+diff --git a/tests/sentry/tasks/test_merge.py b/tests/sentry/tasks/test_merge.py
+index 55f6a83685..35a4a8e9b4 100644
+--- a/tests/sentry/tasks/test_merge.py
++++ b/tests/sentry/tasks/test_merge.py
+@@ -5,7 +5,7 @@ from mock import patch
+ 
+ from sentry import tagstore
+ from sentry.tagstore.models import GroupTagValue
+-from sentry.tasks.merge import merge_group
++from sentry.tasks.merge import merge_groups
+ from sentry.models import Event, Group, GroupEnvironment, GroupMeta, GroupRedirect, UserReport
+ from sentry.similarity import _make_index_backend
+ from sentry.testutils import TestCase
+@@ -25,7 +25,7 @@ class MergeGroupTest(TestCase):
+         eventstream_state = object()
+ 
+         with self.tasks():
+-            merge_group(group1.id, group2.id, eventstream_state=eventstream_state)
++            merge_groups([group1.id], group2.id, eventstream_state=eventstream_state)
+ 
+         mock_eventstream.end_merge.assert_called_once_with(eventstream_state)
+ 
+@@ -50,7 +50,7 @@ class MergeGroupTest(TestCase):
+         )
+ 
+         with self.tasks():
+-            merge_group(group1.id, group2.id)
++            merge_groups([group1.id], group2.id)
+ 
+         assert list(GroupEnvironment.objects.filter(
+             group_id=group2.id,
+@@ -68,7 +68,7 @@ class MergeGroupTest(TestCase):
+         event2 = self.create_event('b' * 32, group=group2, data={'foo': 'baz'})
+ 
+         with self.tasks():
+-            merge_group(group1.id, group2.id)
++            merge_groups([group1.id], group2.id)
+ 
+         assert not Group.objects.filter(id=group1.id).exists()
+ 
+@@ -88,7 +88,7 @@ class MergeGroupTest(TestCase):
+         groups = [self.create_group() for _ in range(0, 3)]
+ 
+         with self.tasks():
+-            merge_group(groups[0].id, groups[1].id)
++            merge_groups([groups[0].id], groups[1].id)
+ 
+         assert not Group.objects.filter(id=groups[0].id).exists()
+         assert GroupRedirect.objects.filter(
+@@ -97,7 +97,7 @@ class MergeGroupTest(TestCase):
+         ).count() == 1
+ 
+         with self.tasks():
+-            merge_group(groups[1].id, groups[2].id)
++            merge_groups([groups[1].id], groups[2].id)
+ 
+         assert not Group.objects.filter(id=groups[1].id).exists()
+         assert GroupRedirect.objects.filter(
+@@ -162,7 +162,7 @@ class MergeGroupTest(TestCase):
+             )
+ 
+         with self.tasks():
+-            merge_group(other.id, target.id)
++            merge_groups([other.id], target.id)
+ 
+         assert not Group.objects.filter(id=other.id).exists()
+         assert len(
+@@ -223,7 +223,7 @@ class MergeGroupTest(TestCase):
+         assert GroupMeta.objects.get_value(group1, 'other:tid') == '567'
+ 
+         with self.tasks():
+-            merge_group(group1.id, group2.id)
++            merge_groups([group1.id], group2.id)
+ 
+         assert not Group.objects.filter(id=group1.id).exists()
+ 
+@@ -244,7 +244,7 @@ class MergeGroupTest(TestCase):
+         ur = UserReport.objects.create(project=project1, group=group1, event_id=event1.event_id)
+ 
+         with self.tasks():
+-            merge_group(group1.id, group2.id)
++            merge_groups([group1.id], group2.id)
+ 
+         assert not Group.objects.filter(id=group1.id).exists()
+ 

@@ -1,0 +1,222 @@
+commit e84a2e4ce99512d10d26acde92a4b8206daed724
+Author: Matt Robenolt <matt@ydekproductions.com>
+Date:   Sun Apr 13 17:44:28 2014 -0400
+
+    Support for sending back Retry-After header when being rate limited
+
+diff --git a/src/sentry/coreapi.py b/src/sentry/coreapi.py
+index 47a98ff7e5..98cef6affd 100644
+--- a/src/sentry/coreapi.py
++++ b/src/sentry/coreapi.py
+@@ -93,6 +93,9 @@ class APIRateLimited(APIError):
+     http_status = 429
+     msg = 'Creation of this event was denied due to rate limiting.'
+ 
++    def __init__(self, retry_after=None):
++        self.retry_after = retry_after
++
+ 
+ def get_interface(name):
+     if name not in settings.SENTRY_ALLOWED_INTERFACES:
+diff --git a/src/sentry/plugins/base.py b/src/sentry/plugins/base.py
+index 072759511d..7f7fc2ee21 100644
+--- a/src/sentry/plugins/base.py
++++ b/src/sentry/plugins/base.py
+@@ -16,6 +16,7 @@ from django.http import HttpResponseRedirect, HttpResponse
+ 
+ from sentry.utils.managers import InstanceManager
+ from sentry.utils.safe import safe_execute
++from sentry.quotas.base import NotRateLimited
+ from threading import local
+ 
+ 
+@@ -428,10 +429,11 @@ class IPlugin(local):
+ 
+     def is_rate_limited(self, project, **kwargs):
+         """
+-        Return True if this project (or the system) is over any defined
+-        quotas.
++        Return a ``RateLimit`` object which indicates if this project
++        (or the system) is over any defined quotas, and specifies how
++        long until the quota has expired so it's safe to try again.
+         """
+-        return False
++        return NotRateLimited
+ 
+     def has_perm(self, user, perm, *objects, **kwargs):
+         """
+diff --git a/src/sentry/quotas/base.py b/src/sentry/quotas/base.py
+index 2412019146..e0ac8f353e 100644
+--- a/src/sentry/quotas/base.py
++++ b/src/sentry/quotas/base.py
+@@ -7,8 +7,14 @@ sentry.quotas.base
+ """
+ from __future__ import absolute_import
+ 
++from collections import namedtuple
++from functools import partial
+ from django.conf import settings
+ 
++RateLimit = namedtuple('RateLimit', ('is_limited', 'retry_after'))
++NotRateLimited = RateLimit(False, None)
++RateLimited = partial(RateLimit, is_limited=True)
++
+ 
+ class Quota(object):
+     """
+@@ -20,7 +26,10 @@ class Quota(object):
+         pass
+ 
+     def is_rate_limited(self, project):
+-        return False
++        return NotRateLimited
++
++    def get_time_remaining(self):
++        return 0
+ 
+     def translate_quota(self, quota, parent_quota):
+         if quota.endswith('%'):
+diff --git a/src/sentry/quotas/redis.py b/src/sentry/quotas/redis.py
+index c8a1412a8b..4dff0171ed 100644
+--- a/src/sentry/quotas/redis.py
++++ b/src/sentry/quotas/redis.py
+@@ -9,7 +9,7 @@ from __future__ import absolute_import
+ 
+ from django.conf import settings
+ from nydus.db import create_cluster
+-from sentry.quotas.base import Quota
++from sentry.quotas.base import Quota, RateLimited, NotRateLimited
+ 
+ 
+ import time
+@@ -40,20 +40,23 @@ class RedisQuota(Quota):
+         system_quota = self.get_system_quota()
+ 
+         if not (proj_quota or system_quota or team_quota):
+-            return False
++            return NotRateLimited
+ 
+         sys_result, team_result, proj_result = self._incr_project(project)
+ 
+         if proj_quota and proj_result > proj_quota:
+-            return True
++            return RateLimited(retry_after=self.get_time_remaining())
+ 
+         if team_quota and team_result > team_quota:
+-            return True
++            return RateLimited(retry_after=self.get_time_remaining())
+ 
+         if system_quota and sys_result > system_quota:
+-            return True
++            return RateLimited(retry_after=self.get_time_remaining())
+ 
+-        return False
++        return NotRateLimited
++
++    def get_time_remaining(self):
++        return int(self.ttl - (time.time() - int(time.time() / self.ttl) * self.ttl))
+ 
+     def _get_system_key(self):
+         return 'quota:s:%s' % (int(time.time() / self.ttl),)
+diff --git a/src/sentry/web/api.py b/src/sentry/web/api.py
+index cc423ed1af..68b33b0e6f 100644
+--- a/src/sentry/web/api.py
++++ b/src/sentry/web/api.py
+@@ -41,6 +41,7 @@ from sentry.models import (
+     User)
+ from sentry.signals import event_received
+ from sentry.plugins import plugins
++from sentry.quotas.base import RateLimit
+ from sentry.utils import json
+ from sentry.utils.cache import cache
+ from sentry.utils.db import has_trending
+@@ -237,6 +238,8 @@ class APIView(BaseView):
+ 
+             except APIError as error:
+                 response = HttpResponse(unicode(error.msg), content_type='text/plain', status=error.http_status)
++                if isinstance(error, APIRateLimited) and error.retry_after is not None:
++                    response['Retry-After'] = str(error.retry_after)
+ 
+         if origin:
+             response['Access-Control-Allow-Origin'] = origin
+@@ -305,13 +308,16 @@ class StoreView(APIView):
+     def process(self, request, project, auth, data, **kwargs):
+         event_received.send_robust(ip=request.META['REMOTE_ADDR'], sender=type(self))
+ 
+-        is_rate_limited = safe_execute(app.quotas.is_rate_limited, project=project)
++        rate_limits = [safe_execute(app.quotas.is_rate_limited, project=project)]
+         for plugin in plugins.all():
+-            if safe_execute(plugin.is_rate_limited, project=project):
+-                is_rate_limited = True
+-
+-        if is_rate_limited:
+-            raise APIRateLimited
++            rate_limit = safe_execute(plugin.is_rate_limited, project=project)
++            # We must handle the case of plugins not returning new RateLimit objects
++            if isinstance(rate_limit, bool):
++                rate_limit = RateLimit(is_limited=rate_limit, retry_after=None)
++            rate_limits.append(rate_limit)
++
++        if any(limit.is_limited for limit in rate_limits):
++            raise APIRateLimited(max(limit.retry_after for limit in rate_limits))
+ 
+         result = plugins.first('has_perm', request.user, 'create_event', project)
+         if result is False:
+diff --git a/tests/sentry/quotas/redis/tests.py b/tests/sentry/quotas/redis/tests.py
+index fd73a945c1..5b71ea5f00 100644
+--- a/tests/sentry/quotas/redis/tests.py
++++ b/tests/sentry/quotas/redis/tests.py
+@@ -54,7 +54,7 @@ class RedisQuotaTest(TestCase):
+         result = self.quota.is_rate_limited(self.project)
+ 
+         assert not self._incr_project.called
+-        assert result is False
++        assert not result.is_limited
+ 
+     def test_enforces_project_quota(self):
+         self.get_project_quota.return_value = 100
+@@ -62,13 +62,13 @@ class RedisQuotaTest(TestCase):
+ 
+         result = self.quota.is_rate_limited(self.project)
+ 
+-        assert result is True
++        assert result.is_limited
+ 
+         self._incr_project.return_value = (0, 0, 99)
+ 
+         result = self.quota.is_rate_limited(self.project)
+ 
+-        assert result is False
++        assert not result.is_limited
+ 
+     def test_enforces_team_quota(self):
+         self.get_team_quota.return_value = 100
+@@ -76,13 +76,13 @@ class RedisQuotaTest(TestCase):
+ 
+         result = self.quota.is_rate_limited(self.project)
+ 
+-        assert result is True
++        assert result.is_limited
+ 
+         self._incr_project.return_value = (0, 99, 0)
+ 
+         result = self.quota.is_rate_limited(self.project)
+ 
+-        assert result is False
++        assert not result.is_limited
+ 
+     def test_enforces_system_quota(self):
+         self.get_system_quota.return_value = 100
+@@ -90,10 +90,10 @@ class RedisQuotaTest(TestCase):
+ 
+         result = self.quota.is_rate_limited(self.project)
+ 
+-        assert result is True
++        assert result.is_limited
+ 
+         self._incr_project.return_value = (99, 0, 0)
+ 
+         result = self.quota.is_rate_limited(self.project)
+ 
+-        assert result is False
++        assert not result.is_limited

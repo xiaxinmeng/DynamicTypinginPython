@@ -1,0 +1,2094 @@
+commit aef16ee1956e8383358697e5356853308af9b7b3
+Author: Felix Fontein <felix@fontein.de>
+Date:   Sun Aug 12 19:12:01 2018 +0200
+
+    ACME: use Cryptography (if a new enough version is available) instead of OpenSSL (#42170)
+    
+    * Collecting PEM -> DER conversions.
+    
+    * Using cryptography instead of OpenSSL binary in some situations.
+    
+    * Moving key-to-disk writing for key content to parse_account_key.
+    
+    * Rename parse_account_key -> parse_key.
+    
+    * Move OpenSSL specific code for key parsing and request signing into global functions.
+    
+    * Also using cryptography for key parsing and request signing.
+    
+    * Remove assert statements.
+    
+    * Fixing handling of key contents for cryptography code path.
+    
+    * Allow to disable the use of cryptography.
+    
+    * Updating documentation.
+    
+    * 1.5 seems to work as well (earlier versions don't have EC sign function). Making Python 2.x adjustments.
+    
+    * Changing option to select_crypto_backend.
+    
+    * Python 2.6 compatibility.
+    
+    * Trying to test both backends separately for acme_account.
+    
+    * Also testing both backends separately for acme_certificate and acme_certificate_revoke.
+    
+    * Adding changelog entry which informs about select_crypto_backend option in case autodetect fails.
+    
+    * Fixing YAML.
+
+diff --git a/changelogs/fragments/42170-acme-backend-selection.yaml b/changelogs/fragments/42170-acme-backend-selection.yaml
+new file mode 100644
+index 0000000000..26109d58c9
+--- /dev/null
++++ b/changelogs/fragments/42170-acme-backend-selection.yaml
+@@ -0,0 +1,8 @@
++---
++minor_changes:
++- "The acme_account and acme_certificate modules now support two backends:
++   the Python cryptograpy module or the OpenSSL binary. By default, the
++   modules detect if a new enough cryptography module is available and
++   use it, with the OpenSSL binary being a fallback. If the detection
++   fails for some reason, the OpenSSL binary backend can be explicitly
++   selected by setting select_crypto_backend to openssl."
+diff --git a/lib/ansible/module_utils/acme.py b/lib/ansible/module_utils/acme.py
+index 131fd10b64..6860195fac 100644
+--- a/lib/ansible/module_utils/acme.py
++++ b/lib/ansible/module_utils/acme.py
+@@ -17,17 +17,38 @@ __metaclass__ = type
+ import base64
+ import binascii
+ import copy
++import datetime
+ import hashlib
+ import json
+ import os
+ import re
+ import shutil
++import sys
+ import tempfile
+ import traceback
+ 
+ from ansible.module_utils._text import to_native, to_text, to_bytes
+ from ansible.module_utils.urls import fetch_url as _fetch_url
+ 
++try:
++    import cryptography
++    import cryptography.hazmat.backends
++    import cryptography.hazmat.primitives.serialization
++    import cryptography.hazmat.primitives.asymmetric.rsa
++    import cryptography.hazmat.primitives.asymmetric.ec
++    import cryptography.hazmat.primitives.asymmetric.padding
++    import cryptography.hazmat.primitives.hashes
++    import cryptography.hazmat.primitives.asymmetric.utils
++    import cryptography.x509
++    import cryptography.x509.oid
++    from distutils.version import LooseVersion
++    CRYPTOGRAPHY_VERSION = cryptography.__version__
++    HAS_CURRENT_CRYPTOGRAPHY = (LooseVersion(CRYPTOGRAPHY_VERSION) >= LooseVersion('1.5'))
++    if HAS_CURRENT_CRYPTOGRAPHY:
++        _cryptography_backend = cryptography.hazmat.backends.default_backend()
++except Exception as _:
++    HAS_CURRENT_CRYPTOGRAPHY = False
++
+ 
+ class ModuleFailException(Exception):
+     '''
+@@ -83,6 +104,14 @@ def simple_get(module, url):
+     return result
+ 
+ 
++def read_file(fn, mode='b'):
++    try:
++        with open(fn, 'r' + mode) as f:
++            return f.read()
++    except Exception as e:
++        raise ModuleFailException('Error while reading file "{0}": {1}'.format(fn, e))
++
++
+ # function source: network/basics/uri.py
+ def write_file(module, dest, content):
+     '''
+@@ -141,6 +170,296 @@ def write_file(module, dest, content):
+     return changed
+ 
+ 
++def pem_to_der(pem_filename):
++    '''
++    Load PEM file, and convert to DER.
++
++    If PEM contains multiple entities, the first entity will be used.
++    '''
++    certificate_lines = []
++    try:
++        with open(pem_filename, "rt") as f:
++            header_line_count = 0
++            for line in f:
++                if line.startswith('-----'):
++                    header_line_count += 1
++                    if header_line_count == 2:
++                        # If certificate file contains other certs appended
++                        # (like intermediate certificates), ignore these.
++                        break
++                    continue
++                certificate_lines.append(line.strip())
++    except Exception as err:
++        raise ModuleFailException("cannot load PEM file {0}: {1}".format(pem_filename, to_native(err)), exception=traceback.format_exc())
++    return base64.b64decode(''.join(certificate_lines))
++
++
++def _parse_key_openssl(openssl_binary, module, key_file=None, key_content=None):
++    '''
++    Parses an RSA or Elliptic Curve key file in PEM format and returns a pair
++    (error, key_data).
++    '''
++    # If key_file isn't given, but key_content, write that to a temporary file
++    if key_file is None:
++        fd, tmpsrc = tempfile.mkstemp()
++        module.add_cleanup_file(tmpsrc)  # Ansible will delete the file on exit
++        f = os.fdopen(fd, 'wb')
++        try:
++            f.write(key_content.encode('utf-8'))
++            key_file = tmpsrc
++        except Exception as err:
++            try:
++                f.close()
++            except Exception as e:
++                pass
++            raise ModuleFailException("failed to create temporary content file: %s" % to_native(err), exception=traceback.format_exc())
++        f.close()
++    # Parse key
++    account_key_type = None
++    with open(key_file, "rt") as f:
++        for line in f:
++            m = re.match(r"^\s*-{5,}BEGIN\s+(EC|RSA)\s+PRIVATE\s+KEY-{5,}\s*$", line)
++            if m is not None:
++                account_key_type = m.group(1).lower()
++                break
++    if account_key_type is None:
++        # This happens for example if openssl_privatekey created this key
++        # (as opposed to the OpenSSL binary). For now, we assume this is
++        # an RSA key.
++        # FIXME: add some kind of auto-detection
++        account_key_type = "rsa"
++    if account_key_type not in ("rsa", "ec"):
++        return 'unknown key type "%s"' % account_key_type, {}
++
++    openssl_keydump_cmd = [openssl_binary, account_key_type, "-in", key_file, "-noout", "-text"]
++    dummy, out, dummy = module.run_command(openssl_keydump_cmd, check_rc=True)
++
++    if account_key_type == 'rsa':
++        pub_hex, pub_exp = re.search(
++            r"modulus:\n\s+00:([a-f0-9\:\s]+?)\npublicExponent: ([0-9]+)",
++            to_text(out, errors='surrogate_or_strict'), re.MULTILINE | re.DOTALL).groups()
++        pub_exp = "{0:x}".format(int(pub_exp))
++        if len(pub_exp) % 2:
++            pub_exp = "0{0}".format(pub_exp)
++
++        return None, {
++            'key_file': key_file,
++            'type': 'rsa',
++            'alg': 'RS256',
++            'jwk': {
++                "kty": "RSA",
++                "e": nopad_b64(binascii.unhexlify(pub_exp.encode("utf-8"))),
++                "n": nopad_b64(binascii.unhexlify(re.sub(r"(\s|:)", "", pub_hex).encode("utf-8"))),
++            },
++            'hash': 'sha256',
++        }
++    elif account_key_type == 'ec':
++        pub_data = re.search(
++            r"pub:\s*\n\s+04:([a-f0-9\:\s]+?)\nASN1 OID: (\S+)(?:\nNIST CURVE: (\S+))?",
++            to_text(out, errors='surrogate_or_strict'), re.MULTILINE | re.DOTALL)
++        if pub_data is None:
++            return 'cannot parse elliptic curve key', {}
++        pub_hex = binascii.unhexlify(re.sub(r"(\s|:)", "", pub_data.group(1)).encode("utf-8"))
++        asn1_oid_curve = pub_data.group(2).lower()
++        nist_curve = pub_data.group(3).lower() if pub_data.group(3) else None
++        if asn1_oid_curve == 'prime256v1' or nist_curve == 'p-256':
++            bits = 256
++            alg = 'ES256'
++            hash = 'sha256'
++            point_size = 32
++            curve = 'P-256'
++        elif asn1_oid_curve == 'secp384r1' or nist_curve == 'p-384':
++            bits = 384
++            alg = 'ES384'
++            hash = 'sha384'
++            point_size = 48
++            curve = 'P-384'
++        elif asn1_oid_curve == 'secp521r1' or nist_curve == 'p-521':
++            # Not yet supported on Let's Encrypt side, see
++            # https://github.com/letsencrypt/boulder/issues/2217
++            bits = 521
++            alg = 'ES512'
++            hash = 'sha512'
++            point_size = 66
++            curve = 'P-521'
++        else:
++            return 'unknown elliptic curve: %s / %s' % (asn1_oid_curve, nist_curve), {}
++        bytes = (bits + 7) // 8
++        if len(pub_hex) != 2 * bytes:
++            return 'bad elliptic curve point (%s / %s)' % (asn1_oid_curve, nist_curve), {}
++        return None, {
++            'key_file': key_file,
++            'type': 'ec',
++            'alg': alg,
++            'jwk': {
++                "kty": "EC",
++                "crv": curve,
++                "x": nopad_b64(pub_hex[:bytes]),
++                "y": nopad_b64(pub_hex[bytes:]),
++            },
++            'hash': hash,
++            'point_size': point_size,
++        }
++
++
++def _sign_request_openssl(openssl_binary, module, payload64, protected64, key_data):
++    openssl_sign_cmd = [openssl_binary, "dgst", "-{0}".format(key_data['hash']), "-sign", key_data['key_file']]
++    sign_payload = "{0}.{1}".format(protected64, payload64).encode('utf8')
++    dummy, out, dummy = module.run_command(openssl_sign_cmd, data=sign_payload, check_rc=True, binary_data=True)
++
++    if key_data['type'] == 'ec':
++        dummy, der_out, dummy = module.run_command(
++            [openssl_binary, "asn1parse", "-inform", "DER"],
++            data=out, binary_data=True)
++        expected_len = 2 * key_data['point_size']
++        sig = re.findall(
++            r"prim:\s+INTEGER\s+:([0-9A-F]{1,%s})\n" % expected_len,
++            to_text(der_out, errors='surrogate_or_strict'))
++        if len(sig) != 2:
++            raise ModuleFailException(
++                "failed to generate Elliptic Curve signature; cannot parse DER output: {0}".format(
++                    to_text(der_out, errors='surrogate_or_strict')))
++        sig[0] = (expected_len - len(sig[0])) * '0' + sig[0]
++        sig[1] = (expected_len - len(sig[1])) * '0' + sig[1]
++        out = binascii.unhexlify(sig[0]) + binascii.unhexlify(sig[1])
++
++    return {
++        "protected": protected64,
++        "payload": payload64,
++        "signature": nopad_b64(to_bytes(out)),
++    }
++
++
++if sys.version_info[0] >= 3:
++    # Python 3 (and newer)
++    def _count_bytes(n):
++        return (n.bit_length() + 7) // 8 if n > 0 else 0
++
++    def _convert_int_to_bytes(count, no):
++        return no.to_bytes(count, byteorder='big')
++
++    def _pad_hex(n, digits):
++        res = hex(n)[2:]
++        if len(res) < digits:
++            res = '0' * (digits - len(res)) + res
++        return res
++else:
++    # Python 2
++    def _count_bytes(n):
++        if n <= 0:
++            return 0
++        h = '%x' % n
++        return (len(h) + 1) // 2
++
++    def _convert_int_to_bytes(count, n):
++        h = '%x' % n
++        if len(h) > 2 * count:
++            raise Exception('Number {1} needs more than {0} bytes!'.format(count, n))
++        return ('0' * (2 * count - len(h)) + h).decode('hex')
++
++    def _pad_hex(n, digits):
++        h = '%x' % n
++        if len(h) < digits:
++            h = '0' * (digits - len(h)) + h
++        return h
++
++
++def _parse_key_cryptography(module, key_file=None, key_content=None):
++    '''
++    Parses an RSA or Elliptic Curve key file in PEM format and returns a pair
++    (error, key_data).
++    '''
++    # If key_content isn't given, read key_file
++    if key_content is None:
++        key_content = read_file(key_file)
++    else:
++        key_content = to_bytes(key_content)
++    # Parse key
++    try:
++        key = cryptography.hazmat.primitives.serialization.load_pem_private_key(key_content, password=None, backend=_cryptography_backend)
++    except Exception as e:
++        return 'error while loading key: {0}'.format(e), None
++    if isinstance(key, cryptography.hazmat.primitives.asymmetric.rsa.RSAPrivateKey):
++        pk = key.public_key().public_numbers()
++        return None, {
++            'key_obj': key,
++            'type': 'rsa',
++            'alg': 'RS256',
++            'jwk': {
++                "kty": "RSA",
++                "e": nopad_b64(_convert_int_to_bytes(_count_bytes(pk.e), pk.e)),
++                "n": nopad_b64(_convert_int_to_bytes(_count_bytes(pk.n), pk.n)),
++            },
++            'hash': 'sha256',
++        }
++    elif isinstance(key, cryptography.hazmat.primitives.asymmetric.ec.EllipticCurvePrivateKey):
++        pk = key.public_key().public_numbers()
++        if pk.curve.name == 'secp256r1':
++            bits = 256
++            alg = 'ES256'
++            hash = 'sha256'
++            point_size = 32
++            curve = 'P-256'
++        elif pk.curve.name == 'secp384r1':
++            bits = 384
++            alg = 'ES384'
++            hash = 'sha384'
++            point_size = 48
++            curve = 'P-384'
++        elif pk.curve.name == 'secp521r1':
++            # Not yet supported on Let's Encrypt side, see
++            # https://github.com/letsencrypt/boulder/issues/2217
++            bits = 521
++            alg = 'ES512'
++            hash = 'sha512'
++            point_size = 66
++            curve = 'P-521'
++        else:
++            return 'unknown elliptic curve: {0}'.format(pk.curve.name), {}
++        bytes = (bits + 7) // 8
++        return None, {
++            'key_obj': key,
++            'type': 'ec',
++            'alg': alg,
++            'jwk': {
++                "kty": "EC",
++                "crv": curve,
++                "x": nopad_b64(_convert_int_to_bytes(bytes, pk.x)),
++                "y": nopad_b64(_convert_int_to_bytes(bytes, pk.y)),
++            },
++            'hash': hash,
++            'point_size': point_size,
++        }
++    else:
++        return 'unknown key type "{0}"'.format(type(key)), {}
++
++
++def _sign_request_cryptography(module, payload64, protected64, key_data):
++    sign_payload = "{0}.{1}".format(protected64, payload64).encode('utf8')
++    if isinstance(key_data['key_obj'], cryptography.hazmat.primitives.asymmetric.rsa.RSAPrivateKey):
++        padding = cryptography.hazmat.primitives.asymmetric.padding.PKCS1v15()
++        hash = cryptography.hazmat.primitives.hashes.SHA256()
++        signature = key_data['key_obj'].sign(sign_payload, padding, hash)
++    elif isinstance(key_data['key_obj'], cryptography.hazmat.primitives.asymmetric.ec.EllipticCurvePrivateKey):
++        if key_data['hash'] == 'sha256':
++            hash = cryptography.hazmat.primitives.hashes.SHA256
++        elif key_data['hash'] == 'sha384':
++            hash = cryptography.hazmat.primitives.hashes.SHA384
++        elif key_data['hash'] == 'sha512':
++            hash = cryptography.hazmat.primitives.hashes.SHA512
++        ecdsa = cryptography.hazmat.primitives.asymmetric.ec.ECDSA(hash())
++        r, s = cryptography.hazmat.primitives.asymmetric.utils.decode_dss_signature(key_data['key_obj'].sign(sign_payload, ecdsa))
++        rr = _pad_hex(r, 2 * key_data['point_size'])
++        ss = _pad_hex(s, 2 * key_data['point_size'])
++        signature = binascii.unhexlify(rr) + binascii.unhexlify(ss)
++
++    return {
++        "protected": protected64,
++        "payload": payload64,
++        "signature": nopad_b64(signature),
++    }
++
++
+ class ACMEDirectory(object):
+     '''
+     The ACME server directory. Gives access to the available resources,
+@@ -199,24 +518,8 @@ class ACMEAccount(object):
+ 
+         self._openssl_bin = module.get_bin_path('openssl', True)
+ 
+-        # Create a key file from content, key (path) and key content are mutually exclusive
+-        if self.key_content is not None:
+-            fd, tmpsrc = tempfile.mkstemp()
+-            module.add_cleanup_file(tmpsrc)  # Ansible will delete the file on exit
+-            f = os.fdopen(fd, 'wb')
+-            try:
+-                f.write(self.key_content.encode('utf-8'))
+-                self.key = tmpsrc
+-            except Exception as err:
+-                try:
+-                    f.close()
+-                except Exception as e:
+-                    pass
+-                raise ModuleFailException("failed to create temporary content file: %s" % to_native(err), exception=traceback.format_exc())
+-            f.close()
+-
+-        if self.key is not None:
+-            error, self.key_data = self.parse_account_key(self.key)
++        if self.key is not None or self.key_content is not None:
++            error, self.key_data = self.parse_key(self.key, self.key_content)
+             if error:
+                 raise ModuleFailException("error while parsing account key: %s" % error)
+             self.jwk = self.key_data['jwk']
+@@ -234,136 +537,37 @@ class ACMEAccount(object):
+         thumbprint = nopad_b64(hashlib.sha256(accountkey_json.encode('utf8')).digest())
+         return "{0}.{1}".format(token, thumbprint)
+ 
+-    def parse_account_key(self, key):
++    def parse_key(self, key_file=None, key_content=None):
+         '''
+         Parses an RSA or Elliptic Curve key file in PEM format and returns a pair
+         (error, key_data).
+         '''
+-        account_key_type = None
+-        with open(key, "rt") as f:
+-            for line in f:
+-                m = re.match(r"^\s*-{5,}BEGIN\s+(EC|RSA)\s+PRIVATE\s+KEY-{5,}\s*$", line)
+-                if m is not None:
+-                    account_key_type = m.group(1).lower()
+-                    break
+-        if account_key_type is None:
+-            # This happens for example if openssl_privatekey created this key
+-            # (as opposed to the OpenSSL binary). For now, we assume this is
+-            # an RSA key.
+-            # FIXME: add some kind of auto-detection
+-            account_key_type = "rsa"
+-        if account_key_type not in ("rsa", "ec"):
+-            return 'unknown key type "%s"' % account_key_type, {}
+-
+-        openssl_keydump_cmd = [self._openssl_bin, account_key_type, "-in", key, "-noout", "-text"]
+-        dummy, out, dummy = self.module.run_command(openssl_keydump_cmd, check_rc=True)
+-
+-        if account_key_type == 'rsa':
+-            pub_hex, pub_exp = re.search(
+-                r"modulus:\n\s+00:([a-f0-9\:\s]+?)\npublicExponent: ([0-9]+)",
+-                to_text(out, errors='surrogate_or_strict'), re.MULTILINE | re.DOTALL).groups()
+-            pub_exp = "{0:x}".format(int(pub_exp))
+-            if len(pub_exp) % 2:
+-                pub_exp = "0{0}".format(pub_exp)
+-
+-            return None, {
+-                'type': 'rsa',
+-                'alg': 'RS256',
+-                'jwk': {
+-                    "kty": "RSA",
+-                    "e": nopad_b64(binascii.unhexlify(pub_exp.encode("utf-8"))),
+-                    "n": nopad_b64(binascii.unhexlify(re.sub(r"(\s|:)", "", pub_hex).encode("utf-8"))),
+-                },
+-                'hash': 'sha256',
+-            }
+-        elif account_key_type == 'ec':
+-            pub_data = re.search(
+-                r"pub:\s*\n\s+04:([a-f0-9\:\s]+?)\nASN1 OID: (\S+)(?:\nNIST CURVE: (\S+))?",
+-                to_text(out, errors='surrogate_or_strict'), re.MULTILINE | re.DOTALL)
+-            if pub_data is None:
+-                return 'cannot parse elliptic curve key', {}
+-            pub_hex = binascii.unhexlify(re.sub(r"(\s|:)", "", pub_data.group(1)).encode("utf-8"))
+-            asn1_oid_curve = pub_data.group(2).lower()
+-            nist_curve = pub_data.group(3).lower() if pub_data.group(3) else None
+-            if asn1_oid_curve == 'prime256v1' or nist_curve == 'p-256':
+-                bits = 256
+-                alg = 'ES256'
+-                hash = 'sha256'
+-                point_size = 32
+-                curve = 'P-256'
+-            elif asn1_oid_curve == 'secp384r1' or nist_curve == 'p-384':
+-                bits = 384
+-                alg = 'ES384'
+-                hash = 'sha384'
+-                point_size = 48
+-                curve = 'P-384'
+-            elif asn1_oid_curve == 'secp521r1' or nist_curve == 'p-521':
+-                # Not yet supported on Let's Encrypt side, see
+-                # https://github.com/letsencrypt/boulder/issues/2217
+-                bits = 521
+-                alg = 'ES512'
+-                hash = 'sha512'
+-                point_size = 66
+-                curve = 'P-521'
+-            else:
+-                return 'unknown elliptic curve: %s / %s' % (asn1_oid_curve, nist_curve), {}
+-            bytes = (bits + 7) // 8
+-            if len(pub_hex) != 2 * bytes:
+-                return 'bad elliptic curve point (%s / %s)' % (asn1_oid_curve, nist_curve), {}
+-            return None, {
+-                'type': 'ec',
+-                'alg': alg,
+-                'jwk': {
+-                    "kty": "EC",
+-                    "crv": curve,
+-                    "x": nopad_b64(pub_hex[:bytes]),
+-                    "y": nopad_b64(pub_hex[bytes:]),
+-                },
+-                'hash': hash,
+-                'point_size': point_size,
+-            }
++        if key_file is None and key_content is None:
++            raise AssertionError('One of key_file and key_content must be specified!')
++        if HAS_CURRENT_CRYPTOGRAPHY:
++            return _parse_key_cryptography(self.module, key_file, key_content)
++        else:
++            return _parse_key_openssl(self._openssl_bin, self.module, key_file, key_content)
+ 
+-    def sign_request(self, protected, payload, key_data, key):
++    def sign_request(self, protected, payload, key_data):
+         try:
+             payload64 = nopad_b64(self.module.jsonify(payload).encode('utf8'))
+             protected64 = nopad_b64(self.module.jsonify(protected).encode('utf8'))
+         except Exception as e:
+             raise ModuleFailException("Failed to encode payload / headers as JSON: {0}".format(e))
+ 
+-        openssl_sign_cmd = [self._openssl_bin, "dgst", "-{0}".format(key_data['hash']), "-sign", key]
+-        sign_payload = "{0}.{1}".format(protected64, payload64).encode('utf8')
+-        dummy, out, dummy = self.module.run_command(openssl_sign_cmd, data=sign_payload, check_rc=True, binary_data=True)
+-
+-        if key_data['type'] == 'ec':
+-            dummy, der_out, dummy = self.module.run_command(
+-                [self._openssl_bin, "asn1parse", "-inform", "DER"],
+-                data=out, binary_data=True)
+-            expected_len = 2 * key_data['point_size']
+-            sig = re.findall(
+-                r"prim:\s+INTEGER\s+:([0-9A-F]{1,%s})\n" % expected_len,
+-                to_text(der_out, errors='surrogate_or_strict'))
+-            if len(sig) != 2:
+-                raise ModuleFailException(
+-                    "failed to generate Elliptic Curve signature; cannot parse DER output: {0}".format(
+-                        to_text(der_out, errors='surrogate_or_strict')))
+-            sig[0] = (expected_len - len(sig[0])) * '0' + sig[0]
+-            sig[1] = (expected_len - len(sig[1])) * '0' + sig[1]
+-            out = binascii.unhexlify(sig[0]) + binascii.unhexlify(sig[1])
+-
+-        return {
+-            "protected": protected64,
+-            "payload": payload64,
+-            "signature": nopad_b64(to_bytes(out)),
+-        }
++        if HAS_CURRENT_CRYPTOGRAPHY:
++            return _sign_request_cryptography(self.module, payload64, protected64, key_data)
++        else:
++            return _sign_request_openssl(self._openssl_bin, self.module, payload64, protected64, key_data)
+ 
+-    def send_signed_request(self, url, payload, key_data=None, key=None, jws_header=None):
++    def send_signed_request(self, url, payload, key_data=None, jws_header=None):
+         '''
+         Sends a JWS signed HTTP POST request to the ACME server and returns
+         the response as dictionary
+         https://tools.ietf.org/html/draft-ietf-acme-acme-12#section-6.2
+         '''
+         key_data = key_data or self.key_data
+-        key = key or self.key
+         jws_header = jws_header or self.jws_header
+         failed_tries = 0
+         while True:
+@@ -372,7 +576,7 @@ class ACMEAccount(object):
+             if self.version != 1:
+                 protected["url"] = url
+ 
+-            data = self.sign_request(protected, payload, key_data, key)
++            data = self.sign_request(protected, payload, key_data)
+             if self.version == 1:
+                 data["header"] = jws_header
+             data = self.module.jsonify(data)
+@@ -530,3 +734,67 @@ class ACMEAccount(object):
+                     result, dummy = self.send_signed_request(self.uri, upd_reg)
+                 changed = True
+         return new_account or changed
++
++
++def cryptography_get_csr_domains(module, csr_filename):
++    '''
++    Return a set of requested domains (CN and SANs) for the CSR.
++    '''
++    domains = set([])
++    csr = cryptography.x509.load_pem_x509_csr(read_file(csr_filename), _cryptography_backend)
++    for sub in csr.subject:
++        if sub.oid == cryptography.x509.oid.NameOID.COMMON_NAME:
++            domains.add(sub.value)
++    for extension in csr.extensions:
++        if extension.oid == cryptography.x509.oid.ExtensionOID.SUBJECT_ALTERNATIVE_NAME:
++            for name in extension.value:
++                if isinstance(name, cryptography.x509.DNSName):
++                    domains.add(name.value)
++    return domains
++
++
++def cryptography_get_cert_days(module, cert_file):
++    '''
++    Return the days the certificate in cert_file remains valid and -1
++    if the file was not found. If cert_file contains more than one
++    certificate, only the first one will be considered.
++    '''
++    if not os.path.exists(cert_file):
++        return -1
++
++    try:
++        cert = cryptography.x509.load_pem_x509_certificate(read_file(cert_file), _cryptography_backend)
++    except Exception as e:
++        raise ModuleFailException('Cannot parse certificate {0}: {1}'.format(cert_file, e))
++    now = datetime.datetime.now()
++    return (cert.not_valid_after - now).days
++
++
++def set_crypto_backend(module):
++    '''
++    Sets which crypto backend to use (default: auto detection).
++
++    Does not care whether a new enough cryptoraphy is available or not. Must
++    be called before any real stuff is done which might evaluate
++    ``HAS_CURRENT_CRYPTOGRAPHY``.
++    '''
++    global HAS_CURRENT_CRYPTOGRAPHY
++    # Choose backend
++    backend = module.params['select_crypto_backend']
++    if backend == 'auto':
++        pass
++    elif backend == 'openssl':
++        HAS_CURRENT_CRYPTOGRAPHY = False
++    elif backend == 'cryptography':
++        try:
++            cryptography.__version__
++        except Exception as _:
++            module.fail_json(msg='Cannot find cryptography module!')
++        HAS_CURRENT_CRYPTOGRAPHY = True
++    else:
++        module.fail_json(msg='Unknown crypto backend "{0}"!'.format(backend))
++    # Inform about choices
++    if HAS_CURRENT_CRYPTOGRAPHY:
++        module.debug('Using cryptography backend (library version {0})'.format(CRYPTOGRAPHY_VERSION))
++    else:
++        module.debug('Using OpenSSL binary backend')
+diff --git a/lib/ansible/modules/web_infrastructure/acme_account.py b/lib/ansible/modules/web_infrastructure/acme_account.py
+index 944a30823c..f6c1b9a3db 100644
+--- a/lib/ansible/modules/web_infrastructure/acme_account.py
++++ b/lib/ansible/modules/web_infrastructure/acme_account.py
+@@ -116,15 +116,10 @@ account_uri:
+ '''
+ 
+ from ansible.module_utils.acme import (
+-    ModuleFailException, ACMEAccount
++    ModuleFailException, ACMEAccount, set_crypto_backend,
+ )
+ 
+-import os
+-import tempfile
+-import traceback
+-
+ from ansible.module_utils.basic import AnsibleModule
+-from ansible.module_utils._text import to_native
+ 
+ 
+ def main():
+@@ -141,6 +136,7 @@ def main():
+             contact=dict(required=False, type='list', default=[]),
+             new_account_key_src=dict(type='path'),
+             new_account_key_content=dict(type='str', no_log=True),
++            select_crypto_backend=dict(required=False, choices=['auto', 'openssl', 'cryptography'], default='auto', type='str'),
+         ),
+         required_one_of=(
+             ['account_key_src', 'account_key_content'],
+@@ -156,6 +152,7 @@ def main():
+         ),
+         supports_check_mode=True,
+     )
++    set_crypto_backend(module)
+ 
+     if not module.params.get('validate_certs'):
+         module.warn(warning='Disabling certificate validation for communications with ACME endpoint. ' +
+@@ -203,24 +200,11 @@ def main():
+                 raise ModuleFailException(msg='Account does not exist or is deactivated.')
+             module.exit_json(changed=changed, account_uri=account.uri)
+         elif state == 'changed_key':
+-            # Get hold of new account key
+-            new_key = module.params.get('new_account_key_src')
+-            if new_key is None:
+-                fd, tmpsrc = tempfile.mkstemp()
+-                module.add_cleanup_file(tmpsrc)  # Ansible will delete the file on exit
+-                f = os.fdopen(fd, 'wb')
+-                try:
+-                    f.write(module.params.get('new_account_key_content').encode('utf-8'))
+-                    new_key = tmpsrc
+-                except Exception as err:
+-                    try:
+-                        f.close()
+-                    except Exception as e:
+-                        pass
+-                    raise ModuleFailException("failed to create temporary content file: %s" % to_native(err), exception=traceback.format_exc())
+-                f.close()
+             # Parse new account key
+-            error, new_key_data = account.parse_account_key(new_key)
++            error, new_key_data = account.parse_key(
++                module.params.get('new_account_key_src'),
++                module.params.get('new_account_key_content')
++            )
+             if error:
+                 raise ModuleFailException("error while parsing account key: %s" % error)
+             # Verify that the account exists and has not been deactivated
+@@ -249,7 +233,7 @@ def main():
+                     "oldKey": account.jwk,  # discussed in https://github.com/ietf-wg-acme/acme/pull/425,
+                                             # might be required in draft 13
+                 }
+-                data = account.sign_request(protected, payload, new_key_data, new_key)
++                data = account.sign_request(protected, payload, new_key_data)
+                 # Send request and verify result
+                 result, info = account.send_signed_request(url, data)
+                 if info['status'] != 200:
+diff --git a/lib/ansible/modules/web_infrastructure/acme_certificate.py b/lib/ansible/modules/web_infrastructure/acme_certificate.py
+index 0625bfe4e0..668d8f9505 100644
+--- a/lib/ansible/modules/web_infrastructure/acme_certificate.py
++++ b/lib/ansible/modules/web_infrastructure/acme_certificate.py
+@@ -328,7 +328,9 @@ account_uri:
+ '''
+ 
+ from ansible.module_utils.acme import (
+-    ModuleFailException, fetch_url, write_file, nopad_b64, simple_get, ACMEAccount
++    ModuleFailException, fetch_url, write_file, nopad_b64, simple_get, pem_to_der, ACMEAccount,
++    HAS_CURRENT_CRYPTOGRAPHY, cryptography_get_csr_domains, cryptography_get_cert_days,
++    set_crypto_backend,
+ )
+ 
+ import base64
+@@ -350,6 +352,8 @@ def get_cert_days(module, cert_file):
+     if the file was not found. If cert_file contains more than one
+     certificate, only the first one will be considered.
+     '''
++    if HAS_CURRENT_CRYPTOGRAPHY:
++        return cryptography_get_cert_days(module, cert_file)
+     if not os.path.exists(cert_file):
+         return -1
+ 
+@@ -422,6 +426,8 @@ class ACMEClient(object):
+         '''
+         Parse the CSR and return the list of requested domains
+         '''
++        if HAS_CURRENT_CRYPTOGRAPHY:
++            return cryptography_get_csr_domains(self.module, self.csr)
+         openssl_csr_cmd = [self._openssl_bin, "req", "-in", self.csr, "-noout", "-text"]
+         dummy, out, dummy = self.module.run_command(openssl_csr_cmd, check_rc=True)
+ 
+@@ -569,11 +575,9 @@ class ACMEClient(object):
+         Return the certificate object as dict
+         https://tools.ietf.org/html/draft-ietf-acme-acme-12#section-7.4
+         '''
+-        openssl_csr_cmd = [self._openssl_bin, "req", "-in", self.csr, "-outform", "DER"]
+-        dummy, out, dummy = self.module.run_command(openssl_csr_cmd, check_rc=True)
+-
++        csr = pem_to_der(self.csr)
+         new_cert = {
+-            "csr": nopad_b64(to_bytes(out)),
++            "csr": nopad_b64(csr),
+         }
+         result, info = self.account.send_signed_request(self.finalize_uri, new_cert)
+         if info['status'] not in [200]:
+@@ -650,12 +654,10 @@ class ACMEClient(object):
+         Return the certificate object as dict
+         https://tools.ietf.org/html/draft-ietf-acme-acme-02#section-6.5
+         '''
+-        openssl_csr_cmd = [self._openssl_bin, "req", "-in", self.csr, "-outform", "DER"]
+-        dummy, out, dummy = self.module.run_command(openssl_csr_cmd, check_rc=True)
+-
++        csr = pem_to_der(self.csr)
+         new_cert = {
+             "resource": "new-cert",
+-            "csr": nopad_b64(to_bytes(out)),
++            "csr": nopad_b64(csr),
+         }
+         result, info = self.account.send_signed_request(self.directory['new-cert'], new_cert)
+ 
+@@ -883,6 +885,7 @@ def main():
+             remaining_days=dict(required=False, default=10, type='int'),
+             deactivate_authzs=dict(required=False, default=False, type='bool'),
+             force=dict(required=False, default=False, type='bool'),
++            select_crypto_backend=dict(required=False, choices=['auto', 'openssl', 'cryptography'], default='auto', type='str'),
+         ),
+         required_one_of=(
+             ['account_key_src', 'account_key_content'],
+@@ -895,6 +898,7 @@ def main():
+     )
+     if module._name == 'letsencrypt':
+         module.deprecate("The 'letsencrypt' module is being renamed 'acme_certificate'", version='2.10')
++    set_crypto_backend(module)
+ 
+     # AnsibleModule() changes the locale, so change it back to C because we rely on time.strptime() when parsing certificate dates.
+     module.run_command_environ_update = dict(LANG='C', LC_ALL='C', LC_MESSAGES='C', LC_CTYPE='C')
+diff --git a/lib/ansible/modules/web_infrastructure/acme_certificate_revoke.py b/lib/ansible/modules/web_infrastructure/acme_certificate_revoke.py
+index 703c6f02b1..3ebee6c8e3 100644
+--- a/lib/ansible/modules/web_infrastructure/acme_certificate_revoke.py
++++ b/lib/ansible/modules/web_infrastructure/acme_certificate_revoke.py
+@@ -53,6 +53,10 @@ options:
+          important private key — it can be used to change the account key,
+          or to revoke your certificates without knowing their private keys
+          —, this might not be acceptable."
++      - "In case C(cryptography) is used, the content is not written into a
++         temporary file. It can still happen that it is written to disk by
++         Ansible in the process of moving the module with its argument to
++         the node where it is executed."
+   revoke_reason:
+     description:
+       - "One of the revocation reasonCodes defined in
+@@ -80,16 +84,10 @@ RETURN = '''
+ '''
+ 
+ from ansible.module_utils.acme import (
+-    ModuleFailException, ACMEAccount, nopad_b64
++    ModuleFailException, ACMEAccount, nopad_b64, pem_to_der, set_crypto_backend,
+ )
+ 
+-import base64
+-import os
+-import tempfile
+-import traceback
+-
+ from ansible.module_utils.basic import AnsibleModule
+-from ansible.module_utils._text import to_native
+ 
+ 
+ def main():
+@@ -104,6 +102,7 @@ def main():
+             private_key_content=dict(type='str', no_log=True),
+             certificate=dict(required=True, type='path'),
+             revoke_reason=dict(required=False, type='int'),
++            select_crypto_backend=dict(required=False, choices=['auto', 'openssl', 'cryptography'], default='auto', type='str'),
+         ),
+         required_one_of=(
+             ['account_key_src', 'account_key_content', 'private_key_src', 'private_key_content'],
+@@ -113,6 +112,7 @@ def main():
+         ),
+         supports_check_mode=False,
+     )
++    set_crypto_backend(module)
+ 
+     if not module.params.get('validate_certs'):
+         module.warn(warning='Disabling certificate validation for communications with ACME endpoint. ' +
+@@ -122,22 +122,8 @@ def main():
+     try:
+         account = ACMEAccount(module)
+         # Load certificate
+-        certificate_lines = []
+-        try:
+-            with open(module.params.get('certificate'), "rt") as f:
+-                header_line_count = 0
+-                for line in f:
+-                    if line.startswith('-----'):
+-                        header_line_count += 1
+-                        if header_line_count == 2:
+-                            # If certificate file contains other certs appended
+-                            # (like intermediate certificates), ignore these.
+-                            break
+-                        continue
+-                    certificate_lines.append(line.strip())
+-        except Exception as err:
+-            raise ModuleFailException("cannot load certificate file: %s" % to_native(err), exception=traceback.format_exc())
+-        certificate = nopad_b64(base64.b64decode(''.join(certificate_lines)))
++        certificate = pem_to_der(module.params.get('certificate'))
++        certificate = nopad_b64(certificate)
+         # Construct payload
+         payload = {
+             'certificate': certificate
+@@ -152,24 +138,11 @@ def main():
+             endpoint = account.directory['revokeCert']
+         # Get hold of private key (if available) and make sure it comes from disk
+         private_key = module.params.get('private_key_src')
+-        if module.params.get('private_key_content') is not None:
+-            fd, tmpsrc = tempfile.mkstemp()
+-            module.add_cleanup_file(tmpsrc)  # Ansible will delete the file on exit
+-            f = os.fdopen(fd, 'wb')
+-            try:
+-                f.write(module.params.get('private_key_content').encode('utf-8'))
+-                private_key = tmpsrc
+-            except Exception as err:
+-                try:
+-                    f.close()
+-                except Exception as e:
+-                    pass
+-                raise ModuleFailException("failed to create temporary content file: %s" % to_native(err), exception=traceback.format_exc())
+-            f.close()
++        private_key_content = module.params.get('private_key_content')
+         # Revoke certificate
+-        if private_key:
++        if private_key or private_key_content:
+             # Step 1: load and parse private key
+-            error, private_key_data = account.parse_account_key(private_key)
++            error, private_key_data = account.parse_key(private_key, private_key_content)
+             if error:
+                 raise ModuleFailException("error while parsing private key: %s" % error)
+             # Step 2: sign revokation request with private key
+@@ -177,8 +150,7 @@ def main():
+                 "alg": private_key_data['alg'],
+                 "jwk": private_key_data['jwk'],
+             }
+-            result, info = account.send_signed_request(endpoint, payload, key=private_key,
+-                                                       key_data=private_key_data, jws_header=jws_header)
++            result, info = account.send_signed_request(endpoint, payload, key_data=private_key_data, jws_header=jws_header)
+         else:
+             # Step 1: get hold of account URI
+             changed = account.init_account(
+diff --git a/lib/ansible/utils/module_docs_fragments/acme.py b/lib/ansible/utils/module_docs_fragments/acme.py
+index feadc0764d..b8dd595c8f 100644
+--- a/lib/ansible/utils/module_docs_fragments/acme.py
++++ b/lib/ansible/utils/module_docs_fragments/acme.py
+@@ -8,9 +8,18 @@ class ModuleDocFragment(object):
+ 
+     # Standard files documentation fragment
+     DOCUMENTATION = """
++description:
++  - "Note that if a new enough version of the C(cryptography) library
++     is available (see Requirements for details), it will be used
++     instead of the C(openssl) binary. This can be explicitly disabled
++     or enabled with the C(select_crypto_backend) option. Note that using
++     the C(openssl) binary will be slower and less secure, as private key
++     contents always have to be stored on disk (see
++     C(account_key_content))."
+ requirements:
+   - "python >= 2.6"
+-  - openssl
++  - "either openssl, ..."
++  - "... or L(cryptography,https://cryptography.io/) >= 1.5"
+ options:
+   account_key_src:
+     description:
+@@ -32,6 +41,10 @@ options:
+          important private key — it can be used to change the account key,
+          or to revoke your certificates without knowing their private keys
+          —, this might not be acceptable."
++      - "In case C(cryptography) is used, the content is not written into a
++         temporary file. It can still happen that it is written to disk by
++         Ansible in the process of moving the module with its argument to
++         the node where it is executed."
+     version_added: "2.5"
+   acme_version:
+     description:
+@@ -64,5 +77,20 @@ options:
+          for example when testing against a local Pebble server."
+     type: bool
+     default: 'yes'
+-    version_added: 2.5
++    version_added: "2.5"
++  select_crypto_backend:
++    description:
++      - "Determines which crypto backend to use. The default choice is C(auto),
++         which tries to use C(cryptography) if available, and falls back to
++         C(openssl)."
++      - "If set to C(openssl), will try to use the C(openssl) binary."
++      - "If set to C(cryptography), will try to use the
++         L(cryptography,https://cryptography.io/) library."
++    type: str
++    default: 'auto'
++    choices:
++      - auto
++      - cryptography
++      - openssl
++    version_added: "2.7"
+ """
+diff --git a/test/integration/targets/acme_account/tasks/impl.yml b/test/integration/targets/acme_account/tasks/impl.yml
+new file mode 100644
+index 0000000000..ee9229321b
+--- /dev/null
++++ b/test/integration/targets/acme_account/tasks/impl.yml
+@@ -0,0 +1,157 @@
++- name: Generate account key
++  command: openssl ecparam -name prime256v1 -genkey -out {{ output_dir }}/accountkey.pem
++
++- name: Parse account key (to ease debugging some test failures)
++  command: openssl ec -in {{ output_dir }}/accountkey.pem -noout -text
++
++- name: Do not try to create account
++  acme_account:
++    select_crypto_backend: "{{ select_crypto_backend }}"
++    account_key_src: "{{ output_dir }}/accountkey.pem"
++    acme_version: 2
++    acme_directory: https://{{ acme_host }}:14000/dir
++    validate_certs: no
++    state: present
++    allow_creation: no
++  ignore_errors: yes
++  register: account_not_created
++
++- name: Create it now
++  acme_account:
++    select_crypto_backend: "{{ select_crypto_backend }}"
++    account_key_src: "{{ output_dir }}/accountkey.pem"
++    acme_version: 2
++    acme_directory: https://{{ acme_host }}:14000/dir
++    validate_certs: no
++    state: present
++    allow_creation: yes
++    terms_agreed: yes
++    contact:
++    - mailto:example@example.org
++  register: account_created
++
++- name: Change email address
++  acme_account:
++    select_crypto_backend: "{{ select_crypto_backend }}"
++    account_key_content: "{{ lookup('file', output_dir ~ '/accountkey.pem') }}"
++    acme_version: 2
++    acme_directory: https://{{ acme_host }}:14000/dir
++    validate_certs: no
++    state: present
++    # allow_creation: no
++    contact:
++    - mailto:example@example.com
++  register: account_modified
++
++- name: Change email address (idempotent)
++  acme_account:
++    select_crypto_backend: "{{ select_crypto_backend }}"
++    account_key_src: "{{ output_dir }}/accountkey.pem"
++    acme_version: 2
++    acme_directory: https://{{ acme_host }}:14000/dir
++    validate_certs: no
++    state: present
++    # allow_creation: no
++    contact:
++    - mailto:example@example.com
++  register: account_modified_idempotent
++
++- name: Generate new account key
++  command: openssl ecparam -name secp384r1 -genkey -out {{ output_dir }}/accountkey2.pem
++
++- name: Parse account key (to ease debugging some test failures)
++  command: openssl ec -in {{ output_dir }}/accountkey2.pem -noout -text
++
++# Note that pebble has no change key endpoint implemented yet!
++# When it has (and the container was updated), uncomment the
++# uncomment the following tests, and delete the ones below the
++# out-commented ones.
++
++# - name: Change account key
++#   acme_account:
++#     select_crypto_backend: "{{ select_crypto_backend }}"
++#     account_key_src: "{{ output_dir }}/accountkey.pem"
++#     acme_version: 2
++#     acme_directory: https://{{ acme_host }}:14000/dir
++#     validate_certs: no
++#     new_account_key_src: "{{ output_dir }}/accountkey2.pem"
++#     state: changed_key
++#     contact:
++#     - mailto:example@example.com
++#   register: account_change_key
++
++# - name: Deactivate account
++#   acme_account:
++#     select_crypto_backend: "{{ select_crypto_backend }}"
++#     account_key_src: "{{ output_dir }}/accountkey2.pem"
++#     acme_version: 2
++#     acme_directory: https://{{ acme_host }}:14000/dir
++#     validate_certs: no
++#     state: absent
++#   register: account_deactivate
++
++# - name: Deactivate account (idempotent)
++#   acme_account:
++#     select_crypto_backend: "{{ select_crypto_backend }}"
++#     account_key_src: "{{ output_dir }}/accountkey2.pem"
++#     acme_version: 2
++#     acme_directory: https://{{ acme_host }}:14000/dir
++#     validate_certs: no
++#     state: absent
++#   register: account_deactivate_idempotent
++
++# - name: Do not try to create account II
++#   acme_account:
++#     select_crypto_backend: "{{ select_crypto_backend }}"
++#     account_key_src: "{{ output_dir }}/accountkey2.pem"
++#     acme_version: 2
++#     acme_directory: https://{{ acme_host }}:14000/dir
++#     validate_certs: no
++#     state: present
++#     allow_creation: no
++#   ignore_errors: yes
++#   register: account_not_created_2
++
++# - name: Do not try to create account III
++#   acme_account:
++#     select_crypto_backend: "{{ select_crypto_backend }}"
++#     account_key_src: "{{ output_dir }}/accountkey.pem"
++#     acme_version: 2
++#     acme_directory: https://{{ acme_host }}:14000/dir
++#     validate_certs: no
++#     state: present
++#     allow_creation: no
++#   ignore_errors: yes
++#   register: account_not_created_3
++
++- name: Deactivate account
++  acme_account:
++    select_crypto_backend: "{{ select_crypto_backend }}"
++    account_key_src: "{{ output_dir }}/accountkey.pem"
++    acme_version: 2
++    acme_directory: https://{{ acme_host }}:14000/dir
++    validate_certs: no
++    state: absent
++  register: account_deactivate
++
++- name: Deactivate account (idempotent)
++  acme_account:
++    select_crypto_backend: "{{ select_crypto_backend }}"
++    account_key_src: "{{ output_dir }}/accountkey.pem"
++    acme_version: 2
++    acme_directory: https://{{ acme_host }}:14000/dir
++    validate_certs: no
++    state: absent
++  register: account_deactivate_idempotent
++
++- name: Do not try to create account II
++  acme_account:
++    select_crypto_backend: "{{ select_crypto_backend }}"
++    account_key_src: "{{ output_dir }}/accountkey.pem"
++    acme_version: 2
++    acme_directory: https://{{ acme_host }}:14000/dir
++    validate_certs: no
++    state: present
++    allow_creation: no
++  ignore_errors: yes
++  register: account_not_created_2
+diff --git a/test/integration/targets/acme_account/tasks/main.yml b/test/integration/targets/acme_account/tasks/main.yml
+index 2db30ae614..e46c6dc4d0 100644
+--- a/test/integration/targets/acme_account/tasks/main.yml
++++ b/test/integration/targets/acme_account/tasks/main.yml
+@@ -1,152 +1,31 @@
+ ---
+ - block:
+-  - name: Generate account key
+-    command: openssl ecparam -name prime256v1 -genkey -out {{ output_dir }}/accountkey.pem
++  - name: Running tests with OpenSSL backend
++    include_tasks: impl.yml
++    vars:
++      select_crypto_backend: openssl
+ 
+-  - name: Parse account key (to ease debugging some test failures)
+-    command: openssl ec -in {{ output_dir }}/accountkey.pem -noout -text
+-
+-  - name: Do not try to create account
+-    acme_account:
+-      account_key_src: "{{ output_dir }}/accountkey.pem"
+-      acme_version: 2
+-      acme_directory: https://{{ acme_host }}:14000/dir
+-      validate_certs: no
+-      state: present
+-      allow_creation: no
+-    ignore_errors: yes
+-    register: account_not_created
+-
+-  - name: Create it now
+-    acme_account:
+-      account_key_src: "{{ output_dir }}/accountkey.pem"
+-      acme_version: 2
+-      acme_directory: https://{{ acme_host }}:14000/dir
+-      validate_certs: no
+-      state: present
+-      allow_creation: yes
+-      terms_agreed: yes
+-      contact:
+-      - mailto:example@example.org
+-    register: account_created
+-
+-  - name: Change email address
+-    acme_account:
+-      account_key_content: "{{ lookup('file', output_dir ~ '/accountkey.pem') }}"
+-      acme_version: 2
+-      acme_directory: https://{{ acme_host }}:14000/dir
+-      validate_certs: no
+-      state: present
+-      # allow_creation: no
+-      contact:
+-      - mailto:example@example.com
+-    register: account_modified
+-
+-  - name: Change email address (idempotent)
+-    acme_account:
+-      account_key_src: "{{ output_dir }}/accountkey.pem"
+-      acme_version: 2
+-      acme_directory: https://{{ acme_host }}:14000/dir
+-      validate_certs: no
+-      state: present
+-      # allow_creation: no
+-      contact:
+-      - mailto:example@example.com
+-    register: account_modified_idempotent
+-
+-  - name: Generate new account key
+-    command: openssl ecparam -name secp384r1 -genkey -out {{ output_dir }}/accountkey2.pem
+-
+-  - name: Parse account key (to ease debugging some test failures)
+-    command: openssl ec -in {{ output_dir }}/accountkey2.pem -noout -text
+-
+-# Note that pebble has no change key endpoint implemented yet!
+-# When it has (and the container was updated), uncomment the
+-# uncomment the following tests, and delete the ones below the
+-# out-commented ones.
+-
+-#  - name: Change account key
+-#    acme_account:
+-#      account_key_src: "{{ output_dir }}/accountkey.pem"
+-#      acme_version: 2
+-#      acme_directory: https://{{ acme_host }}:14000/dir
+-#      validate_certs: no
+-#      new_account_key_src: "{{ output_dir }}/accountkey2.pem"
+-#      state: changed_key
+-#      contact:
+-#      - mailto:example@example.com
+-#    register: account_change_key
+-
+-#  - name: Deactivate account
+-#    acme_account:
+-#      account_key_src: "{{ output_dir }}/accountkey2.pem"
+-#      acme_version: 2
+-#      acme_directory: https://{{ acme_host }}:14000/dir
+-#      validate_certs: no
+-#      state: absent
+-#    register: account_deactivate
+-
+-#  - name: Deactivate account (idempotent)
+-#    acme_account:
+-#      account_key_src: "{{ output_dir }}/accountkey2.pem"
+-#      acme_version: 2
+-#      acme_directory: https://{{ acme_host }}:14000/dir
+-#      validate_certs: no
+-#      state: absent
+-#    register: account_deactivate_idempotent
+-
+-#  - name: Do not try to create account II
+-#    acme_account:
+-#      account_key_src: "{{ output_dir }}/accountkey2.pem"
+-#      acme_version: 2
+-#      acme_directory: https://{{ acme_host }}:14000/dir
+-#      validate_certs: no
+-#      state: present
+-#      allow_creation: no
+-#    ignore_errors: yes
+-#    register: account_not_created_2
++  - import_tasks: ../tests/validate.yml
+ 
+-#  - name: Do not try to create account III
+-#    acme_account:
+-#      account_key_src: "{{ output_dir }}/accountkey.pem"
+-#      acme_version: 2
+-#      acme_directory: https://{{ acme_host }}:14000/dir
+-#      validate_certs: no
+-#      state: present
+-#      allow_creation: no
+-#    ignore_errors: yes
+-#    register: account_not_created_3
++  # Old 0.9.8 versions have insufficient CLI support for signing with EC keys
++  when: openssl_version.stdout is version('1.0.0', '>=')
+ 
+-  - name: Deactivate account
+-    acme_account:
+-      account_key_src: "{{ output_dir }}/accountkey.pem"
+-      acme_version: 2
+-      acme_directory: https://{{ acme_host }}:14000/dir
+-      validate_certs: no
+-      state: absent
+-    register: account_deactivate
++- name: Remove output directory
++  file:
++    path: "{{ output_dir }}"
++    state: absent
+ 
+-  - name: Deactivate account (idempotent)
+-    acme_account:
+-      account_key_src: "{{ output_dir }}/accountkey.pem"
+-      acme_version: 2
+-      acme_directory: https://{{ acme_host }}:14000/dir
+-      validate_certs: no
+-      state: absent
+-    register: account_deactivate_idempotent
++- name: Re-create output directory
++  file:
++    path: "{{ output_dir }}"
++    state: directory
+ 
+-  - name: Do not try to create account II
+-    acme_account:
+-      account_key_src: "{{ output_dir }}/accountkey.pem"
+-      acme_version: 2
+-      acme_directory: https://{{ acme_host }}:14000/dir
+-      validate_certs: no
+-      state: present
+-      allow_creation: no
+-    ignore_errors: yes
+-    register: account_not_created_2
++- block:
++  - name: Running tests with cryptography backend
++    include_tasks: impl.yml
++    vars:
++      select_crypto_backend: cryptography
+ 
+   - import_tasks: ../tests/validate.yml
+ 
+-  # Old 0.9.8 versions have insufficient CLI support for signing with EC keys
+-  when: openssl_version.stdout is version('1.0.0', '>=')
++  when: cryptography_version.stdout is version('1.5', '>=')
+diff --git a/test/integration/targets/acme_certificate/tasks/impl.yml b/test/integration/targets/acme_certificate/tasks/impl.yml
+new file mode 100644
+index 0000000000..b9c037dd29
+--- /dev/null
++++ b/test/integration/targets/acme_certificate/tasks/impl.yml
+@@ -0,0 +1,240 @@
++---
++## SET UP ACCOUNT KEYS ########################################################################
++- name: Create ECC256 account key
++  command: openssl ecparam -name prime256v1 -genkey -out {{ output_dir }}/account-ec256.pem
++- name: Create ECC384 account key
++  command: openssl ecparam -name secp384r1 -genkey -out {{ output_dir }}/account-ec384.pem
++- name: Create RSA-2048 account key
++  command: openssl genrsa -out {{ output_dir }}/account-rsa2048.pem 2048
++## SET UP ACCOUNTS ############################################################################
++- name: Make sure ECC256 account hasn't been created yet
++  acme_account:
++    select_crypto_backend: "{{ select_crypto_backend }}"
++    acme_version: 2
++    acme_directory: https://{{ acme_host }}:14000/dir
++    validate_certs: no
++    account_key_src: "{{ output_dir }}/account-ec256.pem"
++    state: absent
++- name: Create ECC384 account
++  acme_account:
++    select_crypto_backend: "{{ select_crypto_backend }}"
++    acme_version: 2
++    acme_directory: https://{{ acme_host }}:14000/dir
++    validate_certs: no
++    account_key_content: "{{ lookup('file', output_dir ~ '/account-ec384.pem') }}"
++    state: present
++    allow_creation: yes
++    terms_agreed: yes
++    contact:
++    - mailto:example@example.org
++    - mailto:example@example.com
++- name: Create RSA-2048 account
++  acme_account:
++    select_crypto_backend: "{{ select_crypto_backend }}"
++    acme_version: 2
++    acme_directory: https://{{ acme_host }}:14000/dir
++    validate_certs: no
++    account_key_src: "{{ output_dir }}/account-rsa2048.pem"
++    state: present
++    allow_creation: yes
++    terms_agreed: yes
++    contact: []
++## OBTAIN CERTIFICATES ########################################################################
++- name: Obtain cert 1
++  include_tasks: obtain-cert.yml
++  vars:
++    certgen_title: Certificate 1
++    certificate_name: cert-1
++    key_type: rsa
++    rsa_bits: 2048
++    subject_alt_name: "DNS:example.com"
++    subject_alt_name_critical: no
++    account_key: account-ec256
++    challenge: http-01
++    modify_account: yes
++    deactivate_authzs: no
++    force: no
++    remaining_days: 10
++    terms_agreed: yes
++    account_email: "example@example.org"
++- name: Obtain cert 2
++  include_tasks: obtain-cert.yml
++  vars:
++    certgen_title: Certificate 2
++    certificate_name: cert-2
++    key_type: ec256
++    subject_alt_name: "DNS:*.example.com,DNS:example.com"
++    subject_alt_name_critical: yes
++    account_key: account-ec384
++    challenge: dns-01
++    modify_account: no
++    deactivate_authzs: yes
++    force: no
++    remaining_days: 10
++    terms_agreed: no
++    account_email: ""
++- name: Obtain cert 3
++  include_tasks: obtain-cert.yml
++  vars:
++    certgen_title: Certificate 3
++    certificate_name: cert-3
++    key_type: ec384
++    subject_alt_name: "DNS:*.example.com,DNS:example.org,DNS:t1.example.com"
++    subject_alt_name_critical: no
++    account_key_content: "{{ lookup('file', output_dir ~ '/account-rsa2048.pem') }}"
++    challenge: dns-01
++    modify_account: no
++    deactivate_authzs: no
++    force: no
++    remaining_days: 10
++    terms_agreed: no
++    account_email: ""
++- name: Obtain cert 4
++  include_tasks: obtain-cert.yml
++  vars:
++    certgen_title: Certificate 4
++    certificate_name: cert-4
++    key_type: rsa
++    rsa_bits: 2048
++    subject_alt_name: "DNS:example.com,DNS:t1.example.com,DNS:test.t2.example.com,DNS:example.org,DNS:test.example.org"
++    subject_alt_name_critical: no
++    account_key: account-rsa2048
++    challenge: http-01
++    modify_account: no
++    deactivate_authzs: yes
++    force: yes
++    remaining_days: 10
++    terms_agreed: no
++    account_email: ""
++- name: Obtain cert 5
++  include_tasks: obtain-cert.yml
++  vars:
++    certgen_title: Certificate 5, Iteration 1/4
++    certificate_name: cert-5
++    key_type: ec521
++    subject_alt_name: "DNS:t2.example.com"
++    subject_alt_name_critical: no
++    account_key: account-ec384
++    challenge: http-01
++    modify_account: no
++    deactivate_authzs: yes
++    force: yes
++    remaining_days: 10
++    terms_agreed: no
++    account_email: ""
++- name: Obtain cert 5 (should not, since already there and valid for more than 10 days)
++  include_tasks: obtain-cert.yml
++  vars:
++    certgen_title: Certificate 5, Iteration 2/4
++    certificate_name: cert-5
++    key_type: ec521
++    subject_alt_name: "DNS:t2.example.com"
++    subject_alt_name_critical: no
++    account_key: account-ec384
++    challenge: http-01
++    modify_account: no
++    deactivate_authzs: yes
++    force: no
++    remaining_days: 10
++    terms_agreed: no
++    account_email: ""
++- set_fact:
++    cert_5_recreate_1: "{{ challenge_data is changed }}"
++- name: Obtain cert 5 (should again by less days)
++  include_tasks: obtain-cert.yml
++  vars:
++    certgen_title: Certificate 5, Iteration 3/4
++    certificate_name: cert-5
++    key_type: ec521
++    subject_alt_name: "DNS:t2.example.com"
++    subject_alt_name_critical: no
++    account_key: account-ec384
++    challenge: http-01
++    modify_account: no
++    deactivate_authzs: yes
++    force: yes
++    remaining_days: 1000
++    terms_agreed: no
++    account_email: ""
++- set_fact:
++    cert_5_recreate_2: "{{ challenge_data is changed }}"
++- name: Obtain cert 5 (should again by force)
++  include_tasks: obtain-cert.yml
++  vars:
++    certgen_title: Certificate 5, Iteration 4/4
++    certificate_name: cert-5
++    key_type: ec521
++    subject_alt_name: "DNS:t2.example.com"
++    subject_alt_name_critical: no
++    account_key_content: "{{ lookup('file', output_dir ~ '/account-ec384.pem') }}"
++    challenge: http-01
++    modify_account: no
++    deactivate_authzs: yes
++    force: yes
++    remaining_days: 10
++    terms_agreed: no
++    account_email: ""
++- set_fact:
++    cert_5_recreate_3: "{{ challenge_data is changed }}"
++- name: Obtain cert 6
++  include_tasks: obtain-cert.yml
++  vars:
++    certgen_title: Certificate 6
++    certificate_name: cert-6
++    key_type: rsa
++    rsa_bits: 2048
++    subject_alt_name: "DNS:example.org"
++    subject_alt_name_critical: no
++    account_key: account-ec256
++    challenge: tls-alpn-01
++    modify_account: yes
++    deactivate_authzs: no
++    force: no
++    remaining_days: 10
++    terms_agreed: yes
++    account_email: "example@example.org"
++## DISSECT CERTIFICATES #######################################################################
++# Make sure certificates are valid. Root certificate for Pebble equals the chain certificate.
++- name: Verifying cert 1
++  command: openssl verify -CAfile "{{ output_dir }}/cert-1-chain.pem" "{{ output_dir }}/cert-1.pem"
++  ignore_errors: yes
++  register: cert_1_valid
++- name: Verifying cert 2
++  command: openssl verify -CAfile "{{ output_dir }}/cert-2-chain.pem" "{{ output_dir }}/cert-2.pem"
++  ignore_errors: yes
++  register: cert_2_valid
++- name: Verifying cert 3
++  command: openssl verify -CAfile "{{ output_dir }}/cert-3-chain.pem" "{{ output_dir }}/cert-3.pem"
++  ignore_errors: yes
++  register: cert_3_valid
++- name: Verifying cert 4
++  command: openssl verify -CAfile "{{ output_dir }}/cert-4-chain.pem" "{{ output_dir }}/cert-4.pem"
++  ignore_errors: yes
++  register: cert_4_valid
++- name: Verifying cert 5
++  command: openssl verify -CAfile "{{ output_dir }}/cert-5-chain.pem" "{{ output_dir }}/cert-5.pem"
++  ignore_errors: yes
++  register: cert_5_valid
++- name: Verifying cert 6
++  command: openssl verify -CAfile "{{ output_dir }}/cert-6-chain.pem" "{{ output_dir }}/cert-6.pem"
++  ignore_errors: yes
++  register: cert_6_valid
++# Dump certificate info
++- name: Dumping cert 1
++  command: openssl x509 -in "{{ output_dir }}/cert-1.pem" -noout -text
++  register: cert_1_text
++- name: Dumping cert 2
++  command: openssl x509 -in "{{ output_dir }}/cert-2.pem" -noout -text
++  register: cert_2_text
++- name: Dumping cert 3
++  command: openssl x509 -in "{{ output_dir }}/cert-3.pem" -noout -text
++  register: cert_3_text
++- name: Dumping cert 4
++  command: openssl x509 -in "{{ output_dir }}/cert-4.pem" -noout -text
++  register: cert_4_text
++- name: Dumping cert 5
++  command: openssl x509 -in "{{ output_dir }}/cert-5.pem" -noout -text
++  register: cert_5_text
++- name: Dumping cert 6
++  command: openssl x509 -in "{{ output_dir }}/cert-6.pem" -noout -text
++  register: cert_6_text
+diff --git a/test/integration/targets/acme_certificate/tasks/main.yml b/test/integration/targets/acme_certificate/tasks/main.yml
+index 02b4466b24..e46c6dc4d0 100644
+--- a/test/integration/targets/acme_certificate/tasks/main.yml
++++ b/test/integration/targets/acme_certificate/tasks/main.yml
+@@ -1,243 +1,31 @@
+ ---
+ - block:
+-  ## SET UP ACCOUNT KEYS ########################################################################
+-  - name: Create ECC256 account key
+-    command: openssl ecparam -name prime256v1 -genkey -out {{ output_dir }}/account-ec256.pem
+-  - name: Create ECC384 account key
+-    command: openssl ecparam -name secp384r1 -genkey -out {{ output_dir }}/account-ec384.pem
+-  - name: Create RSA-2048 account key
+-    command: openssl genrsa -out {{ output_dir }}/account-rsa2048.pem 2048
+-  ## SET UP ACCOUNTS ############################################################################
+-  - name: Make sure ECC256 account hasn't been created yet
+-    acme_account:
+-      acme_version: 2
+-      acme_directory: https://{{ acme_host }}:14000/dir
+-      validate_certs: no
+-      account_key_src: "{{ output_dir }}/account-ec256.pem"
+-      state: absent
+-  - name: Create ECC384 account
+-    acme_account:
+-      acme_version: 2
+-      acme_directory: https://{{ acme_host }}:14000/dir
+-      validate_certs: no
+-      account_key_content: "{{ lookup('file', output_dir ~ '/account-ec384.pem') }}"
+-      state: present
+-      allow_creation: yes
+-      terms_agreed: yes
+-      contact:
+-      - mailto:example@example.org
+-      - mailto:example@example.com
+-  - name: Create RSA-2048 account
+-    acme_account:
+-      acme_version: 2
+-      acme_directory: https://{{ acme_host }}:14000/dir
+-      validate_certs: no
+-      account_key_src: "{{ output_dir }}/account-rsa2048.pem"
+-      state: present
+-      allow_creation: yes
+-      terms_agreed: yes
+-      contact: []
+-  ## OBTAIN CERTIFICATES ########################################################################
+-  - name: Obtain cert 1
+-    include_tasks: obtain-cert.yml
++  - name: Running tests with OpenSSL backend
++    include_tasks: impl.yml
+     vars:
+-      certgen_title: Certificate 1
+-      certificate_name: cert-1
+-      key_type: rsa
+-      rsa_bits: 2048
+-      subject_alt_name: "DNS:example.com"
+-      subject_alt_name_critical: no
+-      account_key: account-ec256
+-      challenge: http-01
+-      modify_account: yes
+-      deactivate_authzs: no
+-      force: no
+-      remaining_days: 10
+-      terms_agreed: yes
+-      account_email: "example@example.org"
+-  - name: Obtain cert 2
+-    include_tasks: obtain-cert.yml
+-    vars:
+-      certgen_title: Certificate 2
+-      certificate_name: cert-2
+-      key_type: ec256
+-      subject_alt_name: "DNS:*.example.com,DNS:example.com"
+-      subject_alt_name_critical: yes
+-      account_key: account-ec384
+-      challenge: dns-01
+-      modify_account: no
+-      deactivate_authzs: yes
+-      force: no
+-      remaining_days: 10
+-      terms_agreed: no
+-      account_email: ""
+-  - name: Obtain cert 3
+-    include_tasks: obtain-cert.yml
+-    vars:
+-      certgen_title: Certificate 3
+-      certificate_name: cert-3
+-      key_type: ec384
+-      subject_alt_name: "DNS:*.example.com,DNS:example.org,DNS:t1.example.com"
+-      subject_alt_name_critical: no
+-      account_key_content: "{{ lookup('file', output_dir ~ '/account-rsa2048.pem') }}"
+-      challenge: dns-01
+-      modify_account: no
+-      deactivate_authzs: no
+-      force: no
+-      remaining_days: 10
+-      terms_agreed: no
+-      account_email: ""
+-  - name: Obtain cert 4
+-    include_tasks: obtain-cert.yml
+-    vars:
+-      certgen_title: Certificate 4
+-      certificate_name: cert-4
+-      key_type: rsa
+-      rsa_bits: 2048
+-      subject_alt_name: "DNS:example.com,DNS:t1.example.com,DNS:test.t2.example.com,DNS:example.org,DNS:test.example.org"
+-      subject_alt_name_critical: no
+-      account_key: account-rsa2048
+-      challenge: http-01
+-      modify_account: no
+-      deactivate_authzs: yes
+-      force: yes
+-      remaining_days: 10
+-      terms_agreed: no
+-      account_email: ""
+-  - name: Obtain cert 5
+-    include_tasks: obtain-cert.yml
+-    vars:
+-      certgen_title: Certificate 5, Iteration 1/4
+-      certificate_name: cert-5
+-      key_type: ec521
+-      subject_alt_name: "DNS:t2.example.com"
+-      subject_alt_name_critical: no
+-      account_key: account-ec384
+-      challenge: http-01
+-      modify_account: no
+-      deactivate_authzs: yes
+-      force: yes
+-      remaining_days: 10
+-      terms_agreed: no
+-      account_email: ""
+-  - name: Obtain cert 5 (should not, since already there and valid for more than 10 days)
+-    include_tasks: obtain-cert.yml
+-    vars:
+-      certgen_title: Certificate 5, Iteration 2/4
+-      certificate_name: cert-5
+-      key_type: ec521
+-      subject_alt_name: "DNS:t2.example.com"
+-      subject_alt_name_critical: no
+-      account_key: account-ec384
+-      challenge: http-01
+-      modify_account: no
+-      deactivate_authzs: yes
+-      force: no
+-      remaining_days: 10
+-      terms_agreed: no
+-      account_email: ""
+-  - set_fact:
+-      cert_5_recreate_1: "{{ challenge_data is changed }}"
+-  - name: Obtain cert 5 (should again by less days)
+-    include_tasks: obtain-cert.yml
+-    vars:
+-      certgen_title: Certificate 5, Iteration 3/4
+-      certificate_name: cert-5
+-      key_type: ec521
+-      subject_alt_name: "DNS:t2.example.com"
+-      subject_alt_name_critical: no
+-      account_key: account-ec384
+-      challenge: http-01
+-      modify_account: no
+-      deactivate_authzs: yes
+-      force: yes
+-      remaining_days: 1000
+-      terms_agreed: no
+-      account_email: ""
+-  - set_fact:
+-      cert_5_recreate_2: "{{ challenge_data is changed }}"
+-  - name: Obtain cert 5 (should again by force)
+-    include_tasks: obtain-cert.yml
+-    vars:
+-      certgen_title: Certificate 5, Iteration 4/4
+-      certificate_name: cert-5
+-      key_type: ec521
+-      subject_alt_name: "DNS:t2.example.com"
+-      subject_alt_name_critical: no
+-      account_key_content: "{{ lookup('file', output_dir ~ '/account-ec384.pem') }}"
+-      challenge: http-01
+-      modify_account: no
+-      deactivate_authzs: yes
+-      force: yes
+-      remaining_days: 10
+-      terms_agreed: no
+-      account_email: ""
+-  - set_fact:
+-      cert_5_recreate_3: "{{ challenge_data is changed }}"
+-  - name: Obtain cert 6
+-    include_tasks: obtain-cert.yml
+-    vars:
+-      certgen_title: Certificate 6
+-      certificate_name: cert-6
+-      key_type: rsa
+-      rsa_bits: 2048
+-      subject_alt_name: "DNS:example.org"
+-      subject_alt_name_critical: no
+-      account_key: account-ec256
+-      challenge: tls-alpn-01
+-      modify_account: yes
+-      deactivate_authzs: no
+-      force: no
+-      remaining_days: 10
+-      terms_agreed: yes
+-      account_email: "example@example.org"
+-  ## DISSECT CERTIFICATES #######################################################################
+-  # Make sure certificates are valid. Root certificate for Pebble equals the chain certificate.
+-  - name: Verifying cert 1
+-    command: openssl verify -CAfile "{{ output_dir }}/cert-1-chain.pem" "{{ output_dir }}/cert-1.pem"
+-    ignore_errors: yes
+-    register: cert_1_valid
+-  - name: Verifying cert 2
+-    command: openssl verify -CAfile "{{ output_dir }}/cert-2-chain.pem" "{{ output_dir }}/cert-2.pem"
+-    ignore_errors: yes
+-    register: cert_2_valid
+-  - name: Verifying cert 3
+-    command: openssl verify -CAfile "{{ output_dir }}/cert-3-chain.pem" "{{ output_dir }}/cert-3.pem"
+-    ignore_errors: yes
+-    register: cert_3_valid
+-  - name: Verifying cert 4
+-    command: openssl verify -CAfile "{{ output_dir }}/cert-4-chain.pem" "{{ output_dir }}/cert-4.pem"
+-    ignore_errors: yes
+-    register: cert_4_valid
+-  - name: Verifying cert 5
+-    command: openssl verify -CAfile "{{ output_dir }}/cert-5-chain.pem" "{{ output_dir }}/cert-5.pem"
+-    ignore_errors: yes
+-    register: cert_5_valid
+-  - name: Verifying cert 6
+-    command: openssl verify -CAfile "{{ output_dir }}/cert-6-chain.pem" "{{ output_dir }}/cert-6.pem"
+-    ignore_errors: yes
+-    register: cert_6_valid
+-  # Dump certificate info
+-  - name: Dumping cert 1
+-    command: openssl x509 -in "{{ output_dir }}/cert-1.pem" -noout -text
+-    register: cert_1_text
+-  - name: Dumping cert 2
+-    command: openssl x509 -in "{{ output_dir }}/cert-2.pem" -noout -text
+-    register: cert_2_text
+-  - name: Dumping cert 3
+-    command: openssl x509 -in "{{ output_dir }}/cert-3.pem" -noout -text
+-    register: cert_3_text
+-  - name: Dumping cert 4
+-    command: openssl x509 -in "{{ output_dir }}/cert-4.pem" -noout -text
+-    register: cert_4_text
+-  - name: Dumping cert 5
+-    command: openssl x509 -in "{{ output_dir }}/cert-5.pem" -noout -text
+-    register: cert_5_text
+-  - name: Dumping cert 6
+-    command: openssl x509 -in "{{ output_dir }}/cert-6.pem" -noout -text
+-    register: cert_6_text
++      select_crypto_backend: openssl
+ 
+   - import_tasks: ../tests/validate.yml
+ 
+   # Old 0.9.8 versions have insufficient CLI support for signing with EC keys
+   when: openssl_version.stdout is version('1.0.0', '>=')
++
++- name: Remove output directory
++  file:
++    path: "{{ output_dir }}"
++    state: absent
++
++- name: Re-create output directory
++  file:
++    path: "{{ output_dir }}"
++    state: directory
++
++- block:
++  - name: Running tests with cryptography backend
++    include_tasks: impl.yml
++    vars:
++      select_crypto_backend: cryptography
++
++  - import_tasks: ../tests/validate.yml
++
++  when: cryptography_version.stdout is version('1.5', '>=')
+diff --git a/test/integration/targets/acme_certificate_revoke/tasks/impl.yml b/test/integration/targets/acme_certificate_revoke/tasks/impl.yml
+new file mode 100644
+index 0000000000..69545b6971
+--- /dev/null
++++ b/test/integration/targets/acme_certificate_revoke/tasks/impl.yml
+@@ -0,0 +1,89 @@
++---
++## SET UP ACCOUNT KEYS ########################################################################
++- name: Create ECC256 account key
++  command: openssl ecparam -name prime256v1 -genkey -out {{ output_dir }}/account-ec256.pem
++- name: Create ECC384 account key
++  command: openssl ecparam -name secp384r1 -genkey -out {{ output_dir }}/account-ec384.pem
++- name: Create RSA-2048 account key
++  command: openssl genrsa -out {{ output_dir }}/account-rsa2048.pem 2048
++## CREATE ACCOUNTS AND OBTAIN CERTIFICATES ####################################################
++- name: Obtain cert 1
++  include_tasks: obtain-cert.yml
++  vars:
++    certgen_title: Certificate 1 for revocation
++    certificate_name: cert-1
++    key_type: rsa
++    rsa_bits: 2048
++    subject_alt_name: "DNS:example.com"
++    subject_alt_name_critical: no
++    account_key_content: "{{ lookup('file', output_dir ~ '/account-ec256.pem') }}"
++    challenge: http-01
++    modify_account: yes
++    deactivate_authzs: no
++    force: no
++    remaining_days: 10
++    terms_agreed: yes
++    account_email: "example@example.org"
++- name: Obtain cert 2
++  include_tasks: obtain-cert.yml
++  vars:
++    certgen_title: Certificate 2 for revocation
++    certificate_name: cert-2
++    key_type: ec256
++    subject_alt_name: "DNS:*.example.com"
++    subject_alt_name_critical: yes
++    account_key: account-ec384
++    challenge: dns-01
++    modify_account: yes
++    deactivate_authzs: yes
++    force: no
++    remaining_days: 10
++    terms_agreed: yes
++    account_email: "example@example.org"
++- name: Obtain cert 3
++  include_tasks: obtain-cert.yml
++  vars:
++    certgen_title: Certificate 3 for revocation
++    certificate_name: cert-3
++    key_type: ec384
++    subject_alt_name: "DNS:t1.example.com"
++    subject_alt_name_critical: no
++    account_key: account-rsa2048
++    challenge: dns-01
++    modify_account: yes
++    deactivate_authzs: no
++    force: no
++    remaining_days: 10
++    terms_agreed: yes
++    account_email: "example@example.org"
++## REVOKE CERTIFICATES ########################################################################
++- name: Revoke certificate 1 via account key
++  acme_certificate_revoke:
++    select_crypto_backend: "{{ select_crypto_backend }}"
++    account_key_src: "{{ output_dir }}/account-ec256.pem"
++    certificate: "{{ output_dir }}/cert-1.pem"
++    acme_version: 2
++    acme_directory: https://{{ acme_host }}:14000/dir
++    validate_certs: no
++  ignore_errors: yes
++  register: cert_1_revoke
++- name: Revoke certificate 2 via certificate private key
++  acme_certificate_revoke:
++    select_crypto_backend: "{{ select_crypto_backend }}"
++    private_key_src: "{{ output_dir }}/cert-2.key"
++    certificate: "{{ output_dir }}/cert-2.pem"
++    acme_version: 2
++    acme_directory: https://{{ acme_host }}:14000/dir
++    validate_certs: no
++  ignore_errors: yes
++  register: cert_2_revoke
++- name: Revoke certificate 3 via account key (fullchain)
++  acme_certificate_revoke:
++    select_crypto_backend: "{{ select_crypto_backend }}"
++    account_key_content: "{{ lookup('file', output_dir ~ '/account-rsa2048.pem') }}"
++    certificate: "{{ output_dir }}/cert-3-fullchain.pem"
++    acme_version: 2
++    acme_directory: https://{{ acme_host }}:14000/dir
++    validate_certs: no
++  ignore_errors: yes
++  register: cert_3_revoke
+diff --git a/test/integration/targets/acme_certificate_revoke/tasks/main.yml b/test/integration/targets/acme_certificate_revoke/tasks/main.yml
+index 3185878344..e46c6dc4d0 100644
+--- a/test/integration/targets/acme_certificate_revoke/tasks/main.yml
++++ b/test/integration/targets/acme_certificate_revoke/tasks/main.yml
+@@ -1,92 +1,31 @@
+ ---
+ - block:
+-  ## SET UP ACCOUNT KEYS ########################################################################
+-  - name: Create ECC256 account key
+-    command: openssl ecparam -name prime256v1 -genkey -out {{ output_dir }}/account-ec256.pem
+-  - name: Create ECC384 account key
+-    command: openssl ecparam -name secp384r1 -genkey -out {{ output_dir }}/account-ec384.pem
+-  - name: Create RSA-2048 account key
+-    command: openssl genrsa -out {{ output_dir }}/account-rsa2048.pem 2048
+-  ## CREATE ACCOUNTS AND OBTAIN CERTIFICATES ####################################################
+-  - name: Obtain cert 1
+-    include_tasks: obtain-cert.yml
++  - name: Running tests with OpenSSL backend
++    include_tasks: impl.yml
+     vars:
+-      certgen_title: Certificate 1 for revocation
+-      certificate_name: cert-1
+-      key_type: rsa
+-      rsa_bits: 2048
+-      subject_alt_name: "DNS:example.com"
+-      subject_alt_name_critical: no
+-      account_key_content: "{{ lookup('file', output_dir ~ '/account-ec256.pem') }}"
+-      challenge: http-01
+-      modify_account: yes
+-      deactivate_authzs: no
+-      force: no
+-      remaining_days: 10
+-      terms_agreed: yes
+-      account_email: "example@example.org"
+-  - name: Obtain cert 2
+-    include_tasks: obtain-cert.yml
+-    vars:
+-      certgen_title: Certificate 2 for revocation
+-      certificate_name: cert-2
+-      key_type: ec256
+-      subject_alt_name: "DNS:*.example.com"
+-      subject_alt_name_critical: yes
+-      account_key: account-ec384
+-      challenge: dns-01
+-      modify_account: yes
+-      deactivate_authzs: yes
+-      force: no
+-      remaining_days: 10
+-      terms_agreed: yes
+-      account_email: "example@example.org"
+-  - name: Obtain cert 3
+-    include_tasks: obtain-cert.yml
+-    vars:
+-      certgen_title: Certificate 3 for revocation
+-      certificate_name: cert-3
+-      key_type: ec384
+-      subject_alt_name: "DNS:t1.example.com"
+-      subject_alt_name_critical: no
+-      account_key: account-rsa2048
+-      challenge: dns-01
+-      modify_account: yes
+-      deactivate_authzs: no
+-      force: no
+-      remaining_days: 10
+-      terms_agreed: yes
+-      account_email: "example@example.org"
+-  ## REVOKE CERTIFICATES ########################################################################
+-  - name: Revoke certificate 1 via account key
+-    acme_certificate_revoke:
+-      account_key_src: "{{ output_dir }}/account-ec256.pem"
+-      certificate: "{{ output_dir }}/cert-1.pem"
+-      acme_version: 2
+-      acme_directory: https://{{ acme_host }}:14000/dir
+-      validate_certs: no
+-    ignore_errors: yes
+-    register: cert_1_revoke
+-  - name: Revoke certificate 2 via certificate private key
+-    acme_certificate_revoke:
+-      private_key_src: "{{ output_dir }}/cert-2.key"
+-      certificate: "{{ output_dir }}/cert-2.pem"
+-      acme_version: 2
+-      acme_directory: https://{{ acme_host }}:14000/dir
+-      validate_certs: no
+-    ignore_errors: yes
+-    register: cert_2_revoke
+-  - name: Revoke certificate 3 via account key (fullchain)
+-    acme_certificate_revoke:
+-      account_key_content: "{{ lookup('file', output_dir ~ '/account-rsa2048.pem') }}"
+-      certificate: "{{ output_dir }}/cert-3-fullchain.pem"
+-      acme_version: 2
+-      acme_directory: https://{{ acme_host }}:14000/dir
+-      validate_certs: no
+-    ignore_errors: yes
+-    register: cert_3_revoke
++      select_crypto_backend: openssl
+ 
+   - import_tasks: ../tests/validate.yml
+ 
+   # Old 0.9.8 versions have insufficient CLI support for signing with EC keys
+   when: openssl_version.stdout is version('1.0.0', '>=')
++
++- name: Remove output directory
++  file:
++    path: "{{ output_dir }}"
++    state: absent
++
++- name: Re-create output directory
++  file:
++    path: "{{ output_dir }}"
++    state: directory
++
++- block:
++  - name: Running tests with cryptography backend
++    include_tasks: impl.yml
++    vars:
++      select_crypto_backend: cryptography
++
++  - import_tasks: ../tests/validate.yml
++
++  when: cryptography_version.stdout is version('1.5', '>=')
+diff --git a/test/integration/targets/setup_acme/tasks/obtain-cert.yml b/test/integration/targets/setup_acme/tasks/obtain-cert.yml
+index f415fa5857..70a93d923b 100644
+--- a/test/integration/targets/setup_acme/tasks/obtain-cert.yml
++++ b/test/integration/targets/setup_acme/tasks/obtain-cert.yml
+@@ -22,6 +22,7 @@
+ ## ACME STEP 1 ################################################################################
+ - name: ({{ certgen_title }}) Obtain cert, step 1
+   acme_certificate:
++    select_crypto_backend: "{{ select_crypto_backend }}"
+     acme_version: 2
+     acme_directory: https://{{ acme_host }}:14000/dir
+     validate_certs: no
+@@ -41,6 +42,7 @@
+   when: account_key_content is not defined
+ - name: ({{ certgen_title }}) Obtain cert, step 1 (using account key data)
+   acme_certificate:
++    select_crypto_backend: "{{ select_crypto_backend }}"
+     acme_version: 2
+     acme_directory: https://{{ acme_host }}:14000/dir
+     validate_certs: no
+@@ -96,6 +98,7 @@
+ ## ACME STEP 2 ################################################################################
+ - name: ({{ certgen_title }}) Obtain cert, step 2
+   acme_certificate:
++    select_crypto_backend: "{{ select_crypto_backend }}"
+     acme_version: 2
+     acme_directory: https://{{ acme_host }}:14000/dir
+     validate_certs: no
+@@ -115,6 +118,7 @@
+   when: challenge_data is changed and account_key_content is not defined
+ - name: ({{ certgen_title }}) Obtain cert, step 2 (using account key data)
+   acme_certificate:
++    select_crypto_backend: "{{ select_crypto_backend }}"
+     acme_version: 2
+     acme_directory: https://{{ acme_host }}:14000/dir
+     validate_certs: no

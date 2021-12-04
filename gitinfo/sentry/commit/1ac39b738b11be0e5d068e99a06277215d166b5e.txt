@@ -1,0 +1,771 @@
+commit 1ac39b738b11be0e5d068e99a06277215d166b5e
+Author: Jan Michael Auer <jan.auer@sentry.io>
+Date:   Tue Jun 30 17:27:53 2020 +0200
+
+    feat(store): Refund filtered and dropped attachments (#19599)
+    
+    Tracks outcomes for all paths in which we discard or drop attachments
+    and refunds their quota.
+    
+    Refunds are more theoretical. We currently do not have any tracked rate
+    limits for attachments, and it's unlikely that we ever will.
+
+diff --git a/src/sentry/attachments/base.py b/src/sentry/attachments/base.py
+index 996ed03107..8db7d314a2 100644
+--- a/src/sentry/attachments/base.py
++++ b/src/sentry/attachments/base.py
+@@ -30,6 +30,7 @@ class CachedAttachment(object):
+         chunks=None,
+         cache=None,
+         rate_limited=None,
++        size=None,
+         **kwargs
+     ):
+         self.key = key
+@@ -41,6 +42,13 @@ class CachedAttachment(object):
+         assert isinstance(self.type, string_types), self.type
+         self.rate_limited = rate_limited
+ 
++        if size is not None:
++            self.size = size
++        elif data not in (None, UNINITIALIZED_DATA):
++            self.size = len(data)
++        else:
++            self.size = 0
++
+         self._data = data
+         self.chunks = chunks
+         self._cache = cache
+@@ -85,6 +93,7 @@ class CachedAttachment(object):
+                 "content_type": self.content_type,
+                 "type": self.type,
+                 "chunks": self.chunks,
++                "size": self.size or None,  # None for backwards compatibility
+                 "rate_limited": self.rate_limited,
+             }
+         )
+diff --git a/src/sentry/event_manager.py b/src/sentry/event_manager.py
+index 4df9dbe52a..f15b48d796 100644
+--- a/src/sentry/event_manager.py
++++ b/src/sentry/event_manager.py
+@@ -475,6 +475,14 @@ class EventManager(object):
+         _get_or_create_release_many(jobs, projects)
+         _get_event_user_many(jobs, projects)
+ 
++        job["project_key"] = None
++        if job["key_id"] is not None:
++            with metrics.timer("event_manager.load_project_key"):
++                try:
++                    job["project_key"] = ProjectKey.objects.get_from_cache(id=job["key_id"])
++                except ProjectKey.DoesNotExist:
++                    pass
++
+         with metrics.timer("event_manager.load_grouping_config"):
+             # At this point we want to normalize the in_app values in case the
+             # clients did not set this appropriately so far.
+@@ -531,36 +539,19 @@ class EventManager(object):
+         if job["release"]:
+             kwargs["first_release"] = job["release"]
+ 
++        # Load attachments first, but persist them at the very last after
++        # posting to eventstream to make sure all counters and eventstream are
++        # incremented for sure. Also wait for grouping to remove attachments
++        # based on the group counter.
++        with metrics.timer("event_manager.get_attachments"):
++            attachments = get_attachments(cache_key, job)
++
+         try:
+             job["group"], job["is_new"], job["is_regression"] = _save_aggregate(
+                 event=job["event"], hashes=hashes, release=job["release"], **kwargs
+             )
+         except HashDiscarded:
+-            project_key = None
+-            if job["key_id"] is not None:
+-                try:
+-                    project_key = ProjectKey.objects.get_from_cache(id=job["key_id"])
+-                except ProjectKey.DoesNotExist:
+-                    pass
+-
+-            quotas.refund(project, key=project_key, timestamp=start_time)
+-
+-            track_outcome(
+-                org_id=project.organization_id,
+-                project_id=project_id,
+-                key_id=job["key_id"],
+-                outcome=Outcome.FILTERED,
+-                reason=FilterStatKeys.DISCARDED_HASH,
+-                timestamp=to_datetime(job["start_time"]),
+-                event_id=job["event"].event_id,
+-                category=job["category"],
+-            )
+-
+-            metrics.incr(
+-                "events.discarded",
+-                skip_internal=True,
+-                tags={"organization_id": project.organization_id, "platform": job["platform"]},
+-            )
++            discard_event(job, attachments)
+             raise
+ 
+         job["event"].group = job["group"]
+@@ -597,23 +588,16 @@ class EventManager(object):
+                 group=job["group"], environment=job["environment"]
+             )
+ 
++        # XXX: DO NOT MUTATE THE EVENT PAYLOAD AFTER THIS POINT
+         _materialize_event_metrics(jobs)
+ 
+-        # Load attachments first, but persist them at the very last after
+-        # posting to eventstream to make sure all counters and eventstream are
+-        # incremented for sure.
+-        attachments = []
+-        for attachment in get_attachments(cache_key, job["event"]):
+-            try:
+-                attachment_data = attachment.data
+-            except MissingAttachmentChunks:
+-                logger.exception("Missing chunks for cache_key=%s", cache_key)
+-            else:
+-                key = "bytes.stored.%s" % (attachment.type,)
+-                job["event_metrics"][key] = (job["event_metrics"].get(key) or 0) + len(
+-                    attachment_data
+-                )
+-                attachments.append(attachment)
++        with metrics.timer("event_manager.filter_attachments_for_group"):
++            attachments = filter_attachments_for_group(attachments, job)
++
++        for attachment in attachments:
++            key = "bytes.stored.%s" % (attachment.type,)
++            old_bytes = job["event_metrics"].get(key) or 0
++            job["event_metrics"][key] = old_bytes + attachment.size
+ 
+         _nodestore_save_many(jobs)
+ 
+@@ -646,7 +630,8 @@ class EventManager(object):
+ 
+         # Do this last to ensure signals get emitted even if connection to the
+         # file store breaks temporarily.
+-        save_attachments(attachments, job)
++        with metrics.timer("event_manager.save_attachments"):
++            save_attachments(cache_key, attachments, job)
+ 
+         metric_tags = {"from_relay": "_relay_processed" in job["data"]}
+ 
+@@ -1240,32 +1225,114 @@ def _process_existing_aggregate(group, event, data, release):
+     return is_regression
+ 
+ 
+-def get_attachments(cache_key, event):
++def discard_event(job, attachments):
+     """
+-    Computes a list of attachments that should be stored.
++    Refunds consumed quotas for an event and its attachments.
+ 
+-    This method checks whether event attachments are available and sends them to
+-    the blob store. There is special handling for crash reports which may
+-    contain unstripped PII. If the project or organization is configured to
+-    limit the amount of crash reports per group, the number of stored crashes is
+-    limited.
++    For the event and each dropped attachment, an outcome
++    FILTERED(discarded-hash) is emitted.
+ 
+-    :param cache_key: The cache key at which the event payload is stored in the
+-                    cache. This is used to retrieve attachments.
+-    :param event:     The event model instance.
++    :param job:         The job context container.
++    :param attachments: The full list of attachments to filter.
+     """
+-    filtered = []
+ 
++    project = job["event"].project
++
++    quotas.refund(
++        project,
++        key=job["project_key"],
++        timestamp=job["start_time"],
++        category=job["category"],
++        quantity=1,
++    )
++
++    track_outcome(
++        org_id=project.organization_id,
++        project_id=job["project_id"],
++        key_id=job["key_id"],
++        outcome=Outcome.FILTERED,
++        reason=FilterStatKeys.DISCARDED_HASH,
++        timestamp=to_datetime(job["start_time"]),
++        event_id=job["event"].event_id,
++        category=job["category"],
++    )
++
++    attachment_quantity = 0
++    for attachment in attachments:
++        # Quotas are counted with at least ``1`` for attachments.
++        attachment_quantity += attachment.size or 1
++
++        track_outcome(
++            org_id=project.organization_id,
++            project_id=job["project_id"],
++            key_id=job["key_id"],
++            outcome=Outcome.FILTERED,
++            reason=FilterStatKeys.DISCARDED_HASH,
++            timestamp=to_datetime(job["start_time"]),
++            event_id=job["event"].event_id,
++            category=DataCategory.ATTACHMENT,
++            quantity=attachment.size,
++        )
++
++    if attachment_quantity:
++        quotas.refund(
++            project,
++            key=job["project_key"],
++            timestamp=job["start_time"],
++            category=DataCategory.ATTACHMENT,
++            quantity=attachment_quantity,
++        )
++
++    metrics.incr(
++        "events.discarded",
++        skip_internal=True,
++        tags={"organization_id": project.organization_id, "platform": job["platform"]},
++    )
++
++
++def get_attachments(cache_key, job):
++    """
++    Retrieves the list of attachments for this event.
++
++    This method skips attachments that have been marked for rate limiting by
++    earlier ingestion pipeline.
++
++    :param cache_key: The cache key at which the event payload is stored in the
++                      cache. This is used to retrieve attachments.
++    :param job:       The job context container.
++    """
+     if cache_key is None:
+-        return filtered
++        return []
+ 
+-    project = event.project
++    project = job["event"].project
+     if not features.has("organizations:event-attachments", project.organization, actor=None):
+-        return filtered
++        return []
+ 
+     attachments = list(attachment_cache.get(cache_key))
+     if not attachments:
+-        return filtered
++        return []
++
++    return [attachment for attachment in attachments if not attachment.rate_limited]
++
++
++def filter_attachments_for_group(attachments, job):
++    """
++    Removes crash reports exceeding the group-limit.
++
++    If the project or organization is configured to limit the amount of crash
++    reports per group, the number of stored crashes is limited. This requires
++    `event.group` to be set.
++
++    Emits one outcome per removed attachment.
++
++    :param attachments: The full list of attachments to filter.
++    :param job:         The job context container.
++    """
++    if not attachments:
++        return attachments
++
++    event = job["event"]
++    project = event.project
+ 
+     # The setting is both an organization and project setting. The project
+     # setting strictly overrides the organization setting, unless set to the
+@@ -1285,19 +1352,29 @@ def get_attachments(cache_key, event):
+         cached_reports = 0
+     stored_reports = cached_reports
+ 
++    filtered = []
++    refund_quantity = 0
+     for attachment in attachments:
+-        # Relay can mark attachments as ``rate_limited``, in which case they
+-        # should not be saved. They where only retained to allow event
+-        # processing.
+-        if attachment.rate_limited:
+-            continue
+-
+         # If the attachment is a crash report (e.g. minidump), we need to honor
+         # the store_crash_reports setting. Otherwise, we assume that the client
+         # has already verified PII and just store the attachment.
+         if attachment.type in CRASH_REPORT_TYPES:
+             if crashreports_exceeded(stored_reports, max_crashreports):
+-                continue  # TODO: Refund quota
++                track_outcome(
++                    org_id=event.project.organization_id,
++                    project_id=job["project_id"],
++                    key_id=job["key_id"],
++                    outcome=Outcome.FILTERED,
++                    reason=FilterStatKeys.CRASH_REPORT_LIMIT,
++                    timestamp=to_datetime(job["start_time"]),
++                    event_id=event.event_id,
++                    category=DataCategory.ATTACHMENT,
++                    quantity=attachment.size,
++                )
++
++                # Quotas are counted with at least ``1`` for attachments.
++                refund_quantity += attachment.size or 1
++                continue
+             stored_reports += 1
+ 
+         filtered.append(attachment)
+@@ -1309,25 +1386,54 @@ def get_attachments(cache_key, event):
+     if crashreports_exceeded(stored_reports, max_crashreports) and stored_reports > cached_reports:
+         cache.set(crashreports_key, max_crashreports, CRASH_REPORT_TIMEOUT)
+ 
++    if refund_quantity:
++        quotas.refund(
++            project,
++            key=job["project_key"],
++            timestamp=job["start_time"],
++            category=DataCategory.ATTACHMENT,
++            quantity=refund_quantity,
++        )
++
+     return filtered
+ 
+ 
+-def save_attachments(attachments, job):
++def save_attachments(cache_key, attachments, job):
+     """
+     Persists cached event attachments into the file store.
+ 
++    Emits one outcome per attachment, either ACCEPTED on success or
++    INVALID(missing_chunks) if retrieving the attachment fails.
++
+     :param attachments: A filtered list of attachments to save.
+     :param job:         The job context container.
+     """
+     event = job["event"]
+ 
+     for attachment in attachments:
++        try:
++            data = attachment.data
++        except MissingAttachmentChunks:
++            track_outcome(
++                org_id=event.project.organization_id,
++                project_id=job["project_id"],
++                key_id=job["key_id"],
++                outcome=Outcome.INVALID,
++                reason="missing_chunks",
++                timestamp=to_datetime(job["start_time"]),
++                event_id=event.event_id,
++                category=DataCategory.ATTACHMENT,
++            )
++
++            logger.exception("Missing chunks for cache_key=%s", cache_key)
++            continue
++
+         file = File.objects.create(
+             name=attachment.name,
+             type=attachment.type,
+             headers={"Content-Type": attachment.content_type},
+         )
+-        file.putfile(six.BytesIO(attachment.data))
++        file.putfile(six.BytesIO(data))
+ 
+         EventAttachment.objects.create(
+             event_id=event.event_id,
+@@ -1346,7 +1452,7 @@ def save_attachments(attachments, job):
+             timestamp=to_datetime(job["start_time"]),
+             event_id=event.event_id,
+             category=DataCategory.ATTACHMENT,
+-            quantity=len(attachment.data) or 1,
++            quantity=attachment.size or 1,
+         )
+ 
+ 
+diff --git a/src/sentry/quotas/base.py b/src/sentry/quotas/base.py
+index b1e7a68d3f..9a7e6a7cc4 100644
+--- a/src/sentry/quotas/base.py
++++ b/src/sentry/quotas/base.py
+@@ -263,7 +263,7 @@ class Quota(Service):
+         """
+         return NotRateLimited()
+ 
+-    def refund(self, project, key=None, timestamp=None):
++    def refund(self, project, key=None, timestamp=None, category=None, quantity=None):
+         """
+         Signals event rejection after ``quotas.is_rate_limited`` has been called
+         successfully, and refunds the previously consumed quota.
+@@ -275,6 +275,13 @@ class Quota(Service):
+         :param timestamp: The timestamp at which data was ingested. This is used
+                           to determine the correct quota window to refund the
+                           previously consumed data to.
++        :param category:  The data category of the item to refund. This is used
++                          to determine the quotas that should be refunded.
++                          Defaults to ``DataCategory.ERROR``.
++        :param quantity:  The quantity to refund. Defaults to ``1``, which is
++                          the only value that should be used for events. For
++                          attachments, this should be set to the size of the
++                          attachment in bytes.
+         """
+         pass
+ 
+diff --git a/src/sentry/quotas/redis.py b/src/sentry/quotas/redis.py
+index 53dcf5ea99..cc0a426767 100644
+--- a/src/sentry/quotas/redis.py
++++ b/src/sentry/quotas/redis.py
+@@ -164,11 +164,24 @@ class RedisQuota(Quota):
+     def get_refunded_quota_key(self, key):
+         return u"r:{}".format(key)
+ 
+-    def refund(self, project, key=None, timestamp=None):
++    def refund(self, project, key=None, timestamp=None, category=None, quantity=None):
+         if timestamp is None:
+             timestamp = time()
+ 
+-        quotas = [quota for quota in self.get_quotas(project, key=key) if quota.should_track]
++        if category is None:
++            category = DataCategory.ERROR
++
++        if quantity is None:
++            quantity = 1
++
++        # only refund quotas that can be tracked and that specify the given
++        # category. an empty categories list usually refers to all categories,
++        # but such quotas are invalid with counters.
++        quotas = [
++            quota
++            for quota in self.get_quotas(project, key=key)
++            if quota.should_track and category in quota.categories
++        ]
+ 
+         if not quotas:
+             return
+@@ -184,7 +197,7 @@ class RedisQuota(Quota):
+             return_key = self.get_refunded_quota_key(
+                 self.__get_redis_key(quota, timestamp, shift, project.organization_id)
+             )
+-            pipe.incr(return_key, 1)
++            pipe.incr(return_key, quantity)
+             pipe.expireat(return_key, int(expiry))
+ 
+         pipe.execute()
+diff --git a/src/sentry/utils/data_filters.py b/src/sentry/utils/data_filters.py
+index e966fa4397..f2cf95d0f6 100644
+--- a/src/sentry/utils/data_filters.py
++++ b/src/sentry/utils/data_filters.py
+@@ -26,7 +26,8 @@ class FilterStatKeys(object):
+     WEB_CRAWLER = "web-crawlers"
+     INVALID_CSP = "invalid-csp"
+     CORS = "cors"
+-    DISCARDED_HASH = "discarded-hash"
++    DISCARDED_HASH = "discarded-hash"  # Not replicated in Relay
++    CRASH_REPORT_LIMIT = "crash-report-limit"  # Not replicated in Relay
+ 
+ 
+ FILTER_STAT_KEYS_TO_VALUES = {
+diff --git a/src/sentry/utils/outcomes.py b/src/sentry/utils/outcomes.py
+index 4382487186..329ad2782e 100644
+--- a/src/sentry/utils/outcomes.py
++++ b/src/sentry/utils/outcomes.py
+@@ -61,7 +61,11 @@ def mark_tsdb_incremented(project_id, event_id):
+     mark_tsdb_incremented_many([(project_id, event_id)])
+ 
+ 
+-def tsdb_increments_from_outcome(org_id, project_id, key_id, outcome, reason):
++def tsdb_increments_from_outcome(org_id, project_id, key_id, outcome, reason, category):
++    category = category if category is not None else DataCategory.ERROR
++    if category not in DataCategory.event_categories():
++        return
++
+     if outcome != Outcome.INVALID:
+         # This simply preserves old behavior. We never counted invalid events
+         # (too large, duplicate, CORS) toward regular `received` counts.
+@@ -136,7 +140,12 @@ def track_outcome(
+     if not tsdb_in_consumer:
+         increment_list = list(
+             tsdb_increments_from_outcome(
+-                org_id=org_id, project_id=project_id, key_id=key_id, outcome=outcome, reason=reason
++                org_id=org_id,
++                project_id=project_id,
++                key_id=key_id,
++                outcome=outcome,
++                reason=reason,
++                category=category,
+             )
+         )
+ 
+diff --git a/tests/sentry/event_manager/test_event_manager.py b/tests/sentry/event_manager/test_event_manager.py
+index d609121e0f..10cde02905 100644
+--- a/tests/sentry/event_manager/test_event_manager.py
++++ b/tests/sentry/event_manager/test_event_manager.py
+@@ -1015,19 +1015,39 @@ class EventManagerTest(TestCase):
+         )
+         GroupHash.objects.filter(group=group).update(group=None, group_tombstone_id=tombstone.id)
+ 
+-        manager = EventManager(make_event(message="foo", event_id="b" * 32, fingerprint=["a" * 32]))
++        manager = EventManager(
++            make_event(message="foo", event_id="b" * 32, fingerprint=["a" * 32]),
++            project=self.project,
++        )
++        manager.normalize()
++
++        a1 = CachedAttachment(name="a1", data=b"hello")
++        a2 = CachedAttachment(name="a2", data=b"world")
++
++        cache_key = cache_key_for_event(manager.get_data())
++        attachment_cache.set(cache_key, attachments=[a1, a2])
+ 
+         from sentry.utils.outcomes import track_outcome
+ 
+         mock_track_outcome = mock.Mock(wraps=track_outcome)
+         with mock.patch("sentry.event_manager.track_outcome", mock_track_outcome):
+-            with self.tasks():
+-                with self.assertRaises(HashDiscarded):
+-                    event = manager.save(1)
++            with self.feature("organizations:event-attachments"):
++                with self.tasks():
++                    with self.assertRaises(HashDiscarded):
++                        event = manager.save(1, cache_key=cache_key)
+ 
+-        assert_mock_called_once_with_partial(
+-            mock_track_outcome, outcome=Outcome.FILTERED, reason=FilterStatKeys.DISCARDED_HASH
+-        )
++        assert mock_track_outcome.call_count == 3
++
++        for o in mock_track_outcome.mock_calls:
++            assert o.kwargs["outcome"] == Outcome.FILTERED
++            assert o.kwargs["reason"] == FilterStatKeys.DISCARDED_HASH
++
++        o = mock_track_outcome.mock_calls[0]
++        assert o.kwargs["category"] == DataCategory.DEFAULT
++
++        for o in mock_track_outcome.mock_calls[1:]:
++            assert o.kwargs["category"] == DataCategory.ATTACHMENT
++            assert o.kwargs["quantity"] == 5
+ 
+         def query(model, key, **kwargs):
+             return tsdb.get_sums(model, [key], event.datetime, event.datetime, **kwargs)[key]
+@@ -1042,6 +1062,60 @@ class EventManagerTest(TestCase):
+         assert query(tsdb.models.organization_total_blacklisted, event.project.organization.id) == 1
+         assert query(tsdb.models.project_total_blacklisted, event.project.id) == 1
+ 
++    def test_honors_crash_report_limit(self):
++        from sentry.utils.outcomes import track_outcome
++
++        mock_track_outcome = mock.Mock(wraps=track_outcome)
++
++        # Allow exactly one crash report
++        self.project.update_option("sentry:store_crash_reports", 1)
++
++        manager = EventManager(
++            make_event(message="foo", event_id="a" * 32, fingerprint=["a" * 32]),
++            project=self.project,
++        )
++        manager.normalize()
++
++        a1 = CachedAttachment(name="a1", data=b"hello", type="event.minidump")
++        a2 = CachedAttachment(name="a2", data=b"world")
++        cache_key = cache_key_for_event(manager.get_data())
++        attachment_cache.set(cache_key, attachments=[a1, a2])
++
++        with mock.patch("sentry.event_manager.track_outcome", mock_track_outcome):
++            with self.feature("organizations:event-attachments"):
++                with self.tasks():
++                    manager.save(self.project.id, cache_key=cache_key)
++
++        # The first minidump should be accepted, since the limit is 1
++        assert mock_track_outcome.call_count == 3
++        for o in mock_track_outcome.mock_calls:
++            assert o.kwargs["outcome"] == Outcome.ACCEPTED
++
++        mock_track_outcome.reset_mock()
++
++        manager = EventManager(
++            make_event(message="foo", event_id="b" * 32, fingerprint=["a" * 32]),
++            project=self.project,
++        )
++        manager.normalize()
++
++        cache_key = cache_key_for_event(manager.get_data())
++        attachment_cache.set(cache_key, attachments=[a1, a2])
++
++        with mock.patch("sentry.event_manager.track_outcome", mock_track_outcome):
++            with self.feature("organizations:event-attachments"):
++                with self.tasks():
++                    manager.save(self.project.id, cache_key=cache_key)
++
++        assert mock_track_outcome.call_count == 3
++        o = mock_track_outcome.mock_calls[0]
++        assert o.kwargs["outcome"] == Outcome.FILTERED
++        assert o.kwargs["category"] == DataCategory.ATTACHMENT
++        assert o.kwargs["reason"] == FilterStatKeys.CRASH_REPORT_LIMIT
++
++        for o in mock_track_outcome.mock_calls[1:]:
++            assert o.kwargs["outcome"] == Outcome.ACCEPTED
++
+     def test_event_accepted_outcome(self):
+         manager = EventManager(make_event(message="foo"))
+         manager.normalize()
+@@ -1054,7 +1128,7 @@ class EventManagerTest(TestCase):
+             mock_track_outcome, outcome=Outcome.ACCEPTED, category=DataCategory.DEFAULT
+         )
+ 
+-    def test_attachment_outcomes(self):
++    def test_attachment_accepted_outcomes(self):
+         manager = EventManager(make_event(message="foo"), project=self.project)
+         manager.normalize()
+ 
+@@ -1082,6 +1156,42 @@ class EventManagerTest(TestCase):
+         final = mock_track_outcome.mock_calls[2]
+         assert final.kwargs["category"] == DataCategory.DEFAULT
+ 
++    def test_attachment_filtered_outcomes(self):
++        manager = EventManager(make_event(message="foo"), project=self.project)
++        manager.normalize()
++
++        # Disable storing all crash reports, which will drop the minidump but save the other
++        a1 = CachedAttachment(name="a1", data=b"minidump", type="event.minidump")
++        a2 = CachedAttachment(name="a2", data=b"limited", rate_limited=True)
++        a3 = CachedAttachment(name="a3", data=b"world")
++
++        cache_key = cache_key_for_event(manager.get_data())
++        attachment_cache.set(cache_key, attachments=[a1, a2, a3])
++
++        mock_track_outcome = mock.Mock()
++        with mock.patch("sentry.event_manager.track_outcome", mock_track_outcome):
++            with self.feature("organizations:event-attachments"):
++                manager.save(1, cache_key=cache_key)
++
++        assert mock_track_outcome.call_count == 3
++
++        # First outcome is the rejection of the minidump
++        o = mock_track_outcome.mock_calls[0]
++        assert o.kwargs["outcome"] == Outcome.FILTERED
++        assert o.kwargs["category"] == DataCategory.ATTACHMENT
++        assert o.kwargs["reason"] == FilterStatKeys.CRASH_REPORT_LIMIT
++
++        # Second outcome is acceptance of the "a3" attachment
++        o = mock_track_outcome.mock_calls[1]
++        assert o.kwargs["outcome"] == Outcome.ACCEPTED
++        assert o.kwargs["category"] == DataCategory.ATTACHMENT
++        assert o.kwargs["quantity"] == 5
++
++        # Last outcome is the event
++        o = mock_track_outcome.mock_calls[2]
++        assert o.kwargs["outcome"] == Outcome.ACCEPTED
++        assert o.kwargs["category"] == DataCategory.DEFAULT
++
+     def test_checksum_rehashed(self):
+         checksum = "invalid checksum hash"
+         manager = EventManager(make_event(**{"checksum": checksum}))
+diff --git a/tests/sentry/quotas/redis/tests.py b/tests/sentry/quotas/redis/tests.py
+index 410221a4a2..316feeeee0 100644
+--- a/tests/sentry/quotas/redis/tests.py
++++ b/tests/sentry/quotas/redis/tests.py
+@@ -203,7 +203,7 @@ class RedisQuotaTest(TestCase):
+         assert usage == [n if q.id else None for q in quotas] + [0, 0]
+ 
+     @mock.patch.object(RedisQuota, "get_quotas")
+-    def test_refund(self, mock_get_quotas):
++    def test_refund_defaults(self, mock_get_quotas):
+         timestamp = time.time()
+ 
+         mock_get_quotas.return_value = (
+@@ -214,6 +214,7 @@ class RedisQuotaTest(TestCase):
+                 limit=None,
+                 window=1,
+                 reason_code="project_quota",
++                categories=[DataCategory.ERROR],
+             ),
+             QuotaConfig(
+                 id="p",
+@@ -222,6 +223,17 @@ class RedisQuotaTest(TestCase):
+                 limit=1,
+                 window=1,
+                 reason_code="project_quota",
++                categories=[DataCategory.ERROR],
++            ),
++            # Should be ignored
++            QuotaConfig(
++                id="a",
++                scope=QuotaScope.PROJECT,
++                scope_id=1,
++                limit=1 ** 6,
++                window=1,
++                reason_code="attachment_quota",
++                categories=[DataCategory.ATTACHMENT],
+             ),
+         )
+ 
+@@ -230,13 +242,66 @@ class RedisQuotaTest(TestCase):
+             six.text_type(self.project.organization.pk)
+         )
+ 
+-        keys = client.keys("r:quota:p:?:*")
+-
+-        assert len(keys) == 2
++        error_keys = client.keys("r:quota:p:?:*")
++        assert len(error_keys) == 2
+ 
+-        for key in keys:
++        for key in error_keys:
+             assert client.get(key) == "1"
+ 
++        attachment_keys = client.keys("r:quota:a:*")
++        assert len(attachment_keys) == 0
++
++    @mock.patch.object(RedisQuota, "get_quotas")
++    def test_refund_categories(self, mock_get_quotas):
++        timestamp = time.time()
++
++        mock_get_quotas.return_value = (
++            QuotaConfig(
++                id="p",
++                scope=QuotaScope.PROJECT,
++                scope_id=1,
++                limit=None,
++                window=1,
++                reason_code="project_quota",
++                categories=[DataCategory.ERROR],
++            ),
++            QuotaConfig(
++                id="p",
++                scope=QuotaScope.PROJECT,
++                scope_id=2,
++                limit=1,
++                window=1,
++                reason_code="project_quota",
++                categories=[DataCategory.ERROR],
++            ),
++            # Should be ignored
++            QuotaConfig(
++                id="a",
++                scope=QuotaScope.PROJECT,
++                scope_id=1,
++                limit=1 ** 6,
++                window=1,
++                reason_code="attachment_quota",
++                categories=[DataCategory.ATTACHMENT],
++            ),
++        )
++
++        self.quota.refund(
++            self.project, timestamp=timestamp, category=DataCategory.ATTACHMENT, quantity=100
++        )
++        client = self.quota.cluster.get_local_client_for_key(
++            six.text_type(self.project.organization.pk)
++        )
++
++        error_keys = client.keys("r:quota:p:?:*")
++        assert len(error_keys) == 0
++
++        attachment_keys = client.keys("r:quota:a:*")
++        assert len(attachment_keys) == 1
++
++        for key in attachment_keys:
++            assert client.get(key) == "100"
++
+     def test_get_usage_uses_refund(self):
+         timestamp = time.time()
+ 

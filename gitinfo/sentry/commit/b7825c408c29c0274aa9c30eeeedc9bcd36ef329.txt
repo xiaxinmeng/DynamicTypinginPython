@@ -1,0 +1,359 @@
+commit b7825c408c29c0274aa9c30eeeedc9bcd36ef329
+Author: Dan Fuller <dfuller@sentry.io>
+Date:   Tue May 14 18:11:36 2019 -0700
+
+    feat(api): Implement api to update incident status
+    
+    Api to update incident status, and create activity rows documenting the change.
+
+diff --git a/src/sentry/api/bases/incident.py b/src/sentry/api/bases/incident.py
+index 92e34e6ec3..5030bc44b3 100644
+--- a/src/sentry/api/bases/incident.py
++++ b/src/sentry/api/bases/incident.py
+@@ -15,7 +15,7 @@ class IncidentPermission(OrganizationPermission):
+     scope_map = {
+         'GET': ['org:read', 'org:write', 'org:admin'],
+         'POST': ['org:write', 'org:admin', 'project:read', 'project:write', 'project:admin'],
+-        'PUT': ['org:write', 'org:admin'],
++        'PUT': ['org:write', 'org:admin', 'project:read', 'project:write', 'project:admin'],
+     }
+ 
+ 
+diff --git a/src/sentry/api/endpoints/organization_incident_details.py b/src/sentry/api/endpoints/organization_incident_details.py
+index 7b00895738..95790b6f7f 100644
+--- a/src/sentry/api/endpoints/organization_incident_details.py
++++ b/src/sentry/api/endpoints/organization_incident_details.py
+@@ -1,5 +1,6 @@
+ from __future__ import absolute_import
+ 
++from rest_framework import serializers
+ from rest_framework.response import Response
+ 
+ from sentry.api.bases.incident import (
+@@ -8,6 +9,28 @@ from sentry.api.bases.incident import (
+ )
+ from sentry.api.serializers import serialize
+ from sentry.api.serializers.models.incident import DetailedIncidentSerializer
++from sentry.incidents.logic import (
++    StatusAlreadyChangedError,
++    update_incident_status,
++)
++from sentry.incidents.models import IncidentStatus
++
++
++class IncidentSerializer(serializers.Serializer):
++    status = serializers.IntegerField()
++    comment = serializers.CharField(required=False)
++
++    def validate_status(self, attrs, source):
++        value = attrs[source]
++        try:
++            attrs[source] = IncidentStatus(value)
++        except Exception:
++            raise serializers.ValidationError(
++                'Invalid value for status. Valid values: {}'.format(
++                    [e.value for e in IncidentStatus],
++                ),
++            )
++        return attrs
+ 
+ 
+ class OrganizationIncidentDetailsEndpoint(IncidentEndpoint):
+@@ -22,3 +45,22 @@ class OrganizationIncidentDetailsEndpoint(IncidentEndpoint):
+         data = serialize(incident, request.user, DetailedIncidentSerializer())
+ 
+         return Response(data)
++
++    def put(self, request, organization, incident):
++        serializer = IncidentSerializer(data=request.DATA)
++        if serializer.is_valid():
++            result = serializer.object
++            try:
++                incident = update_incident_status(
++                    incident=incident,
++                    status=result['status'],
++                    user=request.user,
++                    comment=result.get('comment'),
++                )
++            except StatusAlreadyChangedError:
++                raise Response(
++                    'Status is already set to {}'.format(result['status']),
++                    status=400,
++                )
++            return Response(serialize(incident, request.user), status=200)
++        return Response(serializer.errors, status=400)
+diff --git a/src/sentry/incidents/logic.py b/src/sentry/incidents/logic.py
+index 3f6c1b9da6..de20f1ba13 100644
+--- a/src/sentry/incidents/logic.py
++++ b/src/sentry/incidents/logic.py
+@@ -2,6 +2,7 @@ from __future__ import absolute_import
+ 
+ from datetime import timedelta
+ 
++import six
+ from django.db import transaction
+ from django.utils import timezone
+ 
+@@ -23,6 +24,10 @@ from sentry.utils.snuba import (
+ MAX_INITIAL_INCIDENT_PERIOD = timedelta(days=7)
+ 
+ 
++class StatusAlreadyChangedError(Exception):
++    pass
++
++
+ def create_incident(
+     organization,
+     status,
+@@ -77,6 +82,41 @@ def create_incident(
+     return incident
+ 
+ 
++def update_incident_status(incident, status, user=None, comment=None):
++    """
++    Updates the status of an Incident and write an IncidentActivity row to log
++    the change. When the status is CLOSED we also set the date closed to the
++    current time and (todo) take a snapshot of the current incident state.
++    """
++    if incident.status == status.value:
++        # If the status isn't actually changing just no-op.
++        raise StatusAlreadyChangedError()
++    with transaction.atomic():
++        create_incident_activity(
++            incident,
++            IncidentActivityType.STATUS_CHANGE,
++            user=user,
++            value=status.value,
++            previous_value=incident.status,
++            comment=comment,
++        )
++        kwargs = {
++            'status': status.value,
++        }
++        if status == IncidentStatus.CLOSED:
++            kwargs['date_closed'] = timezone.now()
++            # TODO: Take a snapshot of the current state once we implement
++            # snapshots
++        elif incident.status == IncidentStatus.CLOSED.value:
++            # If we're moving back out of closed status then unset the closed
++            # date
++            kwargs['date_closed'] = None
++            # TODO: Delete snapshot? Not sure if needed
++
++        incident.update(**kwargs)
++        return incident
++
++
+ def create_initial_event_stats_snapshot(incident):
+     """
+     Creates an event snapshot representing the state at the beginning of
+@@ -101,6 +141,8 @@ def create_incident_activity(
+     comment=None,
+     event_stats_snapshot=None,
+ ):
++    value = six.text_type(value) if value is not None else value
++    previous_value = six.text_type(previous_value) if previous_value is not None else previous_value
+     return IncidentActivity.objects.create(
+         incident=incident,
+         type=activity_type.value,
+diff --git a/tests/sentry/api/endpoints/test_organization_incident_details.py b/tests/sentry/api/endpoints/test_organization_incident_details.py
+index 9cee9dae24..ad70d98ec3 100644
+--- a/tests/sentry/api/endpoints/test_organization_incident_details.py
++++ b/tests/sentry/api/endpoints/test_organization_incident_details.py
+@@ -1,18 +1,29 @@
+ from __future__ import absolute_import
+ 
+-from exam import fixture
++from datetime import datetime
++
+ import mock
+-from django.utils import timezone
+ import pytz
+-from datetime import datetime
++import six
++from django.utils import timezone
++from exam import fixture
+ 
+ from sentry.api.serializers import serialize
++from sentry.incidents.models import (
++    Incident,
++    IncidentActivity,
++    IncidentStatus,
++)
+ from sentry.testutils import APITestCase
+ 
+ 
+-class IncidentDetailsTest(APITestCase):
++class BaseIncidentDetailsTest(object):
+     endpoint = 'sentry-api-0-organization-incident-details'
+ 
++    def setUp(self):
++        self.create_team(organization=self.organization, members=[self.user])
++        self.login_as(self.user)
++
+     @fixture
+     def organization(self):
+         return self.create_organization(owner=self.create_user())
+@@ -25,13 +36,26 @@ class IncidentDetailsTest(APITestCase):
+     def user(self):
+         return self.create_user()
+ 
++    def test_no_perms(self):
++        incident = self.create_incident()
++        self.login_as(self.create_user())
++        with self.feature('organizations:incidents'):
++            resp = self.get_response(incident.organization.slug, incident.id)
++        assert resp.status_code == 403
++
++    def test_no_feature(self):
++        incident = self.create_incident()
++        resp = self.get_response(incident.organization.slug, incident.id)
++        assert resp.status_code == 404
++
++
++class OrganizationIncidentDetailsTest(BaseIncidentDetailsTest, APITestCase):
++
+     @mock.patch('django.utils.timezone.now')
+     def test_simple(self, mock_now):
+         mock_now.return_value = datetime.utcnow().replace(tzinfo=pytz.utc)
+ 
+-        self.create_team(organization=self.organization, members=[self.user])
+         incident = self.create_incident(seen_by=[self.user])
+-        self.login_as(self.user)
+         with self.feature('organizations:incidents'):
+             resp = self.get_valid_response(incident.organization.slug, incident.identifier)
+ 
+@@ -51,16 +75,52 @@ class IncidentDetailsTest(APITestCase):
+         assert resp.data['eventStats'] == expected['eventStats']
+         assert resp.data['seenBy'] == seen_by
+ 
+-    def test_no_perms(self):
++
++class OrganizationIncidentUpdateStatusTest(BaseIncidentDetailsTest, APITestCase):
++    method = 'put'
++
++    def get_valid_response(self, *args, **params):
++        params.setdefault('status', IncidentStatus.CLOSED.value)
++        return super(OrganizationIncidentUpdateStatusTest, self).get_valid_response(*args, **params)
++
++    def test_simple(self):
+         incident = self.create_incident()
+-        self.login_as(self.create_user())
+         with self.feature('organizations:incidents'):
+-            resp = self.get_response(incident.organization.slug, incident.id)
+-        assert resp.status_code == 403
++            self.get_valid_response(
++                incident.organization.slug,
++                incident.identifier,
++                status=IncidentStatus.CLOSED.value,
++            )
+ 
+-    def test_no_feature(self):
+-        self.create_team(organization=self.organization, members=[self.user])
++        incident = Incident.objects.get(id=incident.id)
++        assert incident.status == IncidentStatus.CLOSED.value
++
++    def test_comment(self):
+         incident = self.create_incident()
+-        self.login_as(self.user)
+-        resp = self.get_response(incident.organization.slug, incident.id)
+-        assert resp.status_code == 404
++        status = IncidentStatus.CLOSED.value
++        comment = 'fixd'
++        with self.feature('organizations:incidents'):
++            self.get_valid_response(
++                incident.organization.slug,
++                incident.identifier,
++                status=status,
++                comment=comment
++            )
++
++        incident = Incident.objects.get(id=incident.id)
++        assert incident.status == status
++        activity = IncidentActivity.objects.filter(incident=incident).order_by('-id')[:1].get()
++        assert activity.value == six.text_type(status)
++        assert activity.comment == comment
++        assert activity.user == self.user
++
++    def test_invalid_status(self):
++        incident = self.create_incident()
++        with self.feature('organizations:incidents'):
++            resp = self.get_response(
++                incident.organization.slug,
++                incident.identifier,
++                status=5000,
++            )
++            assert resp.status_code == 400
++            assert resp.data['status'][0].startswith('Invalid value for status')
+diff --git a/tests/sentry/incidents/test_logic.py b/tests/sentry/incidents/test_logic.py
+index 365d347e00..e3014fbd27 100644
+--- a/tests/sentry/incidents/test_logic.py
++++ b/tests/sentry/incidents/test_logic.py
+@@ -15,6 +15,8 @@ from sentry.incidents.logic import (
+     create_initial_event_stats_snapshot,
+     get_incident_aggregates,
+     get_incident_event_stats,
++    StatusAlreadyChangedError,
++    update_incident_status,
+ )
+ from sentry.incidents.models import (
+     IncidentActivity,
+@@ -67,6 +69,58 @@ class CreateIncidentTest(TestCase):
+         ).count() == 1
+ 
+ 
++@freeze_time()
++class UpdateIncidentStatus(TestCase):
++    def get_most_recent_incident_activity(self, incident):
++        return IncidentActivity.objects.filter(incident=incident).order_by('-id')[:1].get()
++
++    def test_status_already_set(self):
++        incident = self.create_incident(IncidentStatus.DETECTED.value)
++        with self.assertRaises(StatusAlreadyChangedError):
++            update_incident_status(incident, IncidentStatus.DETECTED)
++
++    def run_test(
++        self,
++        incident,
++        status,
++        expected_date_closed,
++        user=None,
++        comment=None,
++    ):
++        prev_status = incident.status
++        update_incident_status(incident, status, user=user, comment=comment)
++        assert incident.status == status.value
++        assert incident.date_closed == expected_date_closed
++        activity = self.get_most_recent_incident_activity(incident)
++        assert activity.type == IncidentActivityType.STATUS_CHANGE.value
++        assert activity.user == user
++        assert activity.value == six.text_type(status.value)
++        assert activity.previous_value == six.text_type(prev_status)
++        assert activity.comment == comment
++        assert activity.event_stats_snapshot is None
++
++    def test_closed(self):
++        incident = self.create_incident()
++        self.run_test(incident, IncidentStatus.CLOSED, timezone.now())
++
++    def test_reopened(self):
++        incident = self.create_incident(
++            status=IncidentStatus.CLOSED.value,
++            date_closed=timezone.now()
++        )
++        self.run_test(incident, IncidentStatus.DETECTED, None)
++
++    def test_all_params(self):
++        incident = self.create_incident()
++        self.run_test(
++            incident,
++            IncidentStatus.CLOSED,
++            timezone.now(),
++            user=self.user,
++            comment='lol',
++        )
++
++
+ class BaseIncidentsTest(SnubaTestCase):
+     def create_event(self, timestamp, fingerprint=None, user=None):
+         event_id = uuid4().hex

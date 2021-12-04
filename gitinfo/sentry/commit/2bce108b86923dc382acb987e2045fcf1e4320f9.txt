@@ -1,0 +1,563 @@
+commit 2bce108b86923dc382acb987e2045fcf1e4320f9
+Author: Manu <manu@sentry.io>
+Date:   Thu Oct 17 09:09:07 2019 -0700
+
+    feat(outcomes): TSDB queries snuba for outcomes (#15022)
+    
+    Outcomes are now being stored in Redis and Snuba. We want to move away from storing them in Redis and only store them in Snuba.
+    
+    This PR allows Sentry to query Snuba for outcome related data. However, it does not get the final answer from Snuba because of the ServiceDelegator. It will still get the final answer from Redis. That's cause we want to run Redis and Snuba in parallel and check for differences.
+    
+    getsentry/getsentry#3237 will allow us to run a difference checker, which will check the results from both sources in a background thread. This PR is a dependency for the PR in getsentry.
+
+diff --git a/src/sentry/testutils/cases.py b/src/sentry/testutils/cases.py
+index fc49451011..e063c46460 100644
+--- a/src/sentry/testutils/cases.py
++++ b/src/sentry/testutils/cases.py
+@@ -842,6 +842,36 @@ class SnubaTestCase(BaseTestCase):
+         )
+ 
+ 
++@pytest.mark.snuba
++@requires_snuba
++class OutcomesSnubaTest(TestCase):
++    def setUp(self):
++        super(OutcomesSnubaTest, self).setUp()
++        assert requests.post(settings.SENTRY_SNUBA + "/tests/outcomes/drop").status_code == 200
++
++    def __format(self, org_id, project_id, outcome, timestamp):
++        return {
++            "project_id": project_id,
++            "timestamp": timestamp.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
++            "org_id": org_id,
++            "reason": None,
++            "key_id": 1,
++            "outcome": outcome,
++        }
++
++    def store_outcomes(self, org_id, project_id, outcome, timestamp, num_times):
++        outcomes = []
++        for _ in range(num_times):
++            outcomes.append(self.__format(org_id, project_id, outcome, timestamp))
++
++        assert (
++            requests.post(
++                settings.SENTRY_SNUBA + "/tests/outcomes/insert", data=json.dumps(outcomes)
++            ).status_code
++            == 200
++        )
++
++
+ class IntegrationRepositoryTestCase(APITestCase):
+     def setUp(self):
+         super(IntegrationRepositoryTestCase, self).setUp()
+diff --git a/src/sentry/tsdb/snuba.py b/src/sentry/tsdb/snuba.py
+index a7a184f1b6..aeb00f75a6 100644
+--- a/src/sentry/tsdb/snuba.py
++++ b/src/sentry/tsdb/snuba.py
+@@ -1,13 +1,24 @@
+ from __future__ import absolute_import
+ 
+ import collections
++from copy import deepcopy
+ import six
+ 
+ from sentry.tsdb.base import BaseTSDB, TSDBModel
+-from sentry.utils import snuba
++from sentry.utils import snuba, outcomes
+ from sentry.utils.dates import to_datetime
+ 
+ 
++SnubaModelQuerySettings = collections.namedtuple(
++    # `dataset` - the dataset in Snuba that we want to query
++    # `groupby` - the column in Snuba that we want to put in the group by statement
++    # `aggregate` - the column in Snuba that we want to run the aggregate function on
++    # `conditions` - any additional model specific conditions we want to pass in the query
++    "SnubaModelSettings",
++    ["dataset", "groupby", "aggregate", "conditions"],
++)
++
++
+ class SnubaTSDB(BaseTSDB):
+     """
+     A time series query interface to Snuba
+@@ -19,21 +30,84 @@ class SnubaTSDB(BaseTSDB):
+     will return empty results for unsupported models.
+     """
+ 
+-    # The ``model_columns`` are translations of TSDB models into the required
+-    # columns for querying snuba. Keys are ``TSDBModel`` enumeration values,
+-    # values are in the form ``(groupby_column, aggregateby_column or None)``.
+-    # Only the models that are listed in this mapping are supported.
+-    model_columns = {
+-        TSDBModel.project: ("project_id", None),
+-        TSDBModel.group: ("issue", None),
+-        TSDBModel.release: ("tags[sentry:release]", None),
+-        TSDBModel.users_affected_by_group: ("issue", "tags[sentry:user]"),
+-        TSDBModel.users_affected_by_project: ("project_id", "tags[sentry:user]"),
+-        TSDBModel.frequent_environments_by_group: ("issue", "environment"),
+-        TSDBModel.frequent_releases_by_group: ("issue", "tags[sentry:release]"),
+-        TSDBModel.frequent_issues_by_project: ("project_id", "issue"),
++    # The ``model_query_settings`` and ``model_being_upgraded_query_settings`` are translations of
++    # TSDB models into required settings for querying snuba. Queries for ``model_columns``
++    # directly hit snuba, while queries for ``model_columns_being_upgraded`` hit
++    # redis in the main thread and snuba in a background thread.
++    model_query_settings = {
++        TSDBModel.project: SnubaModelQuerySettings(snuba.Dataset.Events, "project_id", None, None),
++        TSDBModel.group: SnubaModelQuerySettings(snuba.Dataset.Events, "issue", None, None),
++        TSDBModel.release: SnubaModelQuerySettings(
++            snuba.Dataset.Events, "tags[sentry:release]", None, None
++        ),
++        TSDBModel.users_affected_by_group: SnubaModelQuerySettings(
++            snuba.Dataset.Events, "issue", "tags[sentry:user]", None
++        ),
++        TSDBModel.users_affected_by_project: SnubaModelQuerySettings(
++            snuba.Dataset.Events, "project_id", "tags[sentry:user]", None
++        ),
++        TSDBModel.frequent_environments_by_group: SnubaModelQuerySettings(
++            snuba.Dataset.Events, "issue", "environment", None
++        ),
++        TSDBModel.frequent_releases_by_group: SnubaModelQuerySettings(
++            snuba.Dataset.Events, "issue", "tags[sentry:release]", None
++        ),
++        TSDBModel.frequent_issues_by_project: SnubaModelQuerySettings(
++            snuba.Dataset.Events, "project_id", "issue", None
++        ),
+     }
+ 
++    # In getsentry/getsentry:tsdb.py, we check ``model_columns`` to see if a request
++    # should go to snuba. So, for now, for backwards compatibility, alias
++    # ``model_columns`` to ``model_query_settings``.
++    # TODO(manu): use model_query_settings instead of model_columns in getsentry
++    model_columns = model_query_settings
++
++    # ``model_columns_being_upgraded`` are models that currently use Redis but are being
++    # transitioned to use Snuba.
++    model_being_upgraded_query_settings = {
++        TSDBModel.organization_total_received: SnubaModelQuerySettings(
++            snuba.Dataset.Outcomes,
++            "org_id",
++            "times_seen",
++            [["outcome", "=", outcomes.Outcome.ACCEPTED]],
++        ),
++        TSDBModel.organization_total_rejected: SnubaModelQuerySettings(
++            snuba.Dataset.Outcomes,
++            "org_id",
++            "times_seen",
++            [["outcome", "=", outcomes.Outcome.RATE_LIMITED]],
++        ),
++        TSDBModel.organization_total_blacklisted: SnubaModelQuerySettings(
++            snuba.Dataset.Outcomes,
++            "org_id",
++            "times_seen",
++            [["outcome", "=", outcomes.Outcome.FILTERED]],
++        ),
++        TSDBModel.project_total_received: SnubaModelQuerySettings(
++            snuba.Dataset.Outcomes,
++            "project_id",
++            "times_seen",
++            [["outcome", "=", outcomes.Outcome.ACCEPTED]],
++        ),
++        TSDBModel.project_total_rejected: SnubaModelQuerySettings(
++            snuba.Dataset.Outcomes,
++            "project_id",
++            "times_seen",
++            [["outcome", "=", outcomes.Outcome.RATE_LIMITED]],
++        ),
++        TSDBModel.project_total_blacklisted: SnubaModelQuerySettings(
++            snuba.Dataset.Outcomes,
++            "project_id",
++            "times_seen",
++            [["outcome", "=", outcomes.Outcome.FILTERED]],
++        ),
++    }
++
++    all_model_query_settings = dict(
++        model_columns.items() + model_being_upgraded_query_settings.items()
++    )
++
+     def __init__(self, **options):
+         super(SnubaTSDB, self).__init__(**options)
+ 
+@@ -55,12 +129,13 @@ class SnubaTSDB(BaseTSDB):
+         `group_on_time`: whether to add a GROUP BY clause on the 'time' field.
+         `group_on_model`: whether to add a GROUP BY clause on the primary model.
+         """
+-        model_columns = self.model_columns.get(model)
++        model_query_settings = self.all_model_query_settings.get(model)
+ 
+-        if model_columns is None:
++        if model_query_settings is None:
+             raise Exception(u"Unsupported TSDBModel: {}".format(model.name))
+ 
+-        model_group, model_aggregate = model_columns
++        model_group = model_query_settings.groupby
++        model_aggregate = model_query_settings.aggregate
+ 
+         groupby = []
+         if group_on_model and model_group is not None:
+@@ -73,7 +148,8 @@ class SnubaTSDB(BaseTSDB):
+             groupby.append(model_aggregate)
+             model_aggregate = None
+ 
+-        keys_map = dict(zip(model_columns, self.flatten_keys(keys)))
++        columns = (model_query_settings.groupby, model_query_settings.aggregate)
++        keys_map = dict(zip(columns, self.flatten_keys(keys)))
+         keys_map = {k: v for k, v in six.iteritems(keys_map) if k is not None and v is not None}
+         if environment_ids is not None:
+             keys_map["environment"] = environment_ids
+@@ -90,10 +166,13 @@ class SnubaTSDB(BaseTSDB):
+ 
+         if keys:
+             result = snuba.query(
++                dataset=model_query_settings.dataset,
+                 start=start,
+                 end=end,
+                 groupby=groupby,
+-                conditions=None,
++                conditions=deepcopy(
++                    model_query_settings.conditions
++                ),  # copy because we modify the conditions in snuba.query
+                 filter_keys=keys_map,
+                 aggregations=aggregations,
+                 rollup=rollup,
+@@ -150,6 +229,15 @@ class SnubaTSDB(BaseTSDB):
+                         del result[rk]
+ 
+     def get_range(self, model, keys, start, end, rollup=None, environment_ids=None):
++        model_query_settings = self.all_model_query_settings.get(model)
++
++        assert model_query_settings is not None, u"Unsupported TSDBModel: {}".format(model.name)
++
++        if model_query_settings.dataset == snuba.Dataset.Outcomes:
++            aggregate_function = "sum"
++        else:
++            aggregate_function = "count()"
++
+         result = self.get_data(
+             model,
+             keys,
+@@ -157,7 +245,7 @@ class SnubaTSDB(BaseTSDB):
+             end,
+             rollup,
+             environment_ids,
+-            aggregation="count()",
++            aggregation=aggregate_function,
+             group_on_time=True,
+         )
+         # convert
+diff --git a/src/sentry/utils/snuba.py b/src/sentry/utils/snuba.py
+index 90d4a1e61e..482354add0 100644
+--- a/src/sentry/utils/snuba.py
++++ b/src/sentry/utils/snuba.py
+@@ -178,8 +178,7 @@ class SnubaError(Exception):
+ 
+ class UnqualifiedQueryError(SnubaError):
+     """
+-    Exception raised when no project_id qualifications were provided in the
+-    query or could be derived from other filter criteria.
++    Exception raised when a required qualification was not satisfied in the query.
+     """
+ 
+ 
+@@ -644,17 +643,11 @@ def transform_aliases_and_query(skip_conditions=False, **kwargs):
+     return result
+ 
+ 
+-def _prepare_query_params(query_params):
+-    # convert to naive UTC datetimes, as Snuba only deals in UTC
+-    # and this avoids offset-naive and offset-aware issues
+-    start = naiveify_datetime(query_params.start)
+-    end = naiveify_datetime(query_params.end)
+-
+-    with timer("get_snuba_map"):
+-        forward, reverse = get_snuba_translators(
+-            query_params.filter_keys, is_grouprelease=query_params.is_grouprelease
+-        )
+-
++def get_query_params_to_update_for_projects(query_params):
++    """
++    Get the project ID and query params that need to be updated for project
++    based datasets, before we send the query to Snuba.
++    """
+     if "project_id" in query_params.filter_keys:
+         # If we are given a set of project ids, use those directly.
+         project_ids = list(set(query_params.filter_keys["project_id"]))
+@@ -669,6 +662,64 @@ def _prepare_query_params(query_params):
+     else:
+         project_ids = []
+ 
++    if not project_ids:
++        raise UnqualifiedQueryError(
++            "No project_id filter, or none could be inferred from other filters."
++        )
++
++    # any project will do, as they should all be from the same organization
++    organization_id = Project.objects.get(pk=project_ids[0]).organization_id
++
++    return organization_id, {"project": project_ids}
++
++
++def get_query_params_to_update_for_organizations(query_params):
++    """
++    Get the organization ID and query params that need to be updated for organization
++    based datasets, before we send the query to Snuba.
++    """
++    if "org_id" in query_params.filter_keys:
++        organization_ids = list(set(query_params.filter_keys["org_id"]))
++        if len(organization_ids) != 1:
++            raise UnqualifiedQueryError("Multiple organization_ids found. Only one allowed.")
++        organization_id = organization_ids[0]
++    elif "project_id" in query_params.filter_keys:
++        organization_id, _ = get_query_params_to_update_for_projects(query_params)
++    else:
++        organization_id = None
++
++    if not organization_id:
++        raise UnqualifiedQueryError(
++            "No organization_id filter, or none could be inferred from other filters."
++        )
++
++    return organization_id, {"organization": organization_id}
++
++
++def _prepare_query_params(query_params):
++    # convert to naive UTC datetimes, as Snuba only deals in UTC
++    # and this avoids offset-naive and offset-aware issues
++    start = naiveify_datetime(query_params.start)
++    end = naiveify_datetime(query_params.end)
++
++    with timer("get_snuba_map"):
++        forward, reverse = get_snuba_translators(
++            query_params.filter_keys, is_grouprelease=query_params.is_grouprelease
++        )
++
++    if query_params.dataset in [Dataset.Events, Dataset.Transactions]:
++        (organization_id, params_to_update) = get_query_params_to_update_for_projects(query_params)
++    elif query_params.dataset == Dataset.Outcomes:
++        (organization_id, params_to_update) = get_query_params_to_update_for_organizations(
++            query_params
++        )
++    else:
++        raise UnqualifiedQueryError(
++            "No strategy found for getting an organization for the given dataset."
++        )
++
++    query_params.kwargs.update(params_to_update)
++
+     for col, keys in six.iteritems(forward(deepcopy(query_params.filter_keys))):
+         if keys:
+             if len(keys) == 1 and None in keys:
+@@ -676,14 +727,7 @@ def _prepare_query_params(query_params):
+             else:
+                 query_params.conditions.append((col, "IN", keys))
+ 
+-    if not project_ids:
+-        raise UnqualifiedQueryError(
+-            "No project_id filter, or none could be inferred from other filters."
+-        )
+-
+-    # any project will do, as they should all be from the same organization
+-    project = Project.objects.get(pk=project_ids[0])
+-    retention = quotas.get_event_retention(organization=Organization(project.organization_id))
++    retention = quotas.get_event_retention(organization=Organization(organization_id))
+     if retention:
+         start = max(start, datetime.utcnow() - timedelta(days=retention))
+         if start > end:
+@@ -713,7 +757,6 @@ def _prepare_query_params(query_params):
+             "groupby": query_params.groupby,
+             "conditions": query_params.conditions,
+             "aggregations": query_params.aggregations,
+-            "project": project_ids,
+             "granularity": query_params.rollup,  # TODO name these things the same
+         }
+     )
+diff --git a/tests/sentry/tsdb/test_snuba.py b/tests/sentry/tsdb/test_snuba.py
+new file mode 100644
+index 0000000000..6c42d18b8d
+--- /dev/null
++++ b/tests/sentry/tsdb/test_snuba.py
+@@ -0,0 +1,113 @@
++from __future__ import absolute_import
++
++import pytz
++from datetime import datetime, timedelta
++
++from sentry.testutils.cases import OutcomesSnubaTest
++from sentry.tsdb.base import TSDBModel
++from sentry.tsdb.snuba import SnubaTSDB
++from sentry.utils.dates import to_timestamp
++from sentry.utils.outcomes import Outcome
++
++
++def floor_to_hour_epoch(value):
++    value = value.replace(minute=0, second=0, microsecond=0)
++    return int(to_timestamp(value))
++
++
++class SnubaTSDBTest(OutcomesSnubaTest):
++    def setUp(self):
++        super(SnubaTSDBTest, self).setUp()
++        self.db = SnubaTSDB()
++
++        # Set up the times
++        self.now = datetime.now(pytz.utc)
++        self.start_time = self.now - timedelta(days=7)
++        self.one_day_later = self.start_time + timedelta(days=1)
++        self.day_before_start_time = self.start_time - timedelta(days=1)
++
++    def test_organization_outcomes(self):
++        other_organization = self.create_organization()
++
++        for tsdb_model, outcome in [
++            (TSDBModel.organization_total_received, Outcome.ACCEPTED),
++            (TSDBModel.organization_total_rejected, Outcome.RATE_LIMITED),
++            (TSDBModel.organization_total_blacklisted, Outcome.FILTERED),
++        ]:
++            # Create all the outcomes we will be querying
++            self.store_outcomes(
++                self.organization.id, self.project.id, outcome.value, self.start_time, 3
++            )
++            self.store_outcomes(
++                self.organization.id, self.project.id, outcome.value, self.one_day_later, 4
++            )
++
++            # Also create some outcomes we shouldn't be querying
++            self.store_outcomes(
++                other_organization.id, self.project.id, outcome.value, self.one_day_later, 5
++            )
++            self.store_outcomes(
++                self.organization.id, self.project.id, outcome.value, self.day_before_start_time, 6
++            )
++
++            # Query SnubaTSDB
++            response = self.db.get_range(
++                tsdb_model, [self.organization.id], self.start_time, self.now, 3600, None
++            )
++
++            # Assert that the response has values set for the times we expect, and nothing more
++            assert self.organization.id in response.keys()
++            response_dict = {k: v for (k, v) in response[self.organization.id]}
++
++            assert response_dict[floor_to_hour_epoch(self.start_time)] == 3
++            assert response_dict[floor_to_hour_epoch(self.one_day_later)] == 4
++
++            for time, count in response[self.organization.id]:
++                if time not in [
++                    floor_to_hour_epoch(self.start_time),
++                    floor_to_hour_epoch(self.one_day_later),
++                ]:
++                    assert count == 0
++
++    def test_project_outcomes(self):
++        other_project = self.create_project(organization=self.organization)
++
++        for tsdb_model, outcome in [
++            (TSDBModel.project_total_received, Outcome.ACCEPTED),
++            (TSDBModel.project_total_rejected, Outcome.RATE_LIMITED),
++            (TSDBModel.project_total_blacklisted, Outcome.FILTERED),
++        ]:
++            # Create all the outcomes we will be querying
++            self.store_outcomes(
++                self.organization.id, self.project.id, outcome.value, self.start_time, 3
++            )
++            self.store_outcomes(
++                self.organization.id, self.project.id, outcome.value, self.one_day_later, 4
++            )
++
++            # Also create some outcomes we shouldn't be querying
++            self.store_outcomes(
++                self.organization.id, other_project.id, outcome.value, self.one_day_later, 5
++            )
++            self.store_outcomes(
++                self.organization.id, self.project.id, outcome.value, self.day_before_start_time, 6
++            )
++
++            # Query SnubaTSDB
++            response = self.db.get_range(
++                tsdb_model, [self.project.id], self.start_time, self.now, 3600, None
++            )
++
++            # Assert that the response has values set for the times we expect, and nothing more
++            assert self.project.id in response.keys()
++            response_dict = {k: v for (k, v) in response[self.project.id]}
++
++            assert response_dict[floor_to_hour_epoch(self.start_time)] == 3
++            assert response_dict[floor_to_hour_epoch(self.one_day_later)] == 4
++
++            for time, count in response[self.project.id]:
++                if time not in [
++                    floor_to_hour_epoch(self.start_time),
++                    floor_to_hour_epoch(self.one_day_later),
++                ]:
++                    assert count == 0
+diff --git a/tests/sentry/utils/test_snuba.py b/tests/sentry/utils/test_snuba.py
+index c59d2200c1..4832e363ec 100644
+--- a/tests/sentry/utils/test_snuba.py
++++ b/tests/sentry/utils/test_snuba.py
+@@ -2,12 +2,14 @@ from __future__ import absolute_import
+ 
+ from datetime import datetime
+ from mock import patch
++import pytest
+ import pytz
+ 
+ from sentry.models import GroupRelease, Release
+ from sentry.testutils import TestCase, SnubaTestCase
+ from sentry.testutils.helpers.datetime import iso_format, before_now
+ from sentry.utils.snuba import (
++    _prepare_query_params,
+     get_snuba_translators,
+     zerofill,
+     get_json_type,
+@@ -15,6 +17,8 @@ from sentry.utils.snuba import (
+     detect_dataset,
+     transform_aliases_and_query,
+     Dataset,
++    SnubaQueryParams,
++    UnqualifiedQueryError,
+ )
+ 
+ 
+@@ -635,3 +639,41 @@ class DetectDatasetTest(TestCase):
+ 
+         query = {"aggregations": [["uniq", "trace_id", "uniq_trace_id"]]}
+         assert detect_dataset(query) == Dataset.Transactions
++
++
++class PrepareQueryParamsTest(TestCase):
++    def test_events_dataset_with_project_id(self):
++        query_params = SnubaQueryParams(
++            dataset=Dataset.Events, filter_keys={"project_id": [self.project.id]}
++        )
++
++        kwargs, _, _ = _prepare_query_params(query_params)
++        assert kwargs["project"] == [self.project.id]
++
++    def test_transactions_dataset_with_project_id(self):
++        query_params = SnubaQueryParams(
++            dataset=Dataset.Transactions, filter_keys={"project_id": [self.project.id]}
++        )
++
++        kwargs, _, _ = _prepare_query_params(query_params)
++        assert kwargs["project"] == [self.project.id]
++
++    def test_outcomes_dataset_with_org_id(self):
++        query_params = SnubaQueryParams(
++            dataset=Dataset.Outcomes, filter_keys={"org_id": [self.organization.id]}
++        )
++
++        kwargs, _, _ = _prepare_query_params(query_params)
++        assert kwargs["organization"] == self.organization.id
++
++    def test_outcomes_dataset_with_no_org_id_given(self):
++        query_params = SnubaQueryParams(dataset=Dataset.Outcomes)
++
++        with pytest.raises(UnqualifiedQueryError):
++            _prepare_query_params(query_params)
++
++    def test_invalid_dataset_provided(self):
++        query_params = SnubaQueryParams(dataset="invalid_dataset")
++
++        with pytest.raises(UnqualifiedQueryError):
++            _prepare_query_params(query_params)

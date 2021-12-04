@@ -1,0 +1,476 @@
+commit 4cd22b62e46c25ca8e45215a69ea9c5a45d3a849
+Author: Jan Michael Auer <account@jauer.org>
+Date:   Wed Nov 28 11:31:29 2018 +0100
+
+    feat(sdk): Merge python and rust stacktraces (#10804)
+    
+    * feat(sdk): Add a before_send hook to extract rust_info stacktraces
+    
+    * feat(sdk): Strip backtraces from messages and exceptions
+    
+    * fix(sdk): Import correctly
+    
+    * ref(sdk): Create an integration for rust info
+    
+    * fix(sdk): Small bugfixes and documentation
+    
+    * fix(sdk): Check if the rust info integration is active
+    
+    * test(sdk): Add tests for rust info extraction
+
+diff --git a/src/sentry/utils/rust.py b/src/sentry/utils/rust.py
+new file mode 100644
+index 0000000000..e687d2e506
+--- /dev/null
++++ b/src/sentry/utils/rust.py
+@@ -0,0 +1,249 @@
++from __future__ import absolute_import
++
++import re
++import six
++
++from sentry_sdk.hub import Hub
++from sentry_sdk.integrations import Integration
++from sentry_sdk.scope import add_global_event_processor
++
++from sentry.utils.safe import get_path
++
++
++SYSTEM_FRAMES = [
++    "std::",
++    "core::",
++    "alloc::",
++    "backtrace::",
++    "failure::",
++    # these are not modules but things like __rust_maybe_catch_panic
++    "__rust_",
++    "___rust_",
++]
++
++OUTER_BORDER_FRAMES = [
++    "_ffi_call",
++    "ffi_call",
++]
++
++INNER_BORDER_FRAMES = [
++    "std::panicking::begin_panic",
++    "failure::error_message::err_msg",
++    "failure::backtrace::Backtrace::new",
++]
++
++FRAME_RE = re.compile(r'''(?xm)
++    ^
++        [\ ]*                               # leading whitespace
++        (?:\d+:[\ ]*)?                      # leading frame number
++        (?P<addr>0x[a-f0-9]+)?              # instruction address
++        [\ ]-[\ ]
++        (?P<symbol>[^\r\n]+)
++        (?:
++            \r?\n
++            [\ \t]+at[\ ]
++            (?P<path>[^\r\n]+?)
++            (?::(?P<lineno>\d+))?
++        )?
++    $
++''')
++
++HASH_FUNC_RE = re.compile(r'''(?x)
++    ^(.*)::h[a-f0-9]{16}$
++''')
++
++PATTERN_MATCH_RE = re.compile(r'^(_?\<|\w+ as )+')
++
++RUST_CRATE_RE = re.compile(r'([a-zA-Z0-9_]+?)(?:\.\.|::)')
++
++RUST_ESCAPES_RE = re.compile(r'''(?x)
++    \$
++        (SP|BP|RF|LT|GT|LP|RP|C|
++            u7e|u20|u27|u5b|u5d|u7b|u7d|u3b|u2b|u22)
++    \$
++''')
++
++RUST_ESCAPES = {
++    'SP': '@',
++    'BP': '*',
++    'RF': '&',
++    'LT': '<',
++    'GT': '>',
++    'LP': '(',
++    'RP': ')',
++    'C': ',',
++    'u7e': '~',
++    'u20': ' ',
++    'u27': '\'',
++    'u5b': '[',
++    'u5d': ']',
++    'u7b': '{',
++    'u7d': '}',
++    'u3b': ';',
++    'u2b': '+',
++    'u22': '"',
++}
++
++
++def get_filename(abs_path):
++    """Returns the basename of the given absolute path."""
++    return abs_path \
++        .rsplit('/', 1)[-1] \
++        .rsplit('\\', 1)[-1]
++
++
++def strip_symbol(symbol):
++    """Strips rust function hashes of the given symbol."""
++    if symbol:
++        match = HASH_FUNC_RE.match(symbol)
++        if match:
++            return match.group(1)
++
++    return symbol
++
++
++def demangle_rust(symbol):
++    """Demangles common escapes in the given rust symbol."""
++    return RUST_ESCAPES_RE.sub(
++        lambda m: RUST_ESCAPES.get(m.group(1), ''),
++        symbol,
++    )
++
++
++def starts_with(function, pattern):
++    """
++    Returns whether the given function name matches the pattern.
++    This takes trait implementation and name mangling into account.
++    """
++    return PATTERN_MATCH_RE \
++        .sub('', function) \
++        .replace('.', ':') \
++        .startswith(pattern)
++
++
++def matches_frame(function, patterns):
++    """Returns whether the given function name matches any of the patterns."""
++    return any(starts_with(function, p) for p in patterns)
++
++
++def frame_from_match(match, last_addr):
++    """Creates a sentry stack frame from a backtrace entry."""
++    symbol = strip_symbol(match.group('symbol'))
++    function = demangle_rust(symbol)
++
++    frame = {
++        'function': function,
++        'in_app': not matches_frame(function, SYSTEM_FRAMES),
++        'instruction_addr': match.group('addr') or last_addr,
++    }
++
++    if symbol != function:
++        frame['symbol'] = symbol
++
++    package = RUST_CRATE_RE.search(function)
++    if package and package.group(1):
++        frame['package'] = package.group(1)
++
++    path = match.group('path')
++    if path:
++        frame['abs_path'] = path
++        frame['filename'] = get_filename(path)
++
++    lineno = match.group('lineno')
++    if lineno:
++        lineno = int(lineno)
++    if lineno:
++        frame['lineno'] = lineno
++
++    return frame
++
++
++def frames_from_rust_info(rust_info):
++    """
++    Extracts a list of frames from the given rust_info string.
++
++    Border frames from the python interpreter, FFI calls, panic unwinding and
++    backtrace generation are trimmed off.
++    """
++    frames = []
++    last_addr = None
++    for m in FRAME_RE.finditer(rust_info):
++        frame = frame_from_match(m, last_addr)
++        last_addr = frame['instruction_addr']
++        frames.append(frame)
++
++    end = next((
++        i for i, f in enumerate(frames)
++        if matches_frame(f['function'], OUTER_BORDER_FRAMES)
++    ), len(frames))
++
++    start = -next((
++        i for i, f in enumerate(reversed(frames))
++        if matches_frame(f['function'], INNER_BORDER_FRAMES)
++    ), 0)
++
++    return frames[start:end]
++
++
++def strip_backtrace_message(target, field):
++    """
++    Strips the backtrace off a message, if it contains one.
++    """
++    if target and isinstance(target.get(field), six.string_types):
++        target[field] = target[field].split('\n\nstacktrace:', 1)[0].strip()
++
++
++def merge_rust_info_frames(event, hint):
++    """
++    Adds rust exception backtraces to the python traceback.
++
++    If there is no rust_info attribute on the exception or the event has no
++    exception, this operation is a noop. Otherwise, it parses the rust backtrace
++    and adds it on top of existing python frames.
++
++    This changes the event's platform to "native" and patches existing frames.
++    Additionally, the traceback is removed from the exception value and logentry
++    interfaces.
++    """
++    if 'exc_info' not in hint:
++        return event
++
++    exc_type, exc_value, tb = hint['exc_info']
++    if not hasattr(exc_value, 'rust_info') or not exc_value.rust_info:
++        return event
++
++    exception = get_path(event, 'exception', 'values', 0)
++    stacktrace = get_path(exception, 'stacktrace', 'frames')
++    if not stacktrace:
++        return event
++
++    # Update the platform
++    event['platform'] = 'native'
++    for frame in stacktrace:
++        frame['platform'] = 'python'
++
++    # Remove rust_info from messages
++    strip_backtrace_message(exception, 'value')
++    strip_backtrace_message(event.get('logentry'), 'message')
++    strip_backtrace_message(event.get('logentry'), 'formatted')
++
++    # Extend the stacktrace
++    frames = frames_from_rust_info(exc_value.rust_info)
++    if frames:
++        stacktrace.extend(reversed(frames))
++
++    return event
++
++
++class RustInfoIntegration(Integration):
++    identifier = "rust_info"
++
++    @staticmethod
++    def setup_once():
++        @add_global_event_processor
++        def processor(event, hint):
++            integration = Hub.current.get_integration(RustInfoIntegration)
++            if integration is None:
++                return event
++
++            return merge_rust_info_frames(event, hint)
+diff --git a/src/sentry/utils/sdk.py b/src/sentry/utils/sdk.py
+index 87f1103baf..1145328673 100644
+--- a/src/sentry/utils/sdk.py
++++ b/src/sentry/utils/sdk.py
+@@ -16,7 +16,8 @@ from sentry_sdk.consts import VERSION as SDK_VERSION
+ from sentry_sdk.utils import Auth, capture_internal_exceptions
+ from sentry_sdk.utils import logger as sdk_logger
+ 
+-from . import metrics
++from sentry.utils import metrics
++from sentry.utils.rust import RustInfoIntegration
+ 
+ UNSAFE_FILES = ('sentry/event_manager.py', 'sentry/tasks/process_buffer.py', )
+ 
+@@ -100,7 +101,8 @@ def configure_sdk():
+         integrations=[
+             DjangoIntegration(),
+             CeleryIntegration(),
+-            LoggingIntegration(event_level=None)
++            LoggingIntegration(event_level=None),
++            RustInfoIntegration(),
+         ],
+         transport=capture_event,
+         **options
+diff --git a/tests/sentry/utils/test_rust.py b/tests/sentry/utils/test_rust.py
+new file mode 100644
+index 0000000000..9db1b55e8b
+--- /dev/null
++++ b/tests/sentry/utils/test_rust.py
+@@ -0,0 +1,171 @@
++from __future__ import absolute_import
++
++
++from sentry.utils.rust import merge_rust_info_frames, starts_with, strip_symbol
++
++STACKTRACE = """
++stacktrace: stack backtrace:
++   0:        0x111e51cf4 - backtrace::backtrace::trace::h38e3b1de9f341e04
++                        at /.cargo/registry/src/github.com-1ecc6299db9ec823/backtrace-0.3.9/src/backtrace/mod.rs:42
++   1:        0x111e4a3be - failure::backtrace::Backtrace::new::h2abf3908d09948f1
++                        at /.cargo/registry/src/github.com-1ecc6299db9ec823/failure-0.1.3/src/backtrace/mod.rs:111
++   2:        0x11163e27c - <failure::error::Error as core::convert::From<F>>::from::h5ae4b38f39150cb2
++                        at /.cargo/registry/src/github.com-1ecc6299db9ec823/failure-0.1.3/src/error/mod.rs:36
++                         - <T as core::convert::Into<U>>::into::h58e05f056150874e
++                        at libcore/convert.rs:456
++   3:        0x11163a9b7 - symbolic::debuginfo::symbolic_normalize_debug_id::{{closure}}::he767b4111eb41a33
++                        at /symbolic/cabi/src/debuginfo.rs:160
++   4:        0x111e7f5de - ___rust_maybe_catch_panic
++                        at /rustc/da5f414c2c0bfe5198934493f04c676e2b23ff2e/src/libpanic_unwind/lib.rs:103
++   5:        0x111618fcb - std::panic::catch_unwind::h66eea40447da0e66
++                        at /symbolic/cabi/libstd/panic.rs:392
++   6:        0x11160b9c1 - symbolic::utils::landingpad::h3cd528225184a301
++                        at /symbolic/cabi/src/utils.rs:55
++   7:        0x111632f43 - _symbolic_normalize_debug_id
++                        at /symbolic/cabi/src/utils.rs:74
++   8:     0x7fff69609f6b - _ffi_call_unix64
++   9:     0x7fff6960a786 - _ffi_call
++  10:        0x10fab19d6 - _cdata_call
++  11:        0x10efc014f - _PyObject_Call
++  12:        0x10f069f43 - _Py_Main
++"""
++
++
++def get_event(stacktrace):
++    return {
++        'event_id': 'fe628bfa48064c9b97ce7e75a19e6197',
++        'level': 'error',
++        'platform': 'python',
++        'logentry': {
++            'message': 'invalid debug identifier\n\n%s' % stacktrace,
++        },
++        'exception': {
++            'values': [{
++                'type': 'ParseDebugIdError',
++                'value': 'invalid debug identifier\n\n%s' % stacktrace,
++                'stacktrace': {
++                    'frames': [
++                        {
++                            'abs_path': '/symbolic/py/symbolic/utils.py',
++                            'filename': 'symbolic/utils.py',
++                            'function': 'rustcall',
++                            'in_app': True,
++                            'lineno': 93,
++                            'module': 'symbolic.utils',
++                        }
++                    ]
++                },
++            }]
++        },
++    }
++
++
++def get_exc_info(rust_info):
++    exc = ValueError('hello world')
++    if rust_info is not None:
++        exc.rust_info = rust_info
++    return type(exc), exc, None
++
++
++def test_merge_rust_info():
++    event = get_event(STACKTRACE)
++    exc_info = get_exc_info(STACKTRACE)
++
++    merge_rust_info_frames(event, {'exc_info': exc_info})
++
++    assert event['platform'] == 'native'
++    assert event['logentry']['message'] == 'invalid debug identifier'
++
++    exception = event['exception']['values'][0]
++    assert exception['value'] == 'invalid debug identifier'
++
++    frames = exception['stacktrace']['frames']
++    assert len(frames) == 8
++    assert frames[0]['platform'] == 'python'
++
++    # Top frame
++    assert frames[7]['instruction_addr'] == '0x11163e27c'
++    assert frames[7]['function'] == '<failure::error::Error as core::convert::From<F>>::from'
++    assert frames[7]['package'] == 'failure'
++    assert frames[7]['in_app'] is False
++    assert frames[7]['filename'] == 'mod.rs'
++    assert frames[7]['lineno'] == 36
++
++    # Inlined frame, same address
++    assert frames[7]['instruction_addr'] == '0x11163e27c'
++    assert frames[6]['function'] == '<T as core::convert::Into<U>>::into'
++    assert frames[6]['package'] == 'core'
++    assert frames[6]['in_app'] is False
++    assert frames[6]['filename'] == 'convert.rs'
++    assert frames[6]['lineno'] == 456
++
++
++def test_without_exc_info():
++    event = get_event(STACKTRACE)
++    merge_rust_info_frames(event, {})
++    assert event['platform'] == 'python'
++
++
++def test_without_rust_info():
++    event = get_event(STACKTRACE)
++    exc_info = get_exc_info(None)
++
++    merge_rust_info_frames(event, {'exc_info': exc_info})
++    assert event['platform'] == 'python'
++
++
++def test_without_stacktrace():
++    stacktrace = 'stacktrace: stack backtrace:\n\n'
++    event = get_event(stacktrace)
++    exc_info = get_exc_info(stacktrace)
++
++    merge_rust_info_frames(event, {'exc_info': exc_info})
++
++    assert event['platform'] == 'native'
++    assert event['logentry']['message'] == 'invalid debug identifier'
++
++    exception = event['exception']['values'][0]
++    assert exception['value'] == 'invalid debug identifier'
++
++    frames = exception['stacktrace']['frames']
++    assert len(frames) == 1
++
++
++def test_without_exception():
++    event = get_event(STACKTRACE)
++    exc_info = get_exc_info(STACKTRACE)
++
++    del event['exception']
++    merge_rust_info_frames(event, {'exc_info': exc_info})
++    assert event['platform'] == 'python'
++
++
++def test_starts_with():
++    # Basic functions
++    assert starts_with('__rust_maybe_catch_panic', '__rust')
++    assert starts_with('futures::task_impl::std::set', 'futures::')
++    assert not starts_with('futures::task_impl::std::set', 'tokio::')
++
++    # Generics
++    assert starts_with('_<futures..task_impl..Spawn<T>>::enter::_{{closure}}', 'futures::')
++    assert not starts_with('_<futures..task_impl..Spawn<T>>::enter::_{{closure}}', 'tokio::')
++    assert starts_with('<futures::task_impl::Spawn<T>>::enter::{{closure}}', 'futures::')
++    assert not starts_with('<futures::task_impl::Spawn<T>>::enter::{{closure}}',
++                           'tokio::')
++
++    # Trait implementations
++    assert starts_with('<failure::error::Error as core::convert::From<F>>::from', 'failure::')
++    assert starts_with('_<failure::error::Error as core::convert::From<F>>::from', 'failure::')
++
++    # Blanket implementations
++    assert starts_with('<T as core::convert::Into<U>>::into', 'core::')
++
++
++def test_strip_symbol():
++    assert strip_symbol('') == ''
++    assert strip_symbol('_ffi_call_unix64') == '_ffi_call_unix64'
++    assert strip_symbol(
++        'backtrace::backtrace::trace::h1c213d29ba950696') == 'backtrace::backtrace::trace'
++    assert strip_symbol(
++        '<T as core::convert::Into<U>>::into::h58e05f056150874e') == '<T as core::convert::Into<U>>::into'
++    assert strip_symbol('symbolic_symcache_from_object') == 'symbolic_symcache_from_object'

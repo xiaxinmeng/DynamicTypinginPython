@@ -1,0 +1,449 @@
+commit 808218f4bc64be8de065604f6509eb75d98fde88
+Author: Maximilian Hils <git@maximilianhils.com>
+Date:   Fri Aug 14 10:41:11 2015 +0200
+
+    more work on http layer
+
+diff --git a/libmproxy/protocol2/__init__.py b/libmproxy/protocol2/__init__.py
+index e3f06ad7..d5dafaae 100644
+--- a/libmproxy/protocol2/__init__.py
++++ b/libmproxy/protocol2/__init__.py
+@@ -3,8 +3,8 @@ from .root_context import RootContext
+ from .socks_proxy import Socks5Proxy
+ from .reverse_proxy import ReverseProxy
+ from .http_proxy import HttpProxy, HttpUpstreamProxy
+-from .rawtcp import TcpLayer
++from .rawtcp import RawTcpLayer
+ 
+ __all__ = [
+-    "Socks5Proxy", "TcpLayer", "RootContext", "ReverseProxy", "HttpProxy", "HttpUpstreamProxy"
++    "Socks5Proxy", "RawTcpLayer", "RootContext", "ReverseProxy", "HttpProxy", "HttpUpstreamProxy"
+ ]
+diff --git a/libmproxy/protocol2/http.py b/libmproxy/protocol2/http.py
+index 54cc9dbc..44ebf6a8 100644
+--- a/libmproxy/protocol2/http.py
++++ b/libmproxy/protocol2/http.py
+@@ -1,17 +1,22 @@
+ from __future__ import (absolute_import, print_function, division)
+ 
++from .. import version
++from ..exceptions import InvalidCredentials, HttpException, ProtocolException
+ from .layer import Layer, ServerConnectionMixin
+-from libmproxy import version
+-from libmproxy.exceptions import InvalidCredentials
++from .messages import ChangeServer, Connect, Reconnect
++from .http_proxy import HttpProxy, HttpUpstreamProxy
++from libmproxy.protocol import KILL
++
+ from libmproxy.protocol.http import HTTPFlow
+-from libmproxy.protocol.http_wrappers import HTTPResponse
++from libmproxy.protocol.http_wrappers import HTTPResponse, HTTPRequest
+ from libmproxy.protocol2.http_protocol_mock import HTTP1
++from libmproxy.protocol2.tls import TlsLayer
+ from netlib import tcp
+ from netlib.http import status_codes
+ from netlib import odict
+ 
+ 
+-def send_http_error_response(status_code, message, headers=odict.ODictCaseless()):
++def make_error_response(status_code, message, headers=None):
+     response = status_codes.RESPONSES.get(status_code, "Unknown")
+     body = """
+         <html>
+@@ -22,21 +27,40 @@ def send_http_error_response(status_code, message, headers=odict.ODictCaseless()
+         </html>
+     """.strip() % (status_code, response, message)
+ 
++    if not headers:
++        headers = odict.ODictCaseless()
+     headers["Server"] = [version.NAMEVERSION]
+     headers["Connection"] = ["close"]
+     headers["Content-Length"] = [len(body)]
+     headers["Content-Type"] = ["text/html"]
+ 
+-    resp = HTTPResponse(
+-        (1, 1),  # if HTTP/2 is used, this value is ignored anyway
++    return HTTPResponse(
++        (1, 1),  # FIXME: Should be a string.
+         status_code,
+         response,
+         headers,
+         body,
+     )
+ 
+-    protocol = self.c.client_conn.protocol or http1.HTTP1Protocol(self.c.client_conn)
+-    self.c.client_conn.send(protocol.assemble(resp))
++def make_connect_request(address):
++    return HTTPRequest(
++        "authority", "CONNECT", None, address.host, address.port, None, (1,1),
++        odict.ODictCaseless(), ""
++    )
++
++def make_connect_response(httpversion):
++    headers = odict.ODictCaseless([
++        ["Content-Length", "0"],
++        ["Proxy-Agent", version.NAMEVERSION]
++    ])
++    return HTTPResponse(
++        httpversion,
++        200,
++        "Connection established",
++        headers,
++        "",
++    )
++
+ 
+ class HttpLayer(Layer, ServerConnectionMixin):
+     """
+@@ -45,11 +69,16 @@ class HttpLayer(Layer, ServerConnectionMixin):
+ 
+     def __init__(self, ctx):
+         super(HttpLayer, self).__init__(ctx)
+-        self.skip_authentication = False
++        if any(isinstance(l, HttpProxy) for l in self.layers):
++            self.mode = "regular"
++        elif any(isinstance(l, HttpUpstreamProxy) for l in self.layers):
++            self.mode = "upstream"
++        else:
++            # also includes socks or reverse mode, which are handled similarly on this layer.
++            self.mode = "transparent"
+ 
+     def __call__(self):
+         while True:
+-            flow = HTTPFlow(self.client_conn, self.server_conn)
+             try:
+                 request = HTTP1.read_request(
+                     self.client_conn,
+@@ -62,29 +91,126 @@ class HttpLayer(Layer, ServerConnectionMixin):
+ 
+             self.c.log("request", "debug", [repr(request)])
+ 
+-            self.check_authentication(request)
++            # Handle Proxy Authentication
++            self.authenticate(request)
+ 
++            # Regular Proxy Mode: Handle CONNECT
+             if self.mode == "regular" and request.form_in == "authority":
+-                raise NotImplementedError
+-
++                self.server_address = (request.host, request.port)
++                self.send_to_client(make_connect_response(request.httpversion))
++                layer = self.ctx.next_layer(self)
++                for message in layer():
++                    if not self._handle_server_message(message):
++                        yield message
++                return
+ 
++            # Make sure that the incoming request matches our expectations
++            self.validate_request(request)
+ 
+-            ret = self.process_request(flow, request)
+-            if ret is True:
+-                continue
+-            if ret is False:
++            flow = HTTPFlow(self.client_conn, self.server_conn)
++            flow.request = request
++            if not self.process_request_hook(flow):
++                self.log("Connection killed", "info")
+                 return
+ 
+-    def check_authentication(self, request):
++            if not flow.response:
++                self.establish_server_connection(flow)
++
++    def process_request_hook(self, flow):
++        # Determine .scheme, .host and .port attributes for inline scripts.
++        # For absolute-form requests, they are directly given in the request.
++        # For authority-form requests, we only need to determine the request scheme.
++        # For relative-form requests, we need to determine host and port as
++        # well.
++        if self.mode == "regular":
++            pass  # only absolute-form at this point, nothing to do here.
++        elif self.mode == "upstream":
++            if flow.request.form_in == "authority":
++                flow.request.scheme = "http"  # pseudo value
++        else:
++            flow.request.host = self.ctx.server_address.host
++            flow.request.port = self.ctx.server_address.port
++            flow.request.scheme = self.server_conn.tls_established
++
++        # TODO: Expose ChangeServer functionality to inline scripts somehow? (yield_from_callback?)
++        request_reply = self.c.channel.ask("request", flow)
++        if request_reply is None or request_reply == KILL:
++            return False
++        if isinstance(request_reply, HTTPResponse):
++            flow.response = request_reply
++            return
++
++    def establish_server_connection(self, flow):
++
++        address = tcp.Address((flow.request.host, flow.request.port))
++        tls = (flow.request.scheme == "https")
++        if self.mode == "regular" or self.mode == "transparent":
++            # If there's an existing connection that doesn't match our expectations, kill it.
++            if self.server_address != address or tls != self.server_address.ssl_established:
++                yield ChangeServer(address, tls, address.host)
++            # Establish connection is neccessary.
++            if not self.server_conn:
++                yield Connect()
++
++            # ChangeServer is not guaranteed to work with TLS:
++            # If there's not TlsLayer below which could catch the exception,
++            # TLS will not be established.
++            if tls and not self.server_conn.tls_established:
++                raise ProtocolException("Cannot upgrade to SSL, no TLS layer on the protocol stack.")
++
++        else:
++            if tls:
++                raise HttpException("Cannot change scheme in upstream proxy mode.")
++            """
++            # This is a very ugly (untested) workaround to solve a very ugly problem.
++            # FIXME: Check if connected first.
++            if self.server_conn.tls_established and not ssl:
++                yield Reconnect()
++            elif ssl and not hasattr(self, "connected_to") or self.connected_to != address:
++                if self.server_conn.tls_established:
++                    yield Reconnect()
++
++                self.send_to_server(make_connect_request(address))
++                tls_layer = TlsLayer(self, False, True)
++                tls_layer._establish_tls_with_server()
++            """
++
++    def validate_request(self, request):
++        if request.form_in == "absolute" and request.scheme != "http":
++            self.send_resplonse(make_error_response(400, "Invalid request scheme: %s" % request.scheme))
++            raise HttpException("Invalid request scheme: %s" % request.scheme)
++
++        expected_request_forms = {
++            "regular": ("absolute",), # an authority request would already be handled.
++            "upstream": ("authority", "absolute"),
++            "transparent": ("regular",)
++        }
++
++        allowed_request_forms = expected_request_forms[self.mode]
++        if request.form_in not in allowed_request_forms:
++            err_message = "Invalid HTTP request form (expected: %s, got: %s)" % (
++                " or ".join(allowed_request_forms), request.form_in
++            )
++            self.send_to_client(make_error_response(400, err_message))
++            raise HttpException(err_message)
++
++    def authenticate(self, request):
+         if self.config.authenticator:
+             if self.config.authenticator.authenticate(request.headers):
+                 self.config.authenticator.clean(request.headers)
+             else:
+-                self.send_error()
++                self.send_to_client(make_error_response(
++                    407,
++                    "Proxy Authentication Required",
++                    self.config.authenticator.auth_challenge_headers()
++                ))
+                 raise InvalidCredentials("Proxy Authentication Required")
+-                raise http.HttpAuthenticationError(
+-                    self.c.config.authenticator.auth_challenge_headers())
+-        return request.headers
+ 
+-    def send_error(self, code, message, headers):
+-        pass
+\ No newline at end of file
++    def send_to_server(self, message):
++        self.server_conn.wfile.wrie(message)
++
++    def send_to_client(self, message):
++        # FIXME
++        # - possibly do some http2 stuff here
++        # - fix message assembly.
++        self.client_conn.wfile.write(message)
+diff --git a/libmproxy/protocol2/http_proxy.py b/libmproxy/protocol2/http_proxy.py
+index 6b3b6a82..51d3763c 100644
+--- a/libmproxy/protocol2/http_proxy.py
++++ b/libmproxy/protocol2/http_proxy.py
+@@ -4,11 +4,12 @@ from .layer import Layer, ServerConnectionMixin
+ from .http import HttpLayer
+ 
+ 
+-class HttpProxy(Layer):
++class HttpProxy(Layer, ServerConnectionMixin):
+     def __call__(self):
+         layer = HttpLayer(self)
+         for message in layer():
+-            yield message
++            if not self._handle_server_message(message):
++                yield message
+ 
+ 
+ class HttpUpstreamProxy(Layer, ServerConnectionMixin):
+diff --git a/libmproxy/protocol2/layer.py b/libmproxy/protocol2/layer.py
+index 0ae64c43..e9f5c667 100644
+--- a/libmproxy/protocol2/layer.py
++++ b/libmproxy/protocol2/layer.py
+@@ -16,9 +16,7 @@ Regular proxy, CONNECT request with WebSockets over SSL:
+ 
+ Automated protocol detection by peeking into the buffer:
+     TransparentModeLayer
+-    AutoLayer
+     SslLayer
+-    AutoLayer
+     Http2Layer
+ 
+ Communication between layers is done as follows:
+@@ -91,6 +89,13 @@ class Layer(_LayerCodeCompletion):
+         full_msg = "\n".join(full_msg)
+         self.channel.tell("log", Log(full_msg, level))
+ 
++    @property
++    def layers(self):
++        return [self] + self.ctx.layers
++
++    def __repr__(self):
++        return "%s\r\n  %s" % (self.__class__.name__, repr(self.ctx))
++
+ 
+ class ServerConnectionMixin(object):
+     """
+@@ -133,6 +138,8 @@ class ServerConnectionMixin(object):
+         self.server_conn = None
+ 
+     def _connect(self):
++        if not self.server_address:
++            raise ProtocolException("Cannot connect to server, no server address given.")
+         self.log("serverconnect", "debug", [repr(self.server_address)])
+         self.server_conn = ServerConnection(self.server_address)
+         try:
+diff --git a/libmproxy/protocol2/rawtcp.py b/libmproxy/protocol2/rawtcp.py
+index 608a53e3..167c8c79 100644
+--- a/libmproxy/protocol2/rawtcp.py
++++ b/libmproxy/protocol2/rawtcp.py
+@@ -1,4 +1,5 @@
+ from __future__ import (absolute_import, print_function, division)
++
+ import OpenSSL
+ from ..exceptions import ProtocolException
+ from ..protocol.tcp import TCPHandler
+@@ -6,7 +7,7 @@ from .layer import Layer
+ from .messages import Connect
+ 
+ 
+-class TcpLayer(Layer):
++class RawTcpLayer(Layer):
+     def __call__(self):
+         yield Connect()
+         tcp_handler = TCPHandler(self)
+diff --git a/libmproxy/protocol2/reverse_proxy.py b/libmproxy/protocol2/reverse_proxy.py
+index cb6d1d78..bb414ec3 100644
+--- a/libmproxy/protocol2/reverse_proxy.py
++++ b/libmproxy/protocol2/reverse_proxy.py
+@@ -13,7 +13,10 @@ class ReverseProxy(Layer, ServerConnectionMixin):
+         self._server_tls = server_tls
+ 
+     def __call__(self):
+-        layer = TlsLayer(self, self._client_tls, self._server_tls)
++        if self._client_tls or self._server_tls:
++            layer = TlsLayer(self, self._client_tls, self._server_tls)
++        else:
++            layer = self.ctx.next_layer(self)
+         for message in layer():
+             if not self._handle_server_message(message):
+                 yield message
+diff --git a/libmproxy/protocol2/root_context.py b/libmproxy/protocol2/root_context.py
+index cbe596aa..3b341778 100644
+--- a/libmproxy/protocol2/root_context.py
++++ b/libmproxy/protocol2/root_context.py
+@@ -1,4 +1,6 @@
+-from .rawtcp import TcpLayer
++from __future__ import (absolute_import, print_function, division)
++
++from .rawtcp import RawTcpLayer
+ from .tls import TlsLayer
+ 
+ 
+@@ -20,13 +22,30 @@ class RootContext(object):
+         :return: The next layer.
+         """
+ 
+-        d = top_layer.client_conn.rfile.peek(1)
++        d = top_layer.client_conn.rfile.peek(3)
++
++        # TODO: Handle ignore and tcp passthrough
++
++        # TLS ClientHello magic, see http://www.moserware.com/2009/06/first-few-milliseconds-of-https.html#client-hello
++        is_tls_client_hello = (
++            len(d) == 3 and
++            d[0] == '\x16' and
++            d[1] == '\x03' and
++            d[2] in ('\x00', '\x01', '\x02', '\x03')
++        )
+ 
+         if not d:
+             return
+-        # TLS ClientHello magic, see http://www.moserware.com/2009/06/first-few-milliseconds-of-https.html#client-hello
+-        if d[0] == "\x16":
++
++        if is_tls_client_hello:
+             layer = TlsLayer(top_layer, True, True)
+         else:
+-            layer = TcpLayer(top_layer)
++            layer = RawTcpLayer(top_layer)
+         return layer
++
++    @property
++    def layers(self):
++        return []
++
++    def __repr__(self):
++        return "RootContext"
+diff --git a/libmproxy/protocol2/tls.py b/libmproxy/protocol2/tls.py
+index 999cbea6..988304aa 100644
+--- a/libmproxy/protocol2/tls.py
++++ b/libmproxy/protocol2/tls.py
+@@ -1,4 +1,5 @@
+ from __future__ import (absolute_import, print_function, division)
++
+ import traceback
+ from netlib import tcp
+ 
+@@ -99,7 +100,7 @@ class TlsLayer(Layer):
+         if server_err and not self.client_sni:
+             raise server_err
+ 
+-    def handle_sni(self, connection):
++    def __handle_sni(self, connection):
+         """
+         This callback gets called during the TLS handshake with the client.
+         The client has just sent the Sever Name Indication (SNI).
+@@ -119,7 +120,7 @@ class TlsLayer(Layer):
+ 
+             if self.client_sni:
+                 # Now, change client context to reflect possibly changed certificate:
+-                cert, key, chain_file = self.find_cert()
++                cert, key, chain_file = self._find_cert()
+                 new_context = self.client_conn.create_ssl_context(
+                     cert, key,
+                     method=self.config.openssl_method_client,
+@@ -137,13 +138,13 @@ class TlsLayer(Layer):
+     @yield_from_callback
+     def _establish_tls_with_client(self):
+         self.log("Establish TLS with client", "debug")
+-        cert, key, chain_file = self.find_cert()
++        cert, key, chain_file = self._find_cert()
+         try:
+             self.client_conn.convert_to_ssl(
+                 cert, key,
+                 method=self.config.openssl_method_client,
+                 options=self.config.openssl_options_client,
+-                handle_sni=self.handle_sni,
++                handle_sni=self.__handle_sni,
+                 cipher_list=self.config.ciphers_client,
+                 dhparams=self.config.certstore.dhparams,
+                 chain_file=chain_file
+@@ -182,7 +183,7 @@ class TlsLayer(Layer):
+         except tcp.NetLibError as e:
+             raise ProtocolException(repr(e), e)
+ 
+-    def find_cert(self):
++    def _find_cert(self):
+         host = self.server_conn.address.host
+         sans = set()
+         # Incorporate upstream certificate

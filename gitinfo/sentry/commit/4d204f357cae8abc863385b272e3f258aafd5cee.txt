@@ -1,0 +1,287 @@
+commit 4d204f357cae8abc863385b272e3f258aafd5cee
+Author: Arpad Borsos <arpad.borsos@sentry.io>
+Date:   Mon Jun 15 10:22:09 2020 +0200
+
+    feat: Support better proguard stackframe remapping (#19012)
+    
+    This adds support for line number remapping, and inlined frames.
+
+diff --git a/requirements-base.txt b/requirements-base.txt
+index 0e68959999..d5af2cc1b1 100644
+--- a/requirements-base.txt
++++ b/requirements-base.txt
+@@ -56,7 +56,7 @@ six>=1.11.0,<1.12.0
+ sqlparse>=0.2.0,<0.3.0
+ statsd>=3.1.0,<3.2.0
+ structlog==16.1.0
+-symbolic>=7.3.1,<8.0.0
++symbolic>=7.3.5,<8.0.0
+ toronado>=0.0.11,<0.1.0
+ ua-parser>=0.10.0,<0.11.0
+ unidiff>=0.5.4
+diff --git a/src/sentry/lang/java/plugin.py b/src/sentry/lang/java/plugin.py
+index d8520715fd..8b55030d73 100644
+--- a/src/sentry/lang/java/plugin.py
++++ b/src/sentry/lang/java/plugin.py
+@@ -2,15 +2,12 @@ from __future__ import absolute_import
+ 
+ import six
+ 
+-from symbolic import ProguardMappingView
++from symbolic import ProguardMapper
+ from sentry.plugins.base.v2 import Plugin2
+ from sentry.stacktraces.processing import StacktraceProcessor
+ from sentry.models import ProjectDebugFile, EventError
+ from sentry.reprocessing import report_processing_issue
+ from sentry.utils.safe import get_path
+-from sentry.utils.compat import map
+-
+-FRAME_CACHE_VERSION = 2
+ 
+ 
+ def is_valid_image(image):
+@@ -32,16 +29,6 @@ class JavaStacktraceProcessor(StacktraceProcessor):
+         platform = frame.get("platform") or self.data.get("platform")
+         return platform == "java" and self.available and "function" in frame and "module" in frame
+ 
+-    def preprocess_frame(self, processable_frame):
+-        processable_frame.set_cache_key_from_values(
+-            (
+-                FRAME_CACHE_VERSION,
+-                processable_frame.frame["module"],
+-                processable_frame.frame["function"],
+-            )
+-            + tuple(sorted(map(six.text_type, self.images)))
+-        )
+-
+     def preprocess_step(self, processing_task):
+         if not self.available:
+             return False
+@@ -58,7 +45,7 @@ class JavaStacktraceProcessor(StacktraceProcessor):
+             if dif_path is None:
+                 error_type = EventError.PROGUARD_MISSING_MAPPING
+             else:
+-                view = ProguardMappingView.open(dif_path)
++                view = ProguardMapper.open(dif_path)
+                 if not view.has_line_info:
+                     error_type = EventError.PROGUARD_MISSING_LINENO
+                 else:
+@@ -92,9 +79,9 @@ class JavaStacktraceProcessor(StacktraceProcessor):
+         key = "%s.%s" % (mod, ty)
+ 
+         for view in self.mapping_views:
+-            original = view.lookup(key)
+-            if original != key:
+-                new_module, new_cls = original.rsplit(".", 1)
++            mapped = view.remap_class(key)
++            if mapped:
++                new_module, new_cls = mapped.rsplit(".", 1)
+                 exception["module"] = new_module
+                 exception["type"] = new_cls
+                 return True
+@@ -102,33 +89,43 @@ class JavaStacktraceProcessor(StacktraceProcessor):
+         return False
+ 
+     def process_frame(self, processable_frame, processing_task):
+-        new_module = None
+-        new_function = None
+         frame = processable_frame.frame
++        raw_frame = dict(frame)
+ 
+-        if processable_frame.cache_value is None:
+-            alias = "%s:%s" % (frame["module"], frame["function"])
+-            for view in self.mapping_views:
+-                original = view.lookup(alias, frame.get("lineno"))
+-                if original != alias:
+-                    new_module, new_function = original.split(":", 1)
+-                    break
++        # first, try to remap complete frames
++        for view in self.mapping_views:
++            mapped = view.remap_frame(frame["module"], frame["function"], frame.get("lineno") or 0)
+ 
+-            if new_module and new_function:
+-                processable_frame.set_cache_value([new_module, new_function])
++            if len(mapped) > 0:
++                new_frames = []
++                bottom_class = mapped[-1].class_name
+ 
+-        else:
+-            new_module, new_function = processable_frame.cache_value
++                # sentry expects stack traces in reverse order
++                for new_frame in reversed(mapped):
++                    frame = dict(raw_frame)
++                    frame["module"] = new_frame.class_name
++                    frame["function"] = new_frame.method
++                    frame["lineno"] = new_frame.line
+ 
+-        if not new_module or not new_function:
+-            return
++                    # clear the filename for all *foreign* classes
++                    if frame["module"] != bottom_class:
++                        frame.pop("filename", None)
++                        frame.pop("abs_path", None)
+ 
+-        raw_frame = dict(frame)
+-        new_frame = dict(frame)
+-        new_frame["module"] = new_module
+-        new_frame["function"] = new_function
++                    new_frames.append(frame)
++
++                return new_frames, [raw_frame], []
++
++        # second, if that is not possible, try to re-map only the class-name
++        for view in self.mapping_views:
++            mapped = view.remap_class(frame["module"])
++
++            if mapped:
++                new_frame = dict(raw_frame)
++                new_frame["module"] = mapped
++                return [new_frame], [raw_frame], []
+ 
+-        return [new_frame], [raw_frame], []
++        return
+ 
+ 
+ class JavaPlugin(Plugin2):
+diff --git a/tests/sentry/lang/java/test_plugin.py b/tests/sentry/lang/java/test_plugin.py
+index 69dbfe0e68..6b8b8569f9 100644
+--- a/tests/sentry/lang/java/test_plugin.py
++++ b/tests/sentry/lang/java/test_plugin.py
+@@ -18,6 +18,30 @@ org.slf4j.helpers.Util$ClassContextSecurityManager -> org.a.b.g$a:
+     69:69:java.lang.Class[] getExtraClassContext() -> a
+     65:65:void <init>(org.slf4j.helpers.Util$1) -> <init>
+ """
++PROGUARD_INLINE_UUID = "d748e578-b3d1-5be5-b0e5-a42e8c9bf8e0"
++PROGUARD_INLINE_SOURCE = b"""\
++# compiler: R8
++# compiler_version: 2.0.74
++# min_api: 16
++# pg_map_id: 5b46fdc
++# common_typos_disable
++$r8$backportedMethods$utility$Objects$2$equals -> a:
++    boolean equals(java.lang.Object,java.lang.Object) -> a
++$r8$twr$utility -> b:
++    void $closeResource(java.lang.Throwable,java.lang.Object) -> a
++android.support.v4.app.RemoteActionCompatParcelizer -> android.support.v4.app.RemoteActionCompatParcelizer:
++    1:1:void <init>():11:11 -> <init>
++io.sentry.sample.-$$Lambda$r3Avcbztes2hicEObh02jjhQqd4 -> e.a.c.a:
++    io.sentry.sample.MainActivity f$0 -> b
++io.sentry.sample.MainActivity -> io.sentry.sample.MainActivity:
++    1:1:void <init>():15:15 -> <init>
++    1:1:boolean onCreateOptionsMenu(android.view.Menu):60:60 -> onCreateOptionsMenu
++    1:1:boolean onOptionsItemSelected(android.view.MenuItem):69:69 -> onOptionsItemSelected
++    2:2:boolean onOptionsItemSelected(android.view.MenuItem):76:76 -> onOptionsItemSelected
++    1:1:void bar():54:54 -> t
++    1:1:void foo():44 -> t
++    1:1:void onClickHandler(android.view.View):40 -> t
++"""
+ PROGUARD_BUG_UUID = "071207ac-b491-4a74-957c-2c94fd9594f2"
+ PROGUARD_BUG_SOURCE = b"x"
+ 
+@@ -123,6 +147,106 @@ class BasicResolvingIntegrationTest(object):
+             "org.slf4j.helpers.Util$ClassContextSecurityManager " "in getExtraClassContext"
+         )
+ 
++    def test_resolving_inline(self):
++        url = reverse(
++            "sentry-api-0-dsym-files",
++            kwargs={
++                "organization_slug": self.project.organization.slug,
++                "project_slug": self.project.slug,
++            },
++        )
++
++        self.login_as(user=self.user)
++
++        out = BytesIO()
++        f = zipfile.ZipFile(out, "w")
++        f.writestr("proguard/%s.txt" % PROGUARD_INLINE_UUID, PROGUARD_INLINE_SOURCE)
++        f.writestr("ignored-file.txt", b"This is just some stuff")
++        f.close()
++
++        response = self.client.post(
++            url,
++            {
++                "file": SimpleUploadedFile(
++                    "symbols.zip", out.getvalue(), content_type="application/zip"
++                )
++            },
++            format="multipart",
++        )
++        assert response.status_code == 201, response.content
++        assert len(response.data) == 1
++
++        event_data = {
++            "user": {"ip_address": "31.172.207.97"},
++            "extra": {},
++            "project": self.project.id,
++            "platform": "java",
++            "debug_meta": {"images": [{"type": "proguard", "uuid": PROGUARD_INLINE_UUID}]},
++            "exception": {
++                "values": [
++                    {
++                        "stacktrace": {
++                            "frames": [
++                                {
++                                    "function": "onClick",
++                                    "abs_path": None,
++                                    "module": "e.a.c.a",
++                                    "filename": None,
++                                    "lineno": 2,
++                                },
++                                {
++                                    "function": "t",
++                                    "abs_path": None,
++                                    "module": "io.sentry.sample.MainActivity",
++                                    "filename": "MainActivity.java",
++                                    "lineno": 1,
++                                },
++                            ]
++                        },
++                        "module": "org.a.b",
++                        "type": "g$a",
++                        "value": "Shit broke yo",
++                    }
++                ]
++            },
++            "timestamp": iso_format(before_now(seconds=1)),
++        }
++
++        event = self.post_and_retrieve_event(event_data)
++        if not self.use_relay():
++            # We measure the number of queries after an initial post,
++            # because there are many queries polluting the array
++            # before the actual "processing" happens (like, auth_user)
++            with self.assertWriteQueries(
++                {
++                    "nodestore_node": 2,
++                    "sentry_eventuser": 1,
++                    "sentry_groupedmessage": 1,
++                    "sentry_userreport": 1,
++                }
++            ):
++                self.post_and_retrieve_event(event_data)
++
++        exc = event.interfaces["exception"].values[0]
++        bt = exc.stacktrace
++        frames = bt.frames
++
++        assert len(frames) == 4
++
++        assert frames[0].function == "onClick"
++        assert frames[0].module == "io.sentry.sample.-$$Lambda$r3Avcbztes2hicEObh02jjhQqd4"
++
++        assert frames[1].filename == "MainActivity.java"
++        assert frames[1].module == "io.sentry.sample.MainActivity"
++        assert frames[1].function == "onClickHandler"
++        assert frames[1].lineno == 40
++        assert frames[2].function == "foo"
++        assert frames[2].lineno == 44
++        assert frames[3].function == "bar"
++        assert frames[3].lineno == 54
++        assert frames[3].filename == "MainActivity.java"
++        assert frames[3].module == "io.sentry.sample.MainActivity"
++
+     def test_error_on_resolving(self):
+         url = reverse(
+             "sentry-api-0-dsym-files",

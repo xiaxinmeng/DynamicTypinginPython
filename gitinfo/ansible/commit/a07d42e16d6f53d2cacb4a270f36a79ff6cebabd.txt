@@ -1,0 +1,1574 @@
+commit a07d42e16d6f53d2cacb4a270f36a79ff6cebabd
+Author: Matt Clay <matt@mystile.com>
+Date:   Fri May 5 16:23:00 2017 +0800
+
+    Add support for cloud tests to ansible-test. (#24315)
+    
+    * Split out ansible-test docker functions.
+    * Add cloud support to ansible-test.
+
+diff --git a/test/integration/cloud-config-aws.yml.template b/test/integration/cloud-config-aws.yml.template
+new file mode 100644
+index 0000000000..ec8a2859c8
+--- /dev/null
++++ b/test/integration/cloud-config-aws.yml.template
+@@ -0,0 +1,19 @@
++# This is the configuration template for ansible-test AWS integration tests.
++#
++# You do not need this template if you are:
++#
++# 1) Running integration tests without using ansible-test.
++# 2) Using the automatically provisioned AWS credentials in ansible-test.
++#
++# If you do not want to use the automatically provisioned temporary AWS credentials,
++# fill in the @VAR placeholders below and save this file without the .template extension.
++# This will cause ansible-test to use the given configuration instead of temporary credentials.
++#
++# NOTE: Automatic provisioning of AWS credentials requires an ansible-core-ci API key.
++
++aws_access_key: @ACCESS_KEY
++aws_secret_key: @SECRET_KEY
++security_token: @SECURITY_TOKEN
++# aliases for backwards compatibility with older integration test playbooks
++ec2_access_key: '{{ aws_access_key }}'
++ec2_secret_key: '{{ aws_secret_key }}'
+diff --git a/test/integration/cloud-config-cs.ini.template b/test/integration/cloud-config-cs.ini.template
+new file mode 100644
+index 0000000000..7c94eb572e
+--- /dev/null
++++ b/test/integration/cloud-config-cs.ini.template
+@@ -0,0 +1,18 @@
++# This is the configuration template for ansible-test CloudStack integration tests.
++#
++# You do not need this template if you are:
++#
++# 1) Running integration tests without using ansible-test.
++# 2) Using the automatically provisioned cloudstack-sim docker container in ansible-test.
++#
++# If you do not want to use the automatically provided CloudStack simulator,
++# fill in the @VAR placeholders below and save this file without the .template extension.
++# This will cause ansible-test to use the given configuration and not launch the simulator.
++#
++# It is recommended that you DO NOT use this template unless you cannot use the simulator.
++
++[cloudstack]
++endpoint = http://@HOST:@PORT/client/api
++key = @KEY
++secret = @SECRET
++timeout = 60
+diff --git a/test/runner/lib/__init__.py b/test/runner/lib/__init__.py
+index e69de29bb2..c29c477f7a 100644
+--- a/test/runner/lib/__init__.py
++++ b/test/runner/lib/__init__.py
+@@ -0,0 +1 @@
++"""Support code for Ansible testing infrastructure."""
+diff --git a/test/runner/lib/cloud/__init__.py b/test/runner/lib/cloud/__init__.py
+new file mode 100644
+index 0000000000..edf2d33a5f
+--- /dev/null
++++ b/test/runner/lib/cloud/__init__.py
+@@ -0,0 +1,356 @@
++"""Plugin system for cloud providers and environments for use in integration tests."""
++from __future__ import absolute_import, print_function
++
++import abc
++import atexit
++import os
++import platform
++import random
++import re
++import tempfile
++
++from lib.util import (
++    ApplicationError,
++    display,
++    is_shippable,
++    import_plugins,
++    load_plugins,
++)
++
++from lib.test import (
++    TestConfig,
++)
++
++from lib.target import (
++    TestTarget,
++)
++
++PROVIDERS = {}
++ENVIRONMENTS = {}
++
++
++def initialize_cloud_plugins():
++    """Import cloud plugins and load them into the plugin dictionaries."""
++    import_plugins('cloud')
++
++    load_plugins(CloudProvider, PROVIDERS)
++    load_plugins(CloudEnvironment, ENVIRONMENTS)
++
++
++def get_cloud_platforms(args, targets=None):
++    """
++    :type args: TestConfig
++    :type targets: tuple[IntegrationTarget] | None
++    :rtype: list[str]
++    """
++    if targets is None:
++        cloud_platforms = set(args.metadata.cloud_config or [])
++    else:
++        cloud_platforms = set(get_cloud_platform(t) for t in targets)
++
++    cloud_platforms.discard(None)
++
++    return sorted(cloud_platforms)
++
++
++def get_cloud_platform(target):
++    """
++    :type target: IntegrationTarget
++    :rtype: str | None
++    """
++    cloud_platforms = set(a.split('/')[1] for a in target.aliases if a.startswith('cloud/') and a.endswith('/') and a != 'cloud/')
++
++    if not cloud_platforms:
++        return None
++
++    if len(cloud_platforms) == 1:
++        cloud_platform = cloud_platforms.pop()
++
++        if cloud_platform not in PROVIDERS:
++            raise ApplicationError('Target %s aliases contains unknown cloud platform: %s' % (target.name, cloud_platform))
++
++        return cloud_platform
++
++    raise ApplicationError('Target %s aliases contains multiple cloud platforms: %s' % (target.name, ', '.join(sorted(cloud_platforms))))
++
++
++def get_cloud_providers(args, targets=None):
++    """
++    :type args: TestConfig
++    :type targets: tuple[IntegrationTarget] | None
++    :rtype: list[CloudProvider]
++    """
++    return [PROVIDERS[p](args) for p in get_cloud_platforms(args, targets)]
++
++
++def get_cloud_environment(args, target):
++    """
++    :type args: TestConfig
++    :type target: IntegrationTarget
++    :rtype: CloudEnvironment
++    """
++    cloud_platform = get_cloud_platform(target)
++
++    if not cloud_platform:
++        return None
++
++    return ENVIRONMENTS[cloud_platform](args)
++
++
++def cloud_filter(args, targets):
++    """
++    :type args: TestConfig
++    :type targets: tuple[IntegrationTarget]
++    :return: list[str]
++    """
++    if args.metadata.cloud_config is not None:
++        return []  # cloud filter already performed prior to delegation
++
++    exclude = []
++
++    for provider in get_cloud_providers(args, targets):
++        provider.filter(targets, exclude)
++
++    return exclude
++
++
++def cloud_init(args, targets):
++    """
++    :type args: TestConfig
++    :type targets: tuple[IntegrationTarget]
++    """
++    if args.metadata.cloud_config is not None:
++        return  # cloud configuration already established prior to delegation
++
++    args.metadata.cloud_config = {}
++
++    for provider in get_cloud_providers(args, targets):
++        args.metadata.cloud_config[provider.platform] = {}
++        provider.setup()
++
++
++class CloudBase(object):
++    """Base class for cloud plugins."""
++    __metaclass__ = abc.ABCMeta
++
++    _CONFIG_PATH = 'config_path'
++    _RESOURCE_PREFIX = 'resource_prefix'
++    _MANAGED = 'managed'
++
++    def __init__(self, args):
++        """
++        :type args: TestConfig
++        """
++        self.args = args
++        self.platform = self.__module__.split('.')[2]
++
++    @property
++    def config_path(self):
++        """
++        :rtype: str
++        """
++        return os.path.join(os.getcwd(), self._get_cloud_config(self._CONFIG_PATH))
++
++    @config_path.setter
++    def config_path(self, value):
++        """
++        :type value: str
++        """
++        self._set_cloud_config(self._CONFIG_PATH, value)
++
++    @property
++    def resource_prefix(self):
++        """
++        :rtype: str
++        """
++        return self._get_cloud_config(self._RESOURCE_PREFIX)
++
++    @resource_prefix.setter
++    def resource_prefix(self, value):
++        """
++        :type value: str
++        """
++        self._set_cloud_config(self._RESOURCE_PREFIX, value)
++
++    @property
++    def managed(self):
++        """
++        :rtype: bool
++        """
++        return self._get_cloud_config(self._MANAGED)
++
++    @managed.setter
++    def managed(self, value):
++        """
++        :type value: bool
++        """
++        self._set_cloud_config(self._MANAGED, value)
++
++    def _get_cloud_config(self, key):
++        """
++        :type key: str
++        :rtype: str | int | bool
++        """
++        return self.args.metadata.cloud_config[self.platform][key]
++
++    def _set_cloud_config(self, key, value):
++        """
++        :type key: str
++        :type value: str | int | bool
++        """
++        self.args.metadata.cloud_config[self.platform][key] = value
++
++
++class CloudProvider(CloudBase):
++    """Base class for cloud provider plugins. Sets up cloud resources before delegation."""
++    __metaclass__ = abc.ABCMeta
++
++    TEST_DIR = 'test/integration'
++
++    def __init__(self, args, config_extension='.yml'):
++        """
++        :type args: TestConfig
++        :type config_extension: str
++        """
++        super(CloudProvider, self).__init__(args)
++
++        self.remove_config = False
++        self.config_static_path = '%s/cloud-config-%s%s' % (self.TEST_DIR, self.platform, config_extension)
++        self.config_template_path = '%s.template' % self.config_static_path
++        self.config_extension = config_extension
++
++    def filter(self, targets, exclude):
++        """Filter out the cloud tests when the necessary config and resources are not available.
++        :type targets: tuple[TestTarget]
++        :type exclude: list[str]
++        """
++        skip = 'cloud/%s/' % self.platform
++        skipped = [target.name for target in targets if skip in target.aliases]
++
++        if skipped:
++            exclude.append(skip)
++            display.warning('Excluding tests marked "%s" which require config (see "%s"): %s'
++                            % (skip.rstrip('/'), self.config_template_path, ', '.join(skipped)))
++
++    def setup(self):
++        """Setup the cloud resource before delegation and register a cleanup callback."""
++        self.resource_prefix = self._generate_resource_prefix()
++
++        atexit.register(self.cleanup)
++
++    # pylint: disable=locally-disabled, no-self-use
++    def get_remote_ssh_options(self):
++        """Get any additional options needed when delegating tests to a remote instance via SSH.
++        :rtype: list[str]
++        """
++        return []
++
++    # pylint: disable=locally-disabled, no-self-use
++    def get_docker_run_options(self):
++        """Get any additional options needed when delegating tests to a docker container.
++        :rtype: list[str]
++        """
++        return []
++
++    def cleanup(self):
++        """Clean up the cloud resource and any temporary configuration files after tests complete."""
++        if self.remove_config:
++            os.remove(self.config_path)
++
++    def _use_static_config(self):
++        """
++        :rtype: bool
++        """
++        if os.path.isfile(self.config_static_path):
++            display.info('Using existing %s cloud config: %s' % (self.platform, self.config_static_path), verbosity=1)
++            self.config_path = self.config_static_path
++            static = True
++        else:
++            static = False
++
++        self.managed = not static
++
++        return static
++
++    def _write_config(self, content):
++        """
++        :type content: str
++        """
++        prefix = '%s-' % os.path.splitext(os.path.basename(self.config_static_path))[0]
++
++        with tempfile.NamedTemporaryFile(dir=self.TEST_DIR, prefix=prefix, suffix=self.config_extension, delete=False) as config_fd:
++            filename = os.path.join(self.TEST_DIR, os.path.basename(config_fd.name))
++
++            self.config_path = config_fd.name
++            self.remove_config = True
++            self._set_cloud_config('config_path', filename)
++
++            display.info('>>> Config: %s\n%s' % (filename, content.strip()), verbosity=3)
++
++            config_fd.write(content.encode('utf-8'))
++            config_fd.flush()
++
++    def _read_config_template(self):
++        """
++        :rtype: str
++        """
++        with open(self.config_template_path, 'r') as template_fd:
++            lines = template_fd.read().splitlines()
++            lines = [l for l in lines if not l.startswith('#')]
++            config = '\n'.join(lines).strip() + '\n'
++            return config
++
++    @staticmethod
++    def _populate_config_template(template, values):
++        """
++        :type template: str
++        :type values: dict[str, str]
++        :rtype: str
++        """
++        for key in sorted(values):
++            value = values[key]
++            template = template.replace('@%s' % key, value)
++
++        return template
++
++    @staticmethod
++    def _generate_resource_prefix():
++        """
++        :rtype: str
++        """
++        if is_shippable():
++            return 'shippable-%d-%d' % (
++                os.environ['SHIPPABLE_BUILD_NUMBER'],
++                os.environ['SHIPPABLE_JOB_NUMBER'],
++            )
++
++        node = re.sub(r'[^a-zA-Z0-9]+', '-', platform.node().split('.')[0])
++
++        return 'ansible-test-%s-%d' % (node, random.randint(10000000, 99999999))
++
++
++class CloudEnvironment(CloudBase):
++    """Base class for cloud environment plugins. Updates integration test environment after delegation."""
++    __metaclass__ = abc.ABCMeta
++
++    @abc.abstractmethod
++    def configure_environment(self, env, cmd):
++        """
++        :type env: dict[str, str]
++        :type cmd: list[str]
++        """
++        pass
++
++    def on_failure(self, target, tries):
++        """
++        :type target: TestTarget
++        :type tries: int
++        """
++        pass
++
++    @property
++    def inventory_hosts(self):
++        """
++        :rtype: str | None
++        """
++        return None
+diff --git a/test/runner/lib/cloud/aws.py b/test/runner/lib/cloud/aws.py
+new file mode 100644
+index 0000000000..aab90c96f4
+--- /dev/null
++++ b/test/runner/lib/cloud/aws.py
+@@ -0,0 +1,111 @@
++"""AWS plugin for integration tests."""
++from __future__ import absolute_import, print_function
++
++import os
++
++from lib.util import (
++    ApplicationError,
++    display,
++    is_shippable,
++)
++
++from lib.cloud import (
++    CloudProvider,
++    CloudEnvironment,
++)
++
++from lib.core_ci import (
++    AnsibleCoreCI,
++)
++
++
++class AwsCloudProvider(CloudProvider):
++    """AWS cloud provider plugin. Sets up cloud resources before delegation."""
++    def filter(self, targets, exclude):
++        """Filter out the cloud tests when the necessary config and resources are not available.
++        :type targets: tuple[TestTarget]
++        :type exclude: list[str]
++        """
++        if os.path.isfile(self.config_static_path):
++            return
++
++        aci = self._create_ansible_core_ci()
++
++        if os.path.isfile(aci.ci_key):
++            return
++
++        if is_shippable():
++            return
++
++        super(AwsCloudProvider, self).filter(targets, exclude)
++
++    def setup(self):
++        """Setup the cloud resource before delegation and register a cleanup callback."""
++        super(AwsCloudProvider, self).setup()
++
++        aws_config_path = os.path.expanduser('~/.aws')
++
++        if os.path.exists(aws_config_path) and not self.args.docker and not self.args.remote:
++            raise ApplicationError('Rename "%s" or use the --docker or --remote option to isolate tests.' % aws_config_path)
++
++        if not self._use_static_config():
++            self._setup_dynamic()
++
++    def _setup_dynamic(self):
++        """Request AWS credentials through the Ansible Core CI service."""
++        display.info('Provisioning %s cloud environment.' % self.platform, verbosity=1)
++
++        config = self._read_config_template()
++
++        aci = self._create_ansible_core_ci()
++
++        response = aci.start_remote()
++
++        if not self.args.explain:
++            credentials = response['aws']['credentials']
++
++            values = dict(
++                ACCESS_KEY=credentials['access_key'],
++                SECRET_KEY=credentials['secret_key'],
++                SECURITY_TOKEN=credentials['session_token'],
++            )
++
++            config = self._populate_config_template(config, values)
++
++        self._write_config(config)
++
++    def _create_ansible_core_ci(self):
++        """
++        :rtype: AnsibleCoreCI
++        """
++        return AnsibleCoreCI(self.args, 'aws', 'sts', persist=False, stage=self.args.remote_stage)
++
++
++class AwsCloudEnvironment(CloudEnvironment):
++    """AWS cloud environment plugin. Updates integration test environment after delegation."""
++    def configure_environment(self, env, cmd):
++        """
++        :type env: dict[str, str]
++        :type cmd: list[str]
++        """
++        cmd.append('-e')
++        cmd.append('@%s' % self.config_path)
++
++        cmd.append('-e')
++        cmd.append('resource_prefix=%s' % self.resource_prefix)
++
++    def on_failure(self, target, tries):
++        """
++        :type target: TestTarget
++        :type tries: int
++        """
++        if not tries and self.managed:
++            display.notice('If %s failed due to permissions, the IAM test policy may need to be updated. '
++                           'For help, consult @mattclay or @gundalow on GitHub or #ansible-devel on IRC.' % target.name)
++
++    @property
++    def inventory_hosts(self):
++        """
++        :rtype: str | None
++        """
++        return 'amazon'
+diff --git a/test/runner/lib/cloud/cs.py b/test/runner/lib/cloud/cs.py
+new file mode 100644
+index 0000000000..b751548606
+--- /dev/null
++++ b/test/runner/lib/cloud/cs.py
+@@ -0,0 +1,240 @@
++"""CloudStack plugin for integration tests."""
++from __future__ import absolute_import, print_function
++
++import os
++import time
++
++from lib.cloud import (
++    CloudProvider,
++    CloudEnvironment,
++)
++
++from lib.util import (
++    find_executable,
++    ApplicationError,
++    display,
++    SubprocessError,
++    is_shippable,
++)
++
++from lib.http import (
++    HttpClient,
++    urlparse,
++)
++
++from lib.docker_util import (
++    docker_run,
++    docker_rm,
++    docker_inspect,
++    docker_pull,
++)
++
++try:
++    # noinspection PyPep8Naming
++    import ConfigParser as configparser
++except ImportError:
++    # noinspection PyUnresolvedReferences
++    import configparser
++
++
++class CsCloudProvider(CloudProvider):
++    """CloudStack cloud provider plugin. Sets up cloud resources before delegation."""
++    DOCKER_SIMULATOR_NAME = 'cloudstack-sim'
++
++    def __init__(self, args):
++        """
++        :type args: TestConfig
++        """
++        super(CsCloudProvider, self).__init__(args, config_extension='.ini')
++
++        self.image = 'resmo/cloudstack-sim'
++        self.container_name = ''
++        self.endpoint = ''
++        self.host = ''
++        self.port = 0
++
++    def filter(self, targets, exclude):
++        """Filter out the cloud tests when the necessary config and resources are not available.
++        :type targets: tuple[TestTarget]
++        :type exclude: list[str]
++        """
++        if os.path.isfile(self.config_static_path):
++            return
++
++        docker = find_executable('docker')
++
++        if docker:
++            return
++
++        super(CsCloudProvider, self).filter(targets, exclude)
++
++    def setup(self):
++        """Setup the cloud resource before delegation and register a cleanup callback."""
++        super(CsCloudProvider, self).setup()
++
++        if self._use_static_config():
++            self._setup_static()
++        else:
++            self._setup_dynamic()
++
++    def get_remote_ssh_options(self):
++        """Get any additional options needed when delegating tests to a remote instance via SSH.
++        :rtype: list[str]
++        """
++        if self.managed:
++            return ['-R', '8888:localhost:8888']
++
++        return []
++
++    def get_docker_run_options(self):
++        """Get any additional options needed when delegating tests to a docker container.
++        :rtype: list[str]
++        """
++        if self.managed:
++            return ['--link', self.DOCKER_SIMULATOR_NAME]
++
++        return []
++
++    def cleanup(self):
++        """Clean up the cloud resource and any temporary configuration files after tests complete."""
++        if self.container_name:
++            if is_shippable():
++                docker_rm(self.args, self.container_name)
++            elif not self.args.explain:
++                display.notice('Remember to run `docker rm -f %s` when finished testing.' % self.container_name)
++
++        super(CsCloudProvider, self).cleanup()
++
++    def _setup_static(self):
++        """Configure CloudStack tests for use with static configuration."""
++        parser = configparser.RawConfigParser()
++        parser.read(self.config_static_path)
++
++        self.endpoint = parser.get('cloudstack', 'endpoint')
++
++        parts = urlparse(self.endpoint)
++
++        self.host = parts.hostname
++
++        if not self.host:
++            raise ApplicationError('Could not determine host from endpoint: %s' % self.endpoint)
++
++        if parts.port:
++            self.port = parts.port
++        elif parts.scheme == 'http':
++            self.port = 80
++        elif parts.scheme == 'https':
++            self.port = 443
++        else:
++            raise ApplicationError('Could not determine port from endpoint: %s' % self.endpoint)
++
++        display.info('Read cs host "%s" and port %d from config: %s' % (self.host, self.port, self.config_static_path), verbosity=1)
++
++        self._wait_for_service()
++
++    def _setup_dynamic(self):
++        """Create a CloudStack simulator using docker."""
++        config = self._read_config_template()
++
++        self.container_name = self.DOCKER_SIMULATOR_NAME
++
++        results = docker_inspect(self.args, self.container_name)
++
++        if results and not results[0]['State']['Running']:
++            docker_rm(self.args, self.container_name)
++            results = []
++
++        if results:
++            display.info('Using the existing CloudStack simulator docker container.', verbosity=1)
++        else:
++            display.info('Starting a new CloudStack simulator docker container.', verbosity=1)
++            docker_pull(self.args, self.image)
++            docker_run(self.args, self.image, ['-d', '-p', '8888:8888', '--name', self.container_name])
++            display.notice('The CloudStack simulator will probably be ready in 5 - 10 minutes.')
++
++        self.host = 'localhost'
++        self.port = 8888
++        self.endpoint = 'http://%s:%d' % (self.host, self.port)
++
++        self._wait_for_service()
++
++        if self.args.explain:
++            values = dict(
++                HOST=self.host,
++                PORT=str(self.port),
++            )
++        else:
++            credentials = self._get_credentials()
++
++            if self.args.docker:
++                host = self.DOCKER_SIMULATOR_NAME
++            else:
++                host = self.host
++
++            values = dict(
++                HOST=host,
++                PORT=str(self.port),
++                KEY=credentials['apikey'],
++                SECRET=credentials['secretkey'],
++            )
++
++        config = self._populate_config_template(config, values)
++
++        self._write_config(config)
++
++    def _wait_for_service(self):
++        """Wait for the CloudStack service endpoint to accept connections."""
++        if self.args.explain:
++            return
++
++        client = HttpClient(self.args, always=True)
++        endpoint = self.endpoint
++
++        for _ in range(1, 90):
++            display.info('Waiting for CloudStack service: %s' % endpoint, verbosity=1)
++
++            try:
++                client.get(endpoint)
++                return
++            except SubprocessError:
++                pass
++
++            time.sleep(10)
++
++        raise ApplicationError('Timeout waiting for CloudStack service.')
++
++    def _get_credentials(self):
++        """Wait for the CloudStack simulator to return credentials.
++        :rtype: dict[str, str]
++        """
++        client = HttpClient(self.args, always=True)
++        endpoint = '%s/admin.json' % self.endpoint
++
++        for _ in range(1, 90):
++            display.info('Waiting for CloudStack credentials: %s' % endpoint, verbosity=1)
++
++            response = client.get(endpoint)
++
++            if response.status_code == 200:
++                return response.json()
++
++            time.sleep(10)
++
++        raise ApplicationError('Timeout waiting for CloudStack credentials.')
++
++
++class CsCloudEnvironment(CloudEnvironment):
++    """CloudStack cloud environment plugin. Updates integration test environment after delegation."""
++    def configure_environment(self, env, cmd):
++        """
++        :type env: dict[str, str]
++        :type cmd: list[str]
++        """
++        changes = dict(
++            CLOUDSTACK_CONFIG=self.config_path,
++        )
++
++        env.update(changes)
++
++        cmd.append('-e')
++        cmd.append('cs_resource_prefix=%s' % self.resource_prefix)
+diff --git a/test/runner/lib/core_ci.py b/test/runner/lib/core_ci.py
+index b7b9ff041e..5dd7580ba9 100644
+--- a/test/runner/lib/core_ci.py
++++ b/test/runner/lib/core_ci.py
+@@ -52,6 +52,7 @@ class AnsibleCoreCI(object):
+         self.ci_key = os.path.expanduser('~/.ansible-core-ci.key')
+ 
+         aws_platforms = (
++            'aws',
+             'windows',
+             'freebsd',
+             'vyos',
+@@ -125,9 +126,6 @@ class AnsibleCoreCI(object):
+             self.started = False
+             self.instance_id = str(uuid.uuid4())
+ 
+-            display.info('Initializing new %s/%s instance %s.' % (self.platform, self.version, self.instance_id),
+-                         verbosity=1)
+-
+     def start(self):
+         """Start instance."""
+         if is_shippable():
+@@ -140,7 +138,7 @@ class AnsibleCoreCI(object):
+         with open(self.ci_key, 'r') as key_fd:
+             auth_key = key_fd.read().strip()
+ 
+-        self._start(dict(
++        return self._start(dict(
+             remote=dict(
+                 key=auth_key,
+                 nonce=None,
+@@ -149,7 +147,7 @@ class AnsibleCoreCI(object):
+ 
+     def start_shippable(self):
+         """Start instance on Shippable."""
+-        self._start(dict(
++        return self._start(dict(
+             shippable=dict(
+                 run_id=os.environ['SHIPPABLE_BUILD_ID'],
+                 job_number=int(os.environ['SHIPPABLE_JOB_NUMBER']),
+@@ -264,6 +262,8 @@ class AnsibleCoreCI(object):
+                          verbosity=1)
+             return
+ 
++        display.info('Initializing new %s/%s instance %s.' % (self.platform, self.version, self.instance_id), verbosity=1)
++
+         if self.platform == 'windows':
+             with open('examples/scripts/ConfigureRemotingForAnsible.ps1', 'r') as winrm_config_fd:
+                 winrm_config = winrm_config_fd.read()
+@@ -309,6 +309,11 @@ class AnsibleCoreCI(object):
+ 
+         display.info('Started %s/%s from: %s' % (self.platform, self.version, self._uri), verbosity=1)
+ 
++        if self.args.explain:
++            return {}
++
++        return response.json()
++
+     def _clear(self):
+         """Clear instance information."""
+         try:
+diff --git a/test/runner/lib/delegation.py b/test/runner/lib/delegation.py
+index 0a63754def..e90e20f970 100644
+--- a/test/runner/lib/delegation.py
++++ b/test/runner/lib/delegation.py
+@@ -5,7 +5,6 @@ from __future__ import absolute_import, print_function
+ import os
+ import sys
+ import tempfile
+-import time
+ 
+ import lib.pytar
+ import lib.thread
+@@ -13,7 +12,6 @@ import lib.thread
+ from lib.executor import (
+     SUPPORTED_PYTHON_VERSIONS,
+     IntegrationConfig,
+-    SubprocessError,
+     ShellConfig,
+     SanityConfig,
+     UnitsConfig,
+@@ -36,11 +34,20 @@ from lib.util import (
+     ApplicationError,
+     EnvironmentConfig,
+     run_command,
+-    common_environment,
+-    display,
+ )
+ 
+-BUFFER_SIZE = 256 * 256
++from lib.docker_util import (
++    docker_exec,
++    docker_get,
++    docker_pull,
++    docker_put,
++    docker_rm,
++    docker_run,
++)
++
++from lib.cloud import (
++    get_cloud_providers,
++)
+ 
+ 
+ def delegate(args, exclude, require):
+@@ -188,6 +195,11 @@ def delegate_docker(args, exclude, require):
+                 '--env', 'HTTPTESTER=1',
+             ]
+ 
++        cloud_platforms = get_cloud_providers(args)
++
++        for cloud_platform in cloud_platforms:
++            test_options += cloud_platform.get_docker_run_options()
++
+         test_id, _ = docker_run(args, test_image, options=test_options)
+ 
+         if args.explain:
+@@ -220,120 +232,6 @@ def delegate_docker(args, exclude, require):
+             docker_rm(args, test_id)
+ 
+ 
+-def docker_pull(args, image):
+-    """
+-    :type args: EnvironmentConfig
+-    :type image: str
+-    """
+-    if not args.docker_pull:
+-        display.warning('Skipping docker pull for "%s". Image may be out-of-date.' % image)
+-        return
+-
+-    for _ in range(1, 10):
+-        try:
+-            docker_command(args, ['pull', image])
+-            return
+-        except SubprocessError:
+-            display.warning('Failed to pull docker image "%s". Waiting a few seconds before trying again.' % image)
+-            time.sleep(3)
+-
+-    raise ApplicationError('Failed to pull docker image "%s".' % image)
+-
+-
+-def docker_put(args, container_id, src, dst):
+-    """
+-    :type args: EnvironmentConfig
+-    :type container_id: str
+-    :type src: str
+-    :type dst: str
+-    """
+-    # avoid 'docker cp' due to a bug which causes 'docker rm' to fail
+-    with open(src, 'rb') as src_fd:
+-        docker_exec(args, container_id, ['dd', 'of=%s' % dst, 'bs=%s' % BUFFER_SIZE],
+-                    options=['-i'], stdin=src_fd, capture=True)
+-
+-
+-def docker_get(args, container_id, src, dst):
+-    """
+-    :type args: EnvironmentConfig
+-    :type container_id: str
+-    :type src: str
+-    :type dst: str
+-    """
+-    # avoid 'docker cp' due to a bug which causes 'docker rm' to fail
+-    with open(dst, 'wb') as dst_fd:
+-        docker_exec(args, container_id, ['dd', 'if=%s' % src, 'bs=%s' % BUFFER_SIZE],
+-                    options=['-i'], stdout=dst_fd, capture=True)
+-
+-
+-def docker_run(args, image, options):
+-    """
+-    :type args: EnvironmentConfig
+-    :type image: str
+-    :type options: list[str] | None
+-    :rtype: str | None, str | None
+-    """
+-    if not options:
+-        options = []
+-
+-    for _ in range(1, 3):
+-        try:
+-            return docker_command(args, ['run'] + options + [image], capture=True)
+-        except SubprocessError as ex:
+-            display.error(ex)
+-            display.warning('Failed to run docker image "%s". Waiting a few seconds before trying again.' % image)
+-            time.sleep(3)
+-
+-    raise ApplicationError('Failed to run docker image "%s".' % image)
+-
+-
+-def docker_rm(args, container_id):
+-    """
+-    :type args: EnvironmentConfig
+-    :type container_id: str
+-    """
+-    docker_command(args, ['rm', '-f', container_id], capture=True)
+-
+-
+-def docker_exec(args, container_id, cmd, options=None, capture=False, stdin=None, stdout=None):
+-    """
+-    :type args: EnvironmentConfig
+-    :type container_id: str
+-    :type cmd: list[str]
+-    :type options: list[str] | None
+-    :type capture: bool
+-    :type stdin: file | None
+-    :type stdout: file | None
+-    :rtype: str | None, str | None
+-    """
+-    if not options:
+-        options = []
+-
+-    return docker_command(args, ['exec'] + options + [container_id] + cmd, capture=capture, stdin=stdin, stdout=stdout)
+-
+-
+-def docker_command(args, cmd, capture=False, stdin=None, stdout=None):
+-    """
+-    :type args: EnvironmentConfig
+-    :type cmd: list[str]
+-    :type capture: bool
+-    :type stdin: file | None
+-    :type stdout: file | None
+-    :rtype: str | None, str | None
+-    """
+-    env = docker_environment()
+-    return run_command(args, ['docker'] + cmd, env=env, capture=capture, stdin=stdin, stdout=stdout)
+-
+-
+-def docker_environment():
+-    """
+-    :rtype: dict[str, str]
+-    """
+-    env = common_environment()
+-    env.update(dict((key, os.environ[key]) for key in os.environ if key.startswith('DOCKER_')))
+-    return env
+-
+-
+ def delegate_remote(args, exclude, require):
+     """
+     :type args: EnvironmentConfig
+@@ -368,8 +266,15 @@ def delegate_remote(args, exclude, require):
+         manage = ManagePosixCI(core_ci)
+         manage.setup()
+ 
++        ssh_options = []
++
++        cloud_platforms = get_cloud_providers(args)
++
++        for cloud_platform in cloud_platforms:
++            ssh_options += cloud_platform.get_remote_ssh_options()
++
+         try:
+-            manage.ssh(cmd)
++            manage.ssh(cmd, ssh_options)
+         finally:
+             manage.ssh('rm -rf /tmp/results && cp -a ansible/test/results /tmp/results')
+             manage.download('/tmp/results', 'test')
+diff --git a/test/runner/lib/docker_util.py b/test/runner/lib/docker_util.py
+new file mode 100644
+index 0000000000..d93507d2d0
+--- /dev/null
++++ b/test/runner/lib/docker_util.py
+@@ -0,0 +1,154 @@
++"""Functions for accessing docker via the docker cli."""
++
++from __future__ import absolute_import, print_function
++
++import json
++import os
++import time
++
++from lib.executor import (
++    SubprocessError,
++)
++
++from lib.util import (
++    ApplicationError,
++    EnvironmentConfig,
++    run_command,
++    common_environment,
++    display,
++)
++
++BUFFER_SIZE = 256 * 256
++
++
++def docker_pull(args, image):
++    """
++    :type args: EnvironmentConfig
++    :type image: str
++    """
++    if not args.docker_pull:
++        display.warning('Skipping docker pull for "%s". Image may be out-of-date.' % image)
++        return
++
++    for _ in range(1, 10):
++        try:
++            docker_command(args, ['pull', image])
++            return
++        except SubprocessError:
++            display.warning('Failed to pull docker image "%s". Waiting a few seconds before trying again.' % image)
++            time.sleep(3)
++
++    raise ApplicationError('Failed to pull docker image "%s".' % image)
++
++
++def docker_put(args, container_id, src, dst):
++    """
++    :type args: EnvironmentConfig
++    :type container_id: str
++    :type src: str
++    :type dst: str
++    """
++    # avoid 'docker cp' due to a bug which causes 'docker rm' to fail
++    with open(src, 'rb') as src_fd:
++        docker_exec(args, container_id, ['dd', 'of=%s' % dst, 'bs=%s' % BUFFER_SIZE],
++                    options=['-i'], stdin=src_fd, capture=True)
++
++
++def docker_get(args, container_id, src, dst):
++    """
++    :type args: EnvironmentConfig
++    :type container_id: str
++    :type src: str
++    :type dst: str
++    """
++    # avoid 'docker cp' due to a bug which causes 'docker rm' to fail
++    with open(dst, 'wb') as dst_fd:
++        docker_exec(args, container_id, ['dd', 'if=%s' % src, 'bs=%s' % BUFFER_SIZE],
++                    options=['-i'], stdout=dst_fd, capture=True)
++
++
++def docker_run(args, image, options):
++    """
++    :type args: EnvironmentConfig
++    :type image: str
++    :type options: list[str] | None
++    :rtype: str | None, str | None
++    """
++    if not options:
++        options = []
++
++    for _ in range(1, 3):
++        try:
++            return docker_command(args, ['run'] + options + [image], capture=True)
++        except SubprocessError as ex:
++            display.error(ex)
++            display.warning('Failed to run docker image "%s". Waiting a few seconds before trying again.' % image)
++            time.sleep(3)
++
++    raise ApplicationError('Failed to run docker image "%s".' % image)
++
++
++def docker_rm(args, container_id):
++    """
++    :type args: EnvironmentConfig
++    :type container_id: str
++    """
++    docker_command(args, ['rm', '-f', container_id], capture=True)
++
++
++def docker_inspect(args, container_id):
++    """
++    :type args: EnvironmentConfig
++    :type container_id: str
++    :rtype: list[dict]
++    """
++    if args.explain:
++        return []
++
++    try:
++        stdout, _ = docker_command(args, ['inspect', container_id], capture=True)
++        return json.loads(stdout)
++    except SubprocessError as ex:
++        try:
++            return json.loads(ex.stdout)
++        except:
++            raise ex  # pylint: disable=locally-disabled, raising-bad-type
++
++
++def docker_exec(args, container_id, cmd, options=None, capture=False, stdin=None, stdout=None):
++    """
++    :type args: EnvironmentConfig
++    :type container_id: str
++    :type cmd: list[str]
++    :type options: list[str] | None
++    :type capture: bool
++    :type stdin: file | None
++    :type stdout: file | None
++    :rtype: str | None, str | None
++    """
++    if not options:
++        options = []
++
++    return docker_command(args, ['exec'] + options + [container_id] + cmd, capture=capture, stdin=stdin, stdout=stdout)
++
++
++def docker_command(args, cmd, capture=False, stdin=None, stdout=None):
++    """
++    :type args: EnvironmentConfig
++    :type cmd: list[str]
++    :type capture: bool
++    :type stdin: file | None
++    :type stdout: file | None
++    :rtype: str | None, str | None
++    """
++    env = docker_environment()
++    return run_command(args, ['docker'] + cmd, env=env, capture=capture, stdin=stdin, stdout=stdout)
++
++
++def docker_environment():
++    """
++    :rtype: dict[str, str]
++    """
++    env = common_environment()
++    env.update(dict((key, os.environ[key]) for key in os.environ if key.startswith('DOCKER_')))
++    return env
+diff --git a/test/runner/lib/executor.py b/test/runner/lib/executor.py
+index 79dc101ede..e7148a0ce8 100644
+--- a/test/runner/lib/executor.py
++++ b/test/runner/lib/executor.py
+@@ -28,6 +28,13 @@ from lib.manage_ci import (
+     ManageNetworkCI,
+ )
+ 
++from lib.cloud import (
++    cloud_filter,
++    cloud_init,
++    get_cloud_environment,
++    get_cloud_platforms,
++)
++
+ from lib.util import (
+     EnvironmentConfig,
+     ApplicationWarning,
+@@ -144,7 +151,12 @@ def install_command_requirements(args):
+         if args.junit:
+             packages.append('junit-xml')
+ 
+-    cmd = generate_pip_install(args.command, packages)
++    extras = []
++
++    if isinstance(args, TestConfig):
++        extras += ['cloud.%s' % cp for cp in get_cloud_platforms(args)]
++
++    cmd = generate_pip_install(args.command, packages, extras)
+ 
+     if not cmd:
+         return
+@@ -175,10 +187,11 @@ def generate_egg_info(args):
+     run_command(args, ['python', 'setup.py', 'egg_info'], capture=args.verbosity < 3)
+ 
+ 
+-def generate_pip_install(command, packages=None):
++def generate_pip_install(command, packages=None, extras=None):
+     """
+     :type command: str
+     :type packages: list[str] | None
++    :type extras: list[str] | None
+     :rtype: list[str] | None
+     """
+     constraints = 'test/runner/requirements/constraints.txt'
+@@ -186,8 +199,15 @@ def generate_pip_install(command, packages=None):
+ 
+     options = []
+ 
+-    if os.path.exists(requirements) and os.path.getsize(requirements):
+-        options += ['-r', requirements]
++    requirements_list = [requirements]
++
++    if extras:
++        for extra in extras:
++            requirements_list.append('test/runner/requirements/%s.%s.txt' % (command, extra))
++
++    for requirements in requirements_list:
++        if os.path.exists(requirements) and os.path.getsize(requirements):
++            options += ['-r', requirements]
+ 
+     if packages:
+         options += packages
+@@ -436,6 +456,8 @@ def command_integration_filter(args, targets):
+     internal_targets = walk_internal_targets(targets, args.include, exclude, require)
+     environment_exclude = get_integration_filter(args, internal_targets)
+ 
++    environment_exclude += cloud_filter(args, internal_targets)
++
+     if environment_exclude:
+         exclude += environment_exclude
+         internal_targets = walk_internal_targets(targets, args.include, exclude, require)
+@@ -446,6 +468,8 @@ def command_integration_filter(args, targets):
+     if args.start_at and not any(t.name == args.start_at for t in internal_targets):
+         raise ApplicationError('Start at target matches nothing: %s' % args.start_at)
+ 
++    cloud_init(args, internal_targets)
++
+     if args.delegate:
+         raise Delegate(require=changes, exclude=exclude)
+ 
+@@ -492,6 +516,8 @@ def command_integration_filtered(args, targets):
+         tries = 2 if args.retry_on_error else 1
+         verbosity = args.verbosity
+ 
++        cloud_environment = get_cloud_environment(args, target)
++
+         try:
+             while tries:
+                 tries -= 1
+@@ -509,6 +535,9 @@ def command_integration_filtered(args, targets):
+                         start_at_task = None
+                     break
+                 except SubprocessError:
++                    if cloud_environment:
++                        cloud_environment.on_failure(target, tries)
++
+                     if not tries:
+                         raise
+ 
+@@ -527,9 +556,11 @@ def command_integration_filtered(args, targets):
+             display.verbosity = args.verbosity = verbosity
+ 
+ 
+-def integration_environment(args):
++def integration_environment(args, target, cmd):
+     """
+     :type args: IntegrationConfig
++    :type target: IntegrationTarget
++    :type cmd: list[str]
+     :rtype: dict[str, str]
+     """
+     env = ansible_environment(args)
+@@ -541,6 +572,11 @@ def integration_environment(args):
+ 
+     env.update(integration)
+ 
++    cloud_environment = get_cloud_environment(args, target)
++
++    if cloud_environment:
++        cloud_environment.configure_environment(env, cmd)
++
+     return env
+ 
+ 
+@@ -556,7 +592,7 @@ def command_integration_script(args, target):
+     if args.verbosity:
+         cmd.append('-' + ('v' * args.verbosity))
+ 
+-    env = integration_environment(args)
++    env = integration_environment(args, target, cmd)
+     cwd = target.path
+ 
+     intercept_command(args, cmd, env=env, cwd=cwd)
+@@ -587,6 +623,11 @@ def command_integration_role(args, target, start_at_task):
+         hosts = 'testhost'
+         gather_facts = True
+ 
++        cloud_environment = get_cloud_environment(args, target)
++
++        if cloud_environment:
++            hosts = cloud_environment.inventory_hosts or hosts
++
+     playbook = '''
+ - hosts: %s
+   gather_facts: %s
+@@ -610,7 +651,7 @@ def command_integration_role(args, target, start_at_task):
+         if args.verbosity:
+             cmd.append('-' + ('v' * args.verbosity))
+ 
+-        env = integration_environment(args)
++        env = integration_environment(args, target, cmd)
+         cwd = 'test/integration'
+ 
+         env['ANSIBLE_ROLES_PATH'] = os.path.abspath('test/integration/targets')
+diff --git a/test/runner/lib/http.py b/test/runner/lib/http.py
+index f374c0635e..1f2c377536 100644
+--- a/test/runner/lib/http.py
++++ b/test/runner/lib/http.py
+@@ -13,6 +13,13 @@ except ImportError:
+     # noinspection PyCompatibility, PyUnresolvedReferences
+     from urllib.parse import urlencode  # pylint: disable=locally-disabled, import-error, no-name-in-module
+ 
++try:
++    # noinspection PyCompatibility
++    from urlparse import urlparse
++except ImportError:
++    # noinspection PyCompatibility, PyUnresolvedReferences
++    from urllib.parse import urlparse  # pylint: disable=locally-disabled, ungrouped-imports
++
+ from lib.util import (
+     CommonConfig,
+     ApplicationError,
+diff --git a/test/runner/lib/manage_ci.py b/test/runner/lib/manage_ci.py
+index 90c1e12903..7f0910a1d3 100644
+--- a/test/runner/lib/manage_ci.py
++++ b/test/runner/lib/manage_ci.py
+@@ -155,15 +155,20 @@ class ManagePosixCI(object):
+         """
+         self.scp(local, '%s@%s:%s' % (self.core_ci.connection.username, self.core_ci.connection.hostname, remote))
+ 
+-    def ssh(self, command):
++    def ssh(self, command, options=None):
+         """
+         :type command: str | list[str]
++        :type options: list[str] | None
+         """
++        if not options:
++            options = []
++
+         if isinstance(command, list):
+             command = ' '.join(pipes.quote(c) for c in command)
+ 
+         run_command(self.core_ci.args,
+                     ['ssh', '-tt', '-q'] + self.ssh_args +
++                    options +
+                     ['-p', str(self.core_ci.connection.port),
+                      '%s@%s' % (self.core_ci.connection.username, self.core_ci.connection.hostname)] +
+                     self.become + [pipes.quote(command)])
+diff --git a/test/runner/lib/metadata.py b/test/runner/lib/metadata.py
+index 405132dbf3..8fbd048ecf 100644
+--- a/test/runner/lib/metadata.py
++++ b/test/runner/lib/metadata.py
+@@ -17,6 +17,7 @@ class Metadata(object):
+     def __init__(self):
+         """Initialize metadata."""
+         self.changes = {}  # type: dict [str, tuple[tuple[int, int]]
++        self.cloud_config = None  # type: dict [str, str]
+ 
+     def populate_changes(self, diff):
+         """
+@@ -45,6 +46,7 @@ class Metadata(object):
+         """
+         return dict(
+             changes=self.changes,
++            cloud_config=self.cloud_config,
+         )
+ 
+     def to_file(self, path):
+@@ -77,5 +79,6 @@ class Metadata(object):
+         """
+         metadata = Metadata()
+         metadata.changes = data['changes']
++        metadata.cloud_config = data['cloud_config']
+ 
+         return metadata
+diff --git a/test/runner/lib/pytar.py b/test/runner/lib/pytar.py
+index 2f10b18133..f2d0b5d74c 100644
+--- a/test/runner/lib/pytar.py
++++ b/test/runner/lib/pytar.py
+@@ -5,6 +5,10 @@ from __future__ import absolute_import, print_function
+ import tarfile
+ import os
+ 
++from lib.util import (
++    display,
++)
++
+ # improve performance by disabling uid/gid lookups
+ tarfile.pwd = None
+ tarfile.grp = None
+@@ -44,7 +48,7 @@ def ignore(item):
+         if item.path.startswith('./test/results/'):
+             return None
+ 
+-        if item.path.startswith('./docsite/') and filename.endswith('_module.rst'):
++        if item.path.startswith('./docs/docsite/_build/'):
+             return None
+ 
+     if name in IGNORE_FILES:
+@@ -65,5 +69,9 @@ def create_tarfile(dst_path, src_path, tar_filter):
+     :type src_path: str
+     :type tar_filter: (tarfile.TarInfo) -> tarfile.TarInfo | None
+     """
++    display.info('Creating a compressed tar archive of path: %s' % src_path, verbosity=1)
++
+     with tarfile.TarFile.gzopen(dst_path, mode='w', compresslevel=4) as tar:
+         tar.add(src_path, filter=tar_filter)
++
++    display.info('Resulting archive is %d bytes.' % os.path.getsize(dst_path), verbosity=1)
+diff --git a/test/runner/lib/util.py b/test/runner/lib/util.py
+index 358c54a4d7..e075f92458 100644
+--- a/test/runner/lib/util.py
++++ b/test/runner/lib/util.py
+@@ -5,6 +5,7 @@ from __future__ import absolute_import, print_function
+ import errno
+ import os
+ import pipes
++import pkgutil
+ import shutil
+ import subprocess
+ import re
+@@ -505,4 +506,45 @@ def parse_to_dict(pattern, value):
+     return match.groupdict()
+ 
+ 
++def get_subclasses(class_type):
++    """
++    :type class_type: type
++    :rtype: set[str]
++    """
++    subclasses = set()
++    queue = [class_type]
++
++    while queue:
++        parent = queue.pop()
++
++        for child in parent.__subclasses__():
++            if child not in subclasses:
++                subclasses.add(child)
++                queue.append(child)
++
++    return subclasses
++
++
++def import_plugins(directory):
++    """
++    :type directory: str
++    """
++    path = os.path.join(os.path.dirname(__file__), directory)
++    prefix = 'lib.%s.' % directory
++
++    for (_, name, _) in pkgutil.iter_modules([path], prefix=prefix):
++        __import__(name)
++
++
++def load_plugins(base_type, database):
++    """
++    :type base_type: type
++    :type database: dict[str, type]
++    """
++    plugins = dict((sc.__module__.split('.')[2], sc) for sc in get_subclasses(base_type))  # type: dict [str, type]
++
++    for plugin in plugins:
++        database[plugin] = plugins[plugin]
++
++
+ display = Display()  # pylint: disable=locally-disabled, invalid-name
+diff --git a/test/runner/requirements/integration.cloud.aws.txt b/test/runner/requirements/integration.cloud.aws.txt
+new file mode 100644
+index 0000000000..1068d9191d
+--- /dev/null
++++ b/test/runner/requirements/integration.cloud.aws.txt
+@@ -0,0 +1,2 @@
++boto
++boto3
+diff --git a/test/runner/requirements/integration.cloud.cs.txt b/test/runner/requirements/integration.cloud.cs.txt
+new file mode 100644
+index 0000000000..f0a89b9126
+--- /dev/null
++++ b/test/runner/requirements/integration.cloud.cs.txt
+@@ -0,0 +1,2 @@
++cs
++sshpubkeys
+diff --git a/test/runner/test.py b/test/runner/test.py
+index 62275bad85..30b242ef54 100755
+--- a/test/runner/test.py
++++ b/test/runner/test.py
+@@ -60,6 +60,10 @@ from lib.core_ci import (
+     AWS_ENDPOINTS,
+ )
+ 
++from lib.cloud import (
++    initialize_cloud_plugins,
++)
++
+ import lib.cover
+ 
+ 
+@@ -68,6 +72,7 @@ def main():
+     try:
+         git_root = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
+         os.chdir(git_root)
++        initialize_cloud_plugins()
+         sanity_init()
+         args = parse_args()
+         config = args.config(args)
+diff --git a/test/sanity/code-smell/pylint-ansible-test.sh b/test/sanity/code-smell/pylint-ansible-test.sh
+index cf59733a0f..3a92a02d26 100755
+--- a/test/sanity/code-smell/pylint-ansible-test.sh
++++ b/test/sanity/code-smell/pylint-ansible-test.sh
+@@ -2,7 +2,7 @@
+ 
+ cd test/runner/
+ 
+-pylint --max-line-length=160 --reports=n ./*.py ./*/*.py \
++pylint --max-line-length=160 --reports=n ./*.py ./*/*.py ./*/*/*.py \
+     --jobs 2 \
+     --rcfile /dev/null \
+     --function-rgx '[a-z_][a-z0-9_]{2,40}$' \

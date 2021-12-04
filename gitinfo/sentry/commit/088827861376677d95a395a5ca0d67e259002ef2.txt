@@ -1,0 +1,343 @@
+commit 088827861376677d95a395a5ca0d67e259002ef2
+Author: Matt Robenolt <matt@ydekproductions.com>
+Date:   Mon Oct 10 11:58:25 2016 -0700
+
+    tasks: Split preprocess_event task into an extra process_event queue (#4294)
+    
+    Right now, there are basiaclly two classes of events. Events that need
+    preprocessing work, and events that don't.
+    
+    For example, JavaScript sourcemaps or dSYM stuff requires additional
+    work that was done in preprocess_event, while every other event has
+    nothing to do.
+    
+    This discrepency in work loads makes it slower for any other event that
+    has to wait in line in the FIFO queue of preprocess_event. If there were
+    a massive surge of js events with sourcemaps, the entire processing
+    pipeline gets blocked.
+    
+    This split allows us to scale workers and demands for JS/dSYM events
+    separately from the rest of the processing pipeline and isolate issues
+    and downtime to specific classes of events.
+    
+    Overall, this should increase end-to-end latency for every event that
+    doesn't require the additional processing steps.
+
+diff --git a/CHANGES b/CHANGES
+index eac22903b4..179ce74fc3 100644
+--- a/CHANGES
++++ b/CHANGES
+@@ -3,6 +3,7 @@ Version 8.10 (Unreleased)
+ 
+ - Removed previously deprecated ``sentry celery`` command.
+ - Split the ``events`` queue into ``events.{preprocess,save}_event``.
++- Add additional ``events.process_event`` queue.
+ 
+ Version 8.9
+ -----------
+diff --git a/src/sentry/conf/server.py b/src/sentry/conf/server.py
+index 5a2ecde47c..9d4bbca2b6 100644
+--- a/src/sentry/conf/server.py
++++ b/src/sentry/conf/server.py
+@@ -406,6 +406,7 @@ CELERY_QUEUES = [
+     Queue('email', routing_key='email'),
+     Queue('events', routing_key='events'),
+     Queue('events.preprocess_event', routing_key='events.preprocess_event'),
++    Queue('events.process_event', routing_key='events.process_event'),
+     Queue('events.save_event', routing_key='events.save_event'),
+     Queue('merge', routing_key='merge'),
+     Queue('options', routing_key='options'),
+diff --git a/src/sentry/lang/javascript/plugin.py b/src/sentry/lang/javascript/plugin.py
+index 480ef001a7..c473db29ed 100644
+--- a/src/sentry/lang/javascript/plugin.py
++++ b/src/sentry/lang/javascript/plugin.py
+@@ -11,9 +11,6 @@ from .errormapping import rewrite_exception
+ 
+ 
+ def preprocess_event(data):
+-    if data.get('platform') != 'javascript':
+-        return
+-
+     if settings.SENTRY_SCRAPE_JAVASCRIPT_CONTEXT:
+         project = Project.objects.get_from_cache(
+             id=data['project'],
+@@ -119,5 +116,7 @@ class JavascriptPlugin(Plugin2):
+     def can_configure_for_project(self, project, **kwargs):
+         return False
+ 
+-    def get_event_preprocessors(self, **kwargs):
+-        return [preprocess_event]
++    def get_event_preprocessors(self, data, **kwargs):
++        if data.get('platform') == 'javascript':
++            return [preprocess_event]
++        return []
+diff --git a/src/sentry/lang/native/plugin.py b/src/sentry/lang/native/plugin.py
+index 8338b7d7ed..e5f1434513 100644
+--- a/src/sentry/lang/native/plugin.py
++++ b/src/sentry/lang/native/plugin.py
+@@ -259,9 +259,7 @@ def dump_crash_report(report):
+ 
+ def preprocess_apple_crash_event(data):
+     """This processes the "legacy" AppleCrashReport."""
+-    crash_report = data.get('sentry.interfaces.AppleCrashReport')
+-    if crash_report is None:
+-        return
++    crash_report = data['sentry.interfaces.AppleCrashReport']
+ 
+     if os.environ.get('SENTRY_DUMP_APPLE_CRASH_REPORT') == '1':
+         dump_crash_report(crash_report)
+@@ -347,10 +345,7 @@ def preprocess_apple_crash_event(data):
+ 
+ 
+ def resolve_frame_symbols(data):
+-    debug_meta = data.get('debug_meta')
+-    if not debug_meta:
+-        return
+-
++    debug_meta = data['debug_meta']
+     debug_images = debug_meta['images']
+     sdk_info = get_sdk_from_event(data)
+ 
+@@ -443,5 +438,10 @@ def resolve_frame_symbols(data):
+ class NativePlugin(Plugin2):
+     can_disable = False
+ 
+-    def get_event_preprocessors(self, **kwargs):
+-        return [preprocess_apple_crash_event, resolve_frame_symbols]
++    def get_event_preprocessors(self, data, **kwargs):
++        rv = []
++        if data.get('sentry.interfaces.AppleCrashReport'):
++            rv.append(preprocess_apple_crash_event)
++        if data.get('debug_meta'):
++            rv.append(resolve_frame_symbols)
++        return rv
+diff --git a/src/sentry/plugins/base/v2.py b/src/sentry/plugins/base/v2.py
+index d932304c27..219bd34b15 100644
+--- a/src/sentry/plugins/base/v2.py
++++ b/src/sentry/plugins/base/v2.py
+@@ -349,7 +349,7 @@ class IPlugin2(local, PluginConfigMixin):
+         """
+         return []
+ 
+-    def get_event_preprocessors(self, **kwargs):
++    def get_event_preprocessors(self, data, **kwargs):
+         """
+         Return a list of preprocessors to apply to the given event.
+ 
+@@ -357,7 +357,10 @@ class IPlugin2(local, PluginConfigMixin):
+         input and returns modified data as output. If no changes to the data are
+         made it is safe to return ``None``.
+ 
+-        >>> def get_event_preprocessors(self, **kwargs):
++        Preprocessors should not be returned if there is nothing to
++        do with the event data.
++
++        >>> def get_event_preprocessors(self, data, **kwargs):
+         >>>     return [lambda x: x]
+         """
+         return []
+diff --git a/src/sentry/runner/commands/run.py b/src/sentry/runner/commands/run.py
+index e7ae8eb5ab..05cbee84ff 100644
+--- a/src/sentry/runner/commands/run.py
++++ b/src/sentry/runner/commands/run.py
+@@ -49,6 +49,7 @@ class QueueSetType(click.ParamType):
+             queues.add(queue)
+             if queue == 'events':
+                 queues.add('events.preprocess_event')
++                queues.add('events.process_event')
+                 queues.add('events.save_event')
+         return frozenset(queues)
+ 
+diff --git a/src/sentry/tasks/store.py b/src/sentry/tasks/store.py
+index 397c2e38b1..d6fe356c85 100644
+--- a/src/sentry/tasks/store.py
++++ b/src/sentry/tasks/store.py
+@@ -43,10 +43,49 @@ def preprocess_event(cache_key=None, data=None, start_time=None, **kwargs):
+         'project': project,
+     })
+ 
++    # Iterate over all plugins looking for processors based on the input data
++    # plugins should yield a processor function only if it actually can operate
++    # on the input data, otherwise it should yield nothing
++    for plugin in plugins.all(version=2):
++        processors = safe_execute(plugin.get_event_preprocessors, data=data, _with_transaction=False)
++        for processor in (processors or ()):
++            # On the first processor found, we just defer to the process_event
++            # queue to handle the actual work.
++            process_event.delay(cache_key=cache_key, start_time=start_time)
++            return
++
++    # If we get here, that means the event had no preprocessing needed to be done
++    # so we can jump directly to save_event
++    if cache_key:
++        data = None
++    save_event.delay(cache_key=cache_key, data=data, start_time=start_time)
++
++
++@instrumented_task(
++    name='sentry.tasks.store.process_event',
++    queue='events.process_event',
++    time_limit=65,
++    soft_time_limit=60,
++)
++def process_event(cache_key, start_time=None, **kwargs):
++    from sentry.plugins import plugins
++
++    data = default_cache.get(cache_key)
++
++    if data is None:
++        metrics.incr('events.failed', tags={'reason': 'cache', 'stage': 'process'})
++        error_logger.error('process.failed.empty', extra={'cache_key': cache_key})
++        return
++
++    project = data['project']
++    Raven.tags_context({
++        'project': project,
++    })
++
+     # TODO(dcramer): ideally we would know if data changed by default
+     has_changed = False
+     for plugin in plugins.all(version=2):
+-        processors = safe_execute(plugin.get_event_preprocessors, _with_transaction=False)
++        processors = safe_execute(plugin.get_event_preprocessors, data=data, _with_transaction=False)
+         for processor in (processors or ()):
+             result = safe_execute(processor, data)
+             if result:
+@@ -55,12 +94,10 @@ def preprocess_event(cache_key=None, data=None, start_time=None, **kwargs):
+ 
+     assert data['project'] == project, 'Project cannot be mutated by preprocessor'
+ 
+-    if has_changed and cache_key:
++    if has_changed:
+         default_cache.set(cache_key, data, 3600)
+ 
+-    if cache_key:
+-        data = None
+-    save_event.delay(cache_key=cache_key, data=data, start_time=start_time)
++    save_event.delay(cache_key=cache_key, data=None, start_time=start_time)
+ 
+ 
+ @instrumented_task(
+diff --git a/tests/sentry/tasks/test_store.py b/tests/sentry/tasks/test_store.py
+index 84a3d11279..6aed4e83e8 100644
+--- a/tests/sentry/tasks/test_store.py
++++ b/tests/sentry/tasks/test_store.py
+@@ -3,35 +3,113 @@ from __future__ import absolute_import
+ import mock
+ 
+ from sentry.plugins import Plugin2
+-from sentry.tasks.store import preprocess_event
++from sentry.tasks.store import preprocess_event, process_event
+ from sentry.testutils import PluginTestCase
+ 
+ 
+ class BasicPreprocessorPlugin(Plugin2):
+-    def get_event_preprocessors(self):
++    def get_event_preprocessors(self, data):
+         def remove_extra(data):
+             del data['extra']
+             return data
+ 
+-        return [remove_extra, lambda x: None]
++        if data.get('platform') == 'mattlang':
++            return [remove_extra, lambda x: None]
++
++        if data.get('platform') == 'noop':
++            return [lambda data: data]
++
++        return []
+ 
+     def is_enabled(self, project=None):
+         return True
+ 
+ 
+-class PreprocessEventTest(PluginTestCase):
++class StoreTasksTest(PluginTestCase):
+     plugin = BasicPreprocessorPlugin
+ 
+     @mock.patch('sentry.tasks.store.save_event')
+-    def test_simple(self, mock_save_event):
++    @mock.patch('sentry.tasks.store.process_event')
++    def test_move_to_process_event(self, mock_process_event, mock_save_event):
++        project = self.create_project()
++
++        data = {
++            'project': project.id,
++            'platform': 'mattlang',
++            'message': 'test',
++            'extra': {'foo': 'bar'},
++        }
++
++        preprocess_event(data=data)
++
++        assert mock_process_event.delay.call_count == 1
++        assert mock_save_event.delay.call_count == 0
++
++    @mock.patch('sentry.tasks.store.save_event')
++    @mock.patch('sentry.tasks.store.process_event')
++    def test_move_to_save_event(self, mock_process_event, mock_save_event):
+         project = self.create_project()
+ 
+         data = {
+             'project': project.id,
++            'platform': 'NOTMATTLANG',
+             'message': 'test',
+             'extra': {'foo': 'bar'},
+         }
+ 
+         preprocess_event(data=data)
+ 
++        assert mock_process_event.delay.call_count == 0
+         assert mock_save_event.delay.call_count == 1
++
++    @mock.patch('sentry.tasks.store.save_event')
++    @mock.patch('sentry.tasks.store.default_cache')
++    def test_process_event_mutate_and_save(self, mock_default_cache, mock_save_event):
++        project = self.create_project()
++
++        data = {
++            'project': project.id,
++            'platform': 'mattlang',
++            'message': 'test',
++            'extra': {'foo': 'bar'},
++        }
++
++        mock_default_cache.get.return_value = data
++
++        process_event(cache_key='e:1', start_time=1)
++
++        # The event mutated, so make sure we save it back
++        mock_default_cache.set.assert_called_once_with(
++            'e:1', {
++                'project': project.id,
++                'platform': 'mattlang',
++                'message': 'test',
++            }, 3600,
++        )
++
++        mock_save_event.delay.assert_called_once_with(
++            cache_key='e:1', data=None, start_time=1,
++        )
++
++    @mock.patch('sentry.tasks.store.save_event')
++    @mock.patch('sentry.tasks.store.default_cache')
++    def test_process_event_no_mutate_and_save(self, mock_default_cache, mock_save_event):
++        project = self.create_project()
++
++        data = {
++            'project': project.id,
++            'platform': 'noop',
++            'message': 'test',
++            'extra': {'foo': 'bar'},
++        }
++
++        mock_default_cache.get.return_value = data
++
++        process_event(cache_key='e:1', start_time=1)
++
++        # The event did not mutate, so we shouldn't reset it in cache
++        mock_default_cache.set.call_count == 0
++
++        mock_save_event.delay.assert_called_once_with(
++            cache_key='e:1', data=None, start_time=1,
++        )

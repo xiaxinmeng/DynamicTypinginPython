@@ -1,0 +1,168 @@
+commit 42c35a2e0115b5a5656d4646dca775f95c5048fa
+Author: Brian Coca <bcoca@users.noreply.github.com>
+Date:   Wed Jan 23 12:33:59 2019 -0500
+
+    parallelize getting mount info (#49398)
+    
+    * parallelize getting mount info
+    
+    * fixed timeout and made 8 max thread count
+    
+      - minor cleanup
+      - avoid empty mount entries
+      - set timeout on get
+      - enforce timeout per mount/thread
+      - make note on failure per mount
+      - make note on timeout per mount
+      - ensure proper pool control
+      - minor fixes
+      - less vars, simpler code
+      - move filter 'pre threading'
+      - remove timeout for all mounts, now per mount
+      -  also use cpu count from multiprocessing lib
+      -  moved 'bind' options out of thread as per comments
+      - warn on error, more info on failure to get info
+
+diff --git a/lib/ansible/module_utils/facts/hardware/linux.py b/lib/ansible/module_utils/facts/hardware/linux.py
+index 7012d79588..6e51c03037 100644
+--- a/lib/ansible/module_utils/facts/hardware/linux.py
++++ b/lib/ansible/module_utils/facts/hardware/linux.py
+@@ -23,11 +23,14 @@ import json
+ import os
+ import re
+ import sys
++import time
+ 
+-from ansible.module_utils.six import iteritems
++from multiprocessing import cpu_count
++from multiprocessing.pool import ThreadPool
+ 
++from ansible.module_utils._text import to_text
++from ansible.module_utils.six import iteritems
+ from ansible.module_utils.basic import bytes_to_human
+-
+ from ansible.module_utils.facts.hardware.base import Hardware, HardwareCollector
+ from ansible.module_utils.facts.utils import get_file_content, get_file_lines, get_mount_size
+ 
+@@ -443,51 +446,82 @@ class LinuxHardware(Hardware):
+             mtab_entries.append(fields)
+         return mtab_entries
+ 
+-    @timeout.timeout()
++    def get_mount_info(self, mount, device, uuids):
++
++            mount_size = get_mount_size(mount)
++
++            # _udevadm_uuid is a fallback for versions of lsblk <= 2.23 that don't have --paths
++            # see _run_lsblk() above
++            # https://github.com/ansible/ansible/issues/36077
++            uuid = uuids.get(device, self._udevadm_uuid(device))
++
++            return mount_size, uuid
++
+     def get_mount_facts(self):
+-        mount_facts = {}
+ 
+-        mount_facts['mounts'] = []
++        mounts = []
+ 
++        # gather system lists
+         bind_mounts = self._find_bind_mounts()
+         uuids = self._lsblk_uuid()
+         mtab_entries = self._mtab_entries()
+ 
+-        mounts = []
++        # start threads to query each mount
++        results = {}
++        pool = ThreadPool(processes=min(len(mtab_entries), cpu_count()))
++        maxtime = globals().get('GATHER_TIMEOUT') or timeout.DEFAULT_GATHER_TIMEOUT
+         for fields in mtab_entries:
+-            device, mount, fstype, options = fields[0], fields[1], fields[2], fields[3]
+ 
+-            if not device.startswith('/') and ':/' not in device:
+-                continue
++            device, mount, fstype, options = fields[0], fields[1], fields[2], fields[3]
+ 
+-            if fstype == 'none':
++            if not device.startswith('/') and ':/' not in device or fstype == 'none':
+                 continue
+ 
+-            mount_statvfs_info = get_mount_size(mount)
+-
+-            if mount in bind_mounts:
+-                # only add if not already there, we might have a plain /etc/mtab
+-                if not self.MTAB_BIND_MOUNT_RE.match(options):
+-                    options += ",bind"
+-
+-            # _udevadm_uuid is a fallback for versions of lsblk <= 2.23 that don't have --paths
+-            # see _run_lsblk() above
+-            # https://github.com/ansible/ansible/issues/36077
+-            uuid = uuids.get(device, self._udevadm_uuid(device))
+-
+             mount_info = {'mount': mount,
+                           'device': device,
+                           'fstype': fstype,
+-                          'options': options,
+-                          'uuid': uuid}
++                          'options': options}
+ 
+-            mount_info.update(mount_statvfs_info)
+-
+-            mounts.append(mount_info)
++            if mount in bind_mounts:
++                # only add if not already there, we might have a plain /etc/mtab
++                if not self.MTAB_BIND_MOUNT_RE.match(options):
++                    mount_info['options'] += ",bind"
++
++            results[mount] = {'info': mount_info,
++                              'extra': pool.apply_async(self.get_mount_info, (mount, device, uuids)),
++                              'timelimit': time.time() + maxtime}
++
++        pool.close()  # done with new workers, start gc
++
++        # wait for workers and get results
++        while results:
++            for mount in results:
++                res = results[mount]['extra']
++                if res.ready():
++                    if res.successful():
++                        mount_size, uuid = res.get()
++                        if mount_size:
++                            results[mount]['info'].update(mount_size)
++                        results[mount]['info']['uuid'] = uuid or 'N/A'
++                    else:
++                        # give incomplete data
++                        errmsg = to_text(res.get())
++                        self.module.warn("Error prevented getting extra info for mount %s: %s." % (mount, errmsg))
++                        results[mount]['info']['note'] = 'Could not get extra information: %s.' % (errmsg)
+ 
+-        mount_facts['mounts'] = mounts
++                    mounts.append(results[mount]['info'])
++                    del results[mount]
++                    break
++                elif time.time() > results[mount]['timelimit']:
++                    results[mount]['info']['note'] = 'Timed out while attempting to get extra information.'
++                    mounts.append(results[mount]['info'])
++                    del results[mount]
++                    break
++            else:
++                # avoid cpu churn
++                time.sleep(0.1)
+ 
+-        return mount_facts
++        return {'mounts': mounts}
+ 
+     def get_device_links(self, link_dir):
+         if not os.path.exists(link_dir):
+diff --git a/test/units/module_utils/facts/hardware/test_linux.py b/test/units/module_utils/facts/hardware/test_linux.py
+index 20e65b5fcc..6e77683a3d 100644
+--- a/test/units/module_utils/facts/hardware/test_linux.py
++++ b/test/units/module_utils/facts/hardware/test_linux.py
+@@ -84,6 +84,7 @@ class TestFactsLinuxHardwareGetMountFacts(unittest.TestCase):
+                          'uuid': 'N/A'}
+         home_info = [x for x in mount_facts['mounts'] if x['mount'] == '/home'][0]
+ 
++        self.maxDiff = 4096
+         self.assertDictEqual(home_info, home_expected)
+ 
+     @patch('ansible.module_utils.facts.hardware.linux.get_file_content', return_value=MTAB)

@@ -1,0 +1,175 @@
+commit 5de9e6af7bf79c48e29e1144cdb68ffc3b4f92af
+Author: ted kaemming <t.kaemming+github@gmail.com>
+Date:   Wed Jun 22 18:53:38 2016 -0700
+
+    Add method to get the cardinality of a union of distinct counters. (#3569)
+
+diff --git a/src/sentry/tsdb/base.py b/src/sentry/tsdb/base.py
+index 257f016229..6c36d8496b 100644
+--- a/src/sentry/tsdb/base.py
++++ b/src/sentry/tsdb/base.py
+@@ -230,6 +230,13 @@ class BaseTSDB(object):
+         """
+         raise NotImplementedError
+ 
++    def get_distinct_counts_union(self, model, keys, start, end=None, rollup=None):
++        """
++        Count the total number of distinct items across multiple counters
++        during a time range.
++        """
++        raise NotImplementedError
++
+     def record_frequency_multi(self, requests, timestamp=None):
+         """
+         Record items in a frequency table.
+diff --git a/src/sentry/tsdb/dummy.py b/src/sentry/tsdb/dummy.py
+index eb63a5e85f..29613efa60 100644
+--- a/src/sentry/tsdb/dummy.py
++++ b/src/sentry/tsdb/dummy.py
+@@ -29,6 +29,9 @@ class DummyTSDB(BaseTSDB):
+     def get_distinct_counts_totals(self, model, keys, start, end=None, rollup=None):
+         return {k: 0 for k in keys}
+ 
++    def get_distinct_counts_union(self, model, keys, start, end=None, rollup=None):
++        return 0
++
+     def record_frequency_multi(self, requests, timestamp=None):
+         pass
+ 
+diff --git a/src/sentry/tsdb/inmemory.py b/src/sentry/tsdb/inmemory.py
+index 65c760004e..2e0160a3d9 100644
+--- a/src/sentry/tsdb/inmemory.py
++++ b/src/sentry/tsdb/inmemory.py
+@@ -95,6 +95,18 @@ class InMemoryTSDB(BaseTSDB):
+ 
+         return results
+ 
++    def get_distinct_counts_union(self, model, keys, start, end=None, rollup=None):
++        rollup, series = self.get_optimal_rollup_series(start, end, rollup)
++
++        values = set()
++        for key in keys:
++            source = self.sets[model][key]
++            for timestamp in series:
++                r = self.normalize_ts_to_rollup(timestamp, rollup)
++                values.update(source[r])
++
++        return len(values)
++
+     def flush(self):
+         # model => key => timestamp = count
+         self.data = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+diff --git a/src/sentry/tsdb/redis.py b/src/sentry/tsdb/redis.py
+index 9152c8e4e9..eb43c468aa 100644
+--- a/src/sentry/tsdb/redis.py
++++ b/src/sentry/tsdb/redis.py
+@@ -7,8 +7,11 @@ sentry.tsdb.redis
+ """
+ from __future__ import absolute_import
+ 
++import itertools
+ import logging
+ import operator
++import random
++import uuid
+ from binascii import crc32
+ from collections import defaultdict, namedtuple
+ from datetime import timedelta
+@@ -291,6 +294,84 @@ class RedisTSDB(BaseTSDB):
+ 
+         return {key: value.value for key, value in responses.iteritems()}
+ 
++    def get_distinct_counts_union(self, model, keys, start, end=None, rollup=None):
++        rollup, series = self.get_optimal_rollup_series(start, end, rollup)
++
++        temporary_id = uuid.uuid1().hex
++
++        def make_temporary_key(key):
++            return '{}{}:{}'.format(self.prefix, temporary_id, key)
++
++        def expand_key(key):
++            """
++            Return a list containing all keys for each interval in the series for a key.
++            """
++            return [self.make_key(model, rollup, timestamp, key) for timestamp in series]
++
++        router = self.cluster.get_router()
++
++        def map_key_to_host(hosts, key):
++            """
++            Identify the host where a key is located and add it to the host map.
++            """
++            hosts[router.get_host_for_key(key)].add(key)
++            return hosts
++
++        def get_partition_aggregate((host, keys)):
++            """
++            Fetch the HyperLogLog value (in its raw byte representation) that
++            results from merging all HyperLogLogs at the provided keys.
++            """
++            destination = make_temporary_key('p:{}'.format(host))
++            client = self.cluster.get_local_client(host)
++            with client.pipeline(transaction=False) as pipeline:
++                pipeline.execute_command(
++                    'PFMERGE',
++                    destination,
++                    *itertools.chain.from_iterable(
++                        map(expand_key, keys)
++                    )
++                )
++                pipeline.get(destination)
++                pipeline.delete(destination)
++                return (host, pipeline.execute()[1])
++
++        def merge_aggregates(values):
++            """
++            Calculate the cardinality of the provided HyperLogLog values.
++            """
++            destination = make_temporary_key('a')  # all values will be merged into this key
++            aggregates = {make_temporary_key('a:{}'.format(host)): value for host, value in values}
++
++            # Choose a random host to execute the reduction on. (We use a host
++            # here that we've already accessed as part of this process -- this
++            # way, we constrain the choices to only hosts that we know are
++            # running.)
++            client = self.cluster.get_local_client(random.choice(values)[0])
++            with client.pipeline(transaction=False) as pipeline:
++                pipeline.mset(aggregates)
++                pipeline.execute_command('PFMERGE', destination, *aggregates.keys())
++                pipeline.execute_command('PFCOUNT', destination)
++                pipeline.delete(destination, *aggregates.keys())
++                return pipeline.execute()[2]
++
++        # TODO: This could be optimized to skip the intermediate step for the
++        # host that has the largest number of keys if the final merge and count
++        # is performed on that host. If that host contains *all* keys, the
++        # final reduction could be performed as a single PFCOUNT, skipping the
++        # MSET and PFMERGE operations entirely.
++
++        return merge_aggregates(
++            map(
++                get_partition_aggregate,
++                reduce(
++                    map_key_to_host,
++                    keys,
++                    defaultdict(set),
++                ).items(),
++            )
++        )
++
+     def make_frequency_table_keys(self, model, rollup, timestamp, key):
+         prefix = self.make_key(model, rollup, timestamp, key)
+         return map(
+diff --git a/tests/sentry/tsdb/test_redis.py b/tests/sentry/tsdb/test_redis.py
+index 417defc092..1d99b4535b 100644
+--- a/tests/sentry/tsdb/test_redis.py
++++ b/tests/sentry/tsdb/test_redis.py
+@@ -150,6 +150,8 @@ class RedisTSDBTest(TestCase):
+             2: 2,
+         }
+ 
++        assert self.db.get_distinct_counts_union(model, [1, 2], dts[0], dts[-1], rollup=3600) == 3
++
+     def test_frequency_tables(self):
+         now = datetime.utcnow().replace(tzinfo=pytz.UTC)
+         model = TSDBModel.frequent_projects_by_organization

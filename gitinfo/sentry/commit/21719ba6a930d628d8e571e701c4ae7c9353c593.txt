@@ -1,0 +1,1776 @@
+commit 21719ba6a930d628d8e571e701c4ae7c9353c593
+Author: David Cramer <dcramer@gmail.com>
+Date:   Thu Jul 30 14:32:57 2015 -0700
+
+    Refactor core API to improve logging capabilities
+    
+    Refs GH-1661
+
+diff --git a/src/sentry/conf/server.py b/src/sentry/conf/server.py
+index e0dd6d159e..3f71817557 100644
+--- a/src/sentry/conf/server.py
++++ b/src/sentry/conf/server.py
+@@ -453,7 +453,12 @@ LOGGING = {
+             'level': 'ERROR',
+             'filters': ['sentry:internal'],
+             'class': 'raven.contrib.django.handlers.SentryHandler',
+-        }
++        },
++        'console:api': {
++            'level': 'WARNING',
++            'class': 'logging.StreamHandler',
++            'formatter': 'client_info',
++        },
+     },
+     'filters': {
+         'sentry:internal': {
+@@ -465,7 +470,7 @@ LOGGING = {
+             'format': '[%(levelname)s] %(message)s',
+         },
+         'client_info': {
+-            'format': '[%(levelname)s] %(project_slug)s/%(team_slug)s %(message)s',
++            'format': '[%(levelname)s] [%(project)s] [%(agent)s] %(message)s',
+         },
+     },
+     'root': {
+@@ -475,8 +480,9 @@ LOGGING = {
+         'sentry': {
+             'level': 'ERROR',
+         },
+-        'sentry.coreapi': {
+-            'formatter': 'client_info',
++        'sentry.api': {
++            'handlers': ['console:api', 'sentry'],
++            'propagate': False,
+         },
+         'sentry.errors': {
+             'handlers': ['console'],
+diff --git a/src/sentry/coreapi.py b/src/sentry/coreapi.py
+index 507dd525c3..dc755650f9 100644
+--- a/src/sentry/coreapi.py
++++ b/src/sentry/coreapi.py
+@@ -28,7 +28,6 @@ from sentry.constants import (
+     CLIENT_RESERVED_ATTRS, DEFAULT_LOG_LEVEL, LOG_LEVELS, MAX_TAG_VALUE_LENGTH,
+     MAX_TAG_KEY_LENGTH
+ )
+-from sentry.exceptions import InvalidTimestamp
+ from sentry.interfaces.base import get_interface
+ from sentry.models import Project, ProjectKey
+ from sentry.tasks.store import preprocess_event
+@@ -37,19 +36,19 @@ from sentry.utils.auth import parse_auth_header
+ from sentry.utils.compat import StringIO
+ from sentry.utils.strings import decompress
+ 
+-
+-logger = logging.getLogger('sentry.coreapi')
+-
+ LOG_LEVEL_REVERSE_MAP = dict((v, k) for k, v in LOG_LEVELS.iteritems())
+ 
+ 
+ class APIError(Exception):
+     http_status = 400
+     msg = 'Invalid request'
++    name = None
+ 
+-    def __init__(self, msg=None):
++    def __init__(self, msg=None, name=None):
+         if msg:
+             self.msg = msg
++        if self.name:
++            self.name = name
+ 
+     def __str__(self):
+         return self.msg or ''
+@@ -64,343 +63,400 @@ class APIForbidden(APIError):
+     http_status = 403
+ 
+ 
+-class APITimestampExpired(APIError):
+-    http_status = 410
+-
+-
+ class APIRateLimited(APIError):
+     http_status = 429
+-    msg = 'Creation of this event was denied due to rate limiting.'
++    msg = 'Creation of this event was denied due to rate limiting'
++    name = 'rate_limit'
+ 
+     def __init__(self, retry_after=None):
+         self.retry_after = retry_after
+ 
+ 
+-def client_metadata(client=None, project=None, exception=None, tags=None, extra=None):
+-    if not extra:
+-        extra = {}
+-    if not tags:
+-        tags = {}
+-
+-    extra['client'] = client
+-    extra['request'] = env.request
+-    extra['tags'] = tags
+-    if project:
+-        extra['project_slug'] = project.slug
+-        extra['project_id'] = project.id
+-        if project.team:
+-            extra['team_slug'] = project.team.slug
+-            extra['team_id'] = project.team.id
+-        if project.organization:
+-            extra['organization_slug'] = project.organization.slug
+-            extra['organization_id'] = project.organization.id
+-
+-    tags['client'] = client
+-    if exception:
+-        tags['exc_type'] = type(exception).__name__
+-    if project and project.organization:
+-        tags['project'] = '%s/%s' % (project.organization.slug, project.slug)
+-
+-    result = {'extra': extra}
+-    if exception:
+-        result['exc_info'] = True
+-    return result
+-
+-
+-def extract_auth_vars(request):
+-    if request.META.get('HTTP_X_SENTRY_AUTH', '').startswith('Sentry'):
+-        return parse_auth_header(request.META['HTTP_X_SENTRY_AUTH'])
+-    elif request.META.get('HTTP_AUTHORIZATION', '').startswith('Sentry'):
+-        return parse_auth_header(request.META['HTTP_AUTHORIZATION'])
+-    else:
+-        return dict(
+-            (k, request.GET[k])
+-            for k in request.GET.iterkeys()
+-            if k.startswith('sentry_')
+-        )
++class InvalidTimestamp(Exception):
++    pass
++
++
++class Auth(object):
++    def __init__(self, auth_vars, is_public=False):
++        self.client = auth_vars.get('sentry_client')
++        self.version = str(auth_vars.get('sentry_version'))
++        self.secret_key = auth_vars.get('sentry_secret')
++        self.public_key = auth_vars.get('sentry_key')
++        self.is_public = is_public
++
++
++class ClientContext(object):
++    def __init__(self, agent=None, version=None, project_id=None,
++                 ip_address=None):
++        # user-agent (i.e. raven-python)
++        self.agent = agent
++        # protocol version
++        self.version = version
++        # project instance
++        self.project_id = project_id
++        self.project = None
++        self.ip_address = ip_address
++
++    def bind_project(self, project):
++        self.project = project
++        self.project_id = project.id
++
++    def bind_auth(self, auth):
++        self.agent = auth.client
++        self.version = auth.version
++
++    def get_tags_context(self):
++        return {
++            'project': self.project_id,
++            'agent': self.agent,
++            'protocol': self.version
++        }
++
++
++class ClientLogHelper(object):
++    def __init__(self, context):
++        self.context = context
++        self.logger = logging.getLogger('sentry.api')
++
++    def debug(self, *a, **k):
++        self.logger.debug(*a, **self._metadata(**k))
++
++    def info(self, *a, **k):
++        self.logger.info(*a, **self._metadata(**k))
++
++    def warning(self, *a, **k):
++        self.logger.warning(*a, **self._metadata(**k))
+ 
++    def error(self, *a, **k):
++        self.logger.error(*a, **self._metadata(**k))
+ 
+-def project_from_auth_vars(auth_vars):
+-    api_key = auth_vars.get('sentry_key')
+-    if not api_key:
+-        raise APIForbidden('Invalid api key')
+-    try:
+-        pk = ProjectKey.objects.get_from_cache(public_key=api_key)
+-    except ProjectKey.DoesNotExist:
+-        raise APIForbidden('Invalid api key')
++    def _metadata(self, tags=None, extra=None, **kwargs):
++        if not extra:
++            extra = {}
++        if not tags:
++            tags = {}
+ 
+-    if not constant_time_compare(pk.secret_key, auth_vars.get('sentry_secret', pk.secret_key)):
+-        raise APIForbidden('Invalid api key')
++        context = self.context
+ 
+-    if not pk.is_active:
+-        raise APIForbidden('API key is disabled')
++        project = context.project
++        if project:
++            project_label = '%s/%s' % (project.organization.slug, project.slug)
++        else:
++            project_label = 'id=%s' % (context.project_id,)
+ 
+-    if not pk.roles.store:
+-        raise APIForbidden('Key does not allow event storage access')
++        tags.update(context.get_tags_context())
++        tags['project'] = project_label
+ 
+-    project = Project.objects.get_from_cache(pk=pk.project_id)
++        extra['request'] = env.request
++        extra['tags'] = tags
++        extra['agent'] = context.agent
++        extra['protocol'] = context.version
++        extra['project'] = project_label
+ 
+-    return project
++        kwargs['extra'] = extra
+ 
++        return kwargs
+ 
+-def decompress_deflate(encoded_data):
+-    try:
+-        return zlib.decompress(encoded_data)
+-    except Exception as e:
+-        # This error should be caught as it suggests that there's a
+-        # bug somewhere in the client's code.
+-        logger.info(e, **client_metadata(exception=e))
+-        raise APIForbidden('Bad data decoding request (%s, %s)' % (
+-            e.__class__.__name__, e))
+ 
++class ClientApiHelper(object):
++    def __init__(self, agent=None, version=None, project_id=None,
++                 ip_address=None):
++        self.context = ClientContext(
++            agent=agent, version=version, project_id=project_id,
++            ip_address=ip_address,
++        )
++        self.log = ClientLogHelper(self.context)
++
++    def auth_from_request(self, request):
++        if request.META.get('HTTP_X_SENTRY_AUTH', '').startswith('Sentry'):
++            result = parse_auth_header(request.META['HTTP_X_SENTRY_AUTH'])
++        elif request.META.get('HTTP_AUTHORIZATION', '').startswith('Sentry'):
++            result = parse_auth_header(request.META['HTTP_AUTHORIZATION'])
++        else:
++            result = dict(
++                (k, request.GET[k])
++                for k in request.GET.iterkeys()
++                if k.startswith('sentry_')
++            )
++        if not result:
++            raise APIUnauthorized('Unable to find authentication information')
++
++        origin = self.origin_from_request(request)
++        auth = Auth(result, is_public=bool(origin))
++        # default client to user agent
++        if not auth.client:
++            auth.client = request.META.get('HTTP_USER_AGENT')
++        return auth
++
++    def origin_from_request(self, request):
++        """
++        Returns either the Origin or Referer value from the request headers.
++        """
++        return request.META.get('HTTP_ORIGIN', request.META.get('HTTP_REFERER'))
++
++    def project_from_auth(self, auth):
++        if not auth.public_key:
++            raise APIUnauthorized('Invalid api key')
+ 
+-def decompress_gzip(encoded_data):
+-    try:
+-        fp = StringIO(encoded_data)
+         try:
+-            f = GzipFile(fileobj=fp)
+-            return f.read()
+-        finally:
+-            f.close()
+-    except Exception as e:
+-        # This error should be caught as it suggests that there's a
+-        # bug somewhere in the client's code.
+-        logger.info(e, **client_metadata(exception=e))
+-        raise APIForbidden('Bad data decoding request (%s, %s)' % (
+-            e.__class__.__name__, e))
+-
+-
+-def decode_and_decompress_data(encoded_data):
+-    try:
++            pk = ProjectKey.objects.get_from_cache(public_key=auth.public_key)
++        except ProjectKey.DoesNotExist:
++            raise APIUnauthorized('Invalid api key')
++
++        # a secret key may not be present which will be validated elsewhere
++        if not constant_time_compare(pk.secret_key, auth.secret_key or pk.secret_key):
++            raise APIUnauthorized('Invalid api key')
++
++        if not pk.is_active:
++            raise APIUnauthorized('API key is disabled')
++
++        if not pk.roles.store:
++            raise APIUnauthorized('Key does not allow event storage access')
++
++        return Project.objects.get_from_cache(id=pk.project_id)
++
++    def decompress_deflate(self, encoded_data):
+         try:
+-            return decompress(encoded_data)
+-        except zlib.error:
+-            return base64.b64decode(encoded_data)
+-    except Exception as e:
+-        # This error should be caught as it suggests that there's a
+-        # bug somewhere in the client's code.
+-        logger.info(e, **client_metadata(exception=e))
+-        raise APIForbidden('Bad data decoding request (%s, %s)' % (
+-            e.__class__.__name__, e))
+-
+-
+-def safely_load_json_string(json_string):
+-    try:
+-        obj = json.loads(json_string)
+-    except Exception as e:
+-        # This error should be caught as it suggests that there's a
+-        # bug somewhere in the client's code.
+-        logger.info(e, **client_metadata(exception=e))
+-        raise APIForbidden('Bad data reconstructing object (%s, %s)' % (
+-            e.__class__.__name__, e))
+-
+-    # XXX: ensure keys are coerced to strings
+-    return dict((smart_str(k), v) for k, v in obj.iteritems())
+-
+-
+-def process_data_timestamp(data, current_datetime=None):
+-    if not data['timestamp']:
+-        del data['timestamp']
+-        return data
+-    elif is_float(data['timestamp']):
++            return zlib.decompress(encoded_data)
++        except Exception as e:
++            # This error should be caught as it suggests that there's a
++            # bug somewhere in the client's code.
++            self.log.info(unicode(e), exc_info=True)
++            raise APIError('Bad data decoding request (%s, %s)' % (
++                type(e).__name__, e
++            ))
++
++    def decompress_gzip(self, encoded_data):
+         try:
+-            data['timestamp'] = datetime.fromtimestamp(float(data['timestamp']))
+-        except Exception:
+-            raise InvalidTimestamp('Invalid value for timestamp: %r' % data['timestamp'])
+-    elif not isinstance(data['timestamp'], datetime):
+-        if '.' in data['timestamp']:
+-            format = '%Y-%m-%dT%H:%M:%S.%f'
+-        else:
+-            format = '%Y-%m-%dT%H:%M:%S'
+-        if 'Z' in data['timestamp']:
+-            # support UTC market, but not other timestamps
+-            format += 'Z'
++            fp = StringIO(encoded_data)
++            try:
++                f = GzipFile(fileobj=fp)
++                return f.read()
++            finally:
++                f.close()
++        except Exception as e:
++            # This error should be caught as it suggests that there's a
++            # bug somewhere in the client's code.
++            self.log.info(unicode(e), exc_info=True)
++            raise APIError('Bad data decoding request (%s, %s)' % (
++                           type(e).__name__, e))
++
++    def decode_and_decompress_data(self, encoded_data):
+         try:
+-            data['timestamp'] = datetime.strptime(data['timestamp'], format)
+-        except Exception:
+-            raise InvalidTimestamp('Invalid value for timestamp: %r' % data['timestamp'])
++            try:
++                return decompress(encoded_data)
++            except zlib.error:
++                return base64.b64decode(encoded_data)
++        except Exception as e:
++            # This error should be caught as it suggests that there's a
++            # bug somewhere in the client's code.
++            self.log.info(unicode(e), exc_info=True)
++            raise APIError('Bad data decoding request (%s, %s)' % (
++                           type(e).__name__, e))
+ 
+-    if current_datetime is None:
+-        current_datetime = datetime.now()
++    def safely_load_json_string(self, json_string):
++        try:
++            obj = json.loads(json_string)
++        except Exception as e:
++            # This error should be caught as it suggests that there's a
++            # bug somewhere in the client's code.
++            self.log.info(unicode(e), exc_info=True)
++            raise APIError('Bad data reconstructing object (%s, %s)' % (
++                           type(e).__name__, e))
+ 
+-    if data['timestamp'] > current_datetime + timedelta(minutes=1):
+-        raise InvalidTimestamp('Invalid value for timestamp (in future): %r' % data['timestamp'])
++        # XXX: ensure keys are coerced to strings
++        return dict((smart_str(k), v) for k, v in obj.iteritems())
+ 
+-    if data['timestamp'] < current_datetime - timedelta(days=30):
+-        raise InvalidTimestamp('Invalid value for timestamp (too old): %r' % data['timestamp'])
++    def _process_data_timestamp(self, data, current_datetime=None):
++        if not data['timestamp']:
++            del data['timestamp']
++            return data
++        elif is_float(data['timestamp']):
++            try:
++                data['timestamp'] = datetime.fromtimestamp(float(data['timestamp']))
++            except Exception:
++                raise InvalidTimestamp('Invalid value for timestamp: %r' % data['timestamp'])
++        elif not isinstance(data['timestamp'], datetime):
++            if '.' in data['timestamp']:
++                format = '%Y-%m-%dT%H:%M:%S.%f'
++            else:
++                format = '%Y-%m-%dT%H:%M:%S'
++            if 'Z' in data['timestamp']:
++                # support UTC market, but not other timestamps
++                format += 'Z'
++            try:
++                data['timestamp'] = datetime.strptime(data['timestamp'], format)
++            except Exception:
++                raise InvalidTimestamp('Invalid value for timestamp: %r' % data['timestamp'])
+ 
+-    data['timestamp'] = float(data['timestamp'].strftime('%s'))
++        if current_datetime is None:
++            current_datetime = datetime.now()
+ 
+-    return data
++        if data['timestamp'] > current_datetime + timedelta(minutes=1):
++            raise InvalidTimestamp('Invalid value for timestamp (in future): %r' % data['timestamp'])
+ 
++        if data['timestamp'] < current_datetime - timedelta(days=30):
++            raise InvalidTimestamp('Invalid value for timestamp (too old): %r' % data['timestamp'])
+ 
+-def validate_data(project, data, client=None):
+-    # TODO(dcramer): move project out of the data packet
+-    data['project'] = project.id
++        data['timestamp'] = float(data['timestamp'].strftime('%s'))
+ 
+-    if not data.get('message'):
+-        data['message'] = '<no message value>'
+-    elif not isinstance(data['message'], six.string_types):
+-        raise APIError('Invalid value for message')
++        return data
+ 
+-    if data.get('culprit'):
+-        if not isinstance(data['culprit'], six.string_types):
+-            raise APIError('Invalid value for culprit')
++    def validate_data(self, project, data):
++        # TODO(dcramer): move project out of the data packet
++        data['project'] = project.id
+ 
+-    if not data.get('event_id'):
+-        data['event_id'] = uuid.uuid4().hex
+-    elif not isinstance(data['event_id'], six.string_types):
+-        raise APIError('Invalid value for event_id')
+-    if len(data['event_id']) > 32:
+-        logger.info(
+-            'Discarded value for event_id due to length (%d chars)',
+-            len(data['event_id']), **client_metadata(client, project))
+-        data['event_id'] = uuid.uuid4().hex
++        if not data.get('message'):
++            data['message'] = '<no message value>'
++        elif not isinstance(data['message'], six.string_types):
++            raise APIForbidden('Invalid value for message')
+ 
+-    if 'timestamp' in data:
+-        try:
+-            process_data_timestamp(data)
+-        except InvalidTimestamp as e:
+-            # Log the error, remove the timestamp, and continue
+-            logger.info(
+-                'Discarded invalid value for timestamp: %r', data['timestamp'],
+-                **client_metadata(client, project, exception=e))
+-            del data['timestamp']
++        if data.get('culprit'):
++            if not isinstance(data['culprit'], six.string_types):
++                raise APIForbidden('Invalid value for culprit')
+ 
+-    if data.get('modules') and type(data['modules']) != dict:
+-        logger.info(
+-            'Discarded invalid type for modules: %s',
+-            type(data['modules']), **client_metadata(client, project))
+-        del data['modules']
+-
+-    if data.get('extra') is not None and type(data['extra']) != dict:
+-        logger.info(
+-            'Discarded invalid type for extra: %s',
+-            type(data['extra']), **client_metadata(client, project))
+-        del data['extra']
+-
+-    if data.get('tags') is not None:
+-        if type(data['tags']) == dict:
+-            data['tags'] = data['tags'].items()
+-        elif not isinstance(data['tags'], (list, tuple)):
+-            logger.info(
+-                'Discarded invalid type for tags: %s',
+-                type(data['tags']), **client_metadata(client, project))
+-            del data['tags']
+-
+-    if data.get('tags'):
+-        # remove any values which are over 32 characters
+-        tags = []
+-        for pair in data['tags']:
+-            try:
+-                k, v = pair
+-            except ValueError:
+-                logger.info('Discarded invalid tag value: %r',
+-                            pair, **client_metadata(client, project))
+-                continue
++        if not data.get('event_id'):
++            data['event_id'] = uuid.uuid4().hex
++        elif not isinstance(data['event_id'], six.string_types):
++            raise APIForbidden('Invalid value for event_id')
+ 
+-            if not isinstance(k, six.string_types):
+-                try:
+-                    k = six.text_type(k)
+-                except Exception:
+-                    logger.info('Discarded invalid tag key: %r',
+-                                type(k), **client_metadata(client, project))
+-                    continue
++        if len(data['event_id']) > 32:
++            self.log.info(
++                'Discarded value for event_id due to length (%d chars)',
++                len(data['event_id']))
++            data['event_id'] = uuid.uuid4().hex
+ 
+-            if not isinstance(v, six.string_types):
++        if 'timestamp' in data:
++            try:
++                self._process_data_timestamp(data)
++            except InvalidTimestamp as e:
++                self.log.info(
++                    'Discarded invalid value for timestamp: %r',
++                    data['timestamp'], exc_info=True)
++                del data['timestamp']
++
++        if data.get('modules') and type(data['modules']) != dict:
++            self.log.info(
++                'Discarded invalid type for modules: %s',
++                type(data['modules']))
++            del data['modules']
++
++        if data.get('extra') is not None and type(data['extra']) != dict:
++            self.log.info(
++                'Discarded invalid type for extra: %s',
++                type(data['extra']))
++            del data['extra']
++
++        if data.get('tags') is not None:
++            if type(data['tags']) == dict:
++                data['tags'] = data['tags'].items()
++            elif not isinstance(data['tags'], (list, tuple)):
++                self.log.info(
++                    'Discarded invalid type for tags: %s', type(data['tags']))
++                del data['tags']
++
++        if data.get('tags'):
++            # remove any values which are over 32 characters
++            tags = []
++            for pair in data['tags']:
+                 try:
+-                    v = six.text_type(v)
+-                except Exception:
+-                    logger.info('Discarded invalid tag value: %s=%r',
+-                                k, type(v), **client_metadata(client, project))
++                    k, v = pair
++                except ValueError:
++                    self.log.info('Discarded invalid tag value: %r', pair)
+                     continue
+-            if len(k) > MAX_TAG_KEY_LENGTH or len(v) > MAX_TAG_VALUE_LENGTH:
+-                logger.info('Discarded invalid tag: %s=%s',
+-                            k, v, **client_metadata(client, project))
+-                continue
+-            tags.append((k, v))
+-        data['tags'] = tags
+-
+-    for k in data.keys():
+-        if k in CLIENT_RESERVED_ATTRS:
+-            continue
+ 
+-        value = data.pop(k)
+-
+-        if not value:
+-            logger.info(
+-                'Ignored empty interface value: %s', k,
+-                **client_metadata(client, project))
+-            continue
++                if not isinstance(k, six.string_types):
++                    try:
++                        k = six.text_type(k)
++                    except Exception:
++                        self.log.info('Discarded invalid tag key: %r', type(k))
++                        continue
++
++                if not isinstance(v, six.string_types):
++                    try:
++                        v = six.text_type(v)
++                    except Exception:
++                        self.log.info('Discarded invalid tag value: %s=%r',
++                                      k, type(v))
++                        continue
++                if len(k) > MAX_TAG_KEY_LENGTH or len(v) > MAX_TAG_VALUE_LENGTH:
++                    self.log.info('Discarded invalid tag: %s=%s', k, v)
++                    continue
++                tags.append((k, v))
++            data['tags'] = tags
+ 
+-        try:
+-            interface = get_interface(k)
+-        except ValueError:
+-            logger.info(
+-                'Ignored unknown attribute: %s', k,
+-                **client_metadata(client, project))
+-            continue
+-
+-        if type(value) != dict:
+-            # HACK(dcramer): the exception interface supports a list as the
+-            # value. We should change this in a new protocol version.
+-            if type(value) in (list, tuple):
+-                value = {'values': value}
+-            else:
+-                logger.info(
+-                    'Invalid parameters for value: %s', k,
+-                    type(value), **client_metadata(client, project))
++        for k in data.keys():
++            if k in CLIENT_RESERVED_ATTRS:
+                 continue
+ 
+-        try:
+-            inst = interface.to_python(value)
+-            data[inst.get_path()] = inst.to_json()
+-        except Exception as e:
+-            if isinstance(e, AssertionError):
+-                log = logger.info
+-            else:
+-                log = logger.error
+-            log('Discarded invalid value for interface: %s', k,
+-                **client_metadata(client, project, exception=e, extra={'value': value}))
++            value = data.pop(k)
+ 
+-    level = data.get('level') or DEFAULT_LOG_LEVEL
+-    if isinstance(level, six.string_types) and not level.isdigit():
+-        # assume it's something like 'warning'
+-        try:
+-            data['level'] = LOG_LEVEL_REVERSE_MAP[level]
+-        except KeyError as e:
+-            logger.info(
+-                'Discarded invalid logger value: %s', level,
+-                **client_metadata(client, project, exception=e))
+-            data['level'] = LOG_LEVEL_REVERSE_MAP.get(
+-                DEFAULT_LOG_LEVEL, DEFAULT_LOG_LEVEL)
++            if not value:
++                self.log.info('Ignored empty interface value: %s', k)
++                continue
+ 
+-    if data.get('release'):
+-        data['release'] = unicode(data['release'])
++            try:
++                interface = get_interface(k)
++            except ValueError:
++                self.log.info('Ignored unknown attribute: %s', k)
++                continue
+ 
+-    return data
++            if type(value) != dict:
++                # HACK(dcramer): the exception interface supports a list as the
++                # value. We should change this in a new protocol version.
++                if type(value) in (list, tuple):
++                    value = {'values': value}
++                else:
++                    self.log.info(
++                        'Invalid parameter for value: %s (%r)', k,
++                        type(value))
++                    continue
+ 
++            try:
++                inst = interface.to_python(value)
++                data[inst.get_path()] = inst.to_json()
++            except Exception as e:
++                if isinstance(e, AssertionError):
++                    log = self.log.info
++                else:
++                    log = self.log.error
++                log('Discarded invalid value for interface: %s (%r)', k,
++                    exc_info=True)
++
++        level = data.get('level') or DEFAULT_LOG_LEVEL
++        if isinstance(level, six.string_types) and not level.isdigit():
++            # assume it's something like 'warning'
++            try:
++                data['level'] = LOG_LEVEL_REVERSE_MAP[level]
++            except KeyError as e:
++                self.log.info(
++                    'Discarded invalid logger value: %s', level)
++                data['level'] = LOG_LEVEL_REVERSE_MAP.get(
++                    DEFAULT_LOG_LEVEL, DEFAULT_LOG_LEVEL)
+ 
+-def ensure_does_not_have_ip(data):
+-    if 'sentry.interfaces.Http' in data:
+-        if 'env' in data['sentry.interfaces.Http']:
+-            data['sentry.interfaces.Http']['env'].pop('REMOTE_ADDR', None)
++        if data.get('release'):
++            data['release'] = unicode(data['release'])
+ 
+-    if 'sentry.interfaces.User' in data:
+-        data['sentry.interfaces.User'].pop('ip_address', None)
++        return data
+ 
++    def ensure_does_not_have_ip(self, data):
++        if 'sentry.interfaces.Http' in data:
++            if 'env' in data['sentry.interfaces.Http']:
++                data['sentry.interfaces.Http']['env'].pop('REMOTE_ADDR', None)
+ 
+-def ensure_has_ip(data, ip_address):
+-    if data.get('sentry.interfaces.Http', {}).get('env', {}).get('REMOTE_ADDR'):
+-        return
++        if 'sentry.interfaces.User' in data:
++            data['sentry.interfaces.User'].pop('ip_address', None)
+ 
+-    if data.get('sentry.interfaces.User', {}).get('ip_address'):
+-        return
++    def ensure_has_ip(self, data, ip_address):
++        if data.get('sentry.interfaces.Http', {}).get('env', {}).get('REMOTE_ADDR'):
++            return
+ 
+-    data.setdefault('sentry.interfaces.User', {})['ip_address'] = ip_address
++        if data.get('sentry.interfaces.User', {}).get('ip_address'):
++            return
+ 
++        data.setdefault('sentry.interfaces.User', {})['ip_address'] = ip_address
+ 
+-def insert_data_to_database(data):
+-    cache_key = 'e:{1}:{0}'.format(data['project'], data['event_id'])
+-    default_cache.set(cache_key, data, timeout=3600)
+-    preprocess_event.delay(cache_key=cache_key, start_time=time())
++    def insert_data_to_database(self, data):
++        cache_key = 'e:{1}:{0}'.format(data['project'], data['event_id'])
++        default_cache.set(cache_key, data, timeout=3600)
++        preprocess_event.delay(cache_key=cache_key, start_time=time())
+diff --git a/src/sentry/exceptions.py b/src/sentry/exceptions.py
+index f956b6a300..f673047010 100644
+--- a/src/sentry/exceptions.py
++++ b/src/sentry/exceptions.py
+@@ -9,10 +9,6 @@ class InvalidInterface(InvalidData):
+     pass
+ 
+ 
+-class InvalidTimestamp(InvalidData):
+-    pass
+-
+-
+ class InvalidRequest(Exception):
+     pass
+ 
+diff --git a/src/sentry/utils/raven.py b/src/sentry/utils/raven.py
+index f5a7c2f551..f1cf336ca3 100644
+--- a/src/sentry/utils/raven.py
++++ b/src/sentry/utils/raven.py
+@@ -2,6 +2,8 @@ from __future__ import absolute_import, print_function
+ 
+ import inspect
+ import logging
++import raven
++import sentry
+ 
+ from django.conf import settings
+ from raven.contrib.django.client import DjangoClient
+@@ -42,10 +44,16 @@ class SentryInternalClient(DjangoClient):
+         # TODO(dcramer): this should respect rate limits/etc and use the normal
+         # pipeline
+         from sentry.app import tsdb
+-        from sentry.coreapi import insert_data_to_database
++        from sentry.coreapi import ClientApiHelper
+         from sentry.event_manager import EventManager
+         from sentry.models import Project
+ 
++        helper = ClientApiHelper(
++            agent='raven-python/%s (sentry %s)' % (raven.VERSION, sentry.VERSION),
++            project_id=settings.SENTRY_PROJECT,
++            version=self.protocol_version,
++        )
++
+         try:
+             project = Project.objects.get_from_cache(id=settings.SENTRY_PROJECT)
+         except Project.DoesNotExist:
+@@ -53,6 +61,8 @@ class SentryInternalClient(DjangoClient):
+                                     settings.SENTRY_PROJECT)
+             return
+ 
++        helper.context.bind_project(project)
++
+         metrics.incr('events.total', 1)
+ 
+         kwargs['project'] = project.id
+@@ -63,7 +73,7 @@ class SentryInternalClient(DjangoClient):
+                 (tsdb.models.project_total_received, project.id),
+                 (tsdb.models.organization_total_received, project.organization_id),
+             ])
+-            insert_data_to_database(data)
++            helper.insert_data_to_database(data)
+         except Exception as e:
+             if self.raise_send_errors:
+                 raise
+diff --git a/src/sentry/utils/runner.py b/src/sentry/utils/runner.py
+index 75e4870d39..228eccd85a 100644
+--- a/src/sentry/utils/runner.py
++++ b/src/sentry/utils/runner.py
+@@ -89,6 +89,9 @@ SENTRY_REDIS_OPTIONS = {
+ # Cache #
+ #########
+ 
++# Sentry currently utilizes two separate mechanisms. While CACHES is not a
++# requirement, it will optimize several high throughput patterns.
++
+ # If you wish to use memcached, install the dependencies and adjust the config
+ # as shown:
+ #
+@@ -100,9 +103,8 @@ SENTRY_REDIS_OPTIONS = {
+ #         'LOCATION': ['127.0.0.1:11211'],
+ #     }
+ # }
+-#
+-# SENTRY_CACHE = 'sentry.cache.django.DjangoCache'
+ 
++# A primary cache is required for things such as processing events
+ SENTRY_CACHE = 'sentry.cache.redis.RedisCache'
+ 
+ #########
+diff --git a/src/sentry/web/api.py b/src/sentry/web/api.py
+index 71307eafb8..63da2f2b8d 100644
+--- a/src/sentry/web/api.py
++++ b/src/sentry/web/api.py
+@@ -8,9 +8,10 @@ sentry.web.views
+ from __future__ import absolute_import, print_function
+ 
+ import logging
+-import six
++import traceback
+ 
+ from datetime import timedelta
++from django.conf import settings
+ from django.contrib import messages
+ from django.contrib.auth.models import AnonymousUser
+ from django.core.cache import cache
+@@ -18,8 +19,7 @@ from django.core.urlresolvers import reverse
+ from django.db import connections
+ from django.db.models import Sum, Q
+ from django.http import (
+-    HttpResponse, HttpResponseBadRequest,
+-    HttpResponseForbidden, HttpResponseRedirect,
++    HttpResponse, HttpResponseForbidden, HttpResponseRedirect,
+ )
+ from django.utils import timezone
+ from django.utils.http import urlquote
+@@ -35,11 +35,8 @@ from sentry.api.base import LINK_HEADER
+ from sentry.app import tsdb
+ from sentry.constants import MEMBER_USER, EVENTS_PER_PAGE
+ from sentry.coreapi import (
+-    project_from_auth_vars, decode_and_decompress_data,
+-    safely_load_json_string, validate_data, insert_data_to_database, APIError,
+-    APIForbidden, APIRateLimited, extract_auth_vars, ensure_has_ip,
+-    decompress_deflate, decompress_gzip, ensure_does_not_have_ip)
+-from sentry.exceptions import InvalidData, InvalidOrigin, InvalidRequest
++    APIError, APIForbidden, APIRateLimited, ClientApiHelper
++)
+ from sentry.event_manager import EventManager
+ from sentry.models import (
+     Group, GroupBookmark, GroupStatus, GroupTagValue, Project, TagValue,
+@@ -60,7 +57,7 @@ from sentry.web.decorators import has_access
+ from sentry.web.frontend.groups import _get_group_list
+ from sentry.web.helpers import render_to_response
+ 
+-logger = logging.getLogger('sentry.api')
++logger = logging.getLogger('sentry')
+ 
+ # Transparent 1x1 gif
+ # See http://probablyprogramming.com/2009/03/15/the-tiniest-gif-ever
+@@ -85,15 +82,6 @@ def api(func):
+     return wrapped
+ 
+ 
+-class Auth(object):
+-    def __init__(self, auth_vars, is_public=False):
+-        self.client = auth_vars.get('sentry_client')
+-        self.version = int(float(auth_vars.get('sentry_version')))
+-        self.secret_key = auth_vars.get('sentry_secret')
+-        self.public_key = auth_vars.get('sentry_key')
+-        self.is_public = is_public
+-
+-
+ class APIView(BaseView):
+     def _get_project_from_id(self, project_id):
+         if not project_id:
+@@ -105,120 +93,106 @@ class APIView(BaseView):
+         except Project.DoesNotExist:
+             raise APIError('Invalid project_id: %r' % project_id)
+ 
+-    def _parse_header(self, request, project):
+-        try:
+-            auth_vars = extract_auth_vars(request)
+-        except (IndexError, ValueError):
+-            raise APIError('Invalid auth header')
+-
+-        if not auth_vars:
+-            raise APIError('Client/server version mismatch: Unsupported client')
+-
+-        server_version = auth_vars.get('sentry_version', '1.0')
+-        client = auth_vars.get('sentry_client', request.META.get('HTTP_USER_AGENT'))
++    def _parse_header(self, request, helper, project):
++        auth = helper.auth_from_request(request)
+ 
+-        Raven.tags_context({'client': client})
+-        Raven.tags_context({'protocol': server_version})
++        if auth.version not in PROTOCOL_VERSIONS:
++            raise APIError('Client using unsupported server protocol version (%r)' % str(auth.version or ''))
+ 
+-        if server_version not in PROTOCOL_VERSIONS:
+-            raise APIError('Client/server version mismatch: Unsupported protocol version (%s)' % server_version)
++        if not auth.client:
++            raise APIError("Client did not send 'client' identifier")
+ 
+-        if not client:
+-            raise APIError('Client request error: Missing client version identifier')
+-
+-        return auth_vars
++        return auth
+ 
+     @csrf_exempt
+     @never_cache
+     def dispatch(self, request, project_id=None, *args, **kwargs):
+-        try:
+-            origin = self.get_request_origin(request)
++        helper = ClientApiHelper(
++            agent=request.META.get('HTTP_USER_AGENT'),
++            project_id=project_id,
++            ip_address=request.META['REMOTE_ADDR'],
++        )
++        origin = None
+ 
+-            response = self._dispatch(request, project_id=project_id, *args, **kwargs)
+-        except InvalidRequest as e:
+-            response = HttpResponseBadRequest(str(e), content_type='text/plain')
+-        except Exception:
+-            response = HttpResponse(status=500)
++        try:
++            origin = helper.origin_from_request(request)
+ 
+-        if response.status_code != 200:
++            response = self._dispatch(request, helper, project_id=project_id,
++                                      origin=origin,
++                                      *args, **kwargs)
++        except APIError as e:
++            context = {
++                'error': unicode(e.msg).encode('utf-8'),
++            }
++            if e.name:
++                context['error_name'] = e.name
++
++            response = HttpResponse(json.dumps(context),
++                                    content_type='application/json',
++                                    status=e.http_status)
+             # Set X-Sentry-Error as in many cases it is easier to inspect the headers
+-            response['X-Sentry-Error'] = response.content[:200]  # safety net on content length
++            response['X-Sentry-Error'] = context['error']
+ 
+-            if response.status_code == 500:
+-                log = logger.error
+-                exc_info = True
+-            else:
+-                log = logger.info
+-                exc_info = None
++            if isinstance(e, APIRateLimited) and e.retry_after is not None:
++                response['Retry-After'] = str(e.retry_after)
+ 
+-            log('status=%s project_id=%s user_id=%s ip=%s agent=%s %s', response.status_code, project_id,
+-                request.user.is_authenticated() and request.user.id or None,
+-                request.META['REMOTE_ADDR'], request.META.get('HTTP_USER_AGENT'),
+-                response['X-Sentry-Error'], extra={
+-                    'request': request,
+-                }, exc_info=exc_info)
++        except Exception:
++            if settings.DEBUG or True:
++                content = traceback.format_exc()
++            else:
++                content = ''
++            traceback.print_exc()
++            response = HttpResponse(content,
++                                    content_type='text/plain',
++                                    status=500)
+ 
+-            if origin:
+-                # We allow all origins on errors
+-                response['Access-Control-Allow-Origin'] = '*'
++        if response.status_code != 200 and origin:
++            # We allow all origins on errors
++            response['Access-Control-Allow-Origin'] = '*'
+ 
+         if origin:
+-            response['Access-Control-Allow-Headers'] = 'X-Sentry-Auth, X-Requested-With, Origin, Accept, Content-Type, ' \
+-                'Authentication'
+-            response['Access-Control-Allow-Methods'] = ', '.join(self._allowed_methods())
++            response['Access-Control-Allow-Headers'] = \
++                'X-Sentry-Auth, X-Requested-With, Origin, Accept, ' \
++                'Content-Type, Authentication'
++            response['Access-Control-Allow-Methods'] = \
++                ', '.join(self._allowed_methods())
+ 
+         return response
+ 
+-    def get_request_origin(self, request):
+-        """
+-        Returns either the Origin or Referer value from the request headers.
+-        """
+-        return request.META.get('HTTP_ORIGIN', request.META.get('HTTP_REFERER'))
+-
+-    def _dispatch(self, request, project_id=None, *args, **kwargs):
++    def _dispatch(self, request, helper, project_id=None, origin=None,
++                  *args, **kwargs):
+         request.user = AnonymousUser()
+ 
+-        try:
+-            project = self._get_project_from_id(project_id)
+-        except APIError as e:
+-            raise InvalidRequest(str(e))
+-
++        project = self._get_project_from_id(project_id)
+         if project:
+-            Raven.tags_context({'project': project.id})
++            helper.context.bind_project(project)
++            Raven.tags_context(helper.context.get_tags_context())
+ 
+-        origin = self.get_request_origin(request)
+         if origin is not None:
+             # This check is specific for clients who need CORS support
+             if not project:
+-                raise InvalidRequest('Your client must be upgraded for CORS support.')
++                raise APIError('Client must be upgraded for CORS support')
+             if not is_valid_origin(origin, project):
+-                raise InvalidOrigin(origin)
++                raise APIForbidden('Invalid origin: %s' % (origin,))
+ 
+         # XXX: It seems that the OPTIONS call does not always include custom headers
+         if request.method == 'OPTIONS':
+             response = self.options(request, project)
+         else:
+-            try:
+-                auth_vars = self._parse_header(request, project)
+-            except APIError as e:
+-                raise InvalidRequest(str(e))
++            auth = self._parse_header(request, helper, project)
+ 
+-            try:
+-                project_ = project_from_auth_vars(auth_vars)
+-            except APIError as error:
+-                return HttpResponse(six.text_type(error.msg), status=error.http_status)
++            project_ = helper.project_from_auth(auth)
+ 
+             # Legacy API was /api/store/ and the project ID was only available elsewhere
+             if not project:
+                 if not project_:
+-                    raise InvalidRequest('Unable to identify project')
++                    raise APIError('Unable to identify project')
+                 project = project_
+             elif project_ != project:
+-                raise InvalidRequest('Project ID mismatch')
+-            else:
+-                Raven.tags_context({'project': project.id})
++                raise APIError('Two different project were specified')
+ 
+-            auth = Auth(auth_vars, is_public=bool(origin))
++            helper.context.bind_auth(auth)
++            Raven.tags_context(helper.context.get_tags_context())
+ 
+             if auth.version >= 3:
+                 if request.method == 'GET':
+@@ -228,19 +202,19 @@ class APIView(BaseView):
+                     # it can be safely assumed that it was checked previously and it's ok.
+                     if origin is None and not is_valid_origin(origin, project):
+                         # Special case an error message for a None origin when None wasn't allowed
+-                        raise InvalidRequest('Missing required Origin or Referer header')
++                        raise APIForbidden('Missing required Origin or Referer header')
+                 else:
+                     # Version 3 enforces secret key for server side requests
+                     if not auth.secret_key:
+-                        raise InvalidRequest('Missing required attribute in authentication header: sentry_secret')
+-
+-            try:
+-                response = super(APIView, self).dispatch(request, project=project, auth=auth, **kwargs)
++                        raise APIForbidden('Missing required attribute in authentication header: sentry_secret')
+ 
+-            except APIError as error:
+-                response = HttpResponse(six.text_type(error.msg), content_type='text/plain', status=error.http_status)
+-                if isinstance(error, APIRateLimited) and error.retry_after is not None:
+-                    response['Retry-After'] = str(error.retry_after)
++            response = super(APIView, self).dispatch(
++                request=request,
++                project=project,
++                auth=auth,
++                helper=helper,
++                **kwargs
++            )
+ 
+         if origin:
+             response['Access-Control-Allow-Origin'] = origin
+@@ -287,18 +261,18 @@ class StoreView(APIView):
+        the user be authenticated, and a project_id be sent in the GET variables.
+ 
+     """
+-    def post(self, request, project, auth, **kwargs):
++    def post(self, request, **kwargs):
+         data = request.body
+-        response_or_event_id = self.process(request, project, auth, data, **kwargs)
++        response_or_event_id = self.process(request, data=data, **kwargs)
+         if isinstance(response_or_event_id, HttpResponse):
+             return response_or_event_id
+         return HttpResponse(json.dumps({
+             'id': response_or_event_id,
+         }), content_type='application/json')
+ 
+-    def get(self, request, project, auth, **kwargs):
++    def get(self, request, **kwargs):
+         data = request.GET.get('sentry_data', '')
+-        response_or_event_id = self.process(request, project, auth, data, **kwargs)
++        response_or_event_id = self.process(request, data=data, **kwargs)
+ 
+         # Return a simple 1x1 gif for browser so they don't throw a warning
+         response = HttpResponse(PIXEL, 'image/gif')
+@@ -306,7 +280,7 @@ class StoreView(APIView):
+             response['X-Sentry-ID'] = response_or_event_id
+         return response
+ 
+-    def process(self, request, project, auth, data, **kwargs):
++    def process(self, request, project, auth, helper, data, **kwargs):
+         metrics.incr('events.total', 1)
+ 
+         event_received.send_robust(ip=request.META['REMOTE_ADDR'], sender=type(self))
+@@ -332,27 +306,25 @@ class StoreView(APIView):
+                 (app.tsdb.models.organization_total_received, project.organization_id),
+             ])
+ 
++        # TODO(dcramer): remove create_event perm hooks
+         result = plugins.first('has_perm', request.user, 'create_event', project,
+                                version=1)
+         if result is False:
+             metrics.incr('events.dropped', 1)
+-            raise APIForbidden('Creation of this event was blocked')
++            raise APIForbidden('Creation of this event was blocked due to a plugin')
+ 
+         content_encoding = request.META.get('HTTP_CONTENT_ENCODING', '')
+ 
+         if content_encoding == 'gzip':
+-            data = decompress_gzip(data)
++            data = helper.decompress_gzip(data)
+         elif content_encoding == 'deflate':
+-            data = decompress_deflate(data)
++            data = helper.decompress_deflate(data)
+         elif not data.startswith('{'):
+-            data = decode_and_decompress_data(data)
+-        data = safely_load_json_string(data)
++            data = helper.decode_and_decompress_data(data)
++        data = helper.safely_load_json_string(data)
+ 
+-        try:
+-            # mutates data
+-            validate_data(project, data, auth.client)
+-        except InvalidData as e:
+-            raise APIError(u'Invalid data: %s (%s)' % (six.text_type(e), type(e)))
++        # mutates data
++        helper.validate_data(project, data)
+ 
+         # mutates data
+         manager = EventManager(data, version=auth.version)
+@@ -362,7 +334,7 @@ class StoreView(APIView):
+ 
+         # insert IP address if not available
+         if auth.is_public and not scrub_ip_address:
+-            ensure_has_ip(data, request.META['REMOTE_ADDR'])
++            helper.ensure_has_ip(data, request.META['REMOTE_ADDR'])
+ 
+         event_id = data['event_id']
+ 
+@@ -371,8 +343,7 @@ class StoreView(APIView):
+         cache_key = 'ev:%s:%s' % (project.id, event_id,)
+ 
+         if cache.get(cache_key) is not None:
+-            logger.warning('Discarded recent duplicate event from project %s/%s (id=%s)', project.organization.slug, project.slug, event_id)
+-            raise InvalidRequest('An event with the same ID already exists.')
++            raise APIForbidden('An event with the same ID already exists (%s)' % (event_id,))
+ 
+         if project.get_option('sentry:scrub_data', True):
+             # We filter data immediately before it ever gets into the queue
+@@ -381,14 +352,14 @@ class StoreView(APIView):
+ 
+         if scrub_ip_address:
+             # We filter data immediately before it ever gets into the queue
+-            ensure_does_not_have_ip(data)
++            helper.ensure_does_not_have_ip(data)
+ 
+         # mutates data (strips a lot of context if not queued)
+-        insert_data_to_database(data)
++        helper.insert_data_to_database(data)
+ 
+         cache.set(cache_key, '', 60 * 5)
+ 
+-        logger.debug('New event from project %s/%s (id=%s)', project.organization.slug, project.slug, event_id)
++        helper.log.debug('New event received (%s)', event_id)
+ 
+         return event_id
+ 
+@@ -733,7 +704,7 @@ def clear(request, organization, project):
+         status=GroupStatus.UNRESOLVED,
+     )
+     rows_affected = queryset.update(status=GroupStatus.RESOLVED)
+-    if rows_affected > 1000:
++    if rows_affected > 10000:
+         logger.warning(
+             'Large resolve on %s of %s rows', project.slug, rows_affected)
+ 
+diff --git a/tests/integration/tests.py b/tests/integration/tests.py
+index 566f629f22..cb2900d4d6 100644
+--- a/tests/integration/tests.py
++++ b/tests/integration/tests.py
+@@ -106,7 +106,7 @@ class RavenIntegrationTest(TransactionTestCase):
+             data=data,
+             content_type=content_type,
+             **headers)
+-        self.assertEquals(resp.status_code, 200, resp.content)
++        assert resp.status_code == 200, resp.content
+ 
+     @mock.patch('raven.base.Client.send_remote')
+     def test_basic(self, send_remote):
+@@ -120,11 +120,11 @@ class RavenIntegrationTest(TransactionTestCase):
+             client.capture('Message', message='foo')
+ 
+         send_remote.assert_called_once()
+-        self.assertEquals(Group.objects.count(), 1)
++        assert Group.objects.count() == 1
+         group = Group.objects.get()
+-        self.assertEquals(group.event_set.count(), 1)
++        assert group.event_set.count() == 1
+         instance = group.event_set.get()
+-        self.assertEquals(instance.message, 'foo')
++        assert instance.message == 'foo'
+ 
+ 
+ class SentryRemoteTest(TestCase):
+@@ -148,63 +148,63 @@ class SentryRemoteTest(TestCase):
+         timestamp = timezone.now().replace(microsecond=0, tzinfo=timezone.utc) - datetime.timedelta(hours=1)
+         kwargs = {u'message': 'hello', 'timestamp': timestamp.strftime('%s.%f')}
+         resp = self._postWithSignature(kwargs)
+-        self.assertEquals(resp.status_code, 200, resp.content)
++        assert resp.status_code == 200, resp.content
+         instance = Event.objects.get()
+-        self.assertEquals(instance.message, 'hello')
+-        self.assertEquals(instance.datetime, timestamp)
++        assert instance.message == 'hello'
++        assert instance.datetime == timestamp
+         group = instance.group
+-        self.assertEquals(group.first_seen, timestamp)
+-        self.assertEquals(group.last_seen, timestamp)
++        assert group.first_seen == timestamp
++        assert group.last_seen == timestamp
+ 
+     def test_timestamp_as_iso(self):
+         timestamp = timezone.now().replace(microsecond=0, tzinfo=timezone.utc) - datetime.timedelta(hours=1)
+         kwargs = {u'message': 'hello', 'timestamp': timestamp.strftime('%Y-%m-%dT%H:%M:%S.%f')}
+         resp = self._postWithSignature(kwargs)
+-        self.assertEquals(resp.status_code, 200, resp.content)
++        assert resp.status_code == 200, resp.content
+         instance = Event.objects.get()
+-        self.assertEquals(instance.message, 'hello')
+-        self.assertEquals(instance.datetime, timestamp)
++        assert instance.message == 'hello'
++        assert instance.datetime == timestamp
+         group = instance.group
+-        self.assertEquals(group.first_seen, timestamp)
+-        self.assertEquals(group.last_seen, timestamp)
++        assert group.first_seen == timestamp
++        assert group.last_seen == timestamp
+ 
+     def test_ungzipped_data(self):
+         kwargs = {'message': 'hello'}
+         resp = self._postWithSignature(kwargs)
+-        self.assertEquals(resp.status_code, 200)
++        assert resp.status_code == 200
+         instance = Event.objects.get()
+-        self.assertEquals(instance.message, 'hello')
++        assert instance.message == 'hello'
+ 
+     @override_settings(SENTRY_ALLOW_ORIGIN='getsentry.com')
+     def test_correct_data_with_get(self):
+         kwargs = {'message': 'hello'}
+         resp = self._getWithReferer(kwargs)
+-        self.assertEquals(resp.status_code, 200, resp.content)
++        assert resp.status_code == 200, resp.content
+         instance = Event.objects.get()
+-        self.assertEquals(instance.message, 'hello')
++        assert instance.message == 'hello'
+ 
+     @override_settings(SENTRY_ALLOW_ORIGIN='getsentry.com')
+     def test_get_without_referer(self):
+         kwargs = {'message': 'hello'}
+         resp = self._getWithReferer(kwargs, referer=None, protocol='4')
+-        self.assertEquals(resp.status_code, 400, resp.content)
++        assert resp.status_code == 403, resp.content
+ 
+     @override_settings(SENTRY_ALLOW_ORIGIN='*')
+     def test_get_without_referer_allowed(self):
+         kwargs = {'message': 'hello'}
+         resp = self._getWithReferer(kwargs, referer=None, protocol='4')
+-        self.assertEquals(resp.status_code, 200, resp.content)
++        assert resp.status_code == 200, resp.content
+ 
+     def test_signature(self):
+         kwargs = {'message': 'hello'}
+ 
+         resp = self._postWithSignature(kwargs)
+ 
+-        self.assertEquals(resp.status_code, 200, resp.content)
++        assert resp.status_code == 200, resp.content
+ 
+         instance = Event.objects.get()
+ 
+-        self.assertEquals(instance.message, 'hello')
++        assert instance.message == 'hello'
+ 
+     def test_content_encoding_deflate(self):
+         kwargs = {'message': 'hello'}
+diff --git a/tests/sentry/coreapi/tests.py b/tests/sentry/coreapi/tests.py
+index e47c5f004d..b52cd74886 100644
+--- a/tests/sentry/coreapi/tests.py
++++ b/tests/sentry/coreapi/tests.py
+@@ -7,10 +7,9 @@ import mock
+ from datetime import datetime
+ from uuid import UUID
+ 
+-from sentry.exceptions import InvalidTimestamp
+ from sentry.coreapi import (
+-    extract_auth_vars, project_from_auth_vars, APIForbidden, ensure_has_ip,
+-    process_data_timestamp, validate_data, get_interface, APIError
++    APIError, APIUnauthorized, Auth, ClientApiHelper, InvalidTimestamp,
++    get_interface
+ )
+ from sentry.testutils import TestCase
+ 
+@@ -22,67 +21,53 @@ class BaseAPITest(TestCase):
+         self.project = self.create_project(team=self.team)
+         self.pm = self.project.team.member_set.get_or_create(user=self.user)[0]
+         self.pk = self.project.key_set.get_or_create()[0]
++        self.helper = ClientApiHelper()
+ 
+ 
+-class ExtractAuthVarsTest(BaseAPITest):
++class AuthFromRequestTest(BaseAPITest):
+     def test_valid(self):
+         request = mock.Mock()
+-        request.META = {'HTTP_X_SENTRY_AUTH': 'Sentry key=value, biz=baz'}
+-        result = extract_auth_vars(request)
+-        self.assertNotEquals(result, None)
+-        self.assertTrue('key' in result)
+-        self.assertEquals(result['key'], 'value')
+-        self.assertTrue('biz' in result)
+-        self.assertEquals(result['biz'], 'baz')
++        request.META = {'HTTP_X_SENTRY_AUTH': 'Sentry sentry_key=value, biz=baz'}
++        result = self.helper.auth_from_request(request)
++        assert result.public_key == 'value'
+ 
+     def test_invalid_header_defers_to_GET(self):
+         request = mock.Mock()
+         request.META = {'HTTP_X_SENTRY_AUTH': 'foobar'}
+-        request.GET = {'sentry_version': 1, 'foo': 'bar'}
+-        result = extract_auth_vars(request)
+-        self.assertEquals(result, {'sentry_version': 1})
+-
+-    def test_valid_version_legacy(self):
+-        request = mock.Mock()
+-        request.META = {'HTTP_AUTHORIZATION': 'Sentry key=value, biz=baz'}
+-        result = extract_auth_vars(request)
+-        self.assertNotEquals(result, None)
+-        self.assertTrue('key' in result)
+-        self.assertEquals(result['key'], 'value')
+-        self.assertTrue('biz' in result)
+-        self.assertEquals(result['biz'], 'baz')
++        request.GET = {'sentry_version': '1', 'foo': 'bar'}
++        result = self.helper.auth_from_request(request)
++        assert result.version == '1'
+ 
+     def test_invalid_legacy_header_defers_to_GET(self):
+         request = mock.Mock()
+         request.META = {'HTTP_AUTHORIZATION': 'foobar'}
+-        request.GET = {'sentry_version': 1, 'foo': 'bar'}
+-        result = extract_auth_vars(request)
+-        self.assertEquals(result, {'sentry_version': 1})
++        request.GET = {'sentry_version': '1', 'foo': 'bar'}
++        result = self.helper.auth_from_request(request)
++        assert result.version == '1'
+ 
+ 
+-class ProjectFromAuthVarsTest(BaseAPITest):
++class ProjectFromAuthTest(BaseAPITest):
+     def test_invalid_if_missing_key(self):
+-        auth_vars = {}
+-        self.assertRaises(APIForbidden, project_from_auth_vars, auth_vars)
++        self.assertRaises(APIUnauthorized, self.helper.project_from_auth, Auth({}))
+ 
+     def test_valid_with_key(self):
+-        auth_vars = {'sentry_key': self.pk.public_key}
+-        result = project_from_auth_vars(auth_vars)
++        auth = Auth({'sentry_key': self.pk.public_key})
++        result = self.helper.project_from_auth(auth)
+         self.assertEquals(result, self.project)
+ 
+     def test_invalid_key(self):
+-        auth_vars = {'sentry_key': 'z'}
+-        self.assertRaises(APIForbidden, project_from_auth_vars, auth_vars)
++        auth = Auth({'sentry_key': 'z'})
++        self.assertRaises(APIUnauthorized, self.helper.project_from_auth, auth)
+ 
+     def test_invalid_secret(self):
+-        auth_vars = {'sentry_key': self.pk.public_key, 'sentry_secret': 'z'}
+-        self.assertRaises(APIForbidden, project_from_auth_vars, auth_vars)
++        auth = Auth({'sentry_key': self.pk.public_key, 'sentry_secret': 'z'})
++        self.assertRaises(APIUnauthorized, self.helper.project_from_auth, auth)
+ 
+ 
+ class ProcessDataTimestampTest(BaseAPITest):
+     def test_iso_timestamp(self):
+         d = datetime(2012, 01, 01, 10, 30, 45)
+-        data = process_data_timestamp({
++        data = self.helper._process_data_timestamp({
+             'timestamp': '2012-01-01T10:30:45'
+         }, current_datetime=d)
+         self.assertTrue('timestamp' in data)
+@@ -90,7 +75,7 @@ class ProcessDataTimestampTest(BaseAPITest):
+ 
+     def test_iso_timestamp_with_ms(self):
+         d = datetime(2012, 01, 01, 10, 30, 45, 434000)
+-        data = process_data_timestamp({
++        data = self.helper._process_data_timestamp({
+             'timestamp': '2012-01-01T10:30:45.434'
+         }, current_datetime=d)
+         self.assertTrue('timestamp' in data)
+@@ -98,89 +83,89 @@ class ProcessDataTimestampTest(BaseAPITest):
+ 
+     def test_timestamp_iso_timestamp_with_Z(self):
+         d = datetime(2012, 01, 01, 10, 30, 45)
+-        data = process_data_timestamp({
++        data = self.helper._process_data_timestamp({
+             'timestamp': '2012-01-01T10:30:45Z'
+         }, current_datetime=d)
+         self.assertTrue('timestamp' in data)
+         self.assertEquals(data['timestamp'], 1325413845.0)
+ 
+     def test_invalid_timestamp(self):
+-        self.assertRaises(InvalidTimestamp, process_data_timestamp, {
++        self.assertRaises(InvalidTimestamp, self.helper._process_data_timestamp, {
+             'timestamp': 'foo'
+         })
+ 
+     def test_invalid_numeric_timestamp(self):
+-        self.assertRaises(InvalidTimestamp, process_data_timestamp, {
++        self.assertRaises(InvalidTimestamp, self.helper._process_data_timestamp, {
+             'timestamp': '100000000000000000000.0'
+         })
+ 
+     def test_future_timestamp(self):
+-        self.assertRaises(InvalidTimestamp, process_data_timestamp, {
++        self.assertRaises(InvalidTimestamp, self.helper._process_data_timestamp, {
+             'timestamp': '2052-01-01T10:30:45Z'
+         })
+ 
+ 
+ class ValidateDataTest(BaseAPITest):
+     def test_missing_project_id(self):
+-        data = validate_data(self.project, {
++        data = self.helper.validate_data(self.project, {
+             'message': 'foo',
+         })
+         assert data['project'] == self.project.id
+ 
+     @mock.patch('uuid.uuid4', return_value=UUID('031667ea1758441f92c7995a428d2d14'))
+     def test_empty_event_id(self, uuid4):
+-        data = validate_data(self.project, {
++        data = self.helper.validate_data(self.project, {
+             'event_id': '',
+         })
+         assert data['event_id'] == '031667ea1758441f92c7995a428d2d14'
+ 
+     @mock.patch('uuid.uuid4', return_value=UUID('031667ea1758441f92c7995a428d2d14'))
+     def test_missing_event_id(self, uuid4):
+-        data = validate_data(self.project, {})
++        data = self.helper.validate_data(self.project, {})
+         assert data['event_id'] == '031667ea1758441f92c7995a428d2d14'
+ 
+     @mock.patch('uuid.uuid4', return_value=UUID('031667ea1758441f92c7995a428d2d14'))
+     def test_invalid_event_id(self, uuid4):
+-        data = validate_data(self.project, {
++        data = self.helper.validate_data(self.project, {
+             'event_id': 'a' * 33,
+         })
+         assert data['event_id'] == '031667ea1758441f92c7995a428d2d14'
+ 
+     def test_invalid_event_id_raises(self):
+-        self.assertRaises(APIError, validate_data, self.project, {
++        self.assertRaises(APIError, self.helper.validate_data, self.project, {
+             'event_id': 1
+         })
+ 
+     def test_unknown_attribute(self):
+-        data = validate_data(self.project, {
++        data = self.helper.validate_data(self.project, {
+             'message': 'foo',
+             'foo': 'bar',
+         })
+         assert 'foo' not in data
+ 
+     def test_invalid_interface_name(self):
+-        data = validate_data(self.project, {
++        data = self.helper.validate_data(self.project, {
+             'message': 'foo',
+             'foo.baz': 'bar',
+         })
+         assert 'foo.baz' not in data
+ 
+     def test_invalid_interface_import_path(self):
+-        data = validate_data(self.project, {
++        data = self.helper.validate_data(self.project, {
+             'message': 'foo',
+             'sentry.interfaces.Exception2': 'bar',
+         })
+         assert 'sentry.interfaces.Exception2' not in data
+ 
+     def test_invalid_interface_args(self):
+-        data = validate_data(self.project, {
++        data = self.helper.validate_data(self.project, {
+             'message': 'foo',
+             'tests.manager.tests.DummyInterface': {'foo': 'bar'}
+         })
+         assert 'tests.manager.tests.DummyInterface' not in data
+ 
+     def test_does_expand_list(self):
+-        data = validate_data(self.project, {
++        data = self.helper.validate_data(self.project, {
+             'message': 'foo',
+             'exception': [{
+                 'type': 'ValueError',
+@@ -191,49 +176,49 @@ class ValidateDataTest(BaseAPITest):
+         assert 'sentry.interfaces.Exception' in data
+ 
+     def test_log_level_as_string(self):
+-        data = validate_data(self.project, {
++        data = self.helper.validate_data(self.project, {
+             'message': 'foo',
+             'level': 'error',
+         })
+         assert data['level'] == 40
+ 
+     def test_invalid_log_level(self):
+-        data = validate_data(self.project, {
++        data = self.helper.validate_data(self.project, {
+             'message': 'foo',
+             'level': 'foobar',
+         })
+         assert data['level'] == 40
+ 
+     def test_tags_as_string(self):
+-        data = validate_data(self.project, {
++        data = self.helper.validate_data(self.project, {
+             'message': 'foo',
+             'tags': 'bar',
+         })
+         assert 'tags' not in data
+ 
+     def test_tags_out_of_bounds(self):
+-        data = validate_data(self.project, {
++        data = self.helper.validate_data(self.project, {
+             'message': 'foo',
+             'tags': {'f' * 33: 'value', 'foo': 'v' * 201, 'bar': 'value'},
+         })
+         assert data['tags'] == [('bar', 'value')]
+ 
+     def test_tags_as_invalid_pair(self):
+-        data = validate_data(self.project, {
++        data = self.helper.validate_data(self.project, {
+             'message': 'foo',
+             'tags': [('foo', 'bar'), ('biz', 'baz', 'boz')],
+         })
+         assert data['tags'] == [('foo', 'bar')]
+ 
+     def test_extra_as_string(self):
+-        data = validate_data(self.project, {
++        data = self.helper.validate_data(self.project, {
+             'message': 'foo',
+             'extra': 'bar',
+         })
+         assert 'extra' not in data
+ 
+     def test_invalid_culprit_raises(self):
+-        self.assertRaises(APIError, validate_data, self.project, {
++        self.assertRaises(APIError, self.helper.validate_data, self.project, {
+             'culprit': 1
+         })
+ 
+@@ -251,7 +236,7 @@ class GetInterfaceTest(TestCase):
+         assert result is Http
+ 
+ 
+-class EnsureHasIpTest(TestCase):
++class EnsureHasIpTest(BaseAPITest):
+     def test_with_remote_addr(self):
+         inp = {
+             'sentry.interfaces.Http': {
+@@ -261,7 +246,7 @@ class EnsureHasIpTest(TestCase):
+             },
+         }
+         out = inp.copy()
+-        ensure_has_ip(out, '127.0.0.1')
++        self.helper.ensure_has_ip(out, '127.0.0.1')
+         assert inp == out
+ 
+     def test_with_user_ip(self):
+@@ -271,7 +256,7 @@ class EnsureHasIpTest(TestCase):
+             },
+         }
+         out = inp.copy()
+-        ensure_has_ip(out, '127.0.0.1')
++        self.helper.ensure_has_ip(out, '127.0.0.1')
+         assert inp == out
+ 
+     def test_without_ip_values(self):
+@@ -282,10 +267,10 @@ class EnsureHasIpTest(TestCase):
+                 'env': {},
+             },
+         }
+-        ensure_has_ip(out, '127.0.0.1')
++        self.helper.ensure_has_ip(out, '127.0.0.1')
+         assert out['sentry.interfaces.User']['ip_address'] == '127.0.0.1'
+ 
+     def test_without_any_values(self):
+         out = {}
+-        ensure_has_ip(out, '127.0.0.1')
++        self.helper.ensure_has_ip(out, '127.0.0.1')
+         assert out['sentry.interfaces.User']['ip_address'] == '127.0.0.1'
+diff --git a/tests/sentry/web/api/tests.py b/tests/sentry/web/api/tests.py
+index e33e0ae22a..7e15de7a9b 100644
+--- a/tests/sentry/web/api/tests.py
++++ b/tests/sentry/web/api/tests.py
+@@ -7,7 +7,7 @@ import mock
+ from django.core.urlresolvers import reverse
+ from exam import fixture
+ 
+-from sentry.models import OrganizationMember, User
++from sentry.models import OrganizationMember, ProjectKey, User
+ from sentry.testutils import TestCase
+ from sentry.utils import json
+ 
+@@ -18,16 +18,16 @@ class StoreViewTest(TestCase):
+         return reverse('sentry-api-store', kwargs={'project_id': self.project.id})
+ 
+     @mock.patch('sentry.web.api.StoreView._parse_header')
+-    @mock.patch('sentry.web.api.project_from_auth_vars')
+-    def test_options_response(self, project_from_auth_vars, parse_header):
++    def test_options_response(self, parse_header):
++        project = self.create_project()
++        pk = ProjectKey.objects.get_or_create(project=project)[0]
+         parse_header.return_value = {
+-            'sentry_project': self.project.id,
+-            'sentry_key': 'a' * 40,
++            'sentry_project': project.id,
++            'sentry_key': pk.public_key,
+             'sentry_version': '2.0',
+         }
+-        project_from_auth_vars.return_value = (self.project, None)
+         resp = self.client.options(self.path)
+-        self.assertEquals(resp.status_code, 200)
++        assert resp.status_code == 200, resp.content
+         self.assertIn('Allow', resp)
+         self.assertEquals(resp['Allow'], 'GET, POST, HEAD, OPTIONS')
+         self.assertIn('Content-Length', resp)
+@@ -36,38 +36,38 @@ class StoreViewTest(TestCase):
+     @mock.patch('sentry.web.api.is_valid_origin', mock.Mock(return_value=False))
+     def test_options_response_with_invalid_origin(self):
+         resp = self.client.options(self.path, HTTP_ORIGIN='http://foo.com')
+-        self.assertEquals(resp.status_code, 400)
++        assert resp.status_code == 403, resp.content
+         self.assertIn('Access-Control-Allow-Origin', resp)
+         self.assertEquals(resp['Access-Control-Allow-Origin'], '*')
+         self.assertIn('X-Sentry-Error', resp)
+-        self.assertEquals(resp['X-Sentry-Error'], "Invalid origin: 'http://foo.com'")
+-        self.assertEquals(resp.content, resp['X-Sentry-Error'])
++        assert resp['X-Sentry-Error'] == "Invalid origin: http://foo.com"
++        assert json.loads(resp.content)['error'] == resp['X-Sentry-Error']
+ 
+     @mock.patch('sentry.web.api.is_valid_origin', mock.Mock(return_value=False))
+     def test_options_response_with_invalid_referrer(self):
+         resp = self.client.options(self.path, HTTP_REFERER='http://foo.com')
+-        self.assertEquals(resp.status_code, 400)
++        assert resp.status_code == 403, resp.content
+         self.assertIn('Access-Control-Allow-Origin', resp)
+         self.assertEquals(resp['Access-Control-Allow-Origin'], '*')
+         self.assertIn('X-Sentry-Error', resp)
+-        self.assertEquals(resp['X-Sentry-Error'], "Invalid origin: 'http://foo.com'")
+-        self.assertEquals(resp.content, resp['X-Sentry-Error'])
++        assert resp['X-Sentry-Error'] == "Invalid origin: http://foo.com"
++        assert json.loads(resp.content)['error'] == resp['X-Sentry-Error']
+ 
+     @mock.patch('sentry.web.api.is_valid_origin', mock.Mock(return_value=True))
+     def test_options_response_with_valid_origin(self):
+         resp = self.client.options(self.path, HTTP_ORIGIN='http://foo.com')
+-        self.assertEquals(resp.status_code, 200)
++        assert resp.status_code == 200, resp.content
+         self.assertIn('Access-Control-Allow-Origin', resp)
+         self.assertEquals(resp['Access-Control-Allow-Origin'], 'http://foo.com')
+ 
+     @mock.patch('sentry.web.api.is_valid_origin', mock.Mock(return_value=True))
+     def test_options_response_with_valid_referrer(self):
+         resp = self.client.options(self.path, HTTP_REFERER='http://foo.com')
+-        self.assertEquals(resp.status_code, 200)
++        assert resp.status_code == 200, resp.content
+         self.assertIn('Access-Control-Allow-Origin', resp)
+         self.assertEquals(resp['Access-Control-Allow-Origin'], 'http://foo.com')
+ 
+-    @mock.patch('sentry.web.api.insert_data_to_database')
++    @mock.patch('sentry.coreapi.ClientApiHelper.insert_data_to_database')
+     def test_scrubs_ip_address(self, mock_insert_data_to_database):
+         self.project.update_option('sentry:scrub_ip_address', True)
+         body = {
+@@ -80,7 +80,7 @@ class StoreViewTest(TestCase):
+             },
+         }
+         resp = self._postWithHeader(body)
+-        assert resp.status_code == 200
++        assert resp.status_code == 200, resp.content
+ 
+         call_data = mock_insert_data_to_database.call_args[0][0]
+         assert not call_data['sentry.interfaces.User'].get('ip_address')
+@@ -97,7 +97,7 @@ class CrossDomainXmlTest(TestCase):
+         get_origins.return_value = '*'
+         resp = self.client.get(self.path)
+         get_origins.assert_called_once_with(self.project)
+-        self.assertEquals(resp.status_code, 200)
++        assert resp.status_code == 200, resp.content
+         self.assertEquals(resp['Content-Type'], 'application/xml')
+         self.assertTemplateUsed(resp, 'sentry/crossdomain.xml')
+         assert '<allow-access-from domain="*" secure="false" />' in resp.content

@@ -1,0 +1,547 @@
+commit 795cefafd70cb8d2f5e17664939d125da6bb90cb
+Author: Markus Unterwaditzer <markus@unterwaditzer.net>
+Date:   Thu Sep 12 09:45:32 2019 +0200
+
+    feat: Add zero-sized quotas (#14558)
+    
+    * feat: Add zero-sized quotas
+    
+    * fix: Enforce invariant
+    
+    * ref: Rename special constants for limit
+    
+    * fix: Fix check in get_usage_for_quota
+    
+    * ref: Add more asserts
+    
+    * ref: Partially remove asserts again
+    
+    * ref: Remove enforce flag
+    
+    * fix: Fix a few tests
+    
+    * bump getsentry hash
+    
+    * ref: Send unlimited quotas to redis
+    
+    * fix: Fix lua syntax
+    
+    * fix: Never create quotas with window=0
+    
+    * fix: Restore old tests
+    
+    * ref: Still run other quotas in presence of zero-sized quotas
+    
+    * fix: Map broken key quota window to nonzero value
+    
+    * fix: Fix tests
+    
+    * fix: Do not send anything to redis if we have no keys
+    
+    * ref: Add alternative constructor for zero-sized quotas
+    
+    * fix: Add big doccomment
+    
+    * doc: Add more comments
+    
+    * ref: Rename function, more docs
+    
+    * ref: Apply feedback
+    
+    * ref: Apply all review feedback
+    
+    * fix: Apply review feedback
+
+diff --git a/src/sentry/quotas/base.py b/src/sentry/quotas/base.py
+index 0d41b355f3..d00d60c65d 100644
+--- a/src/sentry/quotas/base.py
++++ b/src/sentry/quotas/base.py
+@@ -48,6 +48,15 @@ class RateLimited(RateLimit):
+         super(RateLimited, self).__init__(True, **kwargs)
+ 
+ 
++def _limit_from_settings(x):
++    """
++    limit=0 (or any falsy value) in database means "no limit". Convert that to
++    limit=None as limit=0 in code means "reject all"
++    """
++
++    return int(x or 0) or None
++
++
+ class Quota(Service):
+     """
+     Quotas handle tracking a project's event usage (at a per minute tick) and
+@@ -83,8 +92,8 @@ class Quota(Service):
+             pct = int(quota[:-1])
+             quota = int(parent_quota) * pct / 100
+         if not quota:
+-            return int(parent_quota or 0)
+-        return int(quota or 0)
++            return _limit_from_settings(parent_quota)
++        return _limit_from_settings(quota)
+ 
+     def get_key_quota(self, key):
+         from sentry import features
+@@ -99,7 +108,11 @@ class Quota(Service):
+             has_rate_limits = features.has("projects:rate-limits", key.project)
+             cache.set(cache_key, has_rate_limits, 600)
+ 
+-        return key.rate_limit if has_rate_limits else (0, 0)
++        if not has_rate_limits:
++            return (None, None)
++
++        limit, window = key.rate_limit
++        return _limit_from_settings(limit), window
+ 
+     def get_project_quota(self, project):
+         from sentry.models import Organization, OrganizationOption
+@@ -118,20 +131,20 @@ class Quota(Service):
+         if max_quota_share != 100 and org_quota:
+             quota = self.translate_quota(u"{}%".format(max_quota_share), org_quota)
+         else:
+-            quota = 0
++            quota = None
+ 
+         return (quota, window)
+ 
+     def get_organization_quota(self, organization):
+         from sentry.models import OrganizationOption
+ 
+-        account_limit = int(
++        account_limit = _limit_from_settings(
+             OrganizationOption.objects.get_value(
+                 organization=organization, key="sentry:account-rate-limit", default=0
+             )
+         )
+ 
+-        system_limit = options.get("system.rate-limit")
++        system_limit = _limit_from_settings(options.get("system.rate-limit"))
+ 
+         # If there is only a single org, this one org should
+         # be allowed to consume the entire quota.
+@@ -151,7 +164,7 @@ class Quota(Service):
+         """
+         Return the maximum capable rate for an organization.
+         """
+-        return (options.get("system.rate-limit"), 60)
++        return (_limit_from_settings(options.get("system.rate-limit")), 60)
+ 
+     def get_event_retention(self, organization):
+-        return options.get("system.event-retention-days") or None
++        return _limit_from_settings(options.get("system.event-retention-days"))
+diff --git a/src/sentry/quotas/redis.py b/src/sentry/quotas/redis.py
+index 06e5d9a126..82bccfedd7 100644
+--- a/src/sentry/quotas/redis.py
++++ b/src/sentry/quotas/redis.py
+@@ -23,19 +23,91 @@ def get_dynamic_cluster_from_options(setting, config):
+ 
+ 
+ class BasicRedisQuota(object):
+-    __slots__ = ["prefix", "subscope", "limit", "window", "reason_code", "enforce"]
++    """
++    A quota in the most abstract sense consists of an identifier (such as
++    `"organization quota"`, `"smart limit"`, etc) and two integers `limit` and
++    `window` (we accept "limit" events per "window" seconds).
++
++    Sentry applies multiple quotas to an event before accepting it, some of
++    which can be configured by the user depending on plan. An event will be
++    counted against all quotas. For example:
++
++    * If Sentry is told to apply two quotas "one event per minute" and "9999999
++      events per hour", it will practically accept only one event per minute
++    * If Sentry is told to apply "one event per minute" and "30 events per
++      hour", we will be able to get one event accepted every minute. However, if
++      we do that for 30 minutes (ingesting 30 events), we will not be able to get
++      an event through for the rest of the hour. (This example assumes that we
++      start sending events exactly at the start of the time window)
++
++    A `BasicRedisQuota` is a specific quota type that also includes some
++    attributes necessary for looking up event counters and refunds in Redis.
++
++    The `BasicRedisQuota` object is not persisted in any way. It is just a
++    function argument passed around in code. Most importantly, a
++    `BasicRedisQuota` instance does not contain information about how many
++    events can still be accepted (that stuff is stored in Redis but isn't typed
++    out), it only represents settings that should be applied.
++    """
++
++    __slots__ = ["prefix", "subscope", "limit", "window", "reason_code"]
++
++    def __init__(self, prefix=None, subscope=None, limit=None, window=None, reason_code=None):
++        if limit == 0:
++            assert prefix is None and subscope is None, "zero-sized quotas are not tracked in redis"
++            assert window is None, "zero-sized quotas cannot have a window"
++        else:
++            assert prefix, "measured quotas need a prefix to run in redis"
++            assert window and window > 0, "window cannot be zero"
+ 
+-    def __init__(self, prefix, subscope=None, limit=0, window=60, reason_code=None, enforce=True):
+         self.prefix = prefix
+         self.subscope = subscope
+-        # maximum number of events in the given window, 0 indicates "no limit"
++        # maximum number of events in the given window
++        #
++        # None indicates "unlimited amount"
++        # 0 indicates "reject all"
++        # NOTE: Use `quotas.base._limit_from_settings` to map from settings
+         self.limit = limit
+         # time in seconds that this quota reflects
+         self.window = window
+         # a machine readable string
+         self.reason_code = reason_code
+-        # should this quota be hard-enforced (or just tracked)
+-        self.enforce = enforce
++
++    @classmethod
++    def reject_all(cls, reason_code):
++        """
++        A zero-sized quota, which is never counted in Redis. Unconditionally
++        reject the event.
++        """
++
++        return cls(limit=0, reason_code=reason_code)
++
++    @classmethod
++    def limited(cls, prefix, limit, window, reason_code, subscope=None):
++        """
++        A regular quota with limit.
++        """
++
++        assert limit and limit > 0
++        return cls(
++            prefix=prefix, limit=limit, window=window, reason_code=reason_code, subscope=subscope
++        )
++
++    @classmethod
++    def unlimited(cls, prefix, window, subscope=None):
++        """
++        Unlimited quota that is still being counted.
++        """
++
++        return cls(prefix=prefix, window=window, subscope=subscope)
++
++    @property
++    def should_track(self):
++        """
++        Whether the quotas service should track this quota at all.
++        """
++
++        return self.prefix is not None
+ 
+ 
+ class RedisQuota(Quota):
+@@ -86,40 +158,45 @@ class RedisQuota(Quota):
+         interval = quota.window
+         return u"{}:{}:{}".format(self.namespace, local_key, int((timestamp - shift) // interval))
+ 
+-    def get_quotas_with_limits(self, project, key=None):
+-        return [
+-            quota
+-            for quota in self.get_quotas(project, key=key)
+-            # x = (key, limit, interval)
+-            if quota.limit > 0  # a zero limit means "no limit", not "reject all"
+-        ]
+-
+     def get_quotas(self, project, key=None):
+         if key:
+             key.project = project
++
++        results = []
++
+         pquota = self.get_project_quota(project)
++        if pquota[0] is not None:
++            results.append(
++                BasicRedisQuota.limited(
++                    prefix="p",
++                    subscope=project.id,
++                    limit=pquota[0],
++                    window=pquota[1],
++                    reason_code="project_quota",
++                )
++            )
++
+         oquota = self.get_organization_quota(project.organization)
+-        results = [
+-            BasicRedisQuota(
+-                prefix="p",
+-                subscope=project.id,
+-                limit=pquota[0],
+-                window=pquota[1],
+-                reason_code="project_quota",
+-            ),
+-            BasicRedisQuota(prefix="o", limit=oquota[0], window=oquota[1], reason_code="org_quota"),
+-        ]
+-        if key:
+-            kquota = self.get_key_quota(key)
++        if oquota[0] is not None:
+             results.append(
+-                BasicRedisQuota(
+-                    prefix="k",
+-                    subscope=key.id,
+-                    limit=kquota[0],
+-                    window=kquota[1],
+-                    reason_code="key_quota",
++                BasicRedisQuota.limited(
++                    prefix="o", limit=oquota[0], window=oquota[1], reason_code="org_quota"
+                 )
+             )
++
++        if key:
++            kquota = self.get_key_quota(key)
++            if kquota[0] is not None:
++                results.append(
++                    BasicRedisQuota.limited(
++                        prefix="k",
++                        subscope=key.id,
++                        limit=kquota[0],
++                        window=kquota[1],
++                        reason_code="key_quota",
++                    )
++                )
++
+         return results
+ 
+     def get_usage(self, organization_id, quotas, timestamp=None):
+@@ -127,7 +204,7 @@ class RedisQuota(Quota):
+             timestamp = time()
+ 
+         def get_usage_for_quota(client, quota):
+-            if quota.limit == 0:
++            if not quota.should_track:
+                 return (None, None)
+ 
+             key = self.__get_redis_key(
+@@ -163,7 +240,7 @@ class RedisQuota(Quota):
+         if timestamp is None:
+             timestamp = time()
+ 
+-        quotas = self.get_quotas_with_limits(project, key=key)
++        quotas = [quota for quota in self.get_quotas(project, key=key) if quota.should_track]
+ 
+         if not quotas:
+             return
+@@ -192,7 +269,7 @@ class RedisQuota(Quota):
+         if timestamp is None:
+             timestamp = time()
+ 
+-        quotas = self.get_quotas_with_limits(project, key=key)
++        quotas = self.get_quotas(project, key=key)
+ 
+         # If there are no quotas to actually check, skip the trip to the database.
+         if not quotas:
+@@ -201,28 +278,44 @@ class RedisQuota(Quota):
+         keys = []
+         args = []
+         for quota in quotas:
++            if quota.limit == 0:
++                # A zero-sized quota is the absolute worst-case. Do not call
++                # into Redis at all, and do not increment any keys, as one
++                # quota has reached capacity (this is how regular quotas behave
++                # as well).
++                assert quota.window is None
++                assert not quota.should_track
++                return RateLimited(retry_after=None, reason_code=quota.reason_code)
++
++            assert quota.should_track
++
+             shift = project.organization_id % quota.window
+             key = self.__get_redis_key(quota, timestamp, shift, project.organization_id)
+             return_key = self.get_refunded_quota_key(key)
+             keys.extend((key, return_key))
+             expiry = self.get_next_period_start(quota.window, shift, timestamp) + self.grace
+-            args.extend((quota.limit, int(expiry)))
++
++            # limit=None is represented as limit=-1 in lua
++            lua_quota = quota.limit if quota.limit is not None else -1
++            args.extend((lua_quota, int(expiry)))
++
++        if not keys or not args:
++            return NotRateLimited()
+ 
+         client = self.__get_redis_client(six.text_type(project.organization_id))
+         rejections = is_rate_limited(client, keys, args)
+ 
+-        if any(rejections):
+-            enforce = False
+-            worst_case = (0, None)
+-            for quota, rejected in zip(quotas, rejections):
+-                if not rejected:
+-                    continue
+-                if quota.enforce:
+-                    enforce = True
+-                    shift = project.organization_id % quota.window
+-                    delay = self.get_next_period_start(quota.window, shift, timestamp) - timestamp
+-                    if delay > worst_case[0]:
+-                        worst_case = (delay, quota.reason_code)
+-            if enforce:
+-                return RateLimited(retry_after=worst_case[0], reason_code=worst_case[1])
+-        return NotRateLimited()
++        if not any(rejections):
++            return NotRateLimited()
++
++        worst_case = (0, None)
++        for quota, rejected in zip(quotas, rejections):
++            if not rejected:
++                continue
++
++            shift = project.organization_id % quota.window
++            delay = self.get_next_period_start(quota.window, shift, timestamp) - timestamp
++            if delay > worst_case[0]:
++                worst_case = (delay, quota.reason_code)
++
++        return RateLimited(retry_after=worst_case[0], reason_code=worst_case[1])
+diff --git a/src/sentry/scripts/quotas/is_rate_limited.lua b/src/sentry/scripts/quotas/is_rate_limited.lua
+index 3fb07a1ebf..4fbb670b75 100644
+--- a/src/sentry/scripts/quotas/is_rate_limited.lua
++++ b/src/sentry/scripts/quotas/is_rate_limited.lua
+@@ -24,7 +24,12 @@ local results = {}
+ local failed = false
+ for i=1, #KEYS, 2 do
+     local limit = tonumber(ARGV[i])
+-    local rejected = (redis.call('GET', KEYS[i]) or 0) - (redis.call('GET', KEYS[i + 1]) or 0) + 1 > limit
++    local rejected = false
++    -- limit=-1 means "no limit"
++    if limit >= 0 then
++        rejected = (redis.call('GET', KEYS[i]) or 0) - (redis.call('GET', KEYS[i + 1]) or 0) + 1 > limit
++    end
++
+     if rejected then
+         failed = true
+     end
+diff --git a/tests/sentry/quotas/redis/tests.py b/tests/sentry/quotas/redis/tests.py
+index edee15d82b..74691e88f9 100644
+--- a/tests/sentry/quotas/redis/tests.py
++++ b/tests/sentry/quotas/redis/tests.py
+@@ -86,11 +86,11 @@ class RedisQuotaTest(TestCase):
+         self.get_project_quota.return_value = (200, 60)
+         self.get_organization_quota.return_value = (300, 60)
+         quotas = self.quota.get_quotas(self.project)
+-        assert quotas[0].prefix == u'p'
++        assert quotas[0].prefix == u"p"
+         assert quotas[0].subscope == self.project.id
+         assert quotas[0].limit == 200
+         assert quotas[0].window == 60
+-        assert quotas[1].prefix == u'o'
++        assert quotas[1].prefix == u"o"
+         assert quotas[1].subscope is None
+         assert quotas[1].limit == 300
+         assert quotas[1].window == 60
+@@ -115,29 +115,25 @@ class RedisQuotaTest(TestCase):
+         assert self.quota.is_rate_limited(self.project).is_limited
+ 
+     @mock.patch.object(RedisQuota, "get_quotas")
+-    @mock.patch("sentry.quotas.redis.is_rate_limited", return_value=(True, False))
+-    def test_not_limited_without_enforce(self, mock_is_rate_limited, mock_get_quotas):
++    @mock.patch("sentry.quotas.redis.is_rate_limited", return_value=(False, False))
++    def test_not_limited_with_unlimited_quota(self, mock_is_rate_limited, mock_get_quotas):
+         mock_get_quotas.return_value = (
+             BasicRedisQuota(
+-                prefix="p", subscope=1, limit=1, window=1, reason_code="project_quota", enforce=False
+-            ),
+-            BasicRedisQuota(
+-                prefix="p", subscope=2, limit=1, window=1, reason_code="project_quota", enforce=True
++                prefix="p", subscope=1, limit=None, window=1, reason_code="project_quota"
+             ),
++            BasicRedisQuota(prefix="p", subscope=2, limit=1, window=1, reason_code="project_quota"),
+         )
+ 
+         assert not self.quota.is_rate_limited(self.project).is_limited
+ 
+     @mock.patch.object(RedisQuota, "get_quotas")
+-    @mock.patch("sentry.quotas.redis.is_rate_limited", return_value=(True, True))
+-    def test_limited_without_enforce(self, mock_is_rate_limited, mock_get_quotas):
++    @mock.patch("sentry.quotas.redis.is_rate_limited", return_value=(False, True))
++    def test_limited_with_unlimited_quota(self, mock_is_rate_limited, mock_get_quotas):
+         mock_get_quotas.return_value = (
+             BasicRedisQuota(
+-                prefix="p", subscope=1, limit=1, window=1, reason_code="project_quota", enforce=False
+-            ),
+-            BasicRedisQuota(
+-                prefix="p", subscope=2, limit=1, window=1, reason_code="project_quota", enforce=True
++                prefix="p", subscope=1, limit=None, window=1, reason_code="project_quota"
+             ),
++            BasicRedisQuota(prefix="p", subscope=2, limit=1, window=1, reason_code="project_quota"),
+         )
+ 
+         assert self.quota.is_rate_limited(self.project).is_limited
+@@ -158,11 +154,11 @@ class RedisQuotaTest(TestCase):
+             self.project.organization_id,
+             quotas
+             + [
+-                BasicRedisQuota(prefix="unlimited", limit=0, window=60, reason_code="unlimited"),
++                BasicRedisQuota(prefix="unlimited", limit=None, window=60, reason_code="unlimited"),
+                 BasicRedisQuota(prefix="dummy", limit=10, window=60, reason_code="dummy"),
+             ],
+             timestamp=timestamp,
+-        ) == [n for _ in quotas] + [None, 0]
++        ) == [n for _ in quotas] + [0, 0]
+ 
+     @mock.patch.object(RedisQuota, "get_quotas")
+     def test_refund(self, mock_get_quotas):
+@@ -170,11 +166,9 @@ class RedisQuotaTest(TestCase):
+ 
+         mock_get_quotas.return_value = (
+             BasicRedisQuota(
+-                prefix="p", subscope=1, limit=1, window=1, reason_code="project_quota", enforce=False
+-            ),
+-            BasicRedisQuota(
+-                prefix="p", subscope=2, limit=1, window=1, reason_code="project_quota", enforce=True
++                prefix="p", subscope=1, limit=None, window=1, reason_code="project_quota"
+             ),
++            BasicRedisQuota(prefix="p", subscope=2, limit=1, window=1, reason_code="project_quota"),
+         )
+ 
+         self.quota.refund(self.project, timestamp=timestamp)
+@@ -207,9 +201,9 @@ class RedisQuotaTest(TestCase):
+             self.project.organization_id,
+             quotas
+             + [
+-                BasicRedisQuota(prefix="unlimited", limit=0, window=60, reason_code="unlimited"),
++                BasicRedisQuota(prefix="unlimited", limit=None, window=60, reason_code="unlimited"),
+                 BasicRedisQuota(prefix="dummy", limit=10, window=60, reason_code="dummy"),
+             ],
+             timestamp=timestamp,
+             # the - 1 is because we refunded once
+-        ) == [n - 1 for _ in quotas] + [None, 0]
++        ) == [n - 1 for _ in quotas] + [0, 0]
+diff --git a/tests/sentry/quotas/test_base.py b/tests/sentry/quotas/test_base.py
+index a3f0749536..594420f8d2 100644
+--- a/tests/sentry/quotas/test_base.py
++++ b/tests/sentry/quotas/test_base.py
+@@ -17,7 +17,7 @@ class QuotaTest(TestCase):
+ 
+         with self.settings(SENTRY_DEFAULT_MAX_EVENTS_PER_MINUTE=0):
+             with self.options({"system.rate-limit": 0}):
+-                assert self.backend.get_project_quota(project) == (0, 60)
++                assert self.backend.get_project_quota(project) == (None, 60)
+ 
+             OrganizationOption.objects.set_value(org, "sentry:project-rate-limit", 80)
+ 
+@@ -25,7 +25,7 @@ class QuotaTest(TestCase):
+                 assert self.backend.get_project_quota(project) == (80, 60)
+ 
+             with self.options({"system.rate-limit": 0}):
+-                assert self.backend.get_project_quota(project) == (0, 60)
++                assert self.backend.get_project_quota(project) == (None, 60)
+ 
+     def test_get_key_quota(self):
+         key = ProjectKey.objects.create(
+@@ -37,7 +37,7 @@ class QuotaTest(TestCase):
+         key = ProjectKey.objects.create(
+             project=self.project, rate_limit_window=None, rate_limit_count=None
+         )
+-        assert self.backend.get_key_quota(key) == (0, 0)
++        assert self.backend.get_key_quota(key) == (None, 0)
+ 
+     def test_get_key_quota_multiple_keys(self):
+         # This checks for a regression where we'd cache key quotas per project
+@@ -48,7 +48,7 @@ class QuotaTest(TestCase):
+         rate_limited_key = ProjectKey.objects.create(
+             project=self.project, rate_limit_window=200, rate_limit_count=86400
+         )
+-        assert self.backend.get_key_quota(key) == (0, 0)
++        assert self.backend.get_key_quota(key) == (None, 0)
+         assert self.backend.get_key_quota(rate_limited_key) == (86400, 200)
+ 
+     def test_get_organization_quota_with_account_limit_and_higher_system_limit(self):

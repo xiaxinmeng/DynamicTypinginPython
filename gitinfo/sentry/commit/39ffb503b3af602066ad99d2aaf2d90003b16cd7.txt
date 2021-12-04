@@ -1,0 +1,1542 @@
+commit 39ffb503b3af602066ad99d2aaf2d90003b16cd7
+Author: David Cramer <dcramer@gmail.com>
+Date:   Sat Feb 2 22:18:03 2019 -0800
+
+    feat(monitors): Initial UI
+    
+    - Add basic mocks for Monitor entries
+    - Fix project-based access on monitor list
+    - Add search to monitors list endpoint
+    - Add monitor details endpoint
+    - Add (unlinked, draft) monitor edit endpoint
+    - Fix monitor.id (should be guid)
+    - Fix monitor checkin status enums
+    - Fix monitor checkins list (invalid order_by)
+
+diff --git a/bin/load-mocks b/bin/load-mocks
+index 94a5d6fdf8..4e36f20827 100755
+--- a/bin/load-mocks
++++ b/bin/load-mocks
+@@ -26,7 +26,7 @@ from sentry.models import (
+     Environment, File, Group, GroupMeta, GroupRelease, GroupTombstone, Organization,
+     OrganizationAccessRequest, OrganizationMember, Project, Release,
+     ReleaseCommit, ReleaseEnvironment, ReleaseProjectEnvironment, ReleaseFile, Repository,
+-    Team, TOMBSTONE_FIELDS_FROM_GROUP, User, UserReport
++    Team, TOMBSTONE_FIELDS_FROM_GROUP, User, UserReport, Monitor, MonitorStatus, MonitorType, MonitorCheckIn, CheckInStatus
+ )
+ from sentry.signals import mocks_loaded
+ from sentry.similarity import features
+@@ -61,6 +61,14 @@ ENVIRONMENTS = itertools.cycle([
+     ''
+ ])
+ 
++MONITOR_NAMES = itertools.cycle(settings.CELERYBEAT_SCHEDULE.keys())
++
++MONITOR_SCHEDULES = itertools.cycle([
++    '* * * * *',
++    '0 * * * *',
++    '0 0 * * *',
++])
++
+ LONG_MESSAGE = """Code: 0.
+ DB::Exception: String is too long for DateTime: 2018-10-26T19:14:18+00:00. Stack trace:
+ 
+@@ -390,6 +398,35 @@ def main(num_events=1, extra_events=False):
+                     flags=F('flags').bitor(Project.flags.has_releases),
+                 )
+ 
++            monitor, created = Monitor.objects.get_or_create(
++                name=next(MONITOR_NAMES),
++                project_id=project.id,
++                organization_id=org.id,
++                type=MonitorType.CRON_JOB,
++                defaults={
++                    'config': {
++                        'schedule': next(MONITOR_SCHEDULES),
++                    },
++                    'next_checkin': timezone.now() + timedelta(minutes=60),
++                    'last_checkin': timezone.now(),
++                }
++            )
++            if not created:
++                if not (monitor.config or {}).get('schedule'):
++                    monitor.config = {'schedule': next(MONITOR_SCHEDULES)}
++                monitor.update(
++                    config=monitor.config,
++                    status=MonitorStatus.ACTIVE if randint(0, 10) < 7 else MonitorStatus.ERROR,
++                    last_checkin=timezone.now(),
++                    next_checkin=monitor.get_next_scheduled_checkin(timezone.now()),
++                )
++
++            MonitorCheckIn.objects.create(
++                project_id=monitor.project_id,
++                monitor=monitor,
++                status=CheckInStatus.OK if monitor.status == MonitorStatus.ACTIVE else CheckInStatus.ERROR,
++            )
++
+             with transaction.atomic():
+                 has_release = Release.objects.filter(
+                     version=sha1(uuid4().bytes).hexdigest(),
+diff --git a/src/sentry/api/base.py b/src/sentry/api/base.py
+index f3b5c0afb4..5c7b2b832e 100644
+--- a/src/sentry/api/base.py
++++ b/src/sentry/api/base.py
+@@ -315,6 +315,9 @@ class StatsMixin(object):
+         else:
+             start = end - timedelta(days=1, seconds=-1)
+ 
++        if not resolution:
++            resolution = tsdb.get_optimal_rollup(start, end)
++
+         return {
+             'start': start,
+             'end': end,
+diff --git a/src/sentry/api/bases/monitor.py b/src/sentry/api/bases/monitor.py
+new file mode 100644
+index 0000000000..53b7f091ba
+--- /dev/null
++++ b/src/sentry/api/bases/monitor.py
+@@ -0,0 +1,45 @@
++from __future__ import absolute_import
++
++from sentry import features
++from sentry.api.base import Endpoint
++from sentry.api.exceptions import ResourceDoesNotExist
++from sentry.api.bases.project import ProjectPermission
++from sentry.models import Monitor, Project, ProjectStatus
++from sentry.utils.sdk import configure_scope
++
++
++class MonitorEndpoint(Endpoint):
++    permission_classes = (ProjectPermission,)
++
++    def convert_args(self, request, monitor_id, *args, **kwargs):
++        try:
++            monitor = Monitor.objects.get(
++                guid=monitor_id,
++            )
++        except Monitor.DoesNotExist:
++            raise ResourceDoesNotExist
++
++        project = Project.objects.get_from_cache(id=monitor.project_id)
++        if project.status != ProjectStatus.VISIBLE:
++            raise ResourceDoesNotExist
++
++        if hasattr(request.auth, 'project_id') and project.id != request.auth.project_id:
++            return self.respond(status=400)
++
++        if not features.has('organizations:monitors',
++                            project.organization, actor=request.user):
++            raise ResourceDoesNotExist
++
++        self.check_object_permissions(request, project)
++
++        with configure_scope() as scope:
++            scope.set_tag("organization", project.organization_id)
++            scope.set_tag("project", project.id)
++
++        request._request.organization = project.organization
++
++        kwargs.update({
++            'monitor': monitor,
++            'project': project,
++        })
++        return (args, kwargs)
+diff --git a/src/sentry/api/endpoints/monitor_checkins.py b/src/sentry/api/endpoints/monitor_checkins.py
+index ec3e285a9e..8fb57b4f9f 100644
+--- a/src/sentry/api/endpoints/monitor_checkins.py
++++ b/src/sentry/api/endpoints/monitor_checkins.py
+@@ -3,15 +3,11 @@ from __future__ import absolute_import
+ from django.db import transaction
+ from rest_framework import serializers
+ 
+-from sentry import features
+ from sentry.api.authentication import DSNAuthentication
+-from sentry.api.base import Endpoint
+-from sentry.api.exceptions import ResourceDoesNotExist
++from sentry.api.bases.monitor import MonitorEndpoint
+ from sentry.api.paginator import OffsetPaginator
+-from sentry.api.bases.project import ProjectPermission
+ from sentry.api.serializers import serialize
+-from sentry.models import Monitor, MonitorCheckIn, MonitorStatus, CheckInStatus, Project, ProjectKey, ProjectStatus
+-from sentry.utils.sdk import configure_scope
++from sentry.models import Monitor, MonitorCheckIn, MonitorStatus, CheckInStatus, ProjectKey
+ 
+ 
+ class CheckInSerializer(serializers.Serializer):
+@@ -25,44 +21,8 @@ class CheckInSerializer(serializers.Serializer):
+     duration = serializers.IntegerField(required=False)
+ 
+ 
+-class MonitorCheckInsEndpoint(Endpoint):
+-    authentication_classes = Endpoint.authentication_classes + (DSNAuthentication,)
+-    permission_classes = (ProjectPermission,)
+-
+-    # TODO(dcramer): this code needs shared with other endpoints as its security focused
+-    # TODO(dcramer): this doesnt handle is_global roles
+-    def convert_args(self, request, monitor_id, *args, **kwargs):
+-        try:
+-            monitor = Monitor.objects.get(
+-                guid=monitor_id,
+-            )
+-        except Monitor.DoesNotExist:
+-            raise ResourceDoesNotExist
+-
+-        project = Project.objects.get_from_cache(id=monitor.project_id)
+-        if project.status != ProjectStatus.VISIBLE:
+-            raise ResourceDoesNotExist
+-
+-        if hasattr(request.auth, 'project_id') and project.id != request.auth.project_id:
+-            return self.respond(status=400)
+-
+-        if not features.has('organizations:monitors',
+-                            project.organization, actor=request.user):
+-            raise ResourceDoesNotExist
+-
+-        self.check_object_permissions(request, project)
+-
+-        with configure_scope() as scope:
+-            scope.set_tag("organization", project.organization_id)
+-            scope.set_tag("project", project.id)
+-
+-        request._request.organization = project.organization
+-
+-        kwargs.update({
+-            'monitor': monitor,
+-            'project': project,
+-        })
+-        return (args, kwargs)
++class MonitorCheckInsEndpoint(MonitorEndpoint):
++    authentication_classes = MonitorEndpoint.authentication_classes + (DSNAuthentication,)
+ 
+     def get(self, request, project, monitor):
+         """
+@@ -83,7 +43,7 @@ class MonitorCheckInsEndpoint(Endpoint):
+         return self.paginate(
+             request=request,
+             queryset=queryset,
+-            order_by='name',
++            order_by='-date_added',
+             on_results=lambda x: serialize(x, request.user),
+             paginator_cls=OffsetPaginator,
+         )
+diff --git a/src/sentry/api/endpoints/monitor_details.py b/src/sentry/api/endpoints/monitor_details.py
+new file mode 100644
+index 0000000000..5e10068b00
+--- /dev/null
++++ b/src/sentry/api/endpoints/monitor_details.py
+@@ -0,0 +1,16 @@
++from __future__ import absolute_import
++
++from sentry.api.bases.monitor import MonitorEndpoint
++from sentry.api.serializers import serialize
++
++
++class MonitorDetailsEndpoint(MonitorEndpoint):
++    def get(self, request, project, monitor):
++        """
++        Retrieve a monitor
++        ``````````````````
++
++        :pparam string monitor_id: the id of the monitor.
++        :auth: required
++        """
++        return self.respond(serialize(monitor, request.user))
+diff --git a/src/sentry/api/endpoints/monitor_stats.py b/src/sentry/api/endpoints/monitor_stats.py
+new file mode 100644
+index 0000000000..7ebdfed3cb
+--- /dev/null
++++ b/src/sentry/api/endpoints/monitor_stats.py
+@@ -0,0 +1,43 @@
++from __future__ import absolute_import
++
++import six
++
++from collections import OrderedDict
++from rest_framework.response import Response
++
++from sentry import tsdb
++from sentry.api.base import StatsMixin
++from sentry.api.bases.monitor import MonitorEndpoint
++from sentry.models import MonitorCheckIn, CheckInStatus
++
++
++class MonitorStatsEndpoint(MonitorEndpoint, StatsMixin):
++    # TODO(dcramer): probably convert to tsdb
++    def get(self, request, project, monitor):
++        args = self._parse_args(request)
++
++        stats = OrderedDict()
++        current = tsdb.normalize_to_epoch(args['start'], args['rollup'])
++        end = tsdb.normalize_to_epoch(args['end'], args['rollup'])
++        while current <= end:
++            stats[current] = {CheckInStatus.OK: 0, CheckInStatus.ERROR: 0}
++            current += args['rollup']
++
++        history = MonitorCheckIn.objects.filter(
++            monitor=monitor,
++            status__in=[CheckInStatus.OK, CheckInStatus.ERROR],
++            date_added__gt=args['start'],
++            date_added__lte=args['end'],
++        ).values_list('date_added', 'status')
++        for datetime, status in history.iterator():
++            stats[tsdb.normalize_to_epoch(datetime, args['rollup'])][status] += 1
++
++        return Response(
++            [
++                {
++                    'ts': ts,
++                    'ok': data[CheckInStatus.OK],
++                    'error': data[CheckInStatus.ERROR],
++                } for ts, data in six.iteritems(stats)
++            ]
++        )
+diff --git a/src/sentry/api/endpoints/organization_monitors.py b/src/sentry/api/endpoints/organization_monitors.py
+index af0f300151..daf3d35073 100644
+--- a/src/sentry/api/endpoints/organization_monitors.py
++++ b/src/sentry/api/endpoints/organization_monitors.py
+@@ -1,11 +1,27 @@
+ from __future__ import absolute_import
+ 
++import six
++
++from django.db.models import Q
++
+ from sentry import features
++from sentry.api.bases import NoProjects, OrganizationEventsError
+ from sentry.api.bases.organization import OrganizationEndpoint
+ from sentry.api.exceptions import ResourceDoesNotExist
+ from sentry.api.paginator import OffsetPaginator
+ from sentry.api.serializers import serialize
+-from sentry.models import Monitor
++from sentry.models import Monitor, MonitorStatus, MonitorType
++from sentry.search.utils import tokenize_query
++from sentry.db.models.query import in_iexact
++
++
++def map_value_to_constant(constant, value):
++    value = value.upper()
++    if value == 'OK':
++        value = 'ACTIVE'
++    if not hasattr(constant, value):
++        raise ValueError(value)
++    return getattr(constant, value)
+ 
+ 
+ class OrganizationMonitorsEndpoint(OrganizationEndpoint):
+@@ -21,14 +37,62 @@ class OrganizationMonitorsEndpoint(OrganizationEndpoint):
+                             organization, actor=request.user):
+             raise ResourceDoesNotExist
+ 
++        try:
++            filter_params = self.get_filter_params(
++                request,
++                organization,
++                date_filter_optional=True,
++            )
++        except NoProjects:
++            return self.respond([])
++        except OrganizationEventsError as exc:
++            return self.respond({'detail': exc.message}, status=400)
++
+         queryset = Monitor.objects.filter(
+             organization_id=organization.id,
++            project_id__in=filter_params['project_id'],
++        )
++        query = request.GET.get('query')
++        if query:
++            tokens = tokenize_query(query)
++            for key, value in six.iteritems(tokens):
++                if key == 'query':
++                    value = ' '.join(value)
++                    queryset = queryset.filter(Q(name__icontains=value) | Q(id__iexact=value))
++                elif key == 'id':
++                    queryset = queryset.filter(in_iexact('id', value))
++                elif key == 'name':
++                    queryset = queryset.filter(in_iexact('name', value))
++                elif key == 'status':
++                    try:
++                        queryset = queryset.filter(
++                            status__in=map_value_to_constant(
++                                MonitorStatus, value))
++                    except ValueError:
++                        queryset = queryset.none()
++                elif key == 'type':
++                    try:
++                        queryset = queryset.filter(
++                            status__in=map_value_to_constant(
++                                MonitorType, value))
++                    except ValueError:
++                        queryset = queryset.none()
++
++                elif key == 'id':
++                    queryset = queryset.filter(id__in=value)
++                else:
++                    queryset = queryset.none()
++
++        queryset = queryset.extra(
++            select={
++                'is_error': 'sentry_monitor.status = %s' % (MonitorStatus.ERROR,),
++            },
+         )
+ 
+         return self.paginate(
+             request=request,
+             queryset=queryset,
+-            order_by='name',
++            order_by=('-is_error', '-name'),
+             on_results=lambda x: serialize(x, request.user),
+             paginator_cls=OffsetPaginator,
+         )
+diff --git a/src/sentry/api/serializers/models/monitor.py b/src/sentry/api/serializers/models/monitor.py
+index f705f24007..f86edff745 100644
+--- a/src/sentry/api/serializers/models/monitor.py
++++ b/src/sentry/api/serializers/models/monitor.py
+@@ -12,6 +12,9 @@ class MonitorSerializer(Serializer):
+         return {
+             'id': six.text_type(obj.guid),
+             'status': obj.get_status_display(),
++            'type': obj.get_type_display(),
+             'name': obj.name,
++            'lastCheckIn': obj.last_checkin,
++            'nextCheckIn': obj.next_checkin,
+             'dateCreated': obj.date_added,
+         }
+diff --git a/src/sentry/api/urls.py b/src/sentry/api/urls.py
+index 25a89c5d52..b34bb86152 100644
+--- a/src/sentry/api/urls.py
++++ b/src/sentry/api/urls.py
+@@ -51,6 +51,8 @@ from .endpoints.internal_quotas import InternalQuotasEndpoint
+ from .endpoints.internal_stats import InternalStatsEndpoint
+ from .endpoints.monitor_checkins import MonitorCheckInsEndpoint
+ from .endpoints.monitor_checkin_details import MonitorCheckInDetailsEndpoint
++from .endpoints.monitor_details import MonitorDetailsEndpoint
++from .endpoints.monitor_stats import MonitorStatsEndpoint
+ from .endpoints.organization_access_request_details import OrganizationAccessRequestDetailsEndpoint
+ from .endpoints.organization_activity import OrganizationActivityEndpoint
+ from .endpoints.organization_auditlogs import OrganizationAuditLogsEndpoint
+@@ -299,9 +301,11 @@ urlpatterns = patterns(
+         name='sentry-api-0-accept-project-transfer'),
+ 
+     # Monitors
++    url(r'^monitors/(?P<monitor_id>[^\/]+)/$', MonitorDetailsEndpoint.as_view()),
+     url(r'^monitors/(?P<monitor_id>[^\/]+)/checkins/$', MonitorCheckInsEndpoint.as_view()),
+     url(r'^monitors/(?P<monitor_id>[^\/]+)/checkins/(?P<checkin_id>[^\/]+)/$',
+         MonitorCheckInDetailsEndpoint.as_view()),
++    url(r'^monitors/(?P<monitor_id>[^\/]+)/stats/$', MonitorStatsEndpoint.as_view()),
+ 
+     # Users
+     url(r'^users/$', UserIndexEndpoint.as_view(), name='sentry-api-0-user-index'),
+diff --git a/src/sentry/models/monitor.py b/src/sentry/models/monitor.py
+index dcae72e707..e3dd7e490e 100644
+--- a/src/sentry/models/monitor.py
++++ b/src/sentry/models/monitor.py
+@@ -1,6 +1,7 @@
+ from __future__ import absolute_import, print_function
+ 
+ import pytz
++import six
+ 
+ from croniter import croniter
+ from datetime import datetime, timedelta
+@@ -124,7 +125,7 @@ class Monitor(Model):
+                 },
+                 'contexts': {
+                     'monitor': {
+-                        'id': self.id,
++                        'id': six.text_type(self.guid),
+                     },
+                 },
+             },
+diff --git a/src/sentry/models/monitorcheckin.py b/src/sentry/models/monitorcheckin.py
+index 128fe66aee..5741816113 100644
+--- a/src/sentry/models/monitorcheckin.py
++++ b/src/sentry/models/monitorcheckin.py
+@@ -26,8 +26,8 @@ class CheckInStatus(object):
+     def as_choices(cls):
+         return (
+             (cls.UNKNOWN, 'unknown'),
+-            (cls.OK, 'success'),
+-            (cls.ERROR, 'failure'),
++            (cls.OK, 'ok'),
++            (cls.ERROR, 'error'),
+             (cls.IN_PROGRESS, 'in_progress'),
+         )
+ 
+diff --git a/src/sentry/static/sentry/app/components/issueList.jsx b/src/sentry/static/sentry/app/components/issueList.jsx
+index 22e8f9ce02..b0dc214615 100644
+--- a/src/sentry/static/sentry/app/components/issueList.jsx
++++ b/src/sentry/static/sentry/app/components/issueList.jsx
+@@ -10,6 +10,7 @@ import EmptyMessage from 'app/views/settings/components/emptyMessage';
+ import LoadingError from 'app/components/loadingError';
+ import LoadingIndicator from 'app/components/loadingIndicator';
+ import Pagination from 'app/components/pagination';
++import space from 'app/styles/space';
+ import {t} from 'app/locale';
+ 
+ const IssueList = createReactClass({
+@@ -98,7 +99,7 @@ const IssueList = createReactClass({
+     const {noBorder} = this.props;
+ 
+     if (this.state.loading) body = this.renderLoading();
+-    else if (this.state.error) body = <LoadingError onRetry={this.fetchData} />;
++    else if (this.state.error) body = this.renderError();
+     else if (this.state.issueIds.length > 0) {
+       const panelStyle = noBorder ? {border: 0, borderRadius: 0} : {};
+ 
+@@ -124,9 +125,17 @@ const IssueList = createReactClass({
+     return body;
+   },
+ 
++  renderError() {
++    return (
++      <div style={{margin: `${space(2)} ${space(2)} 0`}}>
++        <LoadingError onRetry={this.fetchData} />
++      </div>
++    );
++  },
++
+   renderLoading() {
+     return (
+-      <div className="box">
++      <div style={{margin: '18px 18px 0'}}>
+         <LoadingIndicator />
+       </div>
+     );
+diff --git a/src/sentry/static/sentry/app/components/organizations/globalSelectionHeader/globalSelectionHeader.jsx b/src/sentry/static/sentry/app/components/organizations/globalSelectionHeader/globalSelectionHeader.jsx
+index fb1235d3e7..b01f9b3b79 100644
+--- a/src/sentry/static/sentry/app/components/organizations/globalSelectionHeader/globalSelectionHeader.jsx
++++ b/src/sentry/static/sentry/app/components/organizations/globalSelectionHeader/globalSelectionHeader.jsx
+@@ -57,6 +57,9 @@ class GlobalSelectionHeader extends React.Component {
+     // Display Environment selector?
+     showEnvironmentSelector: PropTypes.bool,
+ 
++    // Display Environment selector?
++    showDateSelector: PropTypes.bool,
++
+     // Disable automatic routing
+     hasCustomRouting: PropTypes.bool,
+ 
+@@ -86,6 +89,7 @@ class GlobalSelectionHeader extends React.Component {
+   static defaultProps = {
+     hasCustomRouting: false,
+     showEnvironmentSelector: true,
++    showDateSelector: true,
+     resetParamsOnChange: [],
+   };
+ 
+@@ -334,6 +338,7 @@ class GlobalSelectionHeader extends React.Component {
+       organization,
+       showAbsolute,
+       showRelative,
++      showDateSelector,
+       showEnvironmentSelector,
+     } = this.props;
+     const {period, start, end, utc} = this.props.selection.datetime || {};
+@@ -366,20 +371,24 @@ class GlobalSelectionHeader extends React.Component {
+           </React.Fragment>
+         )}
+ 
+-        <HeaderSeparator />
+-        <HeaderItemPosition>
+-          <TimeRangeSelector
+-            key={`period:${period}-start:${start}-end:${end}-utc:${utc}`}
+-            showAbsolute={showAbsolute}
+-            showRelative={showRelative}
+-            relative={period}
+-            start={start}
+-            end={end}
+-            utc={utc}
+-            onChange={this.handleChangeTime}
+-            onUpdate={this.handleUpdateTime}
+-          />
+-        </HeaderItemPosition>
++        {showDateSelector && (
++          <React.Fragment>
++            <HeaderSeparator />
++            <HeaderItemPosition>
++              <TimeRangeSelector
++                key={`period:${period}-start:${start}-end:${end}-utc:${utc}`}
++                showAbsolute={showAbsolute}
++                showRelative={showRelative}
++                relative={period}
++                start={start}
++                end={end}
++                utc={utc}
++                onChange={this.handleChangeTime}
++                onUpdate={this.handleUpdateTime}
++              />
++            </HeaderItemPosition>
++          </React.Fragment>
++        )}
+       </Header>
+     );
+   }
+diff --git a/src/sentry/static/sentry/app/components/sidebar/index.jsx b/src/sentry/static/sentry/app/components/sidebar/index.jsx
+index 835aaf93eb..2760b03091 100644
+--- a/src/sentry/static/sentry/app/components/sidebar/index.jsx
++++ b/src/sentry/static/sentry/app/components/sidebar/index.jsx
+@@ -341,6 +341,20 @@ class Sidebar extends React.Component {
+                 </SidebarSection>
+               </Feature>
+ 
++              <Feature features={['monitors']}>
++                <SidebarItem
++                  {...sidebarItemProps}
++                  onClick={(_id, evt) =>
++                    this.navigateWithGlobalSelection(
++                      `/organizations/${organization.slug}/monitors/`,
++                      evt
++                    )}
++                  icon={<InlineSvg src="icon-labs" />}
++                  label={t('Monitors')}
++                  to={`/organizations/${organization.slug}/monitors/`}
++                />
++              </Feature>
++
+               {!hasSentry10 && (
+                 <SidebarSection>
+                   <SidebarItem
+diff --git a/src/sentry/static/sentry/app/routes.jsx b/src/sentry/static/sentry/app/routes.jsx
+index 76427280cb..fe5e3bc330 100644
+--- a/src/sentry/static/sentry/app/routes.jsx
++++ b/src/sentry/static/sentry/app/routes.jsx
+@@ -795,7 +795,30 @@ function routes() {
+               component={errorHandler(LazyLoad)}
+             />
+           </Route>
+-
++          <Route
++            path="/organizations/:orgId/monitors/"
++            componentPromise={() =>
++              import(/* webpackChunkName: "OrganizationMonitorsContainer" */ './views/organizationMonitors')}
++            component={errorHandler(LazyLoad)}
++          >
++            <IndexRoute
++              componentPromise={() =>
++                import(/* webpackChunkName: "OrganizationMonitors" */ './views/organizationMonitors/monitors')}
++              component={errorHandler(LazyLoad)}
++            />
++            <Route
++              path="/organizations/:orgId/monitors/:monitorId/"
++              componentPromise={() =>
++                import(/* webpackChunkName: "OrganizationMonitorDetails" */ './views/organizationMonitors/details')}
++              component={errorHandler(LazyLoad)}
++            />
++            <Route
++              path="/organizations/:orgId/monitors/:monitorId/edit/"
++              componentPromise={() =>
++                import(/* webpackChunkName: "OrganizationMonitorEdit" */ './views/organizationMonitors/edit')}
++              component={errorHandler(LazyLoad)}
++            />
++          </Route>
+           <Route
+             path="/organizations/:orgId/projects/:projectId/getting-started/"
+             component={errorHandler(ProjectGettingStarted)}
+diff --git a/src/sentry/static/sentry/app/views/organizationMonitors/checkInIcon.jsx b/src/sentry/static/sentry/app/views/organizationMonitors/checkInIcon.jsx
+new file mode 100644
+index 0000000000..0e959ba9a6
+--- /dev/null
++++ b/src/sentry/static/sentry/app/views/organizationMonitors/checkInIcon.jsx
+@@ -0,0 +1,22 @@
++import styled from 'react-emotion';
++
++const getBackgroundColor = p => {
++  if (p.color) return `background: ${p.color};`;
++
++  return `background: ${p.status === 'error'
++    ? p.theme.error
++    : p.status === 'ok' ? p.theme.success : p.theme.disabled};`;
++};
++
++const getSize = p => `
++  height: ${p.size}px;
++  width: ${p.size}px;
++`;
++
++export default styled.div`
++  display: inline-block;
++  position: relative;
++  border-radius: 50%;
++  ${getSize};
++  ${getBackgroundColor};
++`;
+diff --git a/src/sentry/static/sentry/app/views/organizationMonitors/details.jsx b/src/sentry/static/sentry/app/views/organizationMonitors/details.jsx
+new file mode 100644
+index 0000000000..089f1d95f9
+--- /dev/null
++++ b/src/sentry/static/sentry/app/views/organizationMonitors/details.jsx
+@@ -0,0 +1,58 @@
++import React from 'react';
++
++import AsyncView from 'app/views/asyncView';
++import {Panel, PanelBody, PanelHeader} from 'app/components/panels';
++import {t} from 'app/locale';
++
++import MonitorCheckIns from './monitorCheckIns';
++import MonitorHeader from './monitorHeader';
++import MonitorIssues from './monitorIssues';
++import MonitorStats from './monitorStats';
++
++class OrganizationMonitorDetails extends AsyncView {
++  getEndpoints() {
++    const {params, location} = this.props;
++    return [
++      [
++        'monitor',
++        `/monitors/${params.monitorId}/`,
++        {
++          query: location.query,
++        },
++      ],
++    ];
++  }
++
++  getTitle() {
++    if (this.state.monitor)
++      return `${this.state.monitor.name} - Monitors - ${this.props.params.orgId}`;
++    return `Monitors - ${this.props.params.orgId}`;
++  }
++
++  renderBody() {
++    const {monitor} = this.state;
++    return (
++      <React.Fragment>
++        <MonitorHeader monitor={monitor} />
++
++        <MonitorStats monitor={monitor} />
++
++        <Panel>
++          <PanelHeader>{t('Related Issues')}</PanelHeader>
++
++          <PanelBody>
++            <MonitorIssues monitor={monitor} orgId={this.props.params.orgId} />
++          </PanelBody>
++        </Panel>
++
++        <Panel>
++          <PanelHeader>{t('Recent Check-ins')}</PanelHeader>
++
++          <MonitorCheckIns monitor={monitor} />
++        </Panel>
++      </React.Fragment>
++    );
++  }
++}
++
++export default OrganizationMonitorDetails;
+diff --git a/src/sentry/static/sentry/app/views/organizationMonitors/edit.jsx b/src/sentry/static/sentry/app/views/organizationMonitors/edit.jsx
+new file mode 100644
+index 0000000000..1e84d5fb61
+--- /dev/null
++++ b/src/sentry/static/sentry/app/views/organizationMonitors/edit.jsx
+@@ -0,0 +1,106 @@
++import React from 'react';
++import PropTypes from 'prop-types';
++
++import Access from 'app/components/acl/access';
++import AsyncView from 'app/views/asyncView';
++import DateTime from 'app/components/dateTime';
++import Field from 'app/views/settings/components/forms/field';
++import Form from 'app/views/settings/components/forms/form';
++import TextCopyInput from 'app/views/settings/components/forms/textCopyInput';
++import TextField from 'app/views/settings/components/forms/textField';
++import {Panel, PanelBody, PanelHeader} from 'app/components/panels';
++import withOrganization from 'app/utils/withOrganization';
++import SentryTypes from 'app/sentryTypes';
++import {t} from 'app/locale';
++
++import MonitorHeader from './monitorHeader';
++
++class EditMonitor extends AsyncView {
++  static contextTypes = {
++    organization: SentryTypes.Organization,
++  };
++
++  static propTypes = {
++    location: PropTypes.object.isRequired,
++    ...AsyncView.propTypes,
++  };
++
++  getEndpoints() {
++    const {params, location} = this.props;
++    return [
++      [
++        'monitor',
++        `/monitors/${params.monitorId}/`,
++        {
++          query: location.query,
++        },
++      ],
++    ];
++  }
++
++  getTitle() {
++    if (this.state.monitor)
++      return `${this.state.monitor.name} - Monitors - ${this.props.params.orgId}`;
++    return `Monitors - ${this.props.params.orgId}`;
++  }
++
++  renderBody() {
++    const {monitor} = this.state;
++    return (
++      <React.Fragment>
++        <MonitorHeader monitor={monitor} />
++
++        <Access access={['project:write']}>
++          {({hasAccess}) => (
++            <React.Fragment>
++              <Form
++                saveOnBlur
++                allowUndo
++                apiEndpoint={`/monitors/${monitor.id}/`}
++                apiMethod="PUT"
++                initialData={{
++                  name: monitor.name,
++                }}
++              >
++                <Panel>
++                  <PanelHeader>{t('Details')}</PanelHeader>
++
++                  <PanelBody>
++                    <Field label={t('ID')}>
++                      <div className="controls">
++                        <TextCopyInput>{monitor.id}</TextCopyInput>
++                      </div>
++                    </Field>
++                    <TextField
++                      name="name"
++                      label={t('Name')}
++                      disabled={!hasAccess}
++                      required={false}
++                    />
++                    <Field label={t('Last Check-in')}>
++                      <div className="controls">
++                        <DateTime date={monitor.lastCheckIn} />
++                      </div>
++                    </Field>
++                    <Field label={t('Next Check-in (expected)')}>
++                      <div className="controls">
++                        <DateTime date={monitor.nextCheckIn} />
++                      </div>
++                    </Field>
++                    <Field label={t('Created')}>
++                      <div className="controls">
++                        <DateTime date={monitor.dateCreated} />
++                      </div>
++                    </Field>
++                  </PanelBody>
++                </Panel>
++              </Form>
++            </React.Fragment>
++          )}
++        </Access>
++      </React.Fragment>
++    );
++  }
++}
++
++export default withOrganization(EditMonitor);
+diff --git a/src/sentry/static/sentry/app/views/organizationMonitors/index.jsx b/src/sentry/static/sentry/app/views/organizationMonitors/index.jsx
+new file mode 100644
+index 0000000000..c8c2fec743
+--- /dev/null
++++ b/src/sentry/static/sentry/app/views/organizationMonitors/index.jsx
+@@ -0,0 +1,43 @@
++import React from 'react';
++import styled from 'react-emotion';
++
++import Feature from 'app/components/acl/feature';
++import GlobalSelectionHeader from 'app/components/organizations/globalSelectionHeader';
++import {PageContent} from 'app/styles/organization';
++import withGlobalSelection from 'app/utils/withGlobalSelection';
++import withOrganization from 'app/utils/withOrganization';
++
++import SentryTypes from 'app/sentryTypes';
++
++const Body = styled('div')`
++  background-color: ${p => p.theme.whiteDark};
++  flex-direction: column;
++  flex: 1;
++`;
++
++class OrganizationMonitorsContainer extends React.Component {
++  static propTypes = {
++    organization: SentryTypes.Organization,
++  };
++
++  render() {
++    const {organization, children} = this.props;
++
++    return (
++      <Feature features={['monitors']} renderDisabled>
++        <GlobalSelectionHeader
++          organization={organization}
++          showEnvironmentSelector={false}
++          showDateSelector={false}
++          resetParamsOnChange={['cursor']}
++        />
++        <PageContent>
++          <Body>{children}</Body>
++        </PageContent>
++      </Feature>
++    );
++  }
++}
++
++export default withOrganization(withGlobalSelection(OrganizationMonitorsContainer));
++export {OrganizationMonitorsContainer};
+diff --git a/src/sentry/static/sentry/app/views/organizationMonitors/monitorCheckIns.jsx b/src/sentry/static/sentry/app/views/organizationMonitors/monitorCheckIns.jsx
+new file mode 100644
+index 0000000000..ed754b6ab5
+--- /dev/null
++++ b/src/sentry/static/sentry/app/views/organizationMonitors/monitorCheckIns.jsx
+@@ -0,0 +1,49 @@
++import React from 'react';
++import PropTypes from 'prop-types';
++import {Box} from 'grid-emotion';
++
++import AsyncComponent from 'app/components/asyncComponent';
++import Duration from 'app/components/duration';
++import TimeSince from 'app/components/timeSince';
++import {PanelBody, PanelItem} from 'app/components/panels';
++
++import CheckInIcon from './checkInIcon';
++
++export default class MonitorCheckIns extends AsyncComponent {
++  static propTypes = {
++    monitor: PropTypes.object.isRequired,
++  };
++
++  getEndpoints() {
++    const {monitor} = this.props;
++    return [
++      ['checkInList', `/monitors/${monitor.id}/checkins/`, {query: {per_page: 10}}],
++    ];
++  }
++
++  renderError() {
++    return <div style={{margin: '18px 18px 0'}}>{super.renderError()}</div>;
++  }
++
++  renderBody() {
++    return (
++      <PanelBody>
++        {this.state.checkInList.map(checkIn => {
++          return (
++            <PanelItem key={checkIn.id}>
++              <Box style={{width: 16}} mr={2}>
++                <CheckInIcon status={checkIn.status} size={16} />
++              </Box>
++              <Box flex="1" direction="column" mr={2}>
++                <TimeSince date={checkIn.dateCreated} />
++              </Box>
++              <Box direction="column">
++                {checkIn.duration && <Duration seconds={checkIn.duration / 100} />}
++              </Box>
++            </PanelItem>
++          );
++        })}
++      </PanelBody>
++    );
++  }
++}
+diff --git a/src/sentry/static/sentry/app/views/organizationMonitors/monitorHeader.jsx b/src/sentry/static/sentry/app/views/organizationMonitors/monitorHeader.jsx
+new file mode 100644
+index 0000000000..0f97f915ac
+--- /dev/null
++++ b/src/sentry/static/sentry/app/views/organizationMonitors/monitorHeader.jsx
+@@ -0,0 +1,44 @@
++import PropTypes from 'prop-types';
++import React from 'react';
++
++import TimeSince from 'app/components/timeSince';
++import {t} from 'app/locale';
++
++import MonitorIcon from './monitorIcon';
++
++export default class MonitorHeader extends React.Component {
++  static propTypes = {
++    monitor: PropTypes.object.isRequired,
++  };
++
++  render() {
++    const {monitor} = this.props;
++
++    return (
++      <div className="release-details">
++        <div className="row">
++          <div className="col-sm-6 col-xs-10">
++            <h3>{t('Monitor Details')}</h3>
++            <div className="release-meta">{monitor.name}</div>
++          </div>
++          <div className="col-sm-2 hidden-xs">
++            <h6 className="nav-header">{t('Last Check-in')}</h6>
++            <TimeSince date={monitor.lastCheckIn} />
++          </div>
++          <div className="col-sm-2 hidden-xs">
++            <h6 className="nav-header">{t('Next Check-in')}</h6>
++            <TimeSince date={monitor.nextCheckIn} />
++          </div>
++          <div className="col-sm-2">
++            <h6 className="nav-header">{t('Status')}</h6>
++            <MonitorIcon
++              status={monitor.status}
++              lastCheckIn={monitor.lastCheckIn}
++              size={16}
++            />
++          </div>
++        </div>
++      </div>
++    );
++  }
++}
+diff --git a/src/sentry/static/sentry/app/views/organizationMonitors/monitorIcon.jsx b/src/sentry/static/sentry/app/views/organizationMonitors/monitorIcon.jsx
+new file mode 100644
+index 0000000000..aa7958cb28
+--- /dev/null
++++ b/src/sentry/static/sentry/app/views/organizationMonitors/monitorIcon.jsx
+@@ -0,0 +1,22 @@
++import styled from 'react-emotion';
++
++const getBackgroundColor = p => {
++  if (p.color) return `background: ${p.color};`;
++
++  return `background: ${p.status === 'error'
++    ? p.theme.error
++    : p.status === 'active' && p.lastCheckIn ? p.theme.success : p.theme.disabled};`;
++};
++
++const getSize = p => `
++  height: ${p.size}px;
++  width: ${p.size}px;
++`;
++
++export default styled.div`
++  display: inline-block;
++  position: relative;
++  border-radius: 50%;
++  ${getSize};
++  ${getBackgroundColor};
++`;
+diff --git a/src/sentry/static/sentry/app/views/organizationMonitors/monitorIssues.jsx b/src/sentry/static/sentry/app/views/organizationMonitors/monitorIssues.jsx
+new file mode 100644
+index 0000000000..769ba2b742
+--- /dev/null
++++ b/src/sentry/static/sentry/app/views/organizationMonitors/monitorIssues.jsx
+@@ -0,0 +1,43 @@
++import React, {Component} from 'react';
++import PropTypes from 'prop-types';
++
++import IssueList from 'app/components/issueList';
++import {Panel, PanelBody, PanelItem} from 'app/components/panels';
++import {t} from 'app/locale';
++
++export default class MonitorIssues extends Component {
++  static propTypes = {
++    orgId: PropTypes.string.isRequired,
++    monitor: PropTypes.object.isRequired,
++  };
++
++  getIssuesPath() {
++    const {orgId} = this.props;
++    return `/organizations/${orgId}/issues/`;
++  }
++
++  render() {
++    const {monitor, orgId} = this.props;
++
++    return (
++      <IssueList
++        endpoint={this.getIssuesPath()}
++        query={{
++          query: 'monitor.id:"' + monitor.id + '"',
++          limit: 5,
++        }}
++        statsPeriod="0"
++        pagination={false}
++        renderEmpty={() => (
++          <Panel>
++            <PanelBody>
++              <PanelItem justify="center">{t('No issues found')}</PanelItem>
++            </PanelBody>
++          </Panel>
++        )}
++        showActions={false}
++        params={{orgId}}
++      />
++    );
++  }
++}
+diff --git a/src/sentry/static/sentry/app/views/organizationMonitors/monitorStats.jsx b/src/sentry/static/sentry/app/views/organizationMonitors/monitorStats.jsx
+new file mode 100644
+index 0000000000..4da00a761b
+--- /dev/null
++++ b/src/sentry/static/sentry/app/views/organizationMonitors/monitorStats.jsx
+@@ -0,0 +1,91 @@
++import PropTypes from 'prop-types';
++import React from 'react';
++
++import AsyncComponent from 'app/components/asyncComponent';
++import {Panel, PanelBody} from 'app/components/panels';
++import {t} from 'app/locale';
++import EmptyMessage from 'app/views/settings/components/emptyMessage';
++import StackedBarChart from 'app/components/stackedBarChart';
++
++export default class MonitorStats extends AsyncComponent {
++  static propTypes = {
++    monitor: PropTypes.object.isRequired,
++    ...AsyncComponent.PropTypes,
++  };
++
++  getDefaultState() {
++    const until = Math.floor(new Date().getTime() / 1000);
++    const since = until - 3600 * 24 * 30;
++
++    return {
++      since,
++      until,
++    };
++  }
++
++  getEndpoints() {
++    const {monitor} = this.props;
++    return [
++      [
++        'stats',
++        `/monitors/${monitor.id}/stats/`,
++        {
++          query: {
++            since: this.state.since,
++            until: this.state.until,
++            resolution: '1d',
++          },
++        },
++      ],
++    ];
++  }
++
++  renderTooltip(point, pointIdx, chart) {
++    const timeLabel = chart.getTimeLabel(point);
++    const [error, ok] = point.y;
++
++    const value = `${ok.toLocaleString()} successful<br>${error.toLocaleString()} failed`;
++
++    return (
++      '<div style="width:150px">' +
++      `<div class="time-label">${timeLabel}</div>` +
++      `<div class="value-label">${value}</div>` +
++      '</div>'
++    );
++  }
++
++  renderBody() {
++    let emptyStats = true;
++    const stats = this.state.stats.map(p => {
++      if (p.ok || p.error) emptyStats = false;
++      return {
++        x: p.ts,
++        y: [p.error, p.ok],
++      };
++    });
++
++    return (
++      <Panel>
++        <PanelBody>
++          {!emptyStats ? (
++            <StackedBarChart
++              points={stats}
++              height={150}
++              label="events"
++              barClasses={['error', 'success']}
++              className="standard-barchart"
++              style={{border: 'none'}}
++              tooltip={this.renderTooltip}
++            />
++          ) : (
++            <EmptyMessage
++              css={{flexDirection: 'column', alignItems: 'center'}}
++              title={t('Nothing recorded in the last 30 days.')}
++              description={t('All check-ins for this monitor.')}
++            />
++          )}
++        </PanelBody>
++      </Panel>
++    );
++  }
++}
+diff --git a/src/sentry/static/sentry/app/views/organizationMonitors/monitors.jsx b/src/sentry/static/sentry/app/views/organizationMonitors/monitors.jsx
+new file mode 100644
+index 0000000000..b47bbe28c1
+--- /dev/null
++++ b/src/sentry/static/sentry/app/views/organizationMonitors/monitors.jsx
+@@ -0,0 +1,124 @@
++import React from 'react';
++import {Link, withRouter} from 'react-router';
++import PropTypes from 'prop-types';
++import styled from 'react-emotion';
++import {Box} from 'grid-emotion';
++
++import AsyncView from 'app/views/asyncView';
++import BetaTag from 'app/components/betaTag';
++import {getParams} from 'app/views/organizationEvents/utils/getParams';
++import {Panel, PanelBody, PanelItem} from 'app/components/panels';
++import {PageHeader} from 'app/styles/organization';
++import PageHeading from 'app/components/pageHeading';
++import TimeSince from 'app/components/timeSince';
++import Pagination from 'app/components/pagination';
++import SentryTypes from 'app/sentryTypes';
++import SearchBar from 'app/components/searchBar';
++import withOrganization from 'app/utils/withOrganization';
++import {t} from 'app/locale';
++
++import MonitorIcon from './monitorIcon';
++
++const HeaderTitle = styled(PageHeading)`
++  flex: 1;
++`;
++
++const StyledSearchBar = styled(SearchBar)`
++  flex: 1;
++`;
++
++class OrganizationMonitors extends AsyncView {
++  static propTypes = {
++    organization: SentryTypes.Organization,
++    location: PropTypes.object.isRequired,
++  };
++
++  static contextTypes = {
++    router: PropTypes.object.isRequired,
++  };
++
++  getEndpoints() {
++    const {params, location} = this.props;
++    return [
++      [
++        'monitorList',
++        `/organizations/${params.orgId}/monitors/`,
++        {
++          query: location.query,
++        },
++      ],
++    ];
++  }
++
++  getTitle() {
++    return `Monitors - ${this.props.params.orgId}`;
++  }
++
++  handleSearch = query => {
++    const {location} = this.props;
++    const {router} = this.context;
++    router.push({
++      pathname: location.pathname,
++      query: getParams({
++        ...(location.query || {}),
++        query,
++      }),
++    });
++  };
++
++  renderBody() {
++    const {monitorListPageLinks} = this.state;
++    const {organization} = this.props;
++    return (
++      <React.Fragment>
++        <PageHeader>
++          <HeaderTitle>
++            {t('Monitors')} <BetaTag />
++          </HeaderTitle>
++          <StyledSearchBar
++            organization={organization}
++            query={(location.query && location.query.query) || ''}
++            placeholder={t('Search for monitors.')}
++            onSearch={this.handleSearch}
++          />
++        </PageHeader>
++        <Panel>
++          <PanelBody>
++            {this.state.monitorList.map(monitor => {
++              return (
++                <PanelItem key={monitor.id}>
++                  <Box style={{width: 16}} align="center" justify="center" mr={2}>
++                    <MonitorIcon
++                      status={monitor.status}
++                      lastCheckIn={monitor.lastCheckIn}
++                      size={16}
++                    />
++                  </Box>
++                  <Box flex="1" mr={2}>
++                    <Link
++                      to={`/organizations/${organization.slug}/monitors/${monitor.id}/`}
++                    >
++                      {monitor.name}
++                    </Link>
++                  </Box>
++                  <Box>
++                    {monitor.nextCheckIn ? (
++                      <TimeSince date={monitor.lastCheckIn} />
++                    ) : (
++                      t('n/a')
++                    )}
++                  </Box>
++                </PanelItem>
++              );
++            })}
++          </PanelBody>
++        </Panel>
++        {monitorListPageLinks && (
++          <Pagination pageLinks={monitorListPageLinks} {...this.props} />
++        )}
++      </React.Fragment>
++    );
++  }
++}
++
++export default withRouter(withOrganization(OrganizationMonitors));
+diff --git a/src/sentry/static/sentry/less/components/charts.less b/src/sentry/static/sentry/less/components/charts.less
+index abbe620996..4b3aba2840 100644
+--- a/src/sentry/static/sentry/less/components/charts.less
++++ b/src/sentry/static/sentry/less/components/charts.less
+@@ -21,6 +21,29 @@
+         background: @purple;
+         fill: @purple;
+         border-color: transparent;
++
++        &.accepted {
++          background: @gray-light;
++          fill: @gray-light;
++        }
++
++        &.success {
++          background: @green;
++          fill: @green;
++        }
++
++        &.rate-limited,
++        &.dropped,
++        &.error {
++          background: @red-dark;
++          fill: @red-dark;
++        }
++
++        &.black-listed,
++        &.filtered {
++          background: @orange-dark;
++          fill: @orange-dark;
++        }
+       }
+     }
+ 
+@@ -41,6 +64,29 @@
+     > .barchart-rect {
+       background: @gray-lighter;
+       fill: @gray-lighter;
++
++      &.accepted {
++        background: @gray-lightest;
++        fill: @gray-lightest;
++      }
++
++      &.success {
++        background: @green-light;
++        fill: @green-light;
++      }
++
++      &.rate-limited,
++      &.dropped,
++      &.error {
++        background: @red;
++        fill: @red;
++      }
++
++      &.black-listed,
++      &.filtered {
++        background: @orange-light;
++        fill: @orange-light;
++      }
+     }
+   }
+ }
+diff --git a/src/sentry/static/sentry/less/shared-components.less b/src/sentry/static/sentry/less/shared-components.less
+index f709fb85b6..7d771859a0 100644
+--- a/src/sentry/static/sentry/less/shared-components.less
++++ b/src/sentry/static/sentry/less/shared-components.less
+@@ -892,8 +892,14 @@ table.table.key-value {
+           fill: @gray-lightest;
+         }
+ 
++        &.success {
++          background: @green-light;
++          fill: @green-light;
++        }
++
+         &.rate-limited,
+-        &.dropped {
++        &.dropped,
++        &.error {
+           background: @red;
+           fill: @red;
+           min-height: 0;
+@@ -914,8 +920,14 @@ table.table.key-value {
+           fill: @gray-light;
+         }
+ 
++        &.success {
++          background: @green;
++          fill: @green;
++        }
++
+         &.rate-limited,
+-        &.dropped {
++        &.dropped,
++        &.error {
+           background: @red-dark;
+           fill: @red-dark;
+         }
+diff --git a/src/sentry/tsdb/base.py b/src/sentry/tsdb/base.py
+index a7d4c04206..d4d92d0f9a 100644
+--- a/src/sentry/tsdb/base.py
++++ b/src/sentry/tsdb/base.py
+@@ -130,11 +130,13 @@ class BaseTSDB(Service):
+ 
+     __all__ = frozenset([
+         'get_earliest_timestamp',
++        'get_optimal_rollup',
+         'get_optimal_rollup_series',
+         'get_rollups',
+         'make_series',
+         'models',
+         'models_with_environment_support',
++        'normalize_to_epoch',
+         'rollup',
+     ]) | __write_methods__ | __read_methods__
+ 
+diff --git a/src/south/management/commands/testserver.py b/src/south/management/commands/testserver.py
+deleted file mode 100644
+index 5f2cc6efd0..0000000000
+--- a/src/south/management/commands/testserver.py
++++ /dev/null
+@@ -1,9 +0,0 @@
+-from django.core.management.commands import testserver
+-
+-from south.management.commands import patch_for_test_db_setup
+-
+-
+-class Command(testserver.Command):
+-    def handle(self, *args, **kwargs):
+-        patch_for_test_db_setup()
+-        super(Command, self).handle(*args, **kwargs)
+diff --git a/tests/acceptance/__init__.py b/tests/acceptance/__init__.py
+new file mode 100644
+index 0000000000..c3961685ab
+--- /dev/null
++++ b/tests/acceptance/__init__.py
+@@ -0,0 +1 @@
++from __future__ import absolute_import
+diff --git a/tests/js/spec/views/userFeedback/__snapshots__/organizationUserFeedback.spec.jsx.snap b/tests/js/spec/views/userFeedback/__snapshots__/organizationUserFeedback.spec.jsx.snap
+index 3b2cd1134d..ca48c03878 100644
+--- a/tests/js/spec/views/userFeedback/__snapshots__/organizationUserFeedback.spec.jsx.snap
++++ b/tests/js/spec/views/userFeedback/__snapshots__/organizationUserFeedback.spec.jsx.snap
+@@ -514,6 +514,7 @@ exports[`OrganizationUserFeedback renders 1`] = `
+                     "projects": Array [],
+                   }
+                 }
++                showDateSelector={true}
+                 showEnvironmentSelector={true}
+               >
+                 <Header>
+diff --git a/tests/sentry/api/endpoints/test_monitor_details.py b/tests/sentry/api/endpoints/test_monitor_details.py
+new file mode 100644
+index 0000000000..43c58dfb4a
+--- /dev/null
++++ b/tests/sentry/api/endpoints/test_monitor_details.py
+@@ -0,0 +1,32 @@
++from __future__ import absolute_import, print_function
++
++import six
++
++from datetime import timedelta
++from django.utils import timezone
++
++from sentry.models import Monitor, MonitorType
++from sentry.testutils import APITestCase
++
++
++class MonitorDetailsTest(APITestCase):
++    def test_simple(self):
++        user = self.create_user()
++        org = self.create_organization(owner=user)
++        team = self.create_team(organization=org, members=[user])
++        project = self.create_project(teams=[team])
++
++        monitor = Monitor.objects.create(
++            organization_id=org.id,
++            project_id=project.id,
++            next_checkin=timezone.now() - timedelta(minutes=1),
++            type=MonitorType.CRON_JOB,
++            config={'schedule': '* * * * *'},
++        )
++
++        self.login_as(user=user)
++        with self.feature({'organizations:monitors': True}):
++            resp = self.client.get('/api/0/monitors/{}/'.format(monitor.guid))
++
++        assert resp.status_code == 200, resp.content
++        assert resp.data['id'] == six.text_type(monitor.guid)
+diff --git a/tests/sentry/api/endpoints/test_organization_monitors.py b/tests/sentry/api/endpoints/test_organization_monitors.py
+index 9610256930..0741c8e8aa 100644
+--- a/tests/sentry/api/endpoints/test_organization_monitors.py
++++ b/tests/sentry/api/endpoints/test_organization_monitors.py
+@@ -15,7 +15,7 @@ class OrganizationProjectsTest(APITestCase):
+ 
+     @fixture
+     def team(self):
+-        return self.create_team(organization=self.org)
++        return self.create_team(organization=self.org, members=[self.user])
+ 
+     @fixture
+     def project(self):
+diff --git a/tests/snuba/__init__.py b/tests/snuba/__init__.py
+new file mode 100644
+index 0000000000..c3961685ab
+--- /dev/null
++++ b/tests/snuba/__init__.py
+@@ -0,0 +1 @@
++from __future__ import absolute_import
+diff --git a/tests/snuba/api/__init__.py b/tests/snuba/api/__init__.py
+new file mode 100644
+index 0000000000..c3961685ab
+--- /dev/null
++++ b/tests/snuba/api/__init__.py
+@@ -0,0 +1 @@
++from __future__ import absolute_import
+diff --git a/tests/snuba/api/endpoints/__init__.py b/tests/snuba/api/endpoints/__init__.py
+new file mode 100644
+index 0000000000..c3961685ab
+--- /dev/null
++++ b/tests/snuba/api/endpoints/__init__.py
+@@ -0,0 +1 @@
++from __future__ import absolute_import
+diff --git a/tests/snuba/api/serializers/__init__.py b/tests/snuba/api/serializers/__init__.py
+new file mode 100644
+index 0000000000..c3961685ab
+--- /dev/null
++++ b/tests/snuba/api/serializers/__init__.py
+@@ -0,0 +1 @@
++from __future__ import absolute_import
+diff --git a/tests/snuba/tagstore/__init__.py b/tests/snuba/tagstore/__init__.py
+new file mode 100644
+index 0000000000..c3961685ab
+--- /dev/null
++++ b/tests/snuba/tagstore/__init__.py
+@@ -0,0 +1 @@
++from __future__ import absolute_import
+diff --git a/tests/snuba/tsdb/__init__.py b/tests/snuba/tsdb/__init__.py
+new file mode 100644
+index 0000000000..c3961685ab
+--- /dev/null
++++ b/tests/snuba/tsdb/__init__.py
+@@ -0,0 +1 @@
++from __future__ import absolute_import

@@ -1,0 +1,163 @@
+commit 9f68490a45f1e6fc044bf574ffda37322f363cbd
+Author: Dan Fuller <dfuller@sentry.io>
+Date:   Mon Apr 20 10:39:44 2020 -0700
+
+    perf(search): Fix performance regression when searching via first_release in a large org (#18353)
+    
+    Based off of https://github.com/getsentry/sentry/pull/18328.
+    
+    This fixes a bug where searching for `first_release` is extremely slow. This only occurs when the user
+    has `All Environments` selected, and is a combination of the generated SQL statement using an OR,
+    and us doing some unnecesary joins inside of a subquery.
+    
+    To fix this, we change the query to only ever query `GroupEnvironment` to get the first release.
+    There will always be a `GroupEnvironment.first_release_id` that matches `Group.first_release_id`, so
+    this will work fine.
+    
+    We did a fair bit of data checking to make sure this is correct historically. We found that out of
+    all 160MM or so groups, > 0.01% had no `GroupEnvironment`. We could backfill these, but since the
+    number is so small it might also be fine to just leave them, we'll investigate them further next
+    week.
+
+diff --git a/src/sentry/search/snuba/backend.py b/src/sentry/search/snuba/backend.py
+index 600929d829..122353c542 100644
+--- a/src/sentry/search/snuba/backend.py
++++ b/src/sentry/search/snuba/backend.py
+@@ -49,6 +49,21 @@ def unassigned_filter(unassigned, projects):
+     return query
+ 
+ 
++def first_release_all_environments_filter(version, projects):
++    try:
++        release_id = Release.objects.get(
++            organization=projects[0].organization_id, version=version
++        ).id
++    except Release.DoesNotExist:
++        release_id = -1
++    return Q(
++        # If no specific environments are supplied, we look at the
++        # first_release of any environment that the group has been
++        # seen in.
++        id__in=GroupEnvironment.objects.filter(first_release_id=release_id).values_list("group_id")
++    )
++
++
+ class Condition(object):
+     """\
+     Adds a single filter to a ``QuerySet`` object. Used with
+@@ -285,27 +300,7 @@ class EventsDatasetSnubaSearchBackend(SnubaSearchBackendBase):
+             queryset_conditions.update(
+                 {
+                     "first_release": QCallbackCondition(
+-                        lambda release_version: Q(
+-                            # if no specific environments are supplied, we either choose any
+-                            # groups/issues whose first release matches the given release_version,
+-                            Q(
+-                                first_release_id__in=Release.objects.filter(
+-                                    version=release_version,
+-                                    organization_id=projects[0].organization_id,
+-                                )
+-                            )
+-                            |
+-                            # or we choose any groups whose first occurrence in any environment and the latest release at
+-                            # the time of the groups' first occurrence matches the given
+-                            # release_version
+-                            Q(
+-                                id__in=GroupEnvironment.objects.filter(
+-                                    first_release__version=release_version,
+-                                    first_release__organization_id=projects[0].organization_id,
+-                                    environment__organization_id=projects[0].organization_id,
+-                                ).values_list("group_id")
+-                            )
+-                        )
++                        functools.partial(first_release_all_environments_filter, projects=projects)
+                     ),
+                     "first_seen": ScalarCondition("first_seen"),
+                 }
+diff --git a/tests/snuba/api/endpoints/test_organization_group_index.py b/tests/snuba/api/endpoints/test_organization_group_index.py
+index 4e7ddeda0f..e4faa1930f 100644
+--- a/tests/snuba/api/endpoints/test_organization_group_index.py
++++ b/tests/snuba/api/endpoints/test_organization_group_index.py
+@@ -369,22 +369,16 @@ class GroupListTest(APITestCase, SnubaTestCase):
+         release.add_project(project)
+         release.add_project(project2)
+         event = self.store_event(
+-            data={
+-                "tags": {"sentry:release": release.version},
+-                "timestamp": iso_format(before_now(seconds=1)),
+-            },
++            data={"release": release.version, "timestamp": iso_format(before_now(seconds=1))},
+             project_id=project.id,
+         )
+         event2 = self.store_event(
+-            data={
+-                "tags": {"sentry:release": release.version},
+-                "timestamp": iso_format(before_now(seconds=1)),
+-            },
++            data={"release": release.version, "timestamp": iso_format(before_now(seconds=1))},
+             project_id=project2.id,
+         )
+ 
+         with self.feature("organizations:global-views"):
+-            response = self.get_valid_response(**{"first-release": '"%s"' % release.version})
++            response = self.get_valid_response(**{"query": 'first-release:"%s"' % release.version})
+         issues = json.loads(response.content)
+         assert len(issues) == 2
+         assert int(issues[0]["id"]) == event2.group.id
+diff --git a/tests/snuba/api/endpoints/test_project_group_index.py b/tests/snuba/api/endpoints/test_project_group_index.py
+index 4ac9494c41..776ab28d63 100644
+--- a/tests/snuba/api/endpoints/test_project_group_index.py
++++ b/tests/snuba/api/endpoints/test_project_group_index.py
+@@ -275,9 +275,15 @@ class GroupListTest(APITestCase, SnubaTestCase):
+         release = Release.objects.create(organization=project.organization, version="12345")
+         release.add_project(project)
+         release.add_project(project2)
+-        group = self.create_group(checksum="a" * 32, project=project, first_release=release)
+-        self.create_group(checksum="b" * 32, project=project2, first_release=release)
+-        url = "%s?query=%s" % (self.path, quote('first-release:"%s"' % release.version))
++        group = self.store_event(
++            data={"release": release.version, "timestamp": iso_format(before_now(seconds=1))},
++            project_id=project.id,
++        ).group
++        self.store_event(
++            data={"release": release.version, "timestamp": iso_format(before_now(seconds=1))},
++            project_id=project2.id,
++        )
++        url = "%s?query=%s" % (self.path, 'first-release:"%s"' % release.version)
+         response = self.client.get(url, format="json")
+         issues = json.loads(response.content)
+         assert response.status_code == 200
+diff --git a/tests/snuba/search/test_backend.py b/tests/snuba/search/test_backend.py
+index 4d37d1fee0..956a6ccb19 100644
+--- a/tests/snuba/search/test_backend.py
++++ b/tests/snuba/search/test_backend.py
+@@ -1064,15 +1064,22 @@ class EventsSnubaSearchTest(TestCase, SnubaTestCase):
+         results = self.make_query(search_filter_query="first_release:%s" % release_1.version)
+         assert set(results) == set([])
+ 
+-        # mark group1's first_release to be release_1.
+-        # group1 should show up for the same query as the previous query (see above)
+-
+-        self.group1.first_release = release_1
+-        self.group1.save()
+-        self.store_group(self.group1)
++        # Create a new event so that we get a group in this release
++        group = self.store_event(
++            data={
++                "fingerprint": ["put-me-in-group9001"],
++                "event_id": "a" * 32,
++                "message": "hello",
++                "environment": "production",
++                "tags": {"server": "example.com"},
++                "release": release_1.version,
++                "stacktrace": {"frames": [{"module": "group1"}]},
++            },
++            project_id=self.project.id,
++        ).group
+ 
+         results = self.make_query(search_filter_query="first_release:%s" % release_1.version)
+-        assert set(results) == set([self.group1])
++        assert set(results) == set([group])
+ 
+     def test_first_release_environments(self):
+         results = self.make_query(

@@ -1,0 +1,697 @@
+commit bcc3e01b8bb7ed90eaee810d61188a3c62c2a29a
+Author: David Cramer <dcramer@gmail.com>
+Date:   Thu Oct 17 12:57:16 2019 -0700
+
+    feat(api): Allow optional default rules on project creation
+    
+    Add support for passing `default_rules=False` to the project creation endpoint, which will disable creating any default rules.
+
+diff --git a/src/sentry/api/endpoints/team_projects.py b/src/sentry/api/endpoints/team_projects.py
+index c4be5f1882..dc79eef4e4 100644
+--- a/src/sentry/api/endpoints/team_projects.py
++++ b/src/sentry/api/endpoints/team_projects.py
+@@ -35,6 +35,7 @@ class ProjectSerializer(serializers.Serializer):
+     name = serializers.CharField(max_length=64, required=True)
+     slug = serializers.RegexField(r"^[a-z0-9_\-]+$", max_length=50, required=False, allow_null=True)
+     platform = serializers.CharField(required=False, allow_blank=True, allow_null=True)
++    default_rules = serializers.BooleanField(required=False, initial=True)
+ 
+ 
+ # While currently the UI suggests teams are a parent of a project, in reality
+@@ -118,6 +119,7 @@ class TeamProjectsEndpoint(TeamEndpoint, EnvironmentMixin):
+         :param string name: the name for the new project.
+         :param string slug: optionally a slug for the new project.  If it's
+                             not provided a slug is generated from the name.
++        :param bool default_rules: create default rules (defaults to True)
+         :auth: required
+         """
+         serializer = ProjectSerializer(data=request.data)
+@@ -125,30 +127,38 @@ class TeamProjectsEndpoint(TeamEndpoint, EnvironmentMixin):
+         if serializer.is_valid():
+             result = serializer.validated_data
+ 
+-            try:
+-                with transaction.atomic():
+-                    project = Project.objects.create(
+-                        name=result["name"],
+-                        slug=result.get("slug"),
+-                        organization=team.organization,
+-                        platform=result.get("platform"),
++            with transaction.atomic():
++                try:
++                    with transaction.atomic():
++                        project = Project.objects.create(
++                            name=result["name"],
++                            slug=result.get("slug"),
++                            organization=team.organization,
++                            platform=result.get("platform"),
++                        )
++                except IntegrityError:
++                    return Response(
++                        {"detail": "A project with this slug already exists."}, status=409
+                     )
+-            except IntegrityError:
+-                return Response({"detail": "A project with this slug already exists."}, status=409)
+-            else:
+-                project.add_team(team)
+-
+-            # XXX: create sample event?
+-
+-            self.create_audit_entry(
+-                request=request,
+-                organization=team.organization,
+-                target_object=project.id,
+-                event=AuditLogEntryEvent.PROJECT_ADD,
+-                data=project.get_audit_log_data(),
+-            )
+-
+-            project_created.send_robust(project=project, user=request.user, sender=self)
++                else:
++                    project.add_team(team)
++
++                # XXX: create sample event?
++
++                self.create_audit_entry(
++                    request=request,
++                    organization=team.organization,
++                    target_object=project.id,
++                    event=AuditLogEntryEvent.PROJECT_ADD,
++                    data=project.get_audit_log_data(),
++                )
++
++                project_created.send(
++                    project=project,
++                    user=request.user,
++                    default_rules=result.get("default_rules", True),
++                    sender=self,
++                )
+ 
+             return Response(serialize(project, request.user), status=201)
+         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+diff --git a/src/sentry/receivers/core.py b/src/sentry/receivers/core.py
+index 03d168e267..c50aadd3c9 100644
+--- a/src/sentry/receivers/core.py
++++ b/src/sentry/receivers/core.py
+@@ -5,6 +5,7 @@ import logging
+ from click import echo
+ from django.conf import settings
+ from django.db import connections, transaction
++from django.contrib.auth.models import AnonymousUser
+ from django.db.utils import OperationalError, ProgrammingError
+ from django.db.models.signals import post_migrate, post_save
+ from functools import wraps
+@@ -12,7 +13,7 @@ from pkg_resources import parse_version as Version
+ 
+ from sentry import options
+ from sentry.models import Organization, OrganizationMember, Project, User, Team, ProjectKey
+-from sentry.utils import db
++from sentry.signals import project_created
+ 
+ PROJECT_SEQUENCE_FIX = """
+ SELECT setval('sentry_project_id_seq', (
+@@ -74,14 +75,21 @@ def create_default_project(id, name, slug, verbosity=2, **kwargs):
+         organization=org, slug="sentry", defaults={"name": "Sentry"}
+     )
+ 
+-    project = Project.objects.create(
+-        id=id, public=False, name=name, slug=slug, organization=team.organization, **kwargs
+-    )
+-    project.add_team(team)
++    with transaction.atomic():
++        project = Project.objects.create(
++            id=id, public=False, name=name, slug=slug, organization=team.organization, **kwargs
++        )
++        project.add_team(team)
++
++        project_created.send(
++            project=project,
++            user=user or AnonymousUser(),
++            default_rules=True,
++            sender=create_default_project,
++        )
+ 
+-    # HACK: manually update the ID after insert due to Postgres
+-    # sequence issues. Seriously, fuck everything about this.
+-    if db.is_postgres(project._state.db):
++        # HACK: manually update the ID after insert due to Postgres
++        # sequence issues. Seriously, fuck everything about this.
+         connection = connections[project._state.db]
+         cursor = connection.cursor()
+         cursor.execute(PROJECT_SEQUENCE_FIX)
+diff --git a/src/sentry/receivers/onboarding.py b/src/sentry/receivers/onboarding.py
+index 94de50410b..754edcbb08 100644
+--- a/src/sentry/receivers/onboarding.py
++++ b/src/sentry/receivers/onboarding.py
+@@ -1,5 +1,7 @@
+ from __future__ import print_function, absolute_import
+ 
++import logging
++
+ from django.db import IntegrityError, transaction
+ from django.db.models import Q
+ from django.utils import timezone
+@@ -58,9 +60,17 @@ def record_new_project(project, user, **kwargs):
+         user_id = default_user_id = user.id
+     else:
+         user = user_id = None
+-        default_user_id = (
+-            Organization.objects.get(id=project.organization_id).get_default_owner().id
+-        )
++        try:
++            default_user_id = (
++                Organization.objects.get(id=project.organization_id).get_default_owner().id
++            )
++        except IndexError:
++            logging.getLogger("sentry").warn(
++                "Cannot initiate onboarding for organization (%s) due to missing owners",
++                project.organization_id,
++            )
++            # XXX(dcramer): we cannot setup onboarding tasks without a user
++            return
+ 
+     analytics.record(
+         "project.created",
+diff --git a/src/sentry/receivers/rules.py b/src/sentry/receivers/rules.py
+index 1240015ffc..aacec9b602 100644
+--- a/src/sentry/receivers/rules.py
++++ b/src/sentry/receivers/rules.py
+@@ -1,8 +1,8 @@
+ from __future__ import absolute_import, print_function
+ 
+-from django.db.models.signals import post_save
++from sentry.signals import project_created
+ 
+-from sentry.models import Project, Rule
++from sentry.models import Rule
+ 
+ DEFAULT_RULE_LABEL = "Send a notification for new issues"
+ DEFAULT_RULE_DATA = {
+@@ -12,13 +12,9 @@ DEFAULT_RULE_DATA = {
+ }
+ 
+ 
+-def create_default_rules(instance, created=True, RuleModel=Rule, **kwargs):
+-    if not created:
+-        return
++def create_default_rules(project, default_rules=True, RuleModel=Rule, **kwargs):
++    if default_rules:
++        RuleModel.objects.create(project=project, label=DEFAULT_RULE_LABEL, data=DEFAULT_RULE_DATA)
+ 
+-    RuleModel.objects.create(project=instance, label=DEFAULT_RULE_LABEL, data=DEFAULT_RULE_DATA)
+ 
+-
+-post_save.connect(
+-    create_default_rules, sender=Project, dispatch_uid="create_default_rules", weak=False
+-)
++project_created.connect(create_default_rules, dispatch_uid="create_default_rules", weak=False)
+diff --git a/src/sentry/signals.py b/src/sentry/signals.py
+index 76d8a33a90..c3760b4607 100644
+--- a/src/sentry/signals.py
++++ b/src/sentry/signals.py
+@@ -62,7 +62,7 @@ event_processed = BetterSignal(providing_args=["project", "event"])
+ event_saved = BetterSignal(providing_args=["project"])
+ 
+ # Organization Onboarding Signals
+-project_created = BetterSignal(providing_args=["project", "user"])
++project_created = BetterSignal(providing_args=["project", "user", "default_rules"])
+ first_event_pending = BetterSignal(providing_args=["project", "user"])
+ first_event_received = BetterSignal(providing_args=["project", "event"])
+ member_invited = BetterSignal(providing_args=["member", "user"])
+diff --git a/src/sentry/testutils/factories.py b/src/sentry/testutils/factories.py
+index 40585679be..e9685bfdd5 100644
+--- a/src/sentry/testutils/factories.py
++++ b/src/sentry/testutils/factories.py
+@@ -12,6 +12,8 @@ import six
+ import warnings
+ from importlib import import_module
+ 
++from django.contrib.auth.models import AnonymousUser
++from django.db import transaction
+ from django.utils import timezone
+ from django.utils.text import slugify
+ from hashlib import sha1
+@@ -64,6 +66,7 @@ from sentry.models import (
+     SentryAppWebhookError,
+ )
+ from sentry.models.integrationfeature import Feature, IntegrationFeature
++from sentry.signals import project_created
+ from sentry.snuba.models import QueryAggregations
+ from sentry.utils import json
+ from sentry.utils.canonical import CanonicalKeyDict
+@@ -270,7 +273,7 @@ class Factories(object):
+         return env
+ 
+     @staticmethod
+-    def create_project(organization=None, teams=None, **kwargs):
++    def create_project(organization=None, teams=None, fire_project_created=False, **kwargs):
+         if not kwargs.get("name"):
+             kwargs["name"] = petname.Generate(2, " ", letters=10).title()
+         if not kwargs.get("slug"):
+@@ -278,10 +281,15 @@ class Factories(object):
+         if not organization and teams:
+             organization = teams[0].organization
+ 
+-        project = Project.objects.create(organization=organization, **kwargs)
+-        if teams:
+-            for team in teams:
+-                project.add_team(team)
++        with transaction.atomic():
++            project = Project.objects.create(organization=organization, **kwargs)
++            if teams:
++                for team in teams:
++                    project.add_team(team)
++            if fire_project_created:
++                project_created.send(
++                    project=project, user=AnonymousUser(), default_rules=True, sender=Factories
++                )
+         return project
+ 
+     @staticmethod
+diff --git a/src/sentry/testutils/fixtures.py b/src/sentry/testutils/fixtures.py
+index a79b6db66d..d572cf28e2 100644
+--- a/src/sentry/testutils/fixtures.py
++++ b/src/sentry/testutils/fixtures.py
+@@ -41,7 +41,9 @@ class Fixtures(object):
+ 
+     @cached_property
+     def project(self):
+-        return self.create_project(name="Bar", slug="bar", teams=[self.team])
++        return self.create_project(
++            name="Bar", slug="bar", teams=[self.team], fire_project_created=True
++        )
+ 
+     @cached_property
+     def environment(self):
+diff --git a/tests/sentry/api/endpoints/test_project_details.py b/tests/sentry/api/endpoints/test_project_details.py
+index 7b9c138714..800d8f5f8c 100644
+--- a/tests/sentry/api/endpoints/test_project_details.py
++++ b/tests/sentry/api/endpoints/test_project_details.py
+@@ -621,8 +621,10 @@ class CopyProjectSettingsTest(APITestCase):
+         self.assert_other_project_settings_not_changed()
+ 
+     def test_project_from_another_org(self):
+-        project = self.create_project()
+-        other_project = self.create_project(organization=self.create_organization())
++        project = self.create_project(fire_project_created=True)
++        other_project = self.create_project(
++            organization=self.create_organization(), fire_project_created=True
++        )
+         resp = self.client.put(self.path(project), data={"copy_from_project": other_project.id})
+         assert resp.status_code == 400
+         assert resp.data == {"copy_from_project": ["Project to copy settings from not found."]}
+@@ -630,7 +632,7 @@ class CopyProjectSettingsTest(APITestCase):
+         self.assert_settings_not_copied(other_project)
+ 
+     def test_project_does_not_exist(self):
+-        project = self.create_project()
++        project = self.create_project(fire_project_created=True)
+         resp = self.client.put(self.path(project), data={"copy_from_project": 1234567890})
+         assert resp.status_code == 400
+         assert resp.data == {"copy_from_project": ["Project to copy settings from not found."]}
+@@ -640,7 +642,7 @@ class CopyProjectSettingsTest(APITestCase):
+         user = self.create_user()
+         self.login_as(user=user)
+         team = self.create_team(members=[user])
+-        project = self.create_project(teams=[team])
++        project = self.create_project(teams=[team], fire_project_created=True)
+         OrganizationMember.objects.filter(user=user, organization=self.organization).update(
+             role="admin"
+         )
+@@ -663,7 +665,7 @@ class CopyProjectSettingsTest(APITestCase):
+         user = self.create_user()
+         self.login_as(user=user)
+         team = self.create_team(members=[user])
+-        project = self.create_project(teams=[team])
++        project = self.create_project(teams=[team], fire_project_created=True)
+         OrganizationMember.objects.filter(user=user, organization=self.organization).update(
+             role="admin"
+         )
+@@ -691,7 +693,7 @@ class CopyProjectSettingsTest(APITestCase):
+     @mock.patch("sentry.models.project.Project.copy_settings_from")
+     def test_copy_project_settings_fails(self, mock_copy_settings_from):
+         mock_copy_settings_from.return_value = False
+-        project = self.create_project()
++        project = self.create_project(fire_project_created=True)
+         resp = self.client.put(
+             self.path(project), data={"copy_from_project": self.other_project.id}
+         )
+diff --git a/tests/sentry/api/endpoints/test_project_rule_details.py b/tests/sentry/api/endpoints/test_project_rule_details.py
+index d39b79a0bd..84082143cc 100644
+--- a/tests/sentry/api/endpoints/test_project_rule_details.py
++++ b/tests/sentry/api/endpoints/test_project_rule_details.py
+@@ -13,8 +13,8 @@ class ProjectRuleDetailsTest(APITestCase):
+         self.login_as(user=self.user)
+ 
+         team = self.create_team()
+-        project1 = self.create_project(teams=[team], name="foo")
+-        self.create_project(teams=[team], name="bar")
++        project1 = self.create_project(teams=[team], name="foo", fire_project_created=True)
++        self.create_project(teams=[team], name="bar", fire_project_created=True)
+ 
+         rule = project1.rule_set.all()[0]
+ 
+@@ -36,8 +36,8 @@ class ProjectRuleDetailsTest(APITestCase):
+         self.login_as(user=self.user)
+ 
+         team = self.create_team()
+-        project1 = self.create_project(teams=[team], name="foo")
+-        self.create_project(teams=[team], name="bar")
++        project1 = self.create_project(teams=[team], name="foo", fire_project_created=True)
++        self.create_project(teams=[team], name="bar", fire_project_created=True)
+ 
+         rule = project1.rule_set.all()[0]
+         rule.update(environment_id=Environment.get_or_create(rule.project, "production").id)
+@@ -60,8 +60,8 @@ class ProjectRuleDetailsTest(APITestCase):
+         self.login_as(user=self.user)
+ 
+         team = self.create_team()
+-        project1 = self.create_project(teams=[team], name="foo")
+-        self.create_project(teams=[team], name="bar")
++        project1 = self.create_project(teams=[team], name="foo", fire_project_created=True)
++        self.create_project(teams=[team], name="bar", fire_project_created=True)
+ 
+         rule = project1.rule_set.all()[0]
+         rule.update(environment_id=None)
+diff --git a/tests/sentry/api/endpoints/test_team_projects.py b/tests/sentry/api/endpoints/test_team_projects.py
+new file mode 100644
+index 0000000000..4b2f19cf10
+--- /dev/null
++++ b/tests/sentry/api/endpoints/test_team_projects.py
+@@ -0,0 +1,78 @@
++from __future__ import absolute_import
++
++import six
++
++from sentry.models import Project, Rule
++from sentry.testutils import APITestCase
++
++
++class TeamProjectsListTest(APITestCase):
++    def test_simple(self):
++        user = self.create_user()
++        org = self.create_organization(owner=user)
++        team1 = self.create_team(organization=org, name="foo")
++        project1 = self.create_project(organization=org, teams=[team1])
++        team2 = self.create_team(organization=org, name="bar")
++        self.create_project(organization=org, teams=[team2])
++
++        path = u"/api/0/teams/{}/{}/projects/".format(org.slug, team1.slug)
++
++        self.login_as(user=user)
++
++        response = self.client.get(path)
++
++        assert response.status_code == 200, response.content
++        assert len(response.data) == 1
++        assert response.data[0]["id"] == six.text_type(project1.id)
++
++
++class TeamProjectsCreateTest(APITestCase):
++    def test_with_default_rules(self):
++        user = self.create_user()
++        org = self.create_organization(owner=user)
++        team1 = self.create_team(organization=org, name="foo")
++
++        path = u"/api/0/teams/{}/{}/projects/".format(org.slug, team1.slug)
++
++        self.login_as(user=user)
++
++        response = self.client.post(path, data={"name": "Test Project"})
++
++        assert response.status_code == 201, response.content
++        project = Project.objects.get(id=response.data["id"])
++        assert project.name == "Test Project"
++        assert project.slug
++
++        assert Rule.objects.filter(project=project).exists()
++
++    def test_without_default_rules(self):
++        user = self.create_user()
++        org = self.create_organization(owner=user)
++        team1 = self.create_team(organization=org, name="foo")
++
++        path = u"/api/0/teams/{}/{}/projects/".format(org.slug, team1.slug)
++
++        self.login_as(user=user)
++
++        response = self.client.post(path, data={"name": "Test Project", "default_rules": False})
++
++        assert response.status_code == 201, response.content
++        project = Project.objects.get(id=response.data["id"])
++        assert project.name == "Test Project"
++        assert project.slug
++
++        assert not Rule.objects.filter(project=project).exists()
++
++    def test_with_duplicate_explicit_slug(self):
++        user = self.create_user()
++        org = self.create_organization(owner=user)
++        team1 = self.create_team(organization=org, name="foo")
++        self.create_project(organization=org, teams=[team1], slug="test-project")
++
++        path = u"/api/0/teams/{}/{}/projects/".format(org.slug, team1.slug)
++
++        self.login_as(user=user)
++
++        response = self.client.post(path, data={"name": "Test Project", "slug": "test-project"})
++
++        assert response.status_code == 409, response.content
+diff --git a/tests/sentry/digests/test_utilities.py b/tests/sentry/digests/test_utilities.py
+index 0ec06371b0..cc3d342d54 100644
+--- a/tests/sentry/digests/test_utilities.py
++++ b/tests/sentry/digests/test_utilities.py
+@@ -32,7 +32,7 @@ class UtilitiesHelpersTestCase(TestCase, SnubaTestCase):
+         )
+ 
+     def test_get_event_from_groups_in_digest(self):
+-        project = self.create_project()
++        project = self.create_project(fire_project_created=True)
+         rule = project.rule_set.all()[0]
+ 
+         events = [
+@@ -160,7 +160,9 @@ class GetPersonalizedDigestsTestCase(TestCase, SnubaTestCase):
+         self.team2 = self.create_team()
+         self.team3 = self.create_team()
+ 
+-        self.project = self.create_project(teams=[self.team1, self.team2, self.team3])
++        self.project = self.create_project(
++            teams=[self.team1, self.team2, self.team3], fire_project_created=True
++        )
+ 
+         self.create_member(user=self.user1, organization=self.organization, teams=[self.team1])
+         self.create_member(user=self.user2, organization=self.organization, teams=[self.team2])
+@@ -266,7 +268,7 @@ class GetPersonalizedDigestsTestCase(TestCase, SnubaTestCase):
+ 
+     def test_team_without_members(self):
+         team = self.create_team()
+-        project = self.create_project(teams=[team])
++        project = self.create_project(teams=[team], fire_project_created=True)
+         ProjectOwnership.objects.create(
+             project_id=project.id,
+             schema=dump_schema([Rule(Matcher("path", "*.cpp"), [Owner("team", team.slug)])]),
+diff --git a/tests/sentry/incidents/test_logic.py b/tests/sentry/incidents/test_logic.py
+index 076b176e7c..4de43c24ca 100644
+--- a/tests/sentry/incidents/test_logic.py
++++ b/tests/sentry/incidents/test_logic.py
+@@ -87,9 +87,8 @@ class CreateIncidentTest(TestCase):
+         title = "hello"
+         query = "goodbye"
+         date_started = timezone.now()
+-        other_project = self.create_project()
++        other_project = self.create_project(fire_project_created=True)
+         other_group = self.create_group(project=other_project)
+-        self.record_event.reset_mock()
+         alert_rule = create_alert_rule(
+             self.organization,
+             [self.project],
+@@ -103,6 +102,7 @@ class CreateIncidentTest(TestCase):
+             1,
+         )
+ 
++        self.record_event.reset_mock()
+         incident = create_incident(
+             self.organization,
+             type=incident_type,
+@@ -313,7 +313,7 @@ class BulkGetIncidentEventStatsTest(TestCase, BaseIncidentEventStatsTest):
+             assert [r["count"] for r in result.data["data"]] == expected_results
+ 
+     def test_project(self):
+-        other_project = self.create_project()
++        other_project = self.create_project(fire_project_created=True)
+         other_incident = self.create_incident(
+             date_started=self.now - timedelta(minutes=5),
+             query="",
+@@ -373,7 +373,7 @@ class GetIncidentAggregatesTest(TestCase, BaseIncidentAggregatesTest):
+ 
+ class BulkGetIncidentAggregatesTest(TestCase, BaseIncidentAggregatesTest):
+     def test_projects(self):
+-        other_project = self.create_project()
++        other_project = self.create_project(fire_project_created=True)
+         other_incident = self.create_incident(
+             date_started=self.now - timedelta(minutes=5),
+             query="",
+@@ -807,7 +807,7 @@ class CreateAlertRuleTest(TestCase, BaseIncidentsTest):
+         assert alert_rule.query_subscriptions.get().project == self.project
+         assert alert_rule.include_all_projects == include_all_projects
+ 
+-        new_project = self.create_project()
++        new_project = self.create_project(fire_project_created=True)
+         alert_rule = self.create_alert_rule(
+             projects=[], include_all_projects=include_all_projects, excluded_projects=[self.project]
+         )
+@@ -884,7 +884,7 @@ class UpdateAlertRuleTest(TestCase, BaseIncidentsTest):
+         resolve_threshold = 800
+         threshold_period = 2
+ 
+-        updated_projects = [self.project, self.create_project()]
++        updated_projects = [self.project, self.create_project(fire_project_created=True)]
+ 
+         update_alert_rule(
+             self.alert_rule,
+@@ -946,7 +946,7 @@ class UpdateAlertRuleTest(TestCase, BaseIncidentsTest):
+     def test_delete_projects(self):
+         alert_rule = create_alert_rule(
+             self.organization,
+-            [self.project, self.create_project()],
++            [self.project, self.create_project(fire_project_created=True)],
+             "something",
+             AlertRuleThresholdType.ABOVE,
+             "level:error",
+@@ -962,7 +962,7 @@ class UpdateAlertRuleTest(TestCase, BaseIncidentsTest):
+     def test_new_updated_deleted_projects(self):
+         alert_rule = create_alert_rule(
+             self.organization,
+-            [self.project, self.create_project()],
++            [self.project, self.create_project(fire_project_created=True)],
+             "something",
+             AlertRuleThresholdType.ABOVE,
+             "level:error",
+@@ -973,7 +973,7 @@ class UpdateAlertRuleTest(TestCase, BaseIncidentsTest):
+             1,
+         )
+         query_update = "level:warning"
+-        new_project = self.create_project()
++        new_project = self.create_project(fire_project_created=True)
+         updated_projects = [self.project, new_project]
+         update_alert_rule(alert_rule, updated_projects, query=query_update)
+         updated_subscriptions = alert_rule.query_subscriptions.all()
+@@ -984,7 +984,7 @@ class UpdateAlertRuleTest(TestCase, BaseIncidentsTest):
+     def test_update_to_include_all(self):
+         orig_project = self.project
+         alert_rule = self.create_alert_rule(projects=[orig_project])
+-        new_project = self.create_project()
++        new_project = self.create_project(fire_project_created=True)
+         assert not QuerySubscription.objects.filter(
+             project=new_project, alert_rules=alert_rule
+         ).exists()
+@@ -996,7 +996,7 @@ class UpdateAlertRuleTest(TestCase, BaseIncidentsTest):
+     def test_update_to_include_all_with_exclude(self):
+         orig_project = self.project
+         alert_rule = self.create_alert_rule(projects=[orig_project])
+-        new_project = self.create_project()
++        new_project = self.create_project(fire_project_created=True)
+         excluded_project = self.create_project()
+         assert not QuerySubscription.objects.filter(
+             project=new_project, alert_rules=alert_rule
+@@ -1009,7 +1009,7 @@ class UpdateAlertRuleTest(TestCase, BaseIncidentsTest):
+         ) == set([orig_project, new_project])
+ 
+     def test_update_include_all_exclude_list(self):
+-        new_project = self.create_project()
++        new_project = self.create_project(fire_project_created=True)
+         projects = set([new_project, self.project])
+         alert_rule = self.create_alert_rule(include_all_projects=True)
+         assert (
+@@ -1028,7 +1028,7 @@ class UpdateAlertRuleTest(TestCase, BaseIncidentsTest):
+         )
+ 
+     def test_update_from_include_all(self):
+-        new_project = self.create_project()
++        new_project = self.create_project(fire_project_created=True)
+         projects = set([new_project, self.project])
+         alert_rule = self.create_alert_rule(include_all_projects=True)
+         assert (
+@@ -1139,7 +1139,7 @@ class CalculateIncidentStartTest(TestCase, BaseIncidentsTest):
+ 
+ class TestGetExcludedProjectsForAlertRule(TestCase):
+     def test(self):
+-        excluded = [self.create_project()]
++        excluded = [self.create_project(fire_project_created=True)]
+         alert_rule = self.create_alert_rule(
+             projects=[], include_all_projects=True, excluded_projects=excluded
+         )
+@@ -1147,7 +1147,7 @@ class TestGetExcludedProjectsForAlertRule(TestCase):
+         assert [exclusion.project for exclusion in exclusions] == excluded
+ 
+     def test_no_excluded(self):
+-        self.create_project()
++        self.create_project(fire_project_created=True)
+         alert_rule = self.create_alert_rule(projects=[], include_all_projects=True)
+         assert list(get_excluded_projects_for_alert_rule(alert_rule)) == []
+ 
+@@ -1172,7 +1172,7 @@ class CreateAlertRuleTriggerTest(TestCase):
+         assert not AlertRuleTriggerExclusion.objects.filter(alert_rule_trigger=trigger).exists()
+ 
+     def test_excluded_projects(self):
+-        excluded_project = self.create_project()
++        excluded_project = self.create_project(fire_project_created=True)
+         alert_rule = self.create_alert_rule(projects=[self.project, excluded_project])
+         trigger = create_alert_rule_trigger(
+             alert_rule,
+@@ -1186,7 +1186,7 @@ class CreateAlertRuleTriggerTest(TestCase):
+         assert exclusion.query_subscription.project == excluded_project
+ 
+     def test_excluded_projects_not_associated_with_rule(self):
+-        other_project = self.create_project()
++        other_project = self.create_project(fire_project_created=True)
+         alert_rule = self.create_alert_rule(projects=[self.project])
+         with self.assertRaises(ProjectsNotAssociatedWithAlertRuleError):
+             create_alert_rule_trigger(
+@@ -1240,7 +1240,7 @@ class UpdateAlertRuleTriggerTest(TestCase):
+             update_alert_rule_trigger(trigger, label=label)
+ 
+     def test_exclude_projects(self):
+-        other_project = self.create_project()
++        other_project = self.create_project(fire_project_created=True)
+ 
+         alert_rule = self.create_alert_rule(projects=[other_project, self.project])
+         trigger = create_alert_rule_trigger(
+@@ -1251,7 +1251,7 @@ class UpdateAlertRuleTriggerTest(TestCase):
+ 
+     def test_complex_exclude_projects(self):
+         excluded_project = self.create_project()
+-        other_project = self.create_project()
++        other_project = self.create_project(fire_project_created=True)
+ 
+         alert_rule = self.create_alert_rule(
+             projects=[excluded_project, self.project, other_project]
+@@ -1271,7 +1271,7 @@ class UpdateAlertRuleTriggerTest(TestCase):
+         assert set(excluded_projects) == set([other_project, excluded_project])
+ 
+     def test_excluded_projects_not_associated_with_rule(self):
+-        other_project = self.create_project()
++        other_project = self.create_project(fire_project_created=True)
+         alert_rule = self.create_alert_rule(projects=[self.project])
+         trigger = create_alert_rule_trigger(
+             alert_rule, "hi", AlertRuleThresholdType.ABOVE, 1000, 400
+diff --git a/tests/sentry/models/test_project.py b/tests/sentry/models/test_project.py
+index d70323d1f9..b1a7b7b48f 100644
+--- a/tests/sentry/models/test_project.py
++++ b/tests/sentry/models/test_project.py
+@@ -277,14 +277,14 @@ class CopyProjectSettingsTest(TestCase):
+         assert rules[0].label == "Send a notification for new issues"
+ 
+     def test_simple(self):
+-        project = self.create_project()
++        project = self.create_project(fire_project_created=True)
+ 
+         assert project.copy_settings_from(self.other_project.id)
+         self.assert_settings_copied(project)
+         self.assert_other_project_settings_not_changed()
+ 
+     def test_copy_with_previous_settings(self):
+-        project = self.create_project()
++        project = self.create_project(fire_project_created=True)
+         project.update_option("sentry:resolve_age", 200)
+         ProjectTeam.objects.create(team=self.create_team(), project=project)
+         self.create_environment(project=project)

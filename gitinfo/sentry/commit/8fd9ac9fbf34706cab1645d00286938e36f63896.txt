@@ -1,0 +1,502 @@
+commit 8fd9ac9fbf34706cab1645d00286938e36f63896
+Author: Radu Woinaroski <5281987+RaduW@users.noreply.github.com>
+Date:   Mon Sep 9 14:17:01 2019 +0200
+
+    feat(ingest): Add kafka event consumer
+    
+    Add feature to consume processed events coming on kafka topics from Relay.
+
+diff --git a/src/sentry/conf/server.py b/src/sentry/conf/server.py
+index ae48980373..64c5b17a22 100644
+--- a/src/sentry/conf/server.py
++++ b/src/sentry/conf/server.py
+@@ -1676,6 +1676,9 @@ KAFKA_CLUSTERS = {
+ KAFKA_EVENTS = "events"
+ KAFKA_OUTCOMES = "outcomes"
+ KAFKA_SNUBA_QUERY_SUBSCRIPTIONS = "snuba-query-subscriptions"
++KAFKA_INGEST_EVENTS = "ingest-events"
++KAFKA_INGEST_ATTACHMENTS = "ingest-attachments"
++KAFKA_INGEST_TRANSACTIONS = "ingest-transactions"
+ 
+ KAFKA_TOPICS = {
+     KAFKA_EVENTS: {"cluster": "default", "topic": KAFKA_EVENTS},
+@@ -1684,6 +1687,12 @@ KAFKA_TOPICS = {
+         "cluster": "default",
+         "topic": KAFKA_SNUBA_QUERY_SUBSCRIPTIONS,
+     },
++    # Topic for receiving simple events (error events without attachments) from Relay
++    KAFKA_INGEST_EVENTS: {"cluster": "default", "topic": KAFKA_INGEST_EVENTS},
++    # Topic for receiving 'complex' events (error events with attachments) from Relay
++    KAFKA_INGEST_ATTACHMENTS: {"cluster": "default", "topic": KAFKA_INGEST_ATTACHMENTS},
++    # Topic for receiving transaction events (APM events) from Relay
++    KAFKA_INGEST_TRANSACTIONS: {"cluster": "default", "topic": KAFKA_INGEST_TRANSACTIONS},
+ }
+ 
+ # Enable this to use the legacy Slack Workspace Token apps. You will likely
+diff --git a/src/sentry/coreapi.py b/src/sentry/coreapi.py
+index c8e455db3b..fb6c3916fc 100644
+--- a/src/sentry/coreapi.py
++++ b/src/sentry/coreapi.py
+@@ -268,7 +268,11 @@ class SecurityAuthHelper(AbstractAuthHelper):
+ 
+ 
+ def cache_key_for_event(data):
+-    return u"e:{1}:{0}".format(data["project"], data["event_id"])
++    return cache_key_from_project_id_and_event_id(data["project"], data["event_id"])
++
++
++def cache_key_from_project_id_and_event_id(project_id, event_id):
++    return u"e:{1}:{0}".format(project_id, event_id)
+ 
+ 
+ def decompress_deflate(encoded_data):
+diff --git a/src/sentry/ingest_consumer.py b/src/sentry/ingest_consumer.py
+new file mode 100644
+index 0000000000..7d64952e48
+--- /dev/null
++++ b/src/sentry/ingest_consumer.py
+@@ -0,0 +1,172 @@
++from __future__ import absolute_import
++
++import logging
++import msgpack
++import signal
++from contextlib import contextmanager
++
++from django.conf import settings
++from django.core.cache import cache
++import confluent_kafka as kafka
++
++from sentry.coreapi import cache_key_from_project_id_and_event_id
++from sentry.cache import default_cache
++from sentry.tasks.store import preprocess_event
++
++logger = logging.getLogger(__name__)
++
++
++class ConsumerType(object):
++    """
++    Defines the types of ingestion consumers
++    """
++
++    Events = "events"  # consumes simple events ( from the Events topic)
++    Attachments = "attachments"  # consumes events with attachments ( from the Attachments topic)
++    Transactions = "transactions"  # consumes transaction events ( from the Transactions topic)
++
++    @staticmethod
++    def get_topic_name(consumer_type, settings):
++        if consumer_type == ConsumerType.Events:
++            return settings.KAFKA_INGEST_EVENTS
++        elif consumer_type == ConsumerType.Attachments:
++            return settings.KAFKA_INGEST_ATTACHMENTS
++        elif consumer_type == ConsumerType.Transactions:
++            return settings.KAFKA_INGEST_TRANSACTIONS
++        raise ValueError("Invalid consumer type", consumer_type)
++
++
++def _create_consumer(consumer_group, consumer_type, settings):
++    """
++    Creates a kafka consumer based on the
++    :param consumer_group:
++    :return:
++    """
++    topic_name = ConsumerType.get_topic_name(consumer_type, settings)
++    cluster_name = settings.KAFKA_TOPICS[topic_name]["cluster"]
++    bootstrap_servers = settings.KAFKA_CLUSTERS[cluster_name]["bootstrap.servers"]
++
++    consumer_configuration = {
++        "bootstrap.servers": bootstrap_servers,
++        "group.id": consumer_group,
++        "enable.auto.commit": "false",  # we commit manually
++        "enable.auto.offset.store": "true",  # we let the broker keep count of the current offset (when committing)
++        "enable.partition.eof": "false",  # stop EOF errors when we read all messages in the topic
++        "default.topic.config": {"auto.offset.reset": "earliest"},
++    }
++
++    return kafka.Consumer(consumer_configuration)
++
++
++@contextmanager
++def set_termination_request_handlers(handler):
++    # hook the new handlers
++    old_sigint = signal.signal(signal.SIGINT, handler)
++    old_sigterm = signal.signal(signal.SIGTERM, handler)
++    try:
++        # run the code inside the with context ( with the hooked handler)
++        yield
++    finally:
++        # restore the old handlers when exiting the with context
++        signal.signal(signal.SIGINT, old_sigint)
++        signal.signal(signal.SIGTERM, old_sigterm)
++
++
++def run_ingest_consumer(
++    commit_batch_size,
++    consumer_group,
++    consumer_type,
++    max_batch_time_seconds,
++    is_shutdown_requested=lambda: False,
++):
++    """
++    Handles events coming via a kafka queue.
++
++    The events should have already been processed (normalized... ) upstream (by Relay).
++
++    :param commit_batch_size: the number of message the consumer will try to process/commit in one loop
++    :param consumer_group: kafka consumer group name
++    :param consumer_type: an enumeration defining the types of ingest messages see `ConsumerType`
++    :param max_batch_time_seconds: the maximum number of seconds a consume operation will be blocked waiting
++        for the specified commit_batch_size number of messages to appear in the queue before it returns. At the
++        end of the specified time the consume operation will return however many messages it has ( including
++        an empty array if no new messages are available).
++    :param is_shutdown_requested: Callable[[],bool] predicate checked after each loop, if it returns
++        True the forwarder stops (by default is lambda: False). In normal operation this should be left to default.
++        For unit testing it offers a way to cleanly stop the forwarder after some particular condition is achieved.
++    """
++
++    logger.debug("Starting ingest-consumer...")
++    consumer = _create_consumer(consumer_group, consumer_type, settings)
++
++    consumer.subscribe([ConsumerType.get_topic_name(consumer_type, settings)])
++    # setup a flag to mark termination signals received, see below why we use an array
++    termination_signal_received = [False]
++
++    def termination_signal_handler(_sig_id, _frame):
++        """
++        Function to use a hook for SIGINT and SIGTERM
++
++        This signal handler only remembers that the signal was emitted.
++        The batch processing loop detects that the signal was emitted
++        and stops once the whole batch is processed.
++        """
++        # We need to use an array so that terminal_signal_received is not a
++        # local variable assignment, but a lookup in the clojure's outer scope.
++        termination_signal_received[0] = True
++
++    with set_termination_request_handlers(termination_signal_handler):
++        while not (is_shutdown_requested() or termination_signal_received[0]):
++            # get up to commit_batch_size messages
++            messages = consumer.consume(
++                num_messages=commit_batch_size, timeout=max_batch_time_seconds
++            )
++
++            for message in messages:
++                message_error = message.error()
++                if message_error is not None:
++                    logger.error(
++                        "Received message with error on %s, error:'%s'",
++                        consumer_type,
++                        message_error,
++                    )
++                    raise ValueError(
++                        "Bad message received from consumer", consumer_type, message_error
++                    )
++
++                message = msgpack.unpackb(message.value(), use_list=False)
++                body = message["payload"]
++                start_time = float(message["start_time"])
++                event_id = message["event_id"]
++                project_id = message["project_id"]
++
++                # check that we haven't already processed this event (a previous instance of the forwarder
++                # died before it could commit the event queue offset)
++                deduplication_key = "ev:{}:{}".format(project_id, event_id)
++                if cache.get(deduplication_key) is not None:
++                    logger.warning(
++                        "pre-process-forwarder detected a duplicated event"
++                        " with id:%s for project:%s.",
++                        event_id,
++                        project_id,
++                    )
++                    continue
++
++                cache_key = cache_key_from_project_id_and_event_id(
++                    project_id=project_id, event_id=event_id
++                )
++                cache_timeout = 3600
++                default_cache.set(cache_key, body, cache_timeout, raw=True)
++                preprocess_event.delay(
++                    cache_key=cache_key, start_time=start_time, event_id=event_id
++                )
++
++                # remember for an 1 hour that we saved this event (deduplication protection)
++                cache.set(deduplication_key, "", 3600)
++
++            if len(messages) > 0:
++                # we have read some messages in the previous consume, commit the offset
++                consumer.commit(asynchronous=False)
++
++    logger.debug("Closing ingest-consumer %s...", consumer_type)
++    consumer.close()
+diff --git a/src/sentry/runner/commands/run.py b/src/sentry/runner/commands/run.py
+index 164b590c65..919297fe76 100644
+--- a/src/sentry/runner/commands/run.py
++++ b/src/sentry/runner/commands/run.py
+@@ -354,3 +354,55 @@ def query_subscription_consumer(**options):
+     signal.signal(signal.SIGINT, handler)
+ 
+     subscriber.run()
++
++
++@run.command("ingest-consumer")
++@log_options()
++@click.option(
++    "--consumer-type",
++    default=None,
++    help="Specify which type of consumer to create, i.e. from which topic to consume messages.",
++    type=click.Choice(["events", "transactions", "attachments"]),
++)
++@click.option(
++    "--group", default="ingest-consumer", help="Kafka consumer group for the ingest consumer. "
++)
++@click.option(
++    "--commit-batch-size",
++    default=100,
++    type=int,
++    help="How many messages to process before committing offsets.",
++)
++@click.option(
++    "--max-batch-time-ms",
++    default=100,
++    type=int,
++    help="Timeout (in milliseconds) for a consume batch operation. Max time the kafka consumer will wait"
++    "before returning the available messages in the topic.",
++)
++@configuration
++def ingest_consumer(**options):
++    """
++    Runs an "ingest consumer" task.
++
++    The "ingest consumer" tasks read events from a kafka topic (coming from Relay) and schedules
++    process event celery tasks for them
++    """
++    from sentry.ingest_consumer import ConsumerType, run_ingest_consumer
++
++    consumer_type = options["consumer_type"]
++    if consumer_type == "events":
++        consumer_type = ConsumerType.Events
++    elif consumer_type == "transactions":
++        consumer_type = ConsumerType.Transactions
++    elif consumer_type == "attachments":
++        consumer_type = ConsumerType.Attachments
++
++    max_batch_time_seconds = options["max-batch-time-ms"] / 1000.0
++
++    run_ingest_consumer(
++        commit_batch_size=options["commit_batch_size"],
++        consumer_group=options["group"],
++        consumer_type=consumer_type,
++        max_batch_time_seconds=max_batch_time_seconds,
++    )
+diff --git a/src/sentry/utils/pytest/__init__.py b/src/sentry/utils/pytest/__init__.py
+index 890ae44e7e..d9bd552be1 100644
+--- a/src/sentry/utils/pytest/__init__.py
++++ b/src/sentry/utils/pytest/__init__.py
+@@ -5,4 +5,5 @@ pytest_plugins = [
+     "sentry.utils.pytest.selenium",
+     "sentry.utils.pytest.fixtures",
+     "sentry.utils.pytest.unittest",
++    "sentry.utils.pytest.kafka",
+ ]
+diff --git a/src/sentry/utils/pytest/kafka.py b/src/sentry/utils/pytest/kafka.py
+new file mode 100644
+index 0000000000..f0236aff9f
+--- /dev/null
++++ b/src/sentry/utils/pytest/kafka.py
+@@ -0,0 +1,74 @@
++from __future__ import absolute_import
++
++import pytest
++
++import six
++from confluent_kafka.admin import AdminClient
++from confluent_kafka import Producer
++
++_EVENTS_TOPIC_NAME = "test-ingest-events"
++_ATTACHMENTS_TOPIC_NAME = "test-ingest-attachments"
++_TRANSACTIONS_TOPIC_NAME = "test-ingest-transactions"
++
++
++def _get_topic_name(base_topic_name, test_name):
++    if test_name is None:
++        return base_topic_name
++    else:
++        return "{}--{}".format(_EVENTS_TOPIC_NAME, test_name)
++
++
++@pytest.fixture
++def kafka_producer():
++    def inner(settings):
++        producer = Producer(
++            {"bootstrap.servers": settings.KAFKA_CLUSTERS["default"]["bootstrap.servers"]}
++        )
++        return producer
++
++    return inner
++
++
++class _KafkaAdminWrapper:
++    def __init__(self, request, settings):
++        self.test_name = request.node.name
++
++        kafka_config = {}
++        for key, val in six.iteritems(settings.KAFKA_CLUSTERS["default"]):
++            kafka_config[key] = val
++
++        self.admin_client = AdminClient(kafka_config)
++
++    def delete_events_topic(self):
++        self._delete_topic(_EVENTS_TOPIC_NAME)
++
++    def _delete_topic(self, base_topic_name):
++        topic_name = _get_topic_name(base_topic_name, self.test_name)
++        try:
++            futures_dict = self.admin_client.delete_topics([topic_name])
++            self._sync_wait_on_result(futures_dict)
++        except Exception:  # noqa
++            pass  # noqa nothing to do (probably there was no topic to start with)
++
++    def _sync_wait_on_result(self, futures_dict):
++        """
++        Synchronously waits on all futures returned by the admin_client api.
++        :param futures_dict: the api returns a dict of futures that can be awaited
++        """
++        # just wait on all futures returned by the async operations of the admin_client
++        for f in futures_dict.values():
++            f.result(5)  # wait up to 5 seconds for the admin operation to finish
++
++
++@pytest.fixture
++def kafka_admin(request):
++    """
++    A fixture representing a simple wrapper over the admin interface
++    :param request: the pytest request
++    :return: a Kafka admin wrapper
++    """
++
++    def inner(settings):
++        return _KafkaAdminWrapper(request, settings)
++
++    return inner
+diff --git a/tests/relay/__init__.py b/tests/relay/__init__.py
+new file mode 100644
+index 0000000000..c3961685ab
+--- /dev/null
++++ b/tests/relay/__init__.py
+@@ -0,0 +1 @@
++from __future__ import absolute_import
+diff --git a/tests/relay/test_ingest_consumer.py b/tests/relay/test_ingest_consumer.py
+new file mode 100644
+index 0000000000..0a2ba2e27a
+--- /dev/null
++++ b/tests/relay/test_ingest_consumer.py
+@@ -0,0 +1,109 @@
++from __future__ import absolute_import
++
++import datetime
++import time
++import logging
++
++import msgpack
++import pytest
++
++from sentry.event_manager import EventManager
++from sentry.ingest_consumer import ConsumerType, run_ingest_consumer
++from sentry.models.event import Event
++from sentry.testutils.factories import Factories
++from django.conf import settings
++
++logger = logging.getLogger(__name__)
++
++
++def _get_test_message(project):
++    """
++    creates a test message to be inserted in a kafka queue
++    """
++    now = datetime.datetime.now()
++    # the event id should be 32 digits
++    event_id = "{}".format(now.strftime("000000000000%Y%m%d%H%M%S%f"))
++    message_text = "some message {}".format(event_id)
++    project_id = project.id  # must match the project id set up by the test fixtures
++    event = {
++        "message": message_text,
++        "extra": {"the_id": event_id},
++        "project_id": project_id,
++        "event_id": event_id,
++    }
++
++    em = EventManager(event, project=project)
++    em.normalize()
++    normalized_event = dict(em.get_data())
++    message = {
++        "ty": (0, ()),
++        "start_time": time.time(),
++        "event_id": event_id,
++        "project_id": 1,
++        "payload": normalized_event,
++    }
++
++    val = msgpack.packb(message)
++    return val, event_id
++
++
++def _shutdown_requested(max_secs, num_events):
++    """
++    Requests a shutdown after the specified interval has passed or the specified number
++    of events are detected
++    :param max_secs: number of seconds after which to request a shutdown
++    :param num_events: number of events after which to request a shutdown
++    :return: True if a shutdown is requested False otherwise
++    """
++
++    def inner():
++        end_time = time.time()
++        if end_time - start_time > max_secs:
++            logger.debug("Shutdown requested because max secs exceeded")
++            return True
++        elif Event.objects.count() >= num_events:
++            logger.debug("Shutdown requested because num events reached")
++            return True
++        else:
++            return False
++
++    start_time = time.time()
++    return inner
++
++
++@pytest.mark.django_db
++def test_ingest_consumer_reads_from_topic_and_calls_celery_task(
++    task_runner, kafka_producer, kafka_admin
++):
++    consumer_group = "test-consumer"
++    admin = kafka_admin(settings)
++    admin.delete_events_topic()
++    producer = kafka_producer(settings)
++
++    organization = Factories.create_organization()
++    project = Factories.create_project(organization=organization)
++
++    topic_event_name = ConsumerType.get_topic_name(ConsumerType.Events, settings)
++
++    event_ids = set()
++    for i in range(1, 4):
++        message, event_id = _get_test_message(project)
++        event_ids.add(event_id)
++        producer.produce(topic_event_name, message)
++
++    with task_runner():
++        run_ingest_consumer(
++            commit_batch_size=2,
++            consumer_group=consumer_group,
++            consumer_type=ConsumerType.Events,
++            max_batch_time_seconds=0.1,
++            is_shutdown_requested=_shutdown_requested(max_secs=10, num_events=3),
++        )
++
++    # check that we got the messages
++    assert Event.objects.count() == 3
++    for event_id in event_ids:
++        message = Event.objects.get(event_id=event_id)
++        assert message is not None
++        # check that the data has not been scrambled
++        assert message.data["extra"]["the_id"] == event_id

@@ -1,0 +1,754 @@
+commit eac69c8952c358450de2a81bb6b300bb7eb6e183
+Author: Dan Fuller <dfuller@sentry.io>
+Date:   Thu Aug 22 23:02:10 2019 -0700
+
+    feat(api): Use results from snuba consumer to trigger/resolve incidents (SEN-900, SEN-901)
+    
+    This introduces `SubscriptionProcessor`, which takes incoming subscription updates, compares them to
+    the associated alert rule and determines whether to create an incident, resolve or do nothing.
+    
+    For the moment all alert rules have a `threshold_period` of 1, meaning that we'll alert/resolve as
+    soon as we hit those thresholds. In the future this may be configurable, so that the subscription
+    needs to hit the thresholds for multiple updates consecutively. We keep track of how many
+    consecutive hits we've had in Redis, as well as the last update time.
+    
+    Last update allows record processing to be idempotent. Any received updates with a timestamp below
+    the last update will just be ignored, which should guarantee that we'll process each record in order
+    and only once. There's a potential slight race condition where after we update the records in Redis
+    we might still error (keyboard interrupt maybe?) and then roll back the transaction. I think in
+    practice this shouldn't be an issue.
+
+diff --git a/src/sentry/incidents/logic.py b/src/sentry/incidents/logic.py
+index e2475dd7c0..d3f5e7fba5 100644
+--- a/src/sentry/incidents/logic.py
++++ b/src/sentry/incidents/logic.py
+@@ -66,10 +66,12 @@ def create_incident(
+     query,
+     date_started=None,
+     date_detected=None,
++    # TODO: Probably remove detection_uuid?
+     detection_uuid=None,
+     projects=None,
+     groups=None,
+     user=None,
++    alert_rule=None,
+ ):
+     if groups:
+         group_projects = [g.project for g in groups]
+@@ -93,6 +95,7 @@ def create_incident(
+             query=query,
+             date_started=date_started,
+             date_detected=date_detected,
++            alert_rule=alert_rule,
+         )
+         if projects:
+             IncidentProject.objects.bulk_create(
+diff --git a/src/sentry/incidents/subscription_processor.py b/src/sentry/incidents/subscription_processor.py
+new file mode 100644
+index 0000000000..2b3cd31d4d
+--- /dev/null
++++ b/src/sentry/incidents/subscription_processor.py
+@@ -0,0 +1,231 @@
++from __future__ import absolute_import
++
++import logging
++import operator
++from datetime import timedelta
++
++from django.conf import settings
++from django.db import transaction
++
++from sentry.incidents.logic import (
++    alert_aggregation_to_snuba,
++    create_incident,
++    update_incident_status,
++)
++from sentry.incidents.models import (
++    AlertRule,
++    AlertRuleAggregations,
++    AlertRuleThresholdType,
++    Incident,
++    IncidentStatus,
++    IncidentType,
++)
++from sentry.utils import metrics, redis
++from sentry.utils.dates import to_datetime
++
++
++logger = logging.getLogger(__name__)
++REDIS_TTL = int(timedelta(days=7).total_seconds())
++ALERT_RULE_BASE_STAT_KEY = "{alert_rule:%s}:%%s"
++ALERT_RULE_STAT_KEYS = ("last_update", "alert_triggered", "resolve_triggered")
++
++
++class SubscriptionProcessor(object):
++    """
++    Class for processing subscription updates for an alert rule. Accepts a subscription
++    and then can process one or more updates via `process_update`. Keeps track of how
++    close an alert rule is to alerting, creates an incident, and auto resolves the
++    incident if a resolve threshold is set and the threshold is triggered.
++    """
++
++    # Each entry is a tuple in format (<alert_operator>, <resolve_operator>)
++    THRESHOLD_TYPE_OPERATORS = {
++        AlertRuleThresholdType.ABOVE: (operator.gt, operator.lt),
++        AlertRuleThresholdType.BELOW: (operator.lt, operator.gt),
++    }
++
++    def __init__(self, subscription):
++        self.subscription = subscription
++        try:
++            self.alert_rule = AlertRule.objects.get(query_subscription=subscription)
++        except AlertRule.DoesNotExist:
++            return
++
++        self.last_update, self.alert_triggers, self.resolve_triggers = get_alert_rule_stats(
++            self.alert_rule
++        )
++        self.orig_alert_triggers = self.alert_triggers
++        self.orig_resolve_triggers = self.resolve_triggers
++
++    @property
++    def active_incident(self):
++        if not hasattr(self, "_active_incident"):
++            try:
++                # Fetch the active incident if one exists for this alert rule.
++                # TODO: Probably worth adding an index to optimize this, since could
++                # potentially be called frequently and could be slow if we have
++                # a lot of incidents created by a rule.
++                self._active_incident = Incident.objects.filter(
++                    type=IncidentType.ALERT_TRIGGERED.value,
++                    status=IncidentStatus.OPEN.value,
++                    alert_rule=self.alert_rule,
++                ).order_by("-date_added")[0]
++            except IndexError:
++                self._active_incident = None
++        return self._active_incident
++
++    @active_incident.setter
++    def active_incident(self, active_incident):
++        self._active_incident = active_incident
++
++    def process_update(self, subscription_update):
++        if not hasattr(self, "alert_rule"):
++            # If the alert rule has been removed then just skip
++            metrics.incr("incidents.alert_rules.no_alert_rule_for_subscription")
++            logger.error(
++                "Received an update for a subscription, but no associated alert rule exists"
++            )
++            # TODO: Delete subscription here.
++            return
++
++        if subscription_update["timestamp"] <= self.last_update:
++            metrics.incr("incidents.alert_rules.skipping_already_processed_update")
++            return
++
++        self.last_update = subscription_update["timestamp"]
++
++        # TODO: At the moment we only have individual aggregations. Handle multiple
++        # later
++        aggregation = AlertRuleAggregations(self.alert_rule.aggregations[0])
++        aggregation_name = alert_aggregation_to_snuba[aggregation][2]
++        aggregation_value = subscription_update["values"][aggregation_name]
++
++        alert_operator, resolve_operator = self.THRESHOLD_TYPE_OPERATORS[
++            AlertRuleThresholdType(self.alert_rule.threshold_type)
++        ]
++
++        if (
++            alert_operator(aggregation_value, self.alert_rule.alert_threshold)
++            and not self.active_incident
++        ):
++            with transaction.atomic():
++                self.trigger_alert_threshold()
++        elif (
++            # TODO: Need to make `resolve_threshold` nullable so that it can be
++            # optional
++            self.alert_rule.resolve_threshold is not None
++            and resolve_operator(aggregation_value, self.alert_rule.resolve_threshold)
++            and self.active_incident
++        ):
++            with transaction.atomic():
++                self.trigger_resolve_threshold()
++        else:
++            self.alert_triggers = 0
++            self.resolve_triggers = 0
++
++        # We update the rule stats here after we commit the transaction. This guarantees
++        # that we'll never miss an update, since we'll never roll back if the process
++        # is killed here. The trade-off is that we might process an update twice. Mostly
++        # this will have no effect, but if someone manages to close a triggered incident
++        # before the next one then we might alert twice.
++        self.update_alert_rule_stats()
++
++    def trigger_alert_threshold(self):
++        """
++        Called when a subscription update exceeds the value defined in the
++        `alert_rule.alert_threshold`, and there is not already an active incident. Increments the
++        count of how many times we've consecutively exceeded the threshold, and if
++        above the `threshold_period` defined in the alert rule then create an incident.
++        :return:
++        """
++        self.alert_triggers += 1
++        if self.alert_triggers >= self.alert_rule.threshold_period:
++            detected_at = to_datetime(self.last_update)
++            self.active_incident = create_incident(
++                self.alert_rule.project.organization,
++                IncidentType.ALERT_TRIGGERED,
++                # TODO: Include more info in name?
++                self.alert_rule.name,
++                alert_rule=self.alert_rule,
++                # TODO: Incidents need to keep track of which metric to display
++                query=self.subscription.query,
++                date_started=detected_at,
++                date_detected=detected_at,
++                projects=[self.alert_rule.project],
++            )
++            # TODO: We should create an audit log, and maybe something that keeps
++            # all of the details available for showing on the incident. Might be a json
++            # blob or w/e? Or might be able to use the audit log.
++
++            # We now set this threshold to 0. We don't need to count it anymore
++            # once we've triggered an incident.
++            self.alert_triggers = 0
++
++    def trigger_resolve_threshold(self):
++        """
++        Called when a subscription update exceeds the value defined in
++        `alert_rule.resolve_threshold` and there's a current active incident.
++        :return:
++        """
++        self.resolve_triggers += 1
++        if self.resolve_triggers >= self.alert_rule.threshold_period:
++            update_incident_status(self.active_incident, IncidentStatus.CLOSED)
++            self.resolve_triggers = 0
++            self.active_incident = None
++
++    def update_alert_rule_stats(self):
++        """
++        Updates stats about the alert rule, if they're changed.
++        :return:
++        """
++        kwargs = {}
++        if self.alert_triggers != self.orig_alert_triggers:
++            self.orig_alert_triggers = kwargs["alert_triggers"] = self.alert_triggers
++        if self.resolve_triggers != self.orig_resolve_triggers:
++            self.orig_resolve_trigger = kwargs["resolve_triggers"] = self.resolve_triggers
++
++        update_alert_rule_stats(self.alert_rule, self.last_update, **kwargs)
++
++
++def build_alert_rule_stat_keys(alert_rule):
++    key_base = ALERT_RULE_BASE_STAT_KEY % alert_rule.id
++    return [key_base % stat_key for stat_key in ALERT_RULE_STAT_KEYS]
++
++
++def get_alert_rule_stats(alert_rule):
++    """
++    Fetches stats about the alert rule
++    :return: A tuple containing the stats about the alert rule.
++     - last_update: Int representing the timestamp the rule was last updated
++     - alert_triggered: Int representing how many consecutive times the rule has
++       triggered the alert threshold
++     - resolve_triggered: Int representing how many consecutive times the rule has
++       triggered the resolve threshold
++    """
++    results = get_redis_client().mget(build_alert_rule_stat_keys(alert_rule))
++    return tuple(0 if result is None else int(result) for result in results)
++
++
++def update_alert_rule_stats(alert_rule, last_update, alert_triggers=None, resolve_triggers=None):
++    """
++    Updates stats about the alert rule, if they're changed.
++    :return:
++    """
++    pipeline = get_redis_client().pipeline()
++    last_update_key, alert_trigger_key, resolve_trigger_key = build_alert_rule_stat_keys(alert_rule)
++    if alert_triggers is not None:
++        pipeline.set(alert_trigger_key, alert_triggers, ex=REDIS_TTL)
++    if resolve_triggers is not None:
++        pipeline.set(resolve_trigger_key, resolve_triggers, ex=REDIS_TTL)
++
++    pipeline.set(last_update_key, last_update, ex=REDIS_TTL)
++    pipeline.execute()
++
++
++def get_redis_client():
++    cluster_key = getattr(settings, "SENTRY_INCIDENT_RULES_REDIS_CLUSTER", None)
++    if cluster_key is None:
++        client = redis.clusters.get("default").get_local_client(0)
++    else:
++        client = redis.redis_clusters.get(cluster_key)
++    return client
+diff --git a/src/sentry/incidents/tasks.py b/src/sentry/incidents/tasks.py
+index a07d2c9332..441017178e 100644
+--- a/src/sentry/incidents/tasks.py
++++ b/src/sentry/incidents/tasks.py
+@@ -165,8 +165,9 @@ def handle_snuba_query_update(subscription_update, subscription):
+     """
+     Handles a subscription update for a `QuerySubscription`.
+     :param subscription_update: dict formatted according to schemas in
+-    sentry/snuba/json_schemas.py
++    sentry.snuba.json_schemas.SUBSCRIPTION_PAYLOAD_VERSIONS
+     :param subscription: The `QuerySubscription` that this update is for
+     """
+-    # TODO: Implement
+-    pass
++    from sentry.incidents.subscription_processor import SubscriptionProcessor
++
++    SubscriptionProcessor(subscription).process_update(subscription_update)
+diff --git a/tests/sentry/incidents/test_logic.py b/tests/sentry/incidents/test_logic.py
+index 94e0dd4a9c..f845c4dfd1 100644
+--- a/tests/sentry/incidents/test_logic.py
++++ b/tests/sentry/incidents/test_logic.py
+@@ -76,6 +76,18 @@ class CreateIncidentTest(TestCase):
+         other_project = self.create_project()
+         other_group = self.create_group(project=other_project)
+         self.record_event.reset_mock()
++        alert_rule = create_alert_rule(
++            self.project,
++            "hello",
++            AlertRuleThresholdType.ABOVE,
++            "level:error",
++            [AlertRuleAggregations.TOTAL],
++            10,
++            1000,
++            400,
++            1,
++        )
++
+         incident = create_incident(
+             self.organization,
+             type=incident_type,
+@@ -84,6 +96,7 @@ class CreateIncidentTest(TestCase):
+             date_started=date_started,
+             projects=[self.project],
+             groups=[self.group, other_group],
++            alert_rule=alert_rule,
+         )
+         assert incident.identifier == 1
+         assert incident.status == incident_type.value
+@@ -91,6 +104,7 @@ class CreateIncidentTest(TestCase):
+         assert incident.query == query
+         assert incident.date_started == date_started
+         assert incident.date_detected == date_started
++        assert incident.alert_rule == alert_rule
+         assert (
+             IncidentGroup.objects.filter(
+                 incident=incident, group__in=[self.group, other_group]
+diff --git a/tests/sentry/incidents/test_subscription_processor.py b/tests/sentry/incidents/test_subscription_processor.py
+new file mode 100644
+index 0000000000..9f21f6c41d
+--- /dev/null
++++ b/tests/sentry/incidents/test_subscription_processor.py
+@@ -0,0 +1,269 @@
++from __future__ import absolute_import
++
++from datetime import timedelta
++from time import time
++from random import randint
++from uuid import uuid4
++
++from django.utils import timezone
++from exam import fixture, patcher
++from freezegun import freeze_time
++
++from sentry.incidents.logic import alert_aggregation_to_snuba, create_alert_rule
++from sentry.incidents.models import (
++    AlertRuleAggregations,
++    AlertRuleThresholdType,
++    Incident,
++    IncidentStatus,
++    IncidentType,
++    SnubaDatasets,
++)
++from sentry.incidents.subscription_processor import get_alert_rule_stats, SubscriptionProcessor
++from sentry.incidents.tasks import INCIDENTS_SNUBA_SUBSCRIPTION_TYPE
++from sentry.snuba.models import QuerySubscription
++from sentry.testutils import TestCase
++from sentry.utils.dates import to_timestamp
++
++
++@freeze_time()
++class ProcessUpdateTest(TestCase):
++    metrics = patcher("sentry.incidents.subscription_processor.metrics")
++
++    @fixture
++    def subscription(self):
++        subscription = QuerySubscription.objects.create(
++            project=self.project,
++            type=INCIDENTS_SNUBA_SUBSCRIPTION_TYPE,
++            subscription_id="some_id",
++            dataset=SnubaDatasets.EVENTS.value,
++            query="",
++            aggregations=[AlertRuleAggregations.TOTAL.value],
++            time_window=1,
++            resolution=1,
++        )
++        return subscription
++
++    @fixture
++    def rule(self):
++        rule = create_alert_rule(
++            self.project,
++            "some rule",
++            AlertRuleThresholdType.ABOVE,
++            query="",
++            aggregations=[AlertRuleAggregations.TOTAL],
++            time_window=1,
++            alert_threshold=100,
++            resolve_threshold=10,
++            threshold_period=1,
++        )
++        rule.update(query_subscription=self.subscription)
++        return rule
++
++    def build_subscription_update(self, subscription=None, time_delta=None, value=None):
++        if time_delta is not None:
++            timestamp = int(to_timestamp(timezone.now() + time_delta))
++        else:
++            timestamp = int(time())
++
++        values = {}
++
++        if subscription:
++            aggregation_type = alert_aggregation_to_snuba[
++                AlertRuleAggregations(subscription.aggregations[0])
++            ]
++            value = randint(0, 100) if value is None else value
++            values = {aggregation_type[2]: value}
++        return {
++            "subscription_id": subscription.subscription_id if subscription else uuid4().hex,
++            "values": values,
++            "timestamp": timestamp,
++            "interval": 1,
++            "partition": 1,
++            "offset": 1,
++        }
++
++    def send_update(self, rule, value, time_delta=None):
++        if time_delta is None:
++            time_delta = timedelta()
++        subscription = rule.query_subscription
++        processor = SubscriptionProcessor(subscription)
++        message = self.build_subscription_update(subscription, value=value, time_delta=time_delta)
++        processor.process_update(message)
++        return processor
++
++    def assert_no_active_incident(self, rule):
++        assert not self.active_incident_exists(rule)
++
++    def assert_active_incident(self, rule):
++        assert self.active_incident_exists(rule)
++
++    def active_incident_exists(self, rule):
++        return Incident.objects.filter(
++            type=IncidentType.ALERT_TRIGGERED.value,
++            status=IncidentStatus.OPEN.value,
++            alert_rule=rule,
++        ).exists()
++
++    def assert_trigger_counts(self, processor, alert_triggers=0, resolve_triggers=0):
++        assert processor.alert_triggers == alert_triggers
++        assert processor.resolve_triggers == resolve_triggers
++        assert get_alert_rule_stats(processor.alert_rule)[1:] == (alert_triggers, resolve_triggers)
++
++    def test_removed_alert_rule(self):
++        message = self.build_subscription_update()
++        SubscriptionProcessor(self.subscription).process_update(message)
++        self.metrics.incr.assert_called_once_with(
++            "incidents.alert_rules.no_alert_rule_for_subscription"
++        )
++        # TODO: Check subscription is deleted once we start doing that
++
++    def test_skip_already_processed_update(self):
++        self.send_update(self.rule, self.rule.alert_threshold)
++        self.metrics.incr.reset_mock()
++        self.send_update(self.rule, self.rule.alert_threshold)
++        self.metrics.incr.assert_called_once_with(
++            "incidents.alert_rules.skipping_already_processed_update"
++        )
++        self.metrics.incr.reset_mock()
++        self.send_update(self.rule, self.rule.alert_threshold, timedelta(hours=-1))
++        self.metrics.incr.assert_called_once_with(
++            "incidents.alert_rules.skipping_already_processed_update"
++        )
++        self.metrics.incr.reset_mock()
++        self.send_update(self.rule, self.rule.alert_threshold, timedelta(hours=1))
++        self.metrics.incr.assert_not_called()  # NOQA
++
++    def test_no_alert(self):
++        rule = self.rule
++        processor = self.send_update(rule, rule.alert_threshold)
++        self.assert_trigger_counts(processor, 0, 0)
++        self.assert_no_active_incident(self.rule)
++
++    def test_alert(self):
++        # Verify that an alert rule that only expects a single update to be over the
++        # alert threshold triggers correctly
++        rule = self.rule
++        processor = self.send_update(rule, rule.alert_threshold + 1)
++        self.assert_trigger_counts(processor, 0, 0)
++        self.assert_active_incident(rule)
++
++    def test_alert_multiple_triggers(self):
++        # Verify that a rule that expects two consecutive updates to be over the
++        # alert threshold triggers correctly
++        rule = self.rule
++        rule.update(threshold_period=2)
++        processor = self.send_update(rule, rule.alert_threshold + 1, timedelta(minutes=-2))
++        self.assert_trigger_counts(processor, 1, 0)
++        self.assert_no_active_incident(rule)
++
++        processor = self.send_update(rule, rule.alert_threshold + 1, timedelta(minutes=-1))
++        self.assert_trigger_counts(processor, 0, 0)
++        self.assert_active_incident(rule)
++
++    def test_alert_multiple_triggers_non_consecutive(self):
++        # Verify that a rule that expects two consecutive updates to be over the
++        # alert threshold doesn't trigger if there are two updates that are above with
++        # an update that is below the threshold in the middle
++        rule = self.rule
++        rule.update(threshold_period=2)
++        processor = self.send_update(rule, rule.alert_threshold + 1, timedelta(minutes=-3))
++        self.assert_trigger_counts(processor, 1, 0)
++        self.assert_no_active_incident(rule)
++
++        processor = self.send_update(rule, rule.alert_threshold, timedelta(minutes=-2))
++        self.assert_trigger_counts(processor, 0, 0)
++        self.assert_no_active_incident(rule)
++
++        processor = self.send_update(rule, rule.alert_threshold + 1, timedelta(minutes=-1))
++        self.assert_trigger_counts(processor, 1, 0)
++        self.assert_no_active_incident(rule)
++
++    def test_no_active_incident_resolve(self):
++        # Test that we don't track stats for resolving if there are no active incidents
++        # related to the alert rule.
++        rule = self.rule
++        processor = self.send_update(rule, rule.resolve_threshold - 1)
++        self.assert_trigger_counts(processor, 0, 0)
++        self.assert_no_active_incident(rule)
++
++    def test_resolve(self):
++        # Verify that an alert rule that only expects a single update to be under the
++        # resolve threshold triggers correctly
++        rule = self.rule
++        processor = self.send_update(rule, rule.alert_threshold + 1, timedelta(minutes=-2))
++        self.assert_trigger_counts(processor, 0, 0)
++        self.assert_active_incident(rule)
++
++        processor = self.send_update(rule, rule.resolve_threshold - 1, timedelta(minutes=-1))
++        self.assert_trigger_counts(processor, 0, 0)
++        self.assert_no_active_incident(rule)
++
++    def test_resolve_multiple_triggers(self):
++        # Verify that a rule that expects two consecutive updates to be under the
++        # resolve threshold triggers correctly
++        rule = self.rule
++
++        processor = self.send_update(rule, rule.alert_threshold + 1, timedelta(minutes=-3))
++        self.assert_trigger_counts(processor, 0, 0)
++        self.assert_active_incident(rule)
++
++        rule.update(threshold_period=2)
++        processor = self.send_update(rule, rule.resolve_threshold - 1, timedelta(minutes=-2))
++        self.assert_trigger_counts(processor, 0, 1)
++        self.assert_active_incident(rule)
++
++        processor = self.send_update(rule, rule.resolve_threshold - 1, timedelta(minutes=-1))
++        self.assert_trigger_counts(processor, 0, 0)
++        self.assert_no_active_incident(rule)
++
++    def test_resolve_multiple_triggers_non_consecutive(self):
++        # Verify that a rule that expects two consecutive updates to be under the
++        # resolve threshold doesn't trigger if there's two updates that are below with
++        # an update that is above the threshold in the middle
++        rule = self.rule
++
++        processor = self.send_update(rule, rule.alert_threshold + 1, timedelta(minutes=-4))
++        self.assert_trigger_counts(processor, 0, 0)
++        self.assert_active_incident(rule)
++
++        rule.update(threshold_period=2)
++        processor = self.send_update(rule, rule.resolve_threshold - 1, timedelta(minutes=-3))
++        self.assert_trigger_counts(processor, 0, 1)
++        self.assert_active_incident(rule)
++
++        processor = self.send_update(rule, rule.resolve_threshold, timedelta(minutes=-2))
++        self.assert_trigger_counts(processor, 0, 0)
++        self.assert_active_incident(rule)
++
++        processor = self.send_update(rule, rule.resolve_threshold - 1, timedelta(minutes=-1))
++        self.assert_trigger_counts(processor, 0, 1)
++        self.assert_active_incident(rule)
++
++    def test_reversed_threshold_alert(self):
++        # Test that inverting thresholds correctly alerts
++        rule = self.rule
++        rule.update(threshold_type=AlertRuleThresholdType.BELOW.value)
++        processor = self.send_update(rule, rule.alert_threshold + 1, timedelta(minutes=-2))
++        self.assert_trigger_counts(processor, 0, 0)
++        self.assert_no_active_incident(rule)
++
++        processor = self.send_update(rule, rule.alert_threshold - 1, timedelta(minutes=-1))
++        self.assert_trigger_counts(processor, 0, 0)
++        self.assert_active_incident(rule)
++
++    def test_reversed_threshold_resolve(self):
++        # Test that inverting thresholds correctly resolves
++        rule = self.rule
++        rule.update(threshold_type=AlertRuleThresholdType.BELOW.value)
++
++        processor = self.send_update(rule, rule.alert_threshold - 1, timedelta(minutes=-3))
++        self.assert_trigger_counts(processor, 0, 0)
++        self.assert_active_incident(rule)
++
++        processor = self.send_update(rule, rule.resolve_threshold - 1, timedelta(minutes=-2))
++        self.assert_trigger_counts(processor, 0, 0)
++        self.assert_active_incident(rule)
++
++        processor = self.send_update(rule, rule.resolve_threshold + 1, timedelta(minutes=-1))
++        self.assert_trigger_counts(processor, 0, 0)
++        self.assert_no_active_incident(rule)
+diff --git a/tests/snuba/incidents/__init__.py b/tests/snuba/incidents/__init__.py
+new file mode 100644
+index 0000000000..c3961685ab
+--- /dev/null
++++ b/tests/snuba/incidents/__init__.py
+@@ -0,0 +1 @@
++from __future__ import absolute_import
+diff --git a/tests/snuba/incidents/test_tasks.py b/tests/snuba/incidents/test_tasks.py
+new file mode 100644
+index 0000000000..13c8ce3d2a
+--- /dev/null
++++ b/tests/snuba/incidents/test_tasks.py
+@@ -0,0 +1,128 @@
++from __future__ import absolute_import
++
++import json
++from copy import deepcopy
++from uuid import uuid4
++
++from confluent_kafka import Producer
++from django.conf import settings
++from django.test.utils import override_settings
++from exam import fixture
++
++from sentry.incidents.logic import alert_aggregation_to_snuba, create_alert_rule
++from sentry.incidents.models import (
++    AlertRuleAggregations,
++    AlertRuleThresholdType,
++    Incident,
++    IncidentStatus,
++    IncidentType,
++    SnubaDatasets,
++)
++from sentry.incidents.tasks import INCIDENTS_SNUBA_SUBSCRIPTION_TYPE
++from sentry.snuba.models import QuerySubscription
++from sentry.snuba.query_subscription_consumer import QuerySubscriptionConsumer, subscriber_registry
++
++from sentry.testutils import TestCase
++
++
++class HandleSubaQueryUpdateTest(TestCase):
++    def setUp(self):
++        super(HandleSubaQueryUpdateTest, self).setUp()
++        self.override_settings_cm = override_settings(
++            KAFKA_TOPICS={self.topic: {"cluster": "default", "topic": self.topic}}
++        )
++        self.override_settings_cm.__enter__()
++        self.orig_registry = deepcopy(subscriber_registry)
++
++    def tearDown(self):
++        super(HandleSubaQueryUpdateTest, self).tearDown()
++        self.override_settings_cm.__exit__(None, None, None)
++        subscriber_registry.clear()
++        subscriber_registry.update(self.orig_registry)
++
++    @fixture
++    def subscription(self):
++        subscription = QuerySubscription.objects.create(
++            project=self.project,
++            type=INCIDENTS_SNUBA_SUBSCRIPTION_TYPE,
++            subscription_id="some_id",
++            dataset=SnubaDatasets.EVENTS.value,
++            query="",
++            aggregations=[AlertRuleAggregations.TOTAL.value],
++            time_window=1,
++            resolution=1,
++        )
++        return subscription
++
++    @fixture
++    def rule(self):
++        rule = create_alert_rule(
++            self.project,
++            "some rule",
++            AlertRuleThresholdType.ABOVE,
++            query="",
++            aggregations=[AlertRuleAggregations.TOTAL],
++            time_window=1,
++            alert_threshold=100,
++            resolve_threshold=10,
++            threshold_period=1,
++        )
++        rule.update(query_subscription=self.subscription)
++        return rule
++
++    @fixture
++    def producer(self):
++        cluster_name = settings.KAFKA_TOPICS[self.topic]["cluster"]
++        conf = {
++            "bootstrap.servers": settings.KAFKA_CLUSTERS[cluster_name]["bootstrap.servers"],
++            "session.timeout.ms": 6000,
++        }
++        return Producer(conf)
++
++    @fixture
++    def topic(self):
++        return uuid4().hex
++
++    def test(self):
++        # Full integration test to ensure that when a subscription receives an update
++        # the `QuerySubscriptionConsumer` successfully retries the subscription and
++        # calls the correct callback, which should result in an incident being created.
++
++        callback = subscriber_registry[INCIDENTS_SNUBA_SUBSCRIPTION_TYPE]
++
++        def exception_callback(*args, **kwargs):
++            # We want to just error after the callback so that we can see the result of
++            # processing. This means the offset won't be committed, but that's fine, we
++            # can still check the results.
++            callback(*args, **kwargs)
++            raise KeyboardInterrupt()
++
++        value_name = alert_aggregation_to_snuba[
++            AlertRuleAggregations(self.subscription.aggregations[0])
++        ][2]
++
++        subscriber_registry[INCIDENTS_SNUBA_SUBSCRIPTION_TYPE] = exception_callback
++        message = {
++            "version": 1,
++            "payload": {
++                "subscription_id": self.subscription.subscription_id,
++                "values": {value_name: self.rule.alert_threshold + 1},
++                "timestamp": 1235,
++                "interval": 5,
++                "partition": 50,
++                "offset": 10,
++            },
++        }
++        self.producer.produce(self.topic, json.dumps(message))
++        self.producer.flush()
++
++        def active_incident_exists():
++            return Incident.objects.filter(
++                type=IncidentType.ALERT_TRIGGERED.value,
++                status=IncidentStatus.OPEN.value,
++                alert_rule=self.rule,
++            ).exists()
++
++        consumer = QuerySubscriptionConsumer("hi", topic=self.topic)
++        with self.assertChanges(active_incident_exists, before=False, after=True):
++            consumer.run()

@@ -1,0 +1,231 @@
+commit c347eada8f95c3182bd346426c8026d8bc036cf6
+Author: David Cramer <dcramer@gmail.com>
+Date:   Wed Sep 19 16:39:51 2018 -0700
+
+    feat: Improve error handling of internal sentry client
+    
+    - Handle IntegrityError when fetching credentials
+    - Switch to machine-readable log events
+    - Mimic correct endpoint with request path
+    - Correct invalid test (passing project vs project_id to EventManager.save)
+
+diff --git a/src/sentry/utils/raven.py b/src/sentry/utils/raven.py
+index 65e64fa551..081422db3f 100644
+--- a/src/sentry/utils/raven.py
++++ b/src/sentry/utils/raven.py
+@@ -5,11 +5,13 @@ import inspect
+ import logging
+ import raven
+ import six
+-import time
+ 
+ from django.conf import settings
++from django.utils.functional import cached_property
++
+ from raven.contrib.django.client import DjangoClient
+ from raven.utils import get_auth_header
++from time import time
+ 
+ from . import metrics
+ 
+@@ -30,10 +32,42 @@ def is_current_event_safe():
+ class SentryInternalClient(DjangoClient):
+     request_factory = None
+ 
++    @cached_property
++    def project_key(self):
++        from django.db import IntegrityError
++        from sentry.models import ProjectKey
++
++        if not settings.SENTRY_PROJECT:
++            return None
++
++        key = None
++        try:
++            if settings.SENTRY_PROJECT_KEY is not None:
++                key = ProjectKey.objects.get(
++                    id=settings.SENTRY_PROJECT_KEY,
++                    project=settings.SENTRY_PROJECT,
++                )
++            else:
++                key = ProjectKey.get_default(settings.SENTRY_PROJECT)
++        except (ProjectKey.DoesNotExist, IntegrityError) as exc:
++            # if the relation fails to query or is missing completely, lets handle
++            # it gracefully
++            self.error_logger.warn('internal-error.unable-to-fetch-project', extra={
++                'project_id': settings.SENTRY_PROJECT,
++                'project_key': settings.SENTRY_PROJECT_KEY,
++                'error_message': six.text_type(exc),
++            })
++        if key is None:
++            self.error_logger.warn('internal-error.no-project-available', extra={
++                'project_id': settings.SENTRY_PROJECT,
++                'project_key': settings.SENTRY_PROJECT_KEY,
++            })
++        return key
++
+     def is_enabled(self):
+         if getattr(settings, 'DISABLE_RAVEN', False):
+             return False
+-        return settings.SENTRY_PROJECT is not None
++        return self.project_key is not None
+ 
+     def can_record_current_event(self):
+         return self.remote.is_active() or is_current_event_safe()
+@@ -41,11 +75,17 @@ class SentryInternalClient(DjangoClient):
+     def capture(self, *args, **kwargs):
+         if not self.can_record_current_event():
+             metrics.incr('internal.uncaptured.events')
+-            self.error_logger.error('Not capturing event due to unsafe stacktrace:\n%r', kwargs)
++            self.error_logger.warn('internal-error.unsafe-stacktrace')
+             return
+         return super(SentryInternalClient, self).capture(*args, **kwargs)
+ 
+     def send(self, **kwargs):
++        # These imports all need to be internal to this function as this class
++        # is set up by django while still parsing LOGGING settings and we
++        # cannot import this stuff until settings are finalized.
++        from sentry.web.api import StoreView
++        from django.test import RequestFactory
++
+         # Report the issue to an upstream Sentry if active
+         # NOTE: we don't want to check self.is_enabled() like normal, since
+         # is_enabled behavior is overridden in this class. We explicitly
+@@ -58,29 +98,18 @@ class SentryInternalClient(DjangoClient):
+             super(SentryInternalClient, self).send(**super_kwargs)
+ 
+         if not is_current_event_safe():
++            self.error_logger.warn('internal-error.unsafe-stacktrace')
+             return
+ 
+-        # These imports all need to be internal to this function as this class
+-        # is set up by django while still parsing LOGGING settings and we
+-        # cannot import this stuff until settings are finalized.
+-        from sentry.models import ProjectKey
+-        from sentry.web.api import StoreView
+-        from django.test import RequestFactory
+-        key = None
+-        if settings.SENTRY_PROJECT_KEY is not None:
+-            key = ProjectKey.objects.filter(
+-                id=settings.SENTRY_PROJECT_KEY,
+-                project=settings.SENTRY_PROJECT).first()
+-        if key is None:
+-            key = ProjectKey.get_default(settings.SENTRY_PROJECT)
++        key = self.project_key
+         if key is None:
+             return
+ 
+-        client_string = 'raven-python/%s' % (raven.VERSION,)
++        client_string = 'raven-python/{}'.format(raven.VERSION)
+         headers = {
+             'HTTP_X_SENTRY_AUTH': get_auth_header(
+                 protocol=self.protocol_version,
+-                timestamp=time.time(),
++                timestamp=time(),
+                 client=client_string,
+                 api_key=key.public_key,
+                 api_secret=key.secret_key,
+@@ -89,15 +118,21 @@ class SentryInternalClient(DjangoClient):
+         }
+         self.request_factory = self.request_factory or RequestFactory()
+         request = self.request_factory.post(
+-            '/api/store',
++            '/api/{}/store/'.format(key.project_id),
+             data=self.encode(kwargs),
+             content_type='application/octet-stream',
+             **headers
+         )
+-        StoreView.as_view()(
++        resp = StoreView.as_view()(
+             request,
+-            project_id=six.text_type(settings.SENTRY_PROJECT),
++            project_id=six.text_type(key.project_id),
+         )
++        if resp.status_code != 200:
++            self.error_logger.warn('internal-error.invalid-response', extra={
++                'project_id': settings.SENTRY_PROJECT,
++                'project_key': settings.SENTRY_PROJECT_KEY,
++                'status_code': resp.status_code,
++            })
+ 
+ 
+ class SentryInternalFilter(logging.Filter):
+diff --git a/tests/integration/tests.py b/tests/integration/tests.py
+index 0b5bea3b9a..79d075856e 100644
+--- a/tests/integration/tests.py
++++ b/tests/integration/tests.py
+@@ -95,7 +95,7 @@ def load_fixture(name):
+ 
+ class AssertHandler(logging.Handler):
+     def emit(self, entry):
+-        raise AssertionError(entry.message)
++        raise AssertionError(entry.msg)
+ 
+ 
+ class RavenIntegrationTest(TransactionTestCase):
+diff --git a/tests/sentry/test_event_manager.py b/tests/sentry/test_event_manager.py
+index 970e18f689..92055d2dfd 100644
+--- a/tests/sentry/test_event_manager.py
++++ b/tests/sentry/test_event_manager.py
+@@ -815,7 +815,7 @@ class EventManagerTest(TransactionTestCase):
+             fingerprint=['totally unique super duper fingerprint'],
+             environment='totally unique super duper environment',
+         ))
+-        event = manager.save(project)
++        event = manager.save(project.id)
+ 
+         def query(model, key, **kwargs):
+             return tsdb.get_sums(model, [key], event.datetime, event.datetime, **kwargs)[key]
+@@ -834,7 +834,7 @@ class EventManagerTest(TransactionTestCase):
+     def test_record_frequencies(self):
+         project = self.project
+         manager = EventManager(self.make_event())
+-        event = manager.save(project)
++        event = manager.save(project.id)
+ 
+         assert tsdb.get_most_frequent(
+             tsdb.models.frequent_issues_by_project,
+diff --git a/tests/sentry/utils/test_raven.py b/tests/sentry/utils/test_raven.py
+index 9f960ff75f..23747b9d58 100644
+--- a/tests/sentry/utils/test_raven.py
++++ b/tests/sentry/utils/test_raven.py
+@@ -1,5 +1,6 @@
+ from __future__ import absolute_import, print_function
+ 
++from django.conf import settings
+ from mock import Mock, patch
+ from raven.contrib.django.models import client
+ from raven.base import Client
+@@ -16,9 +17,11 @@ class SentryInternalClientTest(TestCase):
+         assert client.__class__ is SentryInternalClient
+ 
+         with self.tasks():
+-            client.captureMessage('internal client test')
++            event_id = client.captureMessage('internal client test')
+ 
+         event = Event.objects.get()
++        assert event.project_id == settings.SENTRY_PROJECT
++        assert event.event_id == event_id
+         assert event.data['sentry.interfaces.Message']['message'] == \
+             'internal client test'
+         assert send.call_count == 0
+@@ -29,9 +32,11 @@ class SentryInternalClientTest(TestCase):
+         with self.dsn('http://foo:bar@example.com/1'):
+             with self.options({'sentry:install-id': 'abc123'}):
+                 with self.tasks():
+-                    client.captureMessage('internal client test')
++                    event_id = client.captureMessage('internal client test')
+ 
+                 event = Event.objects.get()
++                assert event.project_id == settings.SENTRY_PROJECT
++                assert event.event_id == event_id
+                 assert event.data['sentry.interfaces.Message']['message'] == \
+                     'internal client test'
+ 
+@@ -59,5 +64,6 @@ class SentryInternalClientTest(TestCase):
+             })
+ 
+         event = Event.objects.get()
++        assert event.project_id == settings.SENTRY_PROJECT
+         assert event.data['sentry.interfaces.Message']['message'] == 'check the req'
+         assert 'NotJSONSerializable' in event.data['extra']['request']

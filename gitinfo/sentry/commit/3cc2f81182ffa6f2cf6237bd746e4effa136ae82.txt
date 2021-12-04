@@ -1,0 +1,274 @@
+commit 3cc2f81182ffa6f2cf6237bd746e4effa136ae82
+Author: Dan Fuller <dfuller@sentry.io>
+Date:   Thu Apr 16 13:53:30 2020 -0700
+
+    feat(mail): Add function to migrate a project to use issue alert targeting. Add ability to run on a (#18300)
+    
+    This adds the migration function we'll use for our migration. I'll add the migration at a later
+    stage, and likely move this function into the migration. Also added a variable to the api so we can
+    opt in specific projects. I'll use this on a test project and then sentry once we're sure things are
+    good to go.
+    
+    The goal of the migration is to move all projects away from using the mail plugin, and any actions
+    that rely on them. The main cases for converting actions are:
+     - `NotifyEventAction` sends to all legacy, which includes mail. We don't want to
+       remove this action, but we do want to create a new IAT action if this exists and the mail plugin
+       is enabled enabled. Once a project is migrated, `NotifyEventAction` will no longer send mail.
+     - `NotifyEventServiceAction` sends to a specific legacy plugin. If this is configured to send to
+       mail, then we want to create the new IAT action and remove this action, since all it does is
+       send mail. If mail is disabled then we'll just removing this action.
+    
+    As well as this, for any projects where mail is disabled we want to disable mail notification
+    settings for users associated with the project. These are the mail:alert and
+    workflow:notifications settings. We do this at the project level to ensure that if they only have
+    mail disabled on a specific project they'll continue to receive it from other projects.
+
+diff --git a/src/sentry/api/endpoints/project_details.py b/src/sentry/api/endpoints/project_details.py
+index 307c8fa017..5905f7b6df 100644
+--- a/src/sentry/api/endpoints/project_details.py
++++ b/src/sentry/api/endpoints/project_details.py
+@@ -26,6 +26,7 @@ from sentry.constants import RESERVED_PROJECT_SLUGS
+ from sentry.datascrubbing import validate_pii_config_update
+ from sentry.lang.native.symbolicator import parse_sources, InvalidSourcesError
+ from sentry.lang.native.utils import convert_crashreport_count
++from sentry.mail.utils import migrate_project_to_issue_alert_targeting
+ from sentry.models import (
+     AuditLogEntryEvent,
+     Group,
+@@ -128,6 +129,9 @@ class ProjectAdminSerializer(ProjectMemberSerializer):
+     resolveAge = EmptyIntegerField(required=False, allow_null=True)
+     platform = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+     copy_from_project = serializers.IntegerField(required=False)
++    # Temporary variable so we can test out the issue alert targeting data migration on
++    # specific projects before blanket applying globally.
++    migrateToIssueAlertTargeting = serializers.BooleanField(required=False)
+ 
+     def validate(self, data):
+         max_delay = (
+@@ -612,6 +616,9 @@ class ProjectDetailsEndpoint(ProjectEndpoint):
+                 if not project.copy_settings_from(result["copy_from_project"]):
+                     return Response({"detail": ["Copy project settings failed."]}, status=409)
+ 
++            if result.get("migrateToIssueAlertTargeting"):
++                migrate_project_to_issue_alert_targeting(project)
++
+             self.create_audit_entry(
+                 request=request,
+                 organization=project.organization,
+diff --git a/src/sentry/mail/utils.py b/src/sentry/mail/utils.py
+new file mode 100644
+index 0000000000..0f5c4f5056
+--- /dev/null
++++ b/src/sentry/mail/utils.py
+@@ -0,0 +1,78 @@
++from __future__ import absolute_import
++
++from django.db import transaction
++from django.db.models import F
++
++from sentry.models.project import Project
++from sentry.models.rule import Rule, RuleStatus
++from sentry.models.user import User
++from sentry.models.useroption import UserOption
++from sentry.plugins.base import plugins
++
++mail_action = {
++    "id": "sentry.mail.actions.NotifyEmailAction",
++    "targetType": "IssueOwners",
++    "targetIdentifier": "None",
++}
++
++
++def migrate_project_to_issue_alert_targeting(project):
++    if project.flags.has_issue_alerts_targeting:
++        # Migration has already been run.
++        return
++    with transaction.atomic():
++        # Determine whether this project actually has mail enabled
++        mail_enabled = any(
++            plugin for plugin in plugins.for_project(project, version=None) if plugin.slug == "mail"
++        )
++        for rule in Rule.objects.filter(project=project, status=RuleStatus.ACTIVE):
++            migrate_legacy_rule(rule, mail_enabled)
++
++        if not mail_enabled:
++            # If mail disabled, then we want to disable mail options for all
++            # users associated with this project so that they don't suddenly start
++            # getting mail via the `MailAdapter`, since it will always be enabled.
++            for user in User.objects.filter(
++                sentry_orgmember_set__teams__in=project.teams.all(), is_active=True
++            ):
++                UserOption.objects.set_value(user, "mail:alert", "0", project=project)
++                UserOption.objects.set_value(user, "workflow:notifications", "0", project=project)
++
++        # This marks the migration finished and shows the new UI
++        project.update(flags=F("flags").bitor(Project.flags.has_issue_alerts_targeting))
++
++
++def migrate_legacy_rule(rule, mail_enabled):
++    actions = rule.data.get("actions", [])
++    new_actions = []
++    has_mail_action = False
++    for action in actions:
++        action_id = action.get("id")
++        if action_id == "sentry.rules.actions.notify_event.NotifyEventAction":
++            # This is the "Send a notification (for all legacy integrations)" action.
++            # When this action exists, we want to add the new `NotifyEmailAction` action
++            # to the rule. We'll still leave `NotifyEventAction` in place, since it will
++            # only notify non-mail plugins once we've migrated.
++            new_actions.append(action)
++            has_mail_action = True
++        elif (
++            action_id == "sentry.rules.actions.notify_event_service.NotifyEventServiceAction"
++            and action.get("service") == "mail"
++        ):
++            # This is the "Send a notification via mail" action. When this action
++            # exists, we want to add the new `NotifyEmailAction` action to the rule.
++            # We'll drop this action from the rule, since all it does it send mail and
++            # we don't want to double up.
++            has_mail_action = True
++        else:
++            new_actions.append(action)
++
++    # We only add the new action if the mail plugin is actually enabled, and there's an
++    # action that sends by mail. We do this outside the loop to ensure we don't add it
++    # more than once.
++    if mail_enabled and has_mail_action:
++        new_actions.append(mail_action)
++
++    if actions != new_actions:
++        rule.data["actions"] = new_actions
++        rule.save()
+diff --git a/tests/sentry/mail/test_utils.py b/tests/sentry/mail/test_utils.py
+new file mode 100644
+index 0000000000..139dd36ad6
+--- /dev/null
++++ b/tests/sentry/mail/test_utils.py
+@@ -0,0 +1,127 @@
++# -*- coding: utf-8 -*-
++
++from __future__ import absolute_import
++
++from uuid import uuid4
++
++from sentry.mail.utils import mail_action, migrate_project_to_issue_alert_targeting
++from sentry.models import Rule, UserOption
++from sentry.testutils import TestCase
++from sentry.plugins.base import plugins
++
++
++class MigrateProjectToIssueAlertTargetingTest(TestCase):
++    def setUp(self):
++        self.organization = self.create_organization()
++        self.user = self.create_user()
++        self.user_2 = self.create_user()
++        self.team = self.create_team(self.organization, members=[self.user, self.user_2])
++        self.project = self.create_project(organization=self.organization, teams=[self.team])
++        self.mail = plugins.get("mail")
++
++    def create_rule(self, actions):
++        data = {
++            "conditions": [
++                {"id": "sentry.rules.conditions.first_seen_event.FirstSeenEventCondition"}
++            ],
++            "actions": actions,
++        }
++        return Rule.objects.create(project=self.project, label=uuid4().hex, data=data)
++
++    def assert_rule_actions_equal(self, rule, expected_actions):
++        rule_actions = rule.data.get("actions")
++        key = lambda action: action["id"]
++        assert sorted(rule_actions, key=key) == sorted(expected_actions, key=key)
++
++    def test_mail_enabled_no_rules(self):
++        self.mail.enable(self.project)
++        assert not self.project.flags.has_issue_alerts_targeting
++        assert not UserOption.objects.filter(user__in=(self.user, self.user_2))
++        assert not Rule.objects.filter(project=self.project).exists()
++        migrate_project_to_issue_alert_targeting(self.project)
++        assert not Rule.objects.filter(project=self.project).exists()
++        assert not UserOption.objects.filter(user__in=(self.user, self.user_2))
++        assert self.project.flags.has_issue_alerts_targeting
++
++    def test_mail_enabled_has_rules(self):
++        self.mail.enable(self.project)
++        assert not self.project.flags.has_issue_alerts_targeting
++        rule = self.create_rule(
++            [
++                # Just adding duplicate rules here because who knows what data people
++                # have.
++                {u"id": u"sentry.rules.actions.notify_event.NotifyEventAction"},
++                {u"id": u"sentry.rules.actions.notify_event.NotifyEventAction"},
++                {
++                    u"id": u"sentry.rules.actions.notify_event_service.NotifyEventServiceAction",
++                    u"service": u"mail",
++                },
++                {
++                    u"id": u"sentry.rules.actions.notify_event_service.NotifyEventServiceAction",
++                    u"service": u"mail",
++                },
++            ]
++        )
++        assert not UserOption.objects.filter(user__in=(self.user, self.user_2))
++        migrate_project_to_issue_alert_targeting(self.project)
++        assert not UserOption.objects.filter(user__in=(self.user, self.user_2))
++        rule.refresh_from_db()
++        self.assert_rule_actions_equal(
++            rule,
++            [
++                {u"id": u"sentry.rules.actions.notify_event.NotifyEventAction"},
++                {u"id": u"sentry.rules.actions.notify_event.NotifyEventAction"},
++                mail_action,
++            ],
++        )
++        assert self.project.flags.has_issue_alerts_targeting
++
++    def test_mail_disabled_no_rules(self):
++        self.mail.disable(self.project)
++        assert not self.project.flags.has_issue_alerts_targeting
++        assert not UserOption.objects.filter(user__in=(self.user, self.user_2))
++        assert not Rule.objects.filter(project=self.project).exists()
++        migrate_project_to_issue_alert_targeting(self.project)
++        assert not Rule.objects.filter(project=self.project).exists()
++        for user in (self.user, self.user_2):
++            assert UserOption.objects.get_value(user, "mail:alert", project=self.project) == "0"
++            assert (
++                UserOption.objects.get_value(user, "workflow:notifications", project=self.project)
++                == "0"
++            )
++        assert self.project.flags.has_issue_alerts_targeting
++
++    def test_mail_disabled_has_rules(self):
++        self.mail.disable(self.project)
++        assert not self.project.flags.has_issue_alerts_targeting
++        rule = self.create_rule(
++            [
++                {u"id": u"sentry.rules.actions.notify_event.NotifyEventAction"},
++                {u"id": u"sentry.rules.actions.notify_event.NotifyEventAction"},
++                {
++                    u"id": u"sentry.rules.actions.notify_event_service.NotifyEventServiceAction",
++                    u"service": u"mail",
++                },
++                {
++                    u"id": u"sentry.rules.actions.notify_event_service.NotifyEventServiceAction",
++                    u"service": u"mail",
++                },
++            ]
++        )
++        assert not UserOption.objects.filter(user__in=(self.user, self.user_2))
++        migrate_project_to_issue_alert_targeting(self.project)
++        rule.refresh_from_db()
++        self.assert_rule_actions_equal(
++            rule,
++            [
++                {u"id": u"sentry.rules.actions.notify_event.NotifyEventAction"},
++                {u"id": u"sentry.rules.actions.notify_event.NotifyEventAction"},
++            ],
++        )
++        for user in (self.user, self.user_2):
++            assert UserOption.objects.get_value(user, "mail:alert", project=self.project) == "0"
++            assert (
++                UserOption.objects.get_value(user, "workflow:notifications", project=self.project)
++                == "0"
++            )
++        assert self.project.flags.has_issue_alerts_targeting

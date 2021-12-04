@@ -1,0 +1,344 @@
+commit 0e61c89a9f0502a477743c7ab2c021fd355972e9
+Author: Wes McKinney <wesmckinn@gmail.com>
+Date:   Sat Dec 17 16:30:34 2011 -0500
+
+    ENH: speed up generic multi-key groupby via SeriesGrouper/Slider Cython classes. A little black magic, GH #496
+
+diff --git a/pandas/core/groupby.py b/pandas/core/groupby.py
+index 0b8427e46..8786955e9 100644
+--- a/pandas/core/groupby.py
++++ b/pandas/core/groupby.py
+@@ -193,6 +193,12 @@ class GroupBy(object):
+     def primary(self):
+         return self.groupings[0]
+ 
++    @property
++    def _group_index(self):
++        result = get_group_index([ping.labels for ping in self.groupings],
++                                 self._group_shape)
++        return result.astype('i4')
++
+     def get_group(self, name, obj=None):
+         if obj is None:
+             obj = self.obj
+@@ -379,28 +385,18 @@ class GroupBy(object):
+         return [(name, raveled[mask]) for name, raveled in name_list]
+ 
+     def _python_agg_general(self, func, *args, **kwargs):
+-        group_shape = self._group_shape
+-        counts = np.zeros(group_shape, dtype=int)
+-
+-        # todo: cythonize?
+-        def _aggregate(output, counts, generator, shape_axis=0):
+-            for label, group in generator:
+-                if group is None:
+-                    continue
+-                counts[label] = group.shape[shape_axis]
+-                output[label] = func(group, *args, **kwargs)
+-
+-        result = np.empty(group_shape, dtype=float)
+-        result.fill(np.nan)
++        agg_func = lambda x: func(x, *args, **kwargs)
++
++        ngroups = np.prod(self._group_shape)
++        group_index = self._group_index
++
+         # iterate through "columns" ex exclusions to populate output dict
+         output = {}
+         for name, obj in self._iterate_slices():
+             try:
+-                _aggregate(result.ravel(), counts.ravel(),
+-                           self._generator_factory(obj))
+-                # TODO: same mask for every column...
+-                output[name] = result.ravel().copy()
+-                result.fill(np.nan)
++                result, counts = self._aggregate_series(obj, agg_func,
++                                                        group_index, ngroups)
++                output[name] = result
+             except TypeError:
+                 continue
+ 
+@@ -410,6 +406,39 @@ class GroupBy(object):
+ 
+         return self._wrap_aggregated_output(output, mask)
+ 
++    def _aggregate_series(self, obj, func, group_index, ngroups):
++        try:
++            return self._aggregate_series_fast(obj, func, group_index, ngroups)
++        except Exception:
++            return self._aggregate_series_pure_python(obj, func, ngroups)
++
++    def _aggregate_series_fast(self, obj, func, group_index, ngroups):
++        if obj.index._has_complex_internals:
++            raise TypeError('Incompatible index for Cython grouper')
++
++        # avoids object / Series creation overhead
++        dummy = obj[:0]
++        indexer = lib.groupsort_indexer(group_index, ngroups)
++        obj = obj.take(indexer)
++        group_index = group_index.take(indexer)
++        grouper = lib.SeriesGrouper(obj, func, group_index, ngroups,
++                                    dummy)
++        result, counts = grouper.get_result()
++        return result, counts
++
++    def _aggregate_series_pure_python(self, obj, func, ngroups):
++        counts = np.zeros(ngroups, dtype=int)
++        result = np.empty(ngroups, dtype=float)
++        result.fill(np.nan)
++
++        for label, group in self._generator_factory(obj):
++            if group is None:
++                continue
++            counts[label] = group.shape[0]
++            result[label] = func(group)
++
++        return result, counts
++
+     def _python_apply_general(self, func, *args, **kwargs):
+         result_keys = []
+         result_values = []
+diff --git a/pandas/core/index.py b/pandas/core/index.py
+index 7a917c7ad..29ce760c9 100644
+--- a/pandas/core/index.py
++++ b/pandas/core/index.py
+@@ -93,6 +93,11 @@ class Index(np.ndarray):
+     def _constructor(self):
+         return Index
+ 
++    @property
++    def _has_complex_internals(self):
++        # to disable groupby tricks in MultiIndex
++        return False
++
+     def summary(self):
+         if len(self) > 0:
+             index_summary = ', %s to %s' % (str(self[0]), str(self[-1]))
+@@ -924,6 +929,11 @@ class MultiIndex(Index):
+         contents = self.view(np.ndarray)
+         return len(contents) > 0 and not isinstance(contents[0], tuple)
+ 
++    @property
++    def _has_complex_internals(self):
++        # to disable groupby tricks
++        return True
++
+     def get_level_values(self, level):
+         """
+         Return vector of label values for requested level, equal to the length
+diff --git a/pandas/src/reduce.pyx b/pandas/src/reduce.pyx
+index 42292234a..201068f93 100644
+--- a/pandas/src/reduce.pyx
++++ b/pandas/src/reduce.pyx
+@@ -95,28 +95,23 @@ cdef class SeriesGrouper:
+     overhead
+     '''
+     cdef:
+-        Py_ssize_t nresults, ngroup
+-        object arr, dummy, f, labels, counts
++        Py_ssize_t nresults, ngroups
+         bint passed_dummy
+ 
+-    def __init__(self, object arr, object f, object labels, ngroups,
+-                 dummy=None):
+-        n = len(arr)
++    cdef public:
++        object arr, index, dummy, f, labels
+ 
+-        assert(arr.ndim == 1)
+-
+-        if not arr.flags.contiguous:
+-            arr = arr.copy()
++    def __init__(self, object series, object f, object labels,
++                 Py_ssize_t ngroups, object dummy):
++        n = len(series)
+ 
+         self.labels = labels
+         self.f = f
+-        self.arr = arr
++        self.arr = series
++        self.index = series.index
+ 
+         self.dummy = self._check_dummy(dummy)
+         self.passed_dummy = dummy is not None
+-
+-        self.counts = np.zeros(ngroups, dtype='i4')
+-
+         self.ngroups = ngroups
+ 
+     def _check_dummy(self, dummy=None):
+@@ -125,42 +120,25 @@ cdef class SeriesGrouper:
+         else:
+             if dummy.dtype != self.arr.dtype:
+                 raise ValueError('Dummy array must be same dtype')
+-            if len(dummy) != self.chunksize:
+-                raise ValueError('Dummy array must be length %d' %
+-                                 self.chunksize)
+-
+         return dummy
+ 
+     def get_result(self):
+         cdef:
+-            char* dummy_buf
+-            ndarray arr, result, chunk
++            ndarray arr, result
+             ndarray[int32_t] labels, counts
+-            Py_ssize_t i, group_size, n, lab
+-            flatiter it
+-            npy_intp *shape
+-            object res
++            Py_ssize_t i, n, group_size, lab
++            object res, chunk
+             bint initialized = 0
+-            tuple args
+-            object kwds
++            Slider vslider, islider
+ 
+         labels = self.labels
+-        counts = self.counts
+-
+-        arr = self.arr
++        counts = np.zeros(self.ngroups, dtype='i4')
+         chunk = self.dummy
+-
+-        dummy_buf = chunk.data
+-        chunk.data = arr.data
+-
+-        shape = chunk.shape
+         group_size = 0
+-        n = len(arr)
++        n = len(self.arr)
+ 
+-        args = cpython.PyTuple_New(1)
+-        kwds = {}
+-        cpython.PyTuple_SET_ITEM(args, 0, chunk)
+-        cpython.Py_INCREF(chunk)
++        vslider = Slider(self.arr, self.dummy)
++        islider = Slider(self.index, self.dummy.index)
+ 
+         try:
+             for i in range(n):
+@@ -169,33 +147,32 @@ cdef class SeriesGrouper:
+                 lab = labels[i]
+ 
+                 if i == n - 1 or lab != labels[i + 1]:
+-                    chunk.shape[0] = group_size
++                    islider.set_length(group_size)
++                    vslider.set_length(group_size)
+ 
+-                    res = cpython.PyObject_Call(self.f, args, kwds)
++                    res = self.f(chunk)
+ 
+-                    # res = self.f(chunk)
+                     if not initialized:
+                         result = self._get_result_array(res)
+-                        it = <flatiter> PyArray_IterNew(result)
+                         initialized = 1
+ 
+-                    PyArray_ITER_GOTO1D(it, lab)
+-                    PyArray_SETITEM(result, PyArray_ITER_DATA(it), res)
++                    util.assign_value_1d(result, lab, res)
+                     counts[lab] = group_size
++                    islider.advance(group_size)
++                    vslider.advance(group_size)
+ 
+-                    chunk.data = chunk.data + group_size
+                     group_size = 0
+         except:
+             raise
+         finally:
+             # so we don't free the wrong memory
+-            chunk.shape[0] = 0
+-            chunk.data = dummy_buf
++            islider.cleanup()
++            vslider.cleanup()
+ 
+         if result.dtype == np.object_:
+             result = maybe_convert_objects(result)
+ 
+-        return result
++        return result, counts
+ 
+     def _get_result_array(self, object res):
+         try:
+@@ -207,6 +184,40 @@ cdef class SeriesGrouper:
+             raise ValueError('function does not reduce')
+         return result
+ 
++cdef class Slider:
++    '''
++    Only handles contiguous data for now
++    '''
++    cdef:
++        ndarray values, buf
++        Py_ssize_t stride, orig_len
++        char *orig_data
++
++    def __init__(self, object values, object buf):
++        assert(values.ndim == 1)
++        if not values.flags.contiguous:
++            values = values.copy()
++
++        assert(values.dtype == buf.dtype)
++        self.values = values
++        self.buf = buf
++        self.stride = values.dtype.itemsize
++
++        self.orig_data = self.buf.data
++        self.orig_len = self.buf.shape[0]
++
++        self.buf.data = self.values.data
++
++    cdef inline advance(self, Py_ssize_t k):
++        self.buf.data = <char*> self.buf.data + self.stride * k
++
++    cdef inline set_length(self, Py_ssize_t length):
++        self.buf.shape[0] = length
++
++    cdef inline cleanup(self):
++        self.buf.shape[0] = self.orig_len
++        self.buf.data = self.orig_data
++
+ def reduce(arr, f, axis=0, dummy=None):
+     reducer = Reducer(arr, f, axis=axis, dummy=dummy)
+     return reducer.get_result()
+diff --git a/pandas/src/sandbox.pyx b/pandas/src/sandbox.pyx
+index e0ccc587b..f04e542bf 100644
+--- a/pandas/src/sandbox.pyx
++++ b/pandas/src/sandbox.pyx
+@@ -51,3 +51,23 @@ def bench_typecheck2(ndarray[object] arr):
+     for i in range(n):
+         PyArray_Check(buf[i])
+ 
++
++def foo(object _chunk, object _arr):
++    cdef:
++        char* dummy_buf
++        ndarray arr, result, chunk
++
++    arr = _arr
++    chunk = _chunk
++
++    dummy_buf = chunk.data
++    chunk.data = arr.data
++
++    shape = chunk.shape
++    group_size = 0
++    n = len(arr)
++
++    inc = arr.dtype.itemsize
++
++    # chunk.shape[0] = 100
++    return chunk
+diff --git a/pandas/tools/util.py b/pandas/tools/util.py
+new file mode 100644
+index 000000000..f10bfe1ea
+--- /dev/null
++++ b/pandas/tools/util.py
+@@ -0,0 +1,6 @@
++from pandas.core.index import Index
++
++def match(needles, haystack):
++    haystack = Index(haystack)
++    needles = Index(needles)
++    return haystack.get_indexer(needles)

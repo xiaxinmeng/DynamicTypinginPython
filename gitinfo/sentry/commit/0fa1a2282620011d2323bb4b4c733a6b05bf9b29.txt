@@ -1,0 +1,352 @@
+commit 0fa1a2282620011d2323bb4b4c733a6b05bf9b29
+Author: Manu <manu@sentry.io>
+Date:   Tue Aug 6 13:02:44 2019 -0700
+
+    perf(snuba): Replace hashes endpoint to use snuba (#14184)
+    
+    Makes the `/api/0/issues/:issue_id/hashes/` endpoint use Snuba instead of Redis.
+
+diff --git a/src/sentry/api/endpoints/group_hashes.py b/src/sentry/api/endpoints/group_hashes.py
+index 2562073ae5..7206d85728 100644
+--- a/src/sentry/api/endpoints/group_hashes.py
++++ b/src/sentry/api/endpoints/group_hashes.py
+@@ -1,13 +1,17 @@
+ from __future__ import absolute_import
+ 
++from functools import partial
++
+ from rest_framework.response import Response
+ 
+ from sentry.api.base import DocSection
+ from sentry.api.bases import GroupEndpoint
+-from sentry.api.serializers import serialize
+-from sentry.models import Group, GroupHash
++from sentry.api.paginator import GenericOffsetPaginator
++from sentry.api.serializers import EventSerializer, serialize
++from sentry.models import Group, GroupHash, SnubaEvent
+ from sentry.tasks.unmerge import unmerge
+ from sentry.utils.apidocs import scenario, attach_scenarios
++from sentry.utils.snuba import raw_query
+ 
+ 
+ @scenario('ListAvailableHashes')
+@@ -32,15 +36,27 @@ class GroupHashesEndpoint(GroupEndpoint):
+         :auth: required
+         """
+ 
+-        queryset = GroupHash.objects.filter(
+-            group=group.id,
++        data_fn = partial(
++            lambda *args, **kwargs: raw_query(*args, **kwargs)['data'],
++            aggregations=[
++                ('argMax(event_id, timestamp)', None, 'event_id'),
++                ('max', 'timestamp', 'latest_event_timestamp')
++            ],
++            filter_keys={
++                'project_id': [group.project_id],
++                'group_id': [group.id]
++            },
++            groupby=['primary_hash'],
++            referrer='api.group-hashes',
++            orderby=['-latest_event_timestamp'],
+         )
+ 
++        handle_results = partial(self.__handle_results, group.project_id, group.id, request.user)
++
+         return self.paginate(
+             request=request,
+-            queryset=queryset,
+-            order_by='id',
+-            on_results=lambda x: serialize(x, request.user),
++            on_results=handle_results,
++            paginator=GenericOffsetPaginator(data_fn=data_fn)
+         )
+ 
+     def delete(self, request, group):
+@@ -69,3 +85,19 @@ class GroupHashesEndpoint(GroupEndpoint):
+         )
+ 
+         return Response(status=202)
++
++    def __handle_results(self, project_id, group_id, user, results):
++        return [self.__handle_result(user, project_id, group_id, result) for result in results]
++
++    def __handle_result(self, user, project_id, group_id, result):
++        event = {
++            'timestamp': result['latest_event_timestamp'],
++            'event_id': result['event_id'],
++            'group_id': group_id,
++            'project_id': project_id
++        }
++
++        return {
++            'id': result['primary_hash'],
++            'latestEvent': serialize(SnubaEvent(event), user, EventSerializer())
++        }
+diff --git a/src/sentry/api/serializers/models/grouphash.py b/src/sentry/api/serializers/models/grouphash.py
+deleted file mode 100644
+index 0bc209d43d..0000000000
+--- a/src/sentry/api/serializers/models/grouphash.py
++++ /dev/null
+@@ -1,64 +0,0 @@
+-from __future__ import absolute_import
+-
+-from collections import defaultdict
+-
+-from sentry.api.serializers import Serializer, register, serialize
+-from sentry.models import Event, GroupHash
+-
+-
+-def get_latest_events(group_hash_list):
+-    """
+-    Fetch the latest events for a collection of ``GroupHash`` instances.
+-    Returns a list of events (or ``None``) in the same order as the input
+-    sequence.
+-    """
+-    group_hashes_by_project_id = defaultdict(list)
+-    for group_hash in group_hash_list:
+-        group_hashes_by_project_id[group_hash.project_id].append(group_hash)
+-
+-    events_by_group_hash = {}
+-    for project_id, group_hash_list_chunk in group_hashes_by_project_id.items():
+-        event_id_list = GroupHash.fetch_last_processed_event_id(
+-            [i.id for i in group_hash_list_chunk])
+-        event_by_event_id = {
+-            event.event_id: event
+-            for event in Event.objects.filter(
+-                project_id=project_id,
+-                event_id__in=filter(None, event_id_list),
+-            )
+-        }
+-        for group_hash, event_id in zip(group_hash_list_chunk, event_id_list):
+-            event = event_by_event_id.get(event_id)
+-            if event is not None and event.group_id == group_hash.group_id:
+-                events_by_group_hash[group_hash] = event
+-
+-    return [events_by_group_hash.get(group_hash) for group_hash in group_hash_list]
+-
+-
+-@register(GroupHash)
+-class GroupHashSerializer(Serializer):
+-    state_text_map = {
+-        None: 'unlocked',
+-        GroupHash.State.LOCKED_IN_MIGRATION: 'locked',
+-    }
+-
+-    def get_attrs(self, item_list, user, **kwargs):
+-        return {
+-            item: {
+-                'latest_event': latest_event
+-            }
+-            for item, latest_event in zip(
+-                item_list,
+-                serialize(
+-                    get_latest_events(item_list),
+-                    user=user,
+-                ),
+-            )
+-        }
+-
+-    def serialize(self, obj, attrs, user):
+-        return {
+-            'id': obj.hash,
+-            'latestEvent': attrs['latest_event'],
+-            'state': self.state_text_map[obj.state],
+-        }
+diff --git a/tests/sentry/api/endpoints/test_group_hashes.py b/tests/sentry/api/endpoints/test_group_hashes.py
+index b274c65ddf..d074b967fd 100644
+--- a/tests/sentry/api/endpoints/test_group_hashes.py
++++ b/tests/sentry/api/endpoints/test_group_hashes.py
+@@ -1,28 +1,103 @@
+ from __future__ import absolute_import
+ 
++import copy
++from datetime import timedelta
++from django.utils import timezone
++
+ from six.moves.urllib.parse import urlencode
+ 
+ from sentry.models import GroupHash
+-from sentry.testutils import APITestCase
++from sentry.testutils import APITestCase, SnubaTestCase
++from sentry.testutils.factories import DEFAULT_EVENT_DATA
++from sentry.eventstream.snuba import SnubaEventStream
+ 
+ 
+-class GroupHashesTest(APITestCase):
+-    def test_simple(self):
++class GroupHashesTest(APITestCase, SnubaTestCase):
++    def test_only_return_latest_event(self):
+         self.login_as(user=self.user)
+ 
+-        group = self.create_group()
+-        GroupHash.objects.create(group=group, hash='a' * 32)
+-        GroupHash.objects.create(group=group, hash='b' * 32)
++        # remove microseconds and timezone from iso format cause that's what store_event expects
++        min_ago = (timezone.now() - timedelta(minutes=1)).isoformat()[:19]
++        two_min_ago = (timezone.now() - timedelta(minutes=2)).isoformat()[:19]
++        new_event_id = 'b' * 32
++
++        old_event = self.store_event(
++            data={
++                'event_id': 'a' * 32,
++                'message': 'message',
++                'timestamp': two_min_ago,
++                'stacktrace': copy.deepcopy(DEFAULT_EVENT_DATA['stacktrace']),
++                'fingerprint': ['group-1']
++            },
++            project_id=self.project.id,
++        )
++
++        new_event = self.store_event(
++            data={
++                'event_id': new_event_id,
++                'message': 'message',
++                'timestamp': min_ago,
++                'stacktrace': copy.deepcopy(DEFAULT_EVENT_DATA['stacktrace']),
++                'fingerprint': ['group-1']
++            },
++            project_id=self.project.id,
++        )
++
++        assert new_event.group_id == old_event.group_id
++
++        url = u'/api/0/issues/{}/hashes/'.format(new_event.group_id)
++        response = self.client.get(url, format='json')
++
++        assert response.status_code == 200, response.content
++        assert len(response.data) == 1
++        assert response.data[0]['latestEvent']['eventID'] == new_event_id
+ 
+-        url = u'/api/0/issues/{}/hashes/'.format(group.id)
++    def test_return_multiple_hashes(self):
++        self.login_as(user=self.user)
++
++        # remove microseconds and timezone from iso format cause that's what store_event expects
++        min_ago = (timezone.now() - timedelta(minutes=1)).isoformat()[:19]
++        two_min_ago = (timezone.now() - timedelta(minutes=2)).isoformat()[:19]
++
++        event1 = self.store_event(
++            data={
++                'event_id': 'a' * 32,
++                'message': 'message',
++                'timestamp': two_min_ago,
++                'stacktrace': copy.deepcopy(DEFAULT_EVENT_DATA['stacktrace']),
++                'fingerprint': ['group-1']
++            },
++            project_id=self.project.id,
++        )
++
++        event2 = self.store_event(
++            data={
++                'event_id': 'b' * 32,
++                'message': 'message2',
++                'timestamp': min_ago,
++                'fingerprint': ['group-2']
++            },
++            project_id=self.project.id,
++        )
++
++        # Merge the events
++        eventstream = SnubaEventStream()
++        state = eventstream.start_merge(
++            self.project.id,
++            [event2.group_id],
++            event1.group_id
++        )
++
++        eventstream.end_merge(state)
++
++        url = u'/api/0/issues/{}/hashes/'.format(event1.group_id)
+         response = self.client.get(url, format='json')
+ 
+         assert response.status_code == 200, response.content
+         assert len(response.data) == 2
+-        assert sorted(map(lambda x: x['id'], response.data)) == sorted([
+-            'a' * 32,
+-            'b' * 32,
+-        ])
++
++        primary_hashes = [hash['id'] for hash in response.data]
++        assert primary_hashes == [event2.get_primary_hash(), event1.get_primary_hash()]
+ 
+     def test_unmerge(self):
+         self.login_as(user=self.user)
+diff --git a/tests/sentry/api/serializers/test_grouphash.py b/tests/sentry/api/serializers/test_grouphash.py
+deleted file mode 100644
+index 5dfd2df374..0000000000
+--- a/tests/sentry/api/serializers/test_grouphash.py
++++ /dev/null
+@@ -1,72 +0,0 @@
+-from __future__ import absolute_import
+-
+-from sentry.api.serializers import serialize
+-from sentry.models import Event, GroupHash
+-from sentry.testutils import TestCase
+-
+-
+-class GroupHashSerializerTest(TestCase):
+-    def test_no_latest_event(self):
+-        user = self.create_user()
+-        group = self.create_group()
+-        hash = GroupHash.objects.create(
+-            project=group.project,
+-            group=group,
+-            hash='xyz',
+-        )
+-
+-        result = serialize(hash, user=user)
+-        assert result['latestEvent'] is None
+-
+-    def test_missing_latest_event(self):
+-        user = self.create_user()
+-        group = self.create_group()
+-        hash = GroupHash.objects.create(
+-            project=group.project,
+-            group=group,
+-            hash='xyz',
+-        )
+-
+-        GroupHash.record_last_processed_event_id(
+-            hash.id,
+-            ['invalid'],
+-        )
+-
+-        result = serialize(hash, user=user)
+-        assert result['latestEvent'] is None
+-
+-    def test_mismatched_latest_event(self):
+-        user = self.create_user()
+-        group = self.create_group()
+-        hash = GroupHash.objects.create(
+-            project=group.project,
+-            group=group,
+-            hash='xyz',
+-        )
+-        event = self.create_event(group=self.create_group())
+-
+-        GroupHash.record_last_processed_event_id(
+-            hash.id,
+-            event.event_id,
+-        )
+-
+-        result = serialize(hash, user=user)
+-        assert result['latestEvent'] is None
+-
+-    def test_valid_latest_event(self):
+-        user = self.create_user()
+-        group = self.create_group()
+-        hash = GroupHash.objects.create(
+-            project=group.project,
+-            group=group,
+-            hash='xyz',
+-        )
+-        event = Event.objects.get(id=self.create_event(group=group).id)
+-
+-        GroupHash.record_last_processed_event_id(
+-            hash.id,
+-            event.event_id,
+-        )
+-
+-        result = serialize(hash, user=user)
+-        assert result['latestEvent'] == serialize(event, user=user)

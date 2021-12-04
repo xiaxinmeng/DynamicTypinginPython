@@ -1,0 +1,375 @@
+commit 93b73aeaa86a8fec904673835d3951e49fc83530
+Author: kilroythethird <kilroythethird@users.noreply.github.com>
+Date:   Mon Feb 25 20:56:51 2019 +0100
+
+    Added multithreading dispatcher for training_data
+
+diff --git a/lib/multithreading.py b/lib/multithreading.py
+index 832a0ee..2f53963 100644
+--- a/lib/multithreading.py
++++ b/lib/multithreading.py
+@@ -3,15 +3,239 @@
+ 
+ import logging
+ import multiprocessing as mp
++from multiprocessing.sharedctypes import RawArray
+ import queue as Queue
+ import sys
+ import threading
++import numpy as np
++from ctypes import c_float
+ from lib.logger import LOG_QUEUE, set_root_logger
+ 
+ logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
+ _launched_processes = set()  # pylint: disable=invalid-name
+ 
+ 
++
++class ConsumerBuffer():
++    def __init__(self, dispatcher, index, data):
++        self._data = data
++        self._id = index
++        self._dispatcher = dispatcher
++
++    def get(self):
++        return self._data
++
++    def free(self):
++        self._dispatcher.free(self._id)
++
++    def __enter__(self):
++        return self.get()
++
++    def __exit__(self, *args):
++        self.free()
++
++
++class WorkerBuffer():
++    def __init__(self, index, data, stop_event, queue):
++        self._id = index
++        self._data = data
++        self._stop_event = stop_event
++        self._queue = queue
++
++    def get(self):
++        return self._data
++
++    def ready(self):
++        if self._stop_event.is_set():
++            return
++        self._queue.put(self._id)
++
++    def __enter__(self):
++        return self.get()
++
++    def __exit__(self, *args):
++        self.ready()
++
++
++class FixedProducerDispatcher():
++    """
++    Runs the given target_function in N subprocesses
++    and provides fixed size shared memory to the target_function.
++    This class is designed for endless running worker processes
++    filling the provided memory with data,
++    like preparing trainingsdata for neural network training.
++
++    As soon as one worker finishes all worker are shutdown.
++
++    Example:
++        # Producer side
++        def do_work(memory_gen):
++            for memory_wrap in memory_gen:
++                # alternative memory_wrap.get and memory_wrap.ready can be used
++                with memory_wrap as memory:
++                    input, exp_result = prepare_batch(...)
++                    memory[0][:] = input
++                    memory[1][:] = exp_result
++
++        # Consumer side
++        batch_size = 64
++        dispatcher = FixedProducerDispatcher(do_work, shapes=[
++            (batch_size, 256,256,3), (batch_size, 256,256,3)])
++        for batch_wrapper in dispatcher:
++            # alternative batch_wrapper.get and batch_wrapper.free can be used
++            with batch_wrapper as batch:
++                send_batch_to_trainer(batch)
++    """
++    EVENT = mp.Event
++    QUEUE = mp.Queue
++
++    def __init__(self, target_function, shapes, args=tuple(),
++                 kwargs={}, ctype=c_float, workers=1,
++                 buffers=None, log_queue=None, log_level=logging.DEBUG):
++        if buffers is None:
++            buffers = workers * 2
++        else:
++            assert buffers >= 2 and buffers > workers
++        self.name = "%s_FixedProducerDispatcher" % str(target_function)
++        self._target_func = target_function
++        self._shapes = shapes
++        self._stop_event = self.EVENT()
++        self._buffer_tokens = self.QUEUE()
++        for i in range(buffers):
++            self._buffer_tokens.put(i)
++        self._result_tokens = self.QUEUE()
++        worker_data, self.data = self._create_data(shapes, ctype, buffers)
++        proc_args = {
++            'data' : worker_data,
++            'stop_event' : self._stop_event,
++            'target' : self._target_func,
++            'buffer_tokens': self._buffer_tokens,
++            'result_tokens': self._result_tokens,
++            'dtype': np.dtype(ctype),
++            'shapes': shapes,
++            'log_queue': log_queue,
++            'log_level': log_level,
++            'args': args,
++            'kwargs': kwargs
++        }
++        self._worker = tuple(self._create_worker(proc_args) for _ in range(workers))
++        self._open_worker = len(self._worker)
++
++    @staticmethod
++    def _np_from_shared(shared, shapes, dtype):
++        arrs = []
++        offset = 0
++        np_data = np.frombuffer(shared, dtype=dtype)
++        for shape in shapes:
++            count = np.prod(shape)
++            arrs.append(np_data[offset:offset+count].reshape(shape))
++            offset += count
++        return arrs
++
++    def _create_data(self, shapes, ctype, buffers):
++        buffer_size = int(sum(np.prod(x) for x in shapes))
++        dtype = np.dtype(ctype)
++        data = tuple(RawArray(ctype, buffer_size) for _ in range(buffers))
++        np_data = tuple(self._np_from_shared(arr, shapes, dtype) for arr in data)
++        return data, np_data
++
++    def _create_worker(self, kwargs):
++        return mp.Process(target=self._runner, kwargs=kwargs)
++
++    def free(self, index):
++        if self._stop_event.is_set():
++            return
++        if isinstance(index, ConsumerBuffer):
++            index = index.index
++        self._buffer_tokens.put(index)
++
++    def __iter__(self):
++        return self
++
++    def __next__(self):
++        return self.next()
++
++    def next(self, block=True, timeout=None):
++        """
++        Yields ConsumerBuffer filled by the worker.
++        Will raise StopIteration if no more elements are available OR any worker is finished.
++        Will raise queue.Empty when block is False and no element is available.
++
++        The returned data is safe until ConsumerBuffer.free() is called or the with context is left.
++        If you plan to hold on to it after that make a copy.
++
++        This method is thread safe.
++        """
++        if self._stop_event.is_set():
++            raise StopIteration
++        i = self._result_tokens.get(block=block, timeout=timeout)
++        if i is None:
++            self._open_worker -= 1
++            raise StopIteration
++        if self._stop_event.is_set():
++            raise StopIteration
++        return ConsumerBuffer(self, i, self.data[i])
++
++    def start(self):
++        for process in self._worker:
++            process.start()
++        _launched_processes.add(self)
++
++    def is_alive(self):
++        for worker in self._worker:
++            if worker.is_alive():
++                return True
++        return False
++
++    def join(self):
++        self.stop()
++        while self._open_worker:
++            if self._result_tokens.get() is None:
++                self._open_worker -= 1
++        self._result_tokens.close()
++        while True:
++            try:
++                self._buffer_tokens.get(block=False, timeout=0.01)
++            except Queue.Empty:
++                break
++        self._buffer_tokens.close()
++        for worker in self._worker:
++            worker.join()
++
++    def stop(self):
++        self._stop_event.set()
++        for _ in range(self._open_worker):
++            self._buffer_tokens.put(None)
++
++    def is_shutdown(self):
++        return self._stop_event.is_set()
++
++    @classmethod
++    def _runner(cls, data=None, stop_event=None, target=None,
++                buffer_tokens=None, result_tokens=None, dtype=None,
++                shapes=None, log_queue=None, log_level=None,
++                args=None, kwargs=None):
++        # Fork inherits the queue handler, so skip registration with "fork"
++        if log_queue and log_level is not None and mp.get_start_method() != "fork":
++            set_root_logger(log_level, queue=log_queue)
++        logger.debug("FixedProducerDispatcher worker for %s started", str(target))
++        np_data = [cls._np_from_shared(d, shapes, dtype) for d in data]
++        def get_free_slot():
++            while not stop_event.is_set():
++                i = buffer_tokens.get()
++                if stop_event.is_set() or i is None:
++                    break
++                yield WorkerBuffer(i, np_data[i], stop_event, result_tokens)
++        args = tuple((get_free_slot(),)) + tuple(args)
++        try:
++            target(*args, **kwargs)
++        except Exception as ex:
++            logger.exception(ex)
++            stop_event.set()
++        result_tokens.put(None)
++        logger.debug("FixedProducerDispatcher worker for %s shutdown", str(target))
++
++
+ class PoolProcess():
+     """ Pool multiple processes """
+     def __init__(self, method, in_queue, out_queue, *args, processes=None, **kwargs):
+diff --git a/lib/training_data.py b/lib/training_data.py
+index 32037c9..8e7aff9 100644
+--- a/lib/training_data.py
++++ b/lib/training_data.py
+@@ -11,7 +11,7 @@ import numpy as np
+ from scipy.interpolate import griddata
+ 
+ from lib.model import masks
+-from lib.multithreading import MultiThread
++from lib.multithreading import MultiThread, FixedProducerDispatcher
+ from lib.queue_manager import queue_manager
+ from lib.umeyama import umeyama
+ 
+@@ -28,10 +28,10 @@ class TrainingDataGenerator():
+                      bool(training_opts.get("landmarks", None)))
+         self.batchsize = 0
+         self.model_input_size = model_input_size
++        self.model_output_size = model_output_size
+         self.training_opts = training_opts
+         self.mask_function = self.set_mask_function()
+         self.landmarks = self.training_opts.get("landmarks", None)
+-
+         self.processing = ImageManipulation(model_input_size,
+                                             model_output_size,
+                                             training_opts.get("coverage_ratio", 0.625))
+@@ -53,35 +53,51 @@ class TrainingDataGenerator():
+         logger.debug("Queue batches: (image_count: %s, batchsize: %s, side: '%s', do_shuffle: %s, "
+                      "is_timelapse: %s)", len(images), batchsize, side, do_shuffle, is_timelapse)
+         self.batchsize = batchsize
++        batch_shape = list((
++            (batchsize,256,256,3), # sample images. We assume (256,256,3) for now
++            (batchsize, self.model_input_size, self.model_input_size, 3),
++            (batchsize, self.model_output_size, self.model_output_size, 3),
++        ))
++        if self.mask_function:
++            batch_shape.append((self.batchsize, self.model_input_size, self.model_input_size, 1))
++
+         q_name = "timelapse_{}".format(side) if is_timelapse else "train_{}".format(side)
+-        q_size = batchsize * 8
+-        # Don't use a multiprocessing queue because sometimes the MP Manager borks on numpy arrays
+-        queue_manager.add_queue(q_name, maxsize=q_size, multiprocessing_queue=False)
+-        load_thread = MultiThread(self.load_batches,
+-                                  images,
+-                                  q_name,
+-                                  side,
+-                                  is_timelapse,
+-                                  do_shuffle)
++        load_thread = FixedProducerDispatcher(
++            self.load_batches,
++            batch_shape,
++            args=(images, q_name, side, is_timelapse, do_shuffle, batchsize),
++            log_queue=queue_manager._log_queue,
++            log_level=logger.getEffectiveLevel(),
++        )
+         load_thread.start()
+         logger.debug("Batching to queue: (side: '%s', queue: '%s')", side, q_name)
+         return self.minibatch(q_name, load_thread)
+ 
+-    def load_batches(self, images, q_name, side, is_timelapse, do_shuffle=True):
++    def load_batches(self, mem_gen, images, q_name, side, is_timelapse, do_shuffle=True, batchsize=0):
+         """ Load the warped images and target images to queue """
+         logger.debug("Loading batch: (image_count: %s, q_name: '%s', side: '%s', "
+                      "is_timelapse: %s, do_shuffle: %s)",
+                      len(images), q_name, side, is_timelapse, do_shuffle)
+-        epoch = 0
+-        queue = queue_manager.get_queue(q_name)
+         self.validate_samples(images)
+-        while True:
+-            if do_shuffle:
+-                shuffle(images)
+-            for img in images:
+-                logger.trace("Putting to batch queue: (q_name: '%s', side: '%s')", q_name, side)
+-                queue.put(self.process_face(img, side, is_timelapse))
+-            epoch += 1
++        def _img_iter(imgs):
++            while True:
++                if do_shuffle:
++                    shuffle(imgs)
++                for img in imgs:
++                    yield img
++        img_iter = _img_iter(images)
++        epoch = 0
++        for memory_wrapper in mem_gen:
++            memory = memory_wrapper.get()
++            logger.debug("Putting to batch queue: (q_name: '%s', side: '%s')", q_name, side)
++            for i, img_path in enumerate(img_iter):
++                imgs = self.process_face(img_path, side, is_timelapse)
++                for j, img in enumerate(imgs):
++                    memory[j][i][:] = img
++                epoch += 1
++                if i == batchsize - 1:
++                    break
++            memory_wrapper.ready()
+         logger.debug("Finished batching: (epoch: %s, q_name: '%s', side: '%s')",
+                      epoch, q_name, side)
+ 
+@@ -98,22 +114,12 @@ class TrainingDataGenerator():
+         """ A generator function that yields epoch, batchsize of warped_img
+             and batchsize of target_img from the load queue """
+         logger.debug("Launching minibatch generator for queue: '%s'", q_name)
+-        queue = queue_manager.get_queue(q_name)
+-        while True:
+-            if load_thread.has_error:
+-                logger.debug("Thread error detected")
+-                break
+-            batch = list()
+-            for _ in range(self.batchsize):
+-                images = queue.get()
+-                for idx, image in enumerate(images):
+-                    if len(batch) < idx + 1:
+-                        batch.append(list())
+-                    batch[idx].append(image)
+-            batch = [np.float32(image) for image in batch]
+-            logger.trace("Yielding batch: (size: %s, item shapes: %s, queue:  '%s'",
+-                         len(batch), [item.shape for item in batch], q_name)
+-            yield batch
++        for batch_wrapper in load_thread:
++            with batch_wrapper as batch:
++                logger.trace("Yielding batch: (size: %s, item shapes: %s, queue:  '%s'",
++                             len(batch), [item.shape for item in batch], q_name)
++                yield batch
++        load_thread.stop()
+         logger.debug("Finished minibatch generator for queue: '%s'", q_name)
+         load_thread.join()
+ 

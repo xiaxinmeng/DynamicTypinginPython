@@ -1,0 +1,387 @@
+commit 1fde606e35c502dbd3a05ad560e4ee468f65b2e3
+Author: David Cramer <dcramer@gmail.com>
+Date:   Sun Oct 11 23:34:05 2015 -0700
+
+    Improve bulk deletion handlers
+    
+    - Abstract code into BulkDeleteQuery
+    - Add MySQL support
+    - Switch Django Nodestore to bulk deletion
+
+diff --git a/src/sentry/db/deletion.py b/src/sentry/db/deletion.py
+new file mode 100644
+index 0000000000..cfa03eaf0d
+--- /dev/null
++++ b/src/sentry/db/deletion.py
+@@ -0,0 +1,113 @@
++from __future__ import absolute_import
++
++from datetime import timedelta
++from django.db import connections
++from django.utils import timezone
++
++from sentry.utils import db
++
++
++class BulkDeleteQuery(object):
++    def __init__(self, model, project_id=None, dtfield=None, days=None):
++        self.model = model
++        self.project_id = int(project_id) if project_id else None
++        self.dtfield = dtfield
++        self.days = int(days) if days is not None else None
++
++    def execute_postgres(self, chunk_size=10000):
++        quote_name = connections['default'].ops.quote_name
++
++        where = []
++        if self.dtfield and self.days is not None:
++            where.append("{} < now() - interval '{} days'".format(
++                quote_name(self.dtfield),
++                self.days,
++            ))
++        if self.project_id:
++            where.append("project_id = {}".format(self.project_id))
++
++        if where:
++            where_clause = 'where {}'.format(' and '.join(where))
++        else:
++            where_clause = ''
++
++        query = """
++            delete from {table}
++            where id = any(array(
++                select id
++                from {table}
++                {where}
++                limit {chunk_size}
++            ));
++        """.format(
++            table=self.model._meta.db_table,
++            chunk_size=self.chunk_size,
++            where=where_clause,
++        )
++
++        return self._continuous_delete(query)
++
++    def execute_mysql(self, chunk_size=10000):
++        quote_name = connections['default'].ops.quote_name
++
++        where = []
++        if self.dtfield and self.days is not None:
++            where.append("{} < now() - interval '{} days'".format(
++                quote_name(self.dtfield),
++                self.days,
++            ))
++        if self.project_id:
++            where.append("project_id = {}".format(self.project_id))
++
++        if where:
++            where_clause = 'where {}'.format(' and '.join(where))
++        else:
++            where_clause = ''
++
++        query = """
++            delete from {table}
++            {where}
++            limit {chunk_size}
++            ));
++        """.format(
++            table=self.model._meta.db_table,
++            chunk_size=chunk_size,
++            where=where_clause,
++        )
++
++        return self._continuous_delete(query)
++
++    def _continuous_query(self, query):
++        results = True
++        cursor = connections['default'].cursor()
++        while results:
++            cursor.execute(query)
++            results = cursor.rowcount > 0
++
++    def execute_generic(self, chunk_size=100):
++        qs = self.model.objects.all()
++
++        if self.days:
++            cutoff = timezone.now() - timedelta(days=self.days)
++            qs = qs.filter(
++                **{'{}__lte'.format(self.dtfield): cutoff}
++            )
++        if self.project_id:
++            qs = qs.filter(project=self.project_id)
++
++        # XXX: we step through because the deletion collector will pull all
++        # relations into memory
++        exists = True
++        while exists:
++            exists = False
++            for item in qs[:chunk_size].iterator():
++                item.delete()
++                exists = True
++
++    def execute(self, chunk_size=10000):
++        if db.is_postgres():
++            self.execute_postgres(chunk_size)
++        elif db.is_mysql():
++            self.execute_mysql(chunk_size)
++        else:
++            self.execute_generic(chunk_size)
+diff --git a/src/sentry/management/commands/cleanup.py b/src/sentry/management/commands/cleanup.py
+index a0c2b427fb..ab5f3ed3db 100644
+--- a/src/sentry/management/commands/cleanup.py
++++ b/src/sentry/management/commands/cleanup.py
+@@ -9,21 +9,15 @@ from __future__ import absolute_import, print_function
+ 
+ from datetime import timedelta
+ from django.core.management.base import BaseCommand
+-from django.db import connections
+ from django.utils import timezone
+ from optparse import make_option
+ 
+ from sentry.app import nodestore
++from sentry.db.deletion import BulkDeleteQuery
+ from sentry.models import (
+     Event, EventMapping, Group, GroupRuleStatus, GroupTagValue,
+     LostPasswordHash, TagValue, GroupEmailThread,
+ )
+-from sentry.utils import db
+-from sentry.utils.threadpool import ThreadPool
+-
+-
+-def delete_object(item):
+-    item.delete()
+ 
+ 
+ class Command(BaseCommand):
+@@ -48,83 +42,6 @@ class Command(BaseCommand):
+         (Group, 'last_seen'),
+     )
+ 
+-    def _postgres_bulk_speed_delete(self, model, dtfield, days=None,
+-                                    chunk_size=100000):
+-        """
+-        Cleanup models which we know dont need expensive (in-app) cascades or
+-        cache handling.
+-
+-        This chunks up delete statements but still does them in bulk.
+-        """
+-        cursor = connections['default'].cursor()
+-        quote_name = connections['default'].ops.quote_name
+-
+-        if days is None:
+-            days = self.days
+-
+-        if self.project:
+-            where_extra = 'and project_id = %d' % (self.project,)
+-        else:
+-            where_extra = ''
+-
+-        keep_it_going = True
+-        while keep_it_going:
+-            cursor.execute("""
+-            delete from %(table)s
+-            where id = any(array(
+-                select id
+-                from %(table)s
+-                where %(dtfield)s < now() - interval '%(days)d days'
+-                %(where_extra)s
+-                limit %(chunk_size)d
+-            ));
+-            """ % dict(
+-                table=model._meta.db_table,
+-                dtfield=quote_name(dtfield),
+-                days=days,
+-                where_extra=where_extra,
+-                chunk_size=chunk_size,
+-            ))
+-            keep_it_going = cursor.rowcount > 0
+-
+-    def bulk_delete(self, model, dtfield, days=None):
+-        if db.is_postgres():
+-            self._postgres_bulk_speed_delete(model, dtfield, days=days)
+-        else:
+-            self.generic_delete(model, dtfield, days=days)
+-
+-    def generic_delete(self, model, dtfield, days=None, chunk_size=1000):
+-        if days is None:
+-            days = self.days
+-
+-        cutoff = timezone.now() - timedelta(days=days)
+-
+-        qs = model.objects.filter(**{'%s__lte' % (dtfield,): cutoff})
+-        if self.project:
+-            qs = qs.filter(project=self.project)
+-
+-        # XXX: we step through because the deletion collector will pull all
+-        # relations into memory
+-        count = 0
+-        while qs.exists():
+-            # TODO(dcramer): change this to delete by chunks of IDs and utilize
+-            # bulk_delete_objects
+-            self.stdout.write("Removing {model} chunk {count}\n".format(
+-                model=model.__name__,
+-                count=count,
+-            ))
+-            if self.concurrency > 1:
+-                worker_pool = ThreadPool(workers=self.concurrency)
+-                for obj in qs[:chunk_size].iterator():
+-                    worker_pool.add(obj.id, delete_object, [obj])
+-                    count += 1
+-                worker_pool.join()
+-                del worker_pool
+-            else:
+-                for obj in qs[:chunk_size].iterator():
+-                    delete_object(obj)
+-                    count += 1
+-
+     def handle(self, **options):
+         self.days = options['days']
+         self.concurrency = options['concurrency']
+@@ -151,7 +68,22 @@ class Command(BaseCommand):
+                 days=self.days,
+                 project=self.project or '*',
+             ))
+-            self.bulk_delete(model, dtfield)
++            BulkDeleteQuery(
++                model=model,
++                dtfield=dtfield,
++                days=self.days,
++                project_id=self.project,
++            ).execute()
++
++        # EventMapping is fairly expensive and is special cased as it's likely you
++        # won't need a reference to an event for nearly as long
++        self.stdout.write("Removing expired values for EventMapping\n")
++        BulkDeleteQuery(
++            model=EventMapping,
++            dtfield='date_added',
++            days=min(self.days, 7),
++            project_id=self.project,
++        ).execute()
+ 
+         for model, dtfield in self.GENERIC_DELETES:
+             self.stdout.write("Removing {model} for days={days} project={project}\n".format(
+@@ -159,9 +91,9 @@ class Command(BaseCommand):
+                 days=self.days,
+                 project=self.project or '*',
+             ))
+-            self.generic_delete(model, dtfield)
+-
+-        # EventMapping is fairly expensive and is special cased as it's likely you
+-        # won't need a reference to an event for nearly as long
+-        self.stdout.write("Removing expired values for EventMapping\n")
+-        self.bulk_delete(EventMapping, 'date_added', days=min(self.days, 7))
++            BulkDeleteQuery(
++                model=model,
++                dtfield=dtfield,
++                days=self.days,
++                project_id=self.project,
++            ).execute_generic()
+diff --git a/src/sentry/nodestore/django/backend.py b/src/sentry/nodestore/django/backend.py
+index 8689391c8b..a9bbef4180 100644
+--- a/src/sentry/nodestore/django/backend.py
++++ b/src/sentry/nodestore/django/backend.py
+@@ -8,12 +8,14 @@ sentry.nodestore.django.backend
+ 
+ from __future__ import absolute_import
+ 
+-from django.db import connection
++import math
++
+ from django.utils import timezone
+ 
+ from sentry.db.models import create_or_update
+ from sentry.nodestore.base import NodeStorage
+ 
++
+ from .models import Node
+ 
+ 
+@@ -44,12 +46,13 @@ class DjangoNodeStorage(NodeStorage):
+         )
+ 
+     def cleanup(self, cutoff_timestamp):
+-        # TODO(dcramer): this should share the efficient bulk deletion
+-        # mechanisms
+-        query = """
+-        DELETE FROM %s WHERE timestamp <= %%s
+-        """ % (Node._meta.db_table,)
+-        params = [cutoff_timestamp]
+-
+-        cursor = connection.cursor()
+-        cursor.execute(query, params)
++        from sentry.db.deletion import BulkDeleteQuery
++
++        total_seconds = (timezone.now() - cutoff_timestamp).total_seconds()
++        days = math.floor(total_seconds / 86400)
++
++        BulkDeleteQuery(
++            model=Node,
++            dtfield='timestamp',
++            days=days,
++        ).execute()
+diff --git a/src/sentry/tasks/deletion.py b/src/sentry/tasks/deletion.py
+index 2f4d1d6bdf..aeae67cb5d 100644
+--- a/src/sentry/tasks/deletion.py
++++ b/src/sentry/tasks/deletion.py
+@@ -8,7 +8,6 @@ sentry.tasks.deletion
+ 
+ from __future__ import absolute_import
+ 
+-
+ from celery.utils.log import get_task_logger
+ 
+ from sentry.utils.query import bulk_delete_objects
+diff --git a/tests/sentry/db/__init__.py b/tests/sentry/db/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/tests/sentry/db/test_deletion.py b/tests/sentry/db/test_deletion.py
+new file mode 100644
+index 0000000000..ac2a61b0b3
+--- /dev/null
++++ b/tests/sentry/db/test_deletion.py
+@@ -0,0 +1,43 @@
++from __future__ import absolute_import
++
++from datetime import timedelta
++from django.utils import timezone
++
++from sentry.db.deletion import BulkDeleteQuery
++from sentry.models import Group, Project
++from sentry.testutils import TestCase
++
++
++class BulkDeleteQueryTest(TestCase):
++    def test_project_restriction(self):
++        project1 = self.create_project()
++        group1_1 = self.create_group(project1)
++        group1_2 = self.create_group(project1)
++        project2 = self.create_project()
++        group2_1 = self.create_group(project2)
++        group2_2 = self.create_group(project2)
++        BulkDeleteQuery(
++            model=Group,
++            project_id=project1.id,
++        ).execute()
++        assert Project.objects.filter(id=project1.id).exists()
++        assert Project.objects.filter(id=project2.id).exists()
++        assert Group.objects.filter(id=group2_1.id).exists()
++        assert Group.objects.filter(id=group2_2.id).exists()
++        assert not Group.objects.filter(id=group1_1.id).exists()
++        assert not Group.objects.filter(id=group1_2.id).exists()
++
++    def test_datetime_restriction(self):
++        now = timezone.now()
++        project1 = self.create_project()
++        group1_1 = self.create_group(project1, last_seen=now - timedelta(days=1))
++        group1_2 = self.create_group(project1, last_seen=now - timedelta(days=1))
++        group1_3 = self.create_group(project1, last_seen=now)
++        BulkDeleteQuery(
++            model=Group,
++            dtfield='last_seen',
++            days=1,
++        ).execute()
++        assert not Group.objects.filter(id=group1_1.id).exists()
++        assert not Group.objects.filter(id=group1_2.id).exists()
++        assert Group.objects.filter(id=group1_3.id).exists()

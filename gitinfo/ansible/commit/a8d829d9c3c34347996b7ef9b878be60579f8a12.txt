@@ -1,0 +1,437 @@
+commit a8d829d9c3c34347996b7ef9b878be60579f8a12
+Author: Matt Clay <matt@mystile.com>
+Date:   Tue Mar 5 11:58:13 2019 -0800
+
+    Add timeout support to ansible-test. (#53302)
+    
+    * Add timeout support to ansible-test.
+    * Fix ansible-test tar filename filter bug.
+    * Update timeouts used on Shippable.
+    * Kill subprocesses when parent process terminates.
+    * Require explicit use of env --show option.
+
+diff --git a/.gitignore b/.gitignore
+index d93ebbdc62..76b764b9df 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -105,3 +105,4 @@ test/units/.coverage.*
+ /test/integration/cloud-config-azure.yml
+ /SYMLINK_CACHE.json
+ changelogs/.plugin-cache.yaml
++.ansible-test-timeout.json
+diff --git a/test/runner/lib/cli.py b/test/runner/lib/cli.py
+index 933a16e1b5..6d6e5653b8 100644
+--- a/test/runner/lib/cli.py
++++ b/test/runner/lib/cli.py
+@@ -52,6 +52,7 @@ from lib.config import (
+ from lib.env import (
+     EnvConfig,
+     command_env,
++    configure_timeout,
+ )
+ 
+ from lib.sanity import (
+@@ -95,6 +96,7 @@ def main():
+         display.color = config.color
+         display.info_stderr = (isinstance(config, SanityConfig) and config.lint) or (isinstance(config, IntegrationConfig) and config.list_targets)
+         check_startup()
++        configure_timeout(config)
+ 
+         display.info('RLIMIT_NOFILE: %s' % (CURRENT_RLIMIT_NOFILE,), verbosity=2)
+         display.info('MAXFD: %d' % MAXFD, verbosity=2)
+@@ -509,6 +511,11 @@ def parse_args():
+                      action='store_true',
+                      help='dump environment to disk')
+ 
++    env.add_argument('--timeout',
++                     type=int,
++                     metavar='MINUTES',
++                     help='timeout for future ansible-test commands (0 clears)')
++
+     if argcomplete:
+         argcomplete.autocomplete(parser, always_complete_options=False, validator=lambda i, k: True)
+ 
+diff --git a/test/runner/lib/constants.py b/test/runner/lib/constants.py
+index 25096742fd..10329f4d9c 100644
+--- a/test/runner/lib/constants.py
++++ b/test/runner/lib/constants.py
+@@ -3,3 +3,6 @@
+ # Setting a low soft RLIMIT_NOFILE value will improve the performance of subprocess.Popen on Python 2.x when close_fds=True.
+ # This will affect all Python subprocesses. It will also affect the current Python process if set before subprocess is imported for the first time.
+ SOFT_RLIMIT_NOFILE = 1024
++
++# File used to track the ansible-test test execution timeout.
++TIMEOUT_PATH = '.ansible-test-timeout.json'
+diff --git a/test/runner/lib/env.py b/test/runner/lib/env.py
+index 908f75a3ac..cb8964debf 100644
+--- a/test/runner/lib/env.py
++++ b/test/runner/lib/env.py
+@@ -4,13 +4,17 @@ from __future__ import absolute_import, print_function
+ 
+ import datetime
+ import json
++import functools
+ import os
+ import platform
+ import re
++import signal
+ import sys
++import time
+ 
+ from lib.config import (
+     CommonConfig,
++    TestConfig,
+ )
+ 
+ from lib.util import (
+@@ -34,6 +38,18 @@ from lib.docker_util import (
+     docker_version
+ )
+ 
++from lib.thread import (
++    WrappedThread,
++)
++
++from lib.constants import (
++    TIMEOUT_PATH,
++)
++
++from lib.test import (
++    TestTimeout,
++)
++
+ 
+ class EnvConfig(CommonConfig):
+     """Configuration for the tools command."""
+@@ -43,14 +59,26 @@ class EnvConfig(CommonConfig):
+         """
+         super(EnvConfig, self).__init__(args, 'env')
+ 
+-        self.show = args.show or not args.dump
++        self.show = args.show
+         self.dump = args.dump
++        self.timeout = args.timeout
+ 
+ 
+ def command_env(args):
+     """
+     :type args: EnvConfig
+     """
++    show_dump_env(args)
++    set_timeout(args)
++
++
++def show_dump_env(args):
++    """
++    :type args: EnvConfig
++    """
++    if not args.show and not args.dump:
++        return
++
+     data = dict(
+         ansible=dict(
+             version=get_ansible_version(args),
+@@ -84,6 +112,105 @@ def command_env(args):
+             results_fd.write(json.dumps(data, sort_keys=True))
+ 
+ 
++def set_timeout(args):
++    """
++    :type args: EnvConfig
++    """
++    if args.timeout is None:
++        return
++
++    if args.timeout:
++        deadline = (datetime.datetime.utcnow() + datetime.timedelta(minutes=args.timeout)).strftime('%Y-%m-%dT%H:%M:%SZ')
++
++        display.info('Setting a %d minute test timeout which will end at: %s' % (args.timeout, deadline), verbosity=1)
++    else:
++        deadline = None
++
++        display.info('Clearing existing test timeout.', verbosity=1)
++
++    if args.explain:
++        return
++
++    if deadline:
++        data = dict(
++            duration=args.timeout,
++            deadline=deadline,
++        )
++
++        with open(TIMEOUT_PATH, 'w') as timeout_fd:
++            json.dump(data, timeout_fd, indent=4, sort_keys=True)
++    elif os.path.exists(TIMEOUT_PATH):
++        os.remove(TIMEOUT_PATH)
++
++
++def get_timeout():
++    """
++    :rtype: dict[str, any] | None
++    """
++    if not os.path.exists(TIMEOUT_PATH):
++        return None
++
++    with open(TIMEOUT_PATH, 'r') as timeout_fd:
++        data = json.load(timeout_fd)
++
++    data['deadline'] = datetime.datetime.strptime(data['deadline'], '%Y-%m-%dT%H:%M:%SZ')
++
++    return data
++
++
++def configure_timeout(args):
++    """
++    :type args: CommonConfig
++    """
++    if isinstance(args, TestConfig):
++        configure_test_timeout(args)  # only tests are subject to the timeout
++
++
++def configure_test_timeout(args):
++    """
++    :type args: TestConfig
++    """
++    timeout = get_timeout()
++
++    if not timeout:
++        return
++
++    timeout_start = datetime.datetime.utcnow()
++    timeout_duration = timeout['duration']
++    timeout_deadline = timeout['deadline']
++    timeout_remaining = timeout_deadline - timeout_start
++
++    test_timeout = TestTimeout(timeout_duration)
++
++    if timeout_remaining <= datetime.timedelta():
++        test_timeout.write(args)
++
++        raise ApplicationError('The %d minute test timeout expired %s ago at %s.' % (
++            timeout_duration, timeout_remaining * -1, timeout_deadline))
++
++    display.info('The %d minute test timeout expires in %s at %s.' % (
++        timeout_duration, timeout_remaining, timeout_deadline), verbosity=1)
++
++    def timeout_handler(_dummy1, _dummy2):
++        """Runs when SIGUSR1 is received."""
++        test_timeout.write(args)
++
++        raise ApplicationError('Tests aborted after exceeding the %d minute time limit.' % timeout_duration)
++
++    def timeout_waiter(timeout_seconds):
++        """
++        :type timeout_seconds: int
++        """
++        time.sleep(timeout_seconds)
++        os.kill(os.getpid(), signal.SIGUSR1)
++
++    signal.signal(signal.SIGUSR1, timeout_handler)
++
++    instance = WrappedThread(functools.partial(timeout_waiter, timeout_remaining.seconds))
++    instance.daemon = True
++    instance.start()
++
++
+ def show_dict(data, verbose, root_verbosity=0, path=None):
+     """
+     :type data: dict[str, any]
+diff --git a/test/runner/lib/pytar.py b/test/runner/lib/pytar.py
+index 145c91afaf..db79d49495 100644
+--- a/test/runner/lib/pytar.py
++++ b/test/runner/lib/pytar.py
+@@ -11,6 +11,10 @@ from lib.util import (
+     ABC,
+ )
+ 
++from lib.constants import (
++    TIMEOUT_PATH,
++)
++
+ # improve performance by disabling uid/gid lookups
+ tarfile.pwd = None
+ tarfile.grp = None
+@@ -45,6 +49,7 @@ class DefaultTarFilter(TarFilter):
+         self.ignore_files = (
+             '.gitignore',
+             '.gitdir',
++            TIMEOUT_PATH,
+         )
+ 
+         self.ignore_extensions = (
+@@ -58,7 +63,7 @@ class DefaultTarFilter(TarFilter):
+         :rtype: tarfile.TarInfo | None
+         """
+         filename = os.path.basename(item.path)
+-        name, ext = os.path.splitext(filename)
++        ext = os.path.splitext(filename)[1]
+         dirs = os.path.split(item.path)
+ 
+         if not item.isdir():
+@@ -68,7 +73,7 @@ class DefaultTarFilter(TarFilter):
+             if item.path.startswith('./docs/docsite/_build/'):
+                 return None
+ 
+-        if name in self.ignore_files:
++        if filename in self.ignore_files:
+             return None
+ 
+         if ext in self.ignore_extensions:
+diff --git a/test/runner/lib/test.py b/test/runner/lib/test.py
+index 2dc2248b1d..9b960c2d99 100644
+--- a/test/runner/lib/test.py
++++ b/test/runner/lib/test.py
+@@ -57,15 +57,17 @@ def calculate_confidence(path, line, metadata):
+ 
+ class TestResult(object):
+     """Base class for test results."""
+-    def __init__(self, command, test, python_version=None):
++    def __init__(self, command, test, python_version=None, enable_junit=False):
+         """
+         :type command: str
+         :type test: str
+         :type python_version: str
++        :type enable_junit: bool
+         """
+         self.command = command
+         self.test = test
+         self.python_version = python_version
++        self.enable_junit = enable_junit
+         self.name = self.test or self.command
+ 
+         if self.python_version:
+@@ -88,7 +90,7 @@ class TestResult(object):
+         if args.lint:
+             self.write_lint()
+ 
+-        if args.junit:
++        if args.junit or self.enable_junit:
+             if self.junit:
+                 self.write_junit(args)
+             else:
+@@ -159,6 +161,38 @@ class TestResult(object):
+             xml.write(report.encode('utf-8', 'strict'))
+ 
+ 
++class TestTimeout(TestResult):
++    """Test timeout."""
++    def __init__(self, timeout_duration):
++        """
++        :type timeout_duration: int
++        """
++        super(TestTimeout, self).__init__(command='timeout', test='', enable_junit=True)
++
++        self.timeout_duration = timeout_duration
++
++    def write_junit(self, args):
++        """
++        :type args: TestConfig
++        """
++        message = 'Tests were aborted after exceeding the %d minute time limit.' % self.timeout_duration
++        output = '''One or more of the following situations may be responsible:
++
++- Code changes have resulted in tests that hang or run for an excessive amount of time.
++- Tests have been added which exceed the time limit when combined with existing tests.
++- Test infrastructure and/or external dependencies are operating slower than normal.'''
++
++        if args.coverage:
++            output += '\n- Additional overhead from collecting code coverage has resulted in tests exceeding the time limit.'
++
++        output += '\n\nConsult the console log for additional details on where the timeout occurred.'
++
++        test_case = self.junit.TestCase(classname=self.command, name=self.name)
++        test_case.add_error_info(message, output)
++
++        self.save_junit(args, test_case)
++
++
+ class TestSuccess(TestResult):
+     """Test success."""
+     def write_junit(self, args):
+diff --git a/test/runner/lib/util.py b/test/runner/lib/util.py
+index 9838b0eab6..43ecbaa555 100644
+--- a/test/runner/lib/util.py
++++ b/test/runner/lib/util.py
+@@ -380,23 +380,30 @@ def raw_command(cmd, capture=False, env=None, data=None, cwd=None, explain=False
+         stderr = None
+ 
+     start = time.time()
++    process = None
+ 
+     try:
+-        process = subprocess.Popen(cmd, env=env, stdin=stdin, stdout=stdout, stderr=stderr, cwd=cwd)
+-    except OSError as ex:
+-        if ex.errno == errno.ENOENT:
+-            raise ApplicationError('Required program "%s" not found.' % cmd[0])
+-        raise
+-
+-    if communicate:
+-        encoding = 'utf-8'
+-        data_bytes = data.encode(encoding, 'surrogateescape') if data else None
+-        stdout_bytes, stderr_bytes = process.communicate(data_bytes)
+-        stdout_text = stdout_bytes.decode(encoding, str_errors) if stdout_bytes else u''
+-        stderr_text = stderr_bytes.decode(encoding, str_errors) if stderr_bytes else u''
+-    else:
+-        process.wait()
+-        stdout_text, stderr_text = None, None
++        try:
++            process = subprocess.Popen(cmd, env=env, stdin=stdin, stdout=stdout, stderr=stderr, cwd=cwd)
++        except OSError as ex:
++            if ex.errno == errno.ENOENT:
++                raise ApplicationError('Required program "%s" not found.' % cmd[0])
++            raise
++
++        if communicate:
++            encoding = 'utf-8'
++            data_bytes = data.encode(encoding, 'surrogateescape') if data else None
++            stdout_bytes, stderr_bytes = process.communicate(data_bytes)
++            stdout_text = stdout_bytes.decode(encoding, str_errors) if stdout_bytes else u''
++            stderr_text = stderr_bytes.decode(encoding, str_errors) if stderr_bytes else u''
++        else:
++            process.wait()
++            stdout_text, stderr_text = None, None
++    finally:
++        if process and process.returncode is None:
++            process.kill()
++            display.info('')  # the process we're interrupting may have completed a partial line of output
++            display.notice('Killed command to avoid an orphaned child process during handling of an unexpected exception.')
+ 
+     status = process.returncode
+     runtime = time.time() - start
+diff --git a/test/utils/shippable/shippable.sh b/test/utils/shippable/shippable.sh
+index e9beaba9e7..78cef019e8 100755
+--- a/test/utils/shippable/shippable.sh
++++ b/test/utils/shippable/shippable.sh
+@@ -116,6 +116,12 @@ function cleanup
+ 
+ trap cleanup EXIT
+ 
+-ansible-test env --dump --show --color -v
++if [[ "${COVERAGE:-}" ]]; then
++    timeout=60
++else
++    timeout=45
++fi
++
++ansible-test env --dump --show --timeout "${timeout}" --color -v
+ 
+ "test/utils/shippable/${script}.sh" "${test}"
+diff --git a/test/utils/shippable/units.sh b/test/utils/shippable/units.sh
+index dc115dec15..11d1a792ca 100755
+--- a/test/utils/shippable/units.sh
++++ b/test/utils/shippable/units.sh
+@@ -7,5 +7,13 @@ IFS='/:' read -ra args <<< "$1"
+ 
+ version="${args[1]}"
+ 
++if [[ "${COVERAGE:-}" ]]; then
++    timeout=90
++else
++    timeout=10
++fi
++
++ansible-test env --timeout "${timeout}" --color -v
++
+ # shellcheck disable=SC2086
+ ansible-test units --color -v --docker default --python "${version}" ${COVERAGE:+"$COVERAGE"} ${CHANGED:+"$CHANGED"} \

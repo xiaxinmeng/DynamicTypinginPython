@@ -1,0 +1,194 @@
+commit d14b11b98e5f31b13a554f47ca4b32477318074e
+Author: torzdf <36920800+torzdf@users.noreply.github.com>
+Date:   Mon Mar 4 16:34:37 2019 +0000
+
+    Minor FixedProducerDispatcher changes. Fix timelapse bug
+
+diff --git a/lib/multithreading.py b/lib/multithreading.py
+index d9a31b2..0ba29ca 100644
+--- a/lib/multithreading.py
++++ b/lib/multithreading.py
+@@ -102,10 +102,10 @@ class FixedProducerDispatcher():
+             with batch_wrapper as batch:
+                 send_batch_to_trainer(batch)
+     """
+-    EVENT = mp.Event
+-    QUEUE = mp.Queue
++    CTX = mp.get_context("spawn")
++    EVENT = CTX.Event
+ 
+-    def __init__(self, method, shapes,
++    def __init__(self, method, shapes, in_queue, out_queue,
+                  args=tuple(), kwargs={}, ctype=c_float, workers=1, buffers=None):
+         logger.debug("Initializing %s: (method: '%s', shapes: %s, args: %s, kwargs: %s, "
+                      "ctype: %s, workers: %s, buffers: %s)", self.__class__.__name__, method,
+@@ -118,10 +118,10 @@ class FixedProducerDispatcher():
+         self._target_func = method
+         self._shapes = shapes
+         self._stop_event = self.EVENT()
+-        self._buffer_tokens = self.QUEUE()
++        self._buffer_tokens = in_queue
+         for i in range(buffers):
+             self._buffer_tokens.put(i)
+-        self._result_tokens = self.QUEUE()
++        self._result_tokens = out_queue
+         worker_data, self.data = self._create_data(shapes, ctype, buffers)
+         proc_args = {
+             'data': worker_data,
+@@ -162,7 +162,7 @@ class FixedProducerDispatcher():
+ 
+     def _create_worker(self, kwargs):
+         """ Create Worker """
+-        return mp.Process(target=self._runner, kwargs=kwargs)
++        return self.CTX.Process(target=self._runner, kwargs=kwargs)
+ 
+     def free(self, index):
+         """ Free memory """
+@@ -220,13 +220,11 @@ class FixedProducerDispatcher():
+         while self._open_worker:
+             if self._result_tokens.get() is None:
+                 self._open_worker -= 1
+-        self._result_tokens.close()
+         while True:
+             try:
+                 self._buffer_tokens.get(block=False, timeout=0.01)
+             except Queue.Empty:
+                 break
+-        self._buffer_tokens.close()
+         for worker in self._worker:
+             worker.join()
+ 
+@@ -247,15 +245,14 @@ class FixedProducerDispatcher():
+                 args=None, kwargs=None):
+         """ Shared Memory Object runner """
+         # Fork inherits the queue handler, so skip registration with "fork"
+-        if log_queue and log_level is not None and mp.get_start_method() != "fork":
+-            set_root_logger(log_level, queue=log_queue)
++        set_root_logger(log_level, queue=log_queue)
+         logger.debug("FixedProducerDispatcher worker for %s started", str(target))
+         np_data = [cls._np_from_shared(d, shapes, dtype) for d in data]
+ 
+         def get_free_slot():
+             while not stop_event.is_set():
+                 i = buffer_tokens.get()
+-                if stop_event.is_set() or i is None:
++                if stop_event.is_set() or i is None or i == "EOF":
+                     break
+                 yield WorkerBuffer(i, np_data[i], stop_event, result_tokens)
+ 
+diff --git a/lib/training_data.py b/lib/training_data.py
+index 1225d1b..1a3ab91 100644
+--- a/lib/training_data.py
++++ b/lib/training_data.py
+@@ -12,6 +12,7 @@ from scipy.interpolate import griddata
+ 
+ from lib.model import masks
+ from lib.multithreading import FixedProducerDispatcher
++from lib.queue_manager import queue_manager
+ from lib.umeyama import umeyama
+ 
+ logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
+@@ -52,6 +53,7 @@ class TrainingDataGenerator():
+         logger.debug("Queue batches: (image_count: %s, batchsize: %s, side: '%s', do_shuffle: %s, "
+                      "is_timelapse: %s)", len(images), batchsize, side, do_shuffle, is_timelapse)
+         self.batchsize = batchsize
++        queue_in, queue_out = self.make_queues(side, is_timelapse)
+         training_size = self.training_opts.get("training_size", 256)
+         batch_shape = list((
+             (batchsize, training_size, training_size, 3),  # sample images
+@@ -61,13 +63,24 @@ class TrainingDataGenerator():
+             batch_shape.append((self.batchsize, self.model_output_size, self.model_output_size, 1))
+ 
+         load_process = FixedProducerDispatcher(
+-            self.load_batches,
+-            batch_shape,
++            method=self.load_batches,
++            shapes=batch_shape,
++            in_queue=queue_in,
++            out_queue=queue_out,
+             args=(images, side, is_timelapse, do_shuffle, batchsize))
+         load_process.start()
+         logger.debug("Batching to queue: (side: '%s', is_timelapse: %s)", side, is_timelapse)
+         return self.minibatch(side, is_timelapse, load_process)
+ 
++    @staticmethod
++    def make_queues(side, is_timelapse):
++        """ Create the buffer token queues for Fixed Producer Dispatcher """
++        q_name = "timelapse_{}".format(side) if is_timelapse else "train_{}".format(side)
++        q_names = ["{}_{}".format(q_name, direction) for direction in ("in", "out")]
++        logger.debug(q_names)
++        queues = [queue_manager.get_queue(queue) for queue in q_names]
++        return queues
++
+     def load_batches(self, mem_gen, images, side, is_timelapse,
+                      do_shuffle=True, batchsize=0):
+         """ Load the warped images and target images to queue """
+diff --git a/plugins/train/trainer/_base.py b/plugins/train/trainer/_base.py
+index c8ba688..da74b8f 100644
+--- a/plugins/train/trainer/_base.py
++++ b/plugins/train/trainer/_base.py
+@@ -132,14 +132,16 @@ class TrainerBase():
+     def train_one_step(self, viewer, timelapse_kwargs):
+         """ Train a batch """
+         logger.trace("Training one step: (iteration: %s)", self.model.iterations)
+-        is_preview_iteration = False if viewer is None else True
++        do_preview = False if viewer is None else True
++        do_timelapse = False if timelapse_kwargs is None else True
+         loss = dict()
+         for side, batcher in self.batchers.items():
+-            loss[side] = batcher.train_one_batch(is_preview_iteration)
+-            if not is_preview_iteration:
++            loss[side] = batcher.train_one_batch(do_preview)
++            if not do_preview and not do_timelapse:
+                 continue
+-            self.samples.images[side] = batcher.compile_sample(self.batch_size)
+-            if timelapse_kwargs:
++            if do_preview:
++                self.samples.images[side] = batcher.compile_sample(self.batch_size)
++            if do_timelapse:
+                 self.timelapse.get_sample(side, timelapse_kwargs)
+ 
+         self.model.state.increment_iterations()
+@@ -149,11 +151,11 @@ class TrainerBase():
+             self.log_tensorboard(side, side_loss)
+         self.print_loss(loss)
+ 
+-        if viewer is not None:
++        if do_preview:
+             viewer(self.samples.show_sample(),
+                    "Training - 'S': Save Now. 'ENTER': Save and Quit")
+ 
+-        if timelapse_kwargs is not None:
++        if do_timelapse:
+             self.timelapse.output_timelapse()
+ 
+     def store_history(self, side, loss):
+@@ -205,23 +207,23 @@ class Batcher():
+         generator = TrainingDataGenerator(input_size, output_size, self.model.training_opts)
+         return generator
+ 
+-    def train_one_batch(self, is_preview_iteration):
++    def train_one_batch(self, do_preview):
+         """ Train a batch """
+         logger.trace("Training one step: (side: %s)", self.side)
+-        batch = self.get_next(is_preview_iteration)
++        batch = self.get_next(do_preview)
+         loss = self.model.predictors[self.side].train_on_batch(*batch)
+         loss = loss if isinstance(loss, list) else [loss]
+         return loss
+ 
+-    def get_next(self, is_preview_iteration):
++    def get_next(self, do_preview):
+         """ Return the next batch from the generator
+             Items should come out as: (warped, target [, mask]) """
+         batch = next(self.feed)
+-        self.samples = batch[0] if is_preview_iteration else None
++        self.samples = batch[0] if do_preview else None
+         batch = batch[1:]   # Remove full size samples from batch
+         if self.use_mask:
+             batch = self.compile_mask(batch)
+-        self.target = batch[1] if is_preview_iteration else None
++        self.target = batch[1] if do_preview else None
+         return batch
+ 
+     def compile_mask(self, batch):

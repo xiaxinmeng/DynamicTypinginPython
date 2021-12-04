@@ -1,0 +1,620 @@
+commit a640a3a9a6436727d3da0cbc91ee0f285a065c62
+Author: Brett Hoerner <brett@bretthoerner.com>
+Date:   Wed Oct 10 16:29:05 2018 -0500
+
+    fix(eventstream): Batch up merge and unmerge events (#10023)
+
+diff --git a/src/sentry/api/endpoints/group_details.py b/src/sentry/api/endpoints/group_details.py
+index 424a988c0a..bb264b993b 100644
+--- a/src/sentry/api/endpoints/group_details.py
++++ b/src/sentry/api/endpoints/group_details.py
+@@ -381,7 +381,7 @@ class GroupDetailsEndpoint(GroupEndpoint, EnvironmentMixin):
+         :pparam string issue_id: the ID of the issue to delete.
+         :auth: required
+         """
+-        from sentry.tasks.deletion import delete_group
++        from sentry.tasks.deletion import delete_groups
+ 
+         updated = Group.objects.filter(
+             id=group.id,
+@@ -392,7 +392,7 @@ class GroupDetailsEndpoint(GroupEndpoint, EnvironmentMixin):
+         if updated:
+             project = group.project
+ 
+-            eventstream.delete_groups(group.project_id, [group.id])
++            eventstream_state = eventstream.start_delete_groups(group.project_id, [group.id])
+ 
+             GroupHashTombstone.tombstone_groups(
+                 project_id=project.id,
+@@ -401,10 +401,11 @@ class GroupDetailsEndpoint(GroupEndpoint, EnvironmentMixin):
+ 
+             transaction_id = uuid4().hex
+ 
+-            delete_group.apply_async(
++            delete_groups.apply_async(
+                 kwargs={
+-                    'object_id': group.id,
++                    'object_ids': [group.id],
+                     'transaction_id': transaction_id,
++                    'eventstream_state': eventstream_state,
+                 },
+                 countdown=3600,
+             )
+diff --git a/src/sentry/api/endpoints/project_group_index.py b/src/sentry/api/endpoints/project_group_index.py
+index b5c3291fd7..14db806bca 100644
+--- a/src/sentry/api/endpoints/project_group_index.py
++++ b/src/sentry/api/endpoints/project_group_index.py
+@@ -31,7 +31,7 @@ from sentry.models.group import looks_like_short_id
+ from sentry.receivers import DEFAULT_SAVED_SEARCHES
+ from sentry.search.utils import InvalidQuery, parse_query
+ from sentry.signals import advanced_search, issue_ignored, issue_resolved_in_release, issue_deleted
+-from sentry.tasks.deletion import delete_group
++from sentry.tasks.deletion import delete_groups
+ from sentry.tasks.integrations import kick_off_status_syncs
+ from sentry.tasks.merge import merge_group
+ from sentry.utils.apidocs import attach_scenarios, scenario
+@@ -852,18 +852,23 @@ class ProjectGroupIndexEndpoint(ProjectEndpoint, EnvironmentMixin):
+         # XXX(dcramer): this feels a bit shady like it should be its own
+         # endpoint
+         if result.get('merge') and len(group_list) > 1:
+-            primary_group = sorted(group_list, key=lambda x: -x.times_seen)[0]
+-            children = []
++            group_list_by_times_seen = sorted(group_list, key=lambda x: x.times_seen, reverse=True)
++            primary_group, groups_to_merge = group_list_by_times_seen[0], group_list_by_times_seen[1:]
++
++            eventstream_state = eventstream.start_merge(
++                primary_group.project_id,
++                [g.id for g in groups_to_merge],
++                primary_group.id
++            )
++
+             transaction_id = uuid4().hex
+-            for group in group_list:
+-                if group == primary_group:
+-                    continue
+-                children.append(group)
++            for group in groups_to_merge:
+                 group.update(status=GroupStatus.PENDING_MERGE)
+                 merge_group.delay(
+                     from_object_id=group.id,
+                     to_object_id=primary_group.id,
+                     transaction_id=transaction_id,
++                    eventstream_state=eventstream_state,
+                 )
+ 
+             Activity.objects.create(
+@@ -874,13 +879,13 @@ class ProjectGroupIndexEndpoint(ProjectEndpoint, EnvironmentMixin):
+                 data={
+                     'issues': [{
+                         'id': c.id
+-                    } for c in children],
++                    } for c in groups_to_merge],
+                 },
+             )
+ 
+             result['merge'] = {
+                 'parent': six.text_type(primary_group.id),
+-                'children': [six.text_type(g.id) for g in children],
++                'children': [six.text_type(g.id) for g in groups_to_merge],
+             }
+ 
+         return Response(result)
+@@ -943,6 +948,9 @@ class ProjectGroupIndexEndpoint(ProjectEndpoint, EnvironmentMixin):
+         return Response(status=204)
+ 
+     def _delete_groups(self, request, project, group_list, delete_type):
++        if not group_list:
++            return
++
+         group_ids = [g.id for g in group_list]
+ 
+         Group.objects.filter(
+@@ -952,7 +960,7 @@ class ProjectGroupIndexEndpoint(ProjectEndpoint, EnvironmentMixin):
+             GroupStatus.DELETION_IN_PROGRESS,
+         ]).update(status=GroupStatus.PENDING_DELETION)
+ 
+-        eventstream.delete_groups(project.id, group_ids)
++        eventstream_state = eventstream.start_delete_groups(project.id, group_ids)
+ 
+         GroupHashTombstone.tombstone_groups(
+             project_id=project.id,
+@@ -961,15 +969,16 @@ class ProjectGroupIndexEndpoint(ProjectEndpoint, EnvironmentMixin):
+ 
+         transaction_id = uuid4().hex
+ 
+-        for group in group_list:
+-            delete_group.apply_async(
+-                kwargs={
+-                    'object_id': group.id,
+-                    'transaction_id': transaction_id,
+-                },
+-                countdown=3600,
+-            )
++        delete_groups.apply_async(
++            kwargs={
++                'object_ids': group_ids,
++                'transaction_id': transaction_id,
++                'eventstream_state': eventstream_state,
++            },
++            countdown=3600,
++        )
+ 
++        for group in group_list:
+             self.create_audit_entry(
+                 request=request,
+                 organization_id=project.organization_id,
+diff --git a/src/sentry/eventstream/base.py b/src/sentry/eventstream/base.py
+index 865fb7fea5..8d6de5e856 100644
+--- a/src/sentry/eventstream/base.py
++++ b/src/sentry/eventstream/base.py
+@@ -12,9 +12,12 @@ logger = logging.getLogger(__name__)
+ class EventStream(Service):
+     __all__ = (
+         'insert',
+-        'unmerge',
+-        'delete_groups',
+-        'merge',
++        'start_delete_groups',
++        'end_delete_groups',
++        'start_merge',
++        'end_merge',
++        'start_unmerge',
++        'end_unmerge',
+     )
+ 
+     def insert(self, group, event, is_new, is_sample, is_regression,
+@@ -32,11 +35,20 @@ class EventStream(Service):
+                 primary_hash=primary_hash,
+             )
+ 
+-    def unmerge(self, project_id, new_group_id, event_ids):
++    def start_delete_groups(self, project_id, group_ids):
+         pass
+ 
+-    def delete_groups(self, project_id, group_ids):
++    def end_delete_groups(self, state):
+         pass
+ 
+-    def merge(self, project_id, previous_group_id, new_group_id):
++    def start_merge(self, project_id, previous_group_ids, new_group_id):
++        pass
++
++    def end_merge(self, state):
++        pass
++
++    def start_unmerge(self, project_id, hashes, previous_group_id, new_group_id):
++        pass
++
++    def end_unmerge(self, state):
+         pass
+diff --git a/src/sentry/eventstream/kafka.py b/src/sentry/eventstream/kafka.py
+index f9bab9a07e..375d6b8da6 100644
+--- a/src/sentry/eventstream/kafka.py
++++ b/src/sentry/eventstream/kafka.py
+@@ -4,6 +4,7 @@ from datetime import datetime
+ import logging
+ import pytz
+ import six
++from uuid import uuid4
+ 
+ from confluent_kafka import Producer
+ from django.utils.functional import cached_property
+@@ -18,30 +19,47 @@ logger = logging.getLogger(__name__)
+ 
+ # Beware! Changing this, or the message format/fields themselves requires
+ # consideration of all downstream consumers.
++EVENT_PROTOCOL_VERSION = 2
++
+ # Version 1 format: (1, TYPE, [...REST...])
+ #   Insert: (1, 'insert', {
+ #       ...event json...
+ #   }, {
+ #       ...state for post-processing...
+ #   })
+-#   Delete Groups: (1, 'delete_groups', {
++#
++#   Mutations that *should be ignored*: (1, ('delete_groups'|'unmerge'|'merge'), {...})
++#
++#   In short, for protocol version 1 only messages starting with (1, 'insert', ...)
++#   should be processed.
++
++# Version 2 format: (2, TYPE, [...REST...])
++#   Insert: (2, 'insert', {
++#       ...event json...
++#   }, {
++#       ...state for post-processing...
++#   })
++#   Delete Groups: (2, '(start_delete_groups|end_delete_groups)', {
++#       'transaction_id': uuid,
+ #       'project_id': id,
+-#       'group_ids': [id1, id2, id3],
++#       'group_ids': [id2, id2, id3],
+ #       'datetime': timestamp,
+ #   })
+-#   Unmerge: (1, 'unmerge', {
++#   Merge: (2, '(start_merge|end_merge)', {
++#       'transaction_id': uuid,
+ #       'project_id': id,
++#       'previous_group_ids': [id2, id2],
+ #       'new_group_id': id,
+-#       'event_ids': [id1, id2]
+ #       'datetime': timestamp,
+ #   })
+-#   Merge: (1, 'merge', {
++#   Unmerge: (2, '(start_unmerge|end_unmerge)', {
++#       'transaction_id': uuid,
+ #       'project_id': id,
+ #       'previous_group_id': id,
+ #       'new_group_id': id,
++#       'hashes': [hash2, hash2]
+ #       'datetime': timestamp,
+ #   })
+-EVENT_PROTOCOL_VERSION = 1
+ 
+ 
+ class KafkaEventStream(EventStream):
+@@ -118,31 +136,93 @@ class KafkaEventStream(EventStream):
+             'is_new_group_environment': is_new_group_environment,
+         },))
+ 
+-    def unmerge(self, project_id, new_group_id, event_ids):
+-        if not event_ids:
++    def start_delete_groups(self, project_id, group_ids):
++        if not group_ids:
+             return
+ 
+-        self._send(project_id, 'unmerge', extra_data=({
++        state = {
++            'transaction_id': uuid4().hex,
+             'project_id': project_id,
+-            'new_group_id': new_group_id,
+-            'event_ids': event_ids,
++            'group_ids': group_ids,
+             'datetime': datetime.now(tz=pytz.utc),
+-        },), asynchronous=False)
++        }
+ 
+-    def delete_groups(self, project_id, group_ids):
+-        if not group_ids:
++        self._send(
++            project_id,
++            'delete_groups',
++            extra_data=(state,),
++            asynchronous=False
++        )
++
++        return state
++
++    def end_delete_groups(self, state):
++        state = state.copy()
++        state['datetime'] = datetime.now(tz=pytz.utc)
++        self._send(
++            state['project_id'],
++            'end_delete_groups',
++            extra_data=(state,),
++            asynchronous=False
++        )
++
++    def start_merge(self, project_id, previous_group_ids, new_group_id):
++        if not previous_group_ids:
+             return
+ 
+-        self._send(project_id, 'delete_groups', extra_data=({
++        state = {
++            'transaction_id': uuid4().hex,
+             'project_id': project_id,
+-            'group_ids': group_ids,
++            'previous_group_ids': previous_group_ids,
++            'new_group_id': new_group_id,
+             'datetime': datetime.now(tz=pytz.utc),
+-        },), asynchronous=False)
++        }
++
++        self._send(
++            project_id,
++            'merge',
++            extra_data=(state,),
++            asynchronous=False
++        )
+ 
+-    def merge(self, project_id, previous_group_id, new_group_id):
+-        self._send(project_id, 'merge', extra_data=({
++    def end_merge(self, state):
++        state = state.copy()
++        state['datetime'] = datetime.now(tz=pytz.utc)
++        self._send(
++            state['project_id'],
++            'merge',
++            extra_data=(state,),
++            asynchronous=False
++        )
++
++    def start_unmerge(self, project_id, hashes, previous_group_id, new_group_id):
++        if not hashes:
++            return
++
++        state = {
++            'transaction_id': uuid4().hex,
+             'project_id': project_id,
+             'previous_group_id': previous_group_id,
+             'new_group_id': new_group_id,
++            'hashes': hashes,
+             'datetime': datetime.now(tz=pytz.utc),
+-        },), asynchronous=False)
++        }
++
++        self._send(
++            project_id,
++            'start_unmerge',
++            extra_data=(state,),
++            asynchronous=False
++        )
++
++        return state
++
++    def end_unmerge(self, state):
++        state = state.copy()
++        state['datetime'] = datetime.now(tz=pytz.utc)
++        self._send(
++            state['project_id'],
++            'end_unmerge',
++            extra_data=(state,),
++            asynchronous=False
++        )
+diff --git a/src/sentry/eventstream/snuba.py b/src/sentry/eventstream/snuba.py
+index a1aa20c35a..92e5c87b19 100644
+--- a/src/sentry/eventstream/snuba.py
++++ b/src/sentry/eventstream/snuba.py
+@@ -23,11 +23,20 @@ class SnubaEventStream(EventStream):
+             primary_hash, skip_consume
+         )
+ 
+-    def unmerge(self, project_id, new_group_id, event_ids):
++    def start_delete_groups(self, project_id, group_ids):
+         pass
+ 
+-    def delete_groups(self, project_id, group_ids):
++    def end_delete_groups(self, state):
+         pass
+ 
+-    def merge(self, project_id, previous_group_id, new_group_id):
++    def start_merge(self, project_id, previous_group_ids, new_group_id):
++        pass
++
++    def end_merge(self, state):
++        pass
++
++    def start_unmerge(self, project_id, hashes, previous_group_id, new_group_id):
++        pass
++
++    def end_unmerge(self, state):
+         pass
+diff --git a/src/sentry/tasks/deletion.py b/src/sentry/tasks/deletion.py
+index f989f5b5e2..08192c1966 100644
+--- a/src/sentry/tasks/deletion.py
++++ b/src/sentry/tasks/deletion.py
+@@ -267,6 +267,43 @@ def delete_group(object_id, transaction_id=None, **kwargs):
+         )
+ 
+ 
++@instrumented_task(
++    name='sentry.tasks.deletion.delete_groups',
++    queue='cleanup',
++    default_retry_delay=60 * 5,
++    max_retries=MAX_RETRIES
++)
++@retry(exclude=(DeleteAborted, ))
++def delete_groups(object_ids, transaction_id=None, eventstream_state=None, **kwargs):
++    from sentry import deletions, eventstream
++    from sentry.models import Group
++
++    transaction_id = transaction_id or uuid4().hex
++
++    max_batch_size = 100
++    current_batch, rest = object_ids[:max_batch_size], object_ids[max_batch_size:]
++
++    task = deletions.get(
++        model=Group,
++        query={
++            'id__in': current_batch,
++        },
++        transaction_id=transaction_id,
++    )
++    has_more = task.chunk()
++    if has_more or rest:
++        delete_groups.apply_async(
++            kwargs={'object_ids': object_ids if has_more else rest,
++                    'transaction_id': transaction_id,
++                    'eventstream_state': eventstream_state},
++            countdown=15,
++        )
++    else:
++        # all groups have been deleted
++        if eventstream_state:
++            eventstream.end_delete_groups(eventstream_state)
++
++
+ @instrumented_task(
+     name='sentry.tasks.deletion.delete_api_application',
+     queue='cleanup',
+diff --git a/src/sentry/tasks/merge.py b/src/sentry/tasks/merge.py
+index b6d6c591d1..3e2edfb81a 100644
+--- a/src/sentry/tasks/merge.py
++++ b/src/sentry/tasks/merge.py
+@@ -32,7 +32,8 @@ EXTRA_MERGE_MODELS = []
+     max_retries=None
+ )
+ def merge_group(
+-    from_object_id=None, to_object_id=None, transaction_id=None, recursed=False, **kwargs
++    from_object_id=None, to_object_id=None, transaction_id=None,
++    recursed=False, eventstream_state=None, **kwargs
+ ):
+     # TODO(mattrobenolt): Write tests for all of this
+     from sentry.models import (
+@@ -112,14 +113,18 @@ def merge_group(
+         transaction_id=transaction_id,
+     )
+ 
++    last_task = False
+     if has_more:
+         merge_group.delay(
+             from_object_id=from_object_id,
+             to_object_id=to_object_id,
+             transaction_id=transaction_id,
+             recursed=True,
++            eventstream_state=eventstream_state,
+         )
+         return
++    else:
++        last_task = True
+ 
+     features.merge(new_group, [group], allow_unsafe=True)
+ 
+@@ -190,7 +195,8 @@ def merge_group(
+     except DataError:
+         pass
+ 
+-    eventstream.merge(group.project_id, previous_group_id, new_group.id)
++    if last_task and eventstream_state:
++        eventstream.end_merge(eventstream_state)
+ 
+ 
+ def _get_event_environment(event, project, cache):
+diff --git a/src/sentry/tasks/unmerge.py b/src/sentry/tasks/unmerge.py
+index c15af4a5e1..b2ac21db3a 100644
+--- a/src/sentry/tasks/unmerge.py
++++ b/src/sentry/tasks/unmerge.py
+@@ -148,14 +148,15 @@ def get_fingerprint(event):
+     return md5_from_hash(primary_hash)
+ 
+ 
+-def migrate_events(caches, project, source_id, destination_id, fingerprints, events, actor_id):
++def migrate_events(caches, project, source_id, destination_id,
++                   fingerprints, events, actor_id, eventstream_state):
+     # XXX: This is only actually able to create a destination group and migrate
+     # the group hashes if there are events that can be migrated. How do we
+     # handle this if there aren't any events? We can't create a group (there
+     # isn't any data to derive the aggregates from), so we'd have to mark the
+     # hash as in limbo somehow...?)
+     if not events:
+-        return destination_id
++        return (destination_id, eventstream_state)
+ 
+     if destination_id is None:
+         # XXX: There is a race condition here between the (wall clock) time
+@@ -177,6 +178,13 @@ def migrate_events(caches, project, source_id, destination_id, fingerprints, eve
+ 
+         destination_id = destination.id
+ 
++        eventstream_state = eventstream.start_unmerge(
++            project.id,
++            fingerprints,
++            source_id,
++            destination_id
++        )
++
+         # Move the group hashes to the destination.
+         GroupHash.objects.filter(
+             project_id=project.id,
+@@ -212,8 +220,6 @@ def migrate_events(caches, project, source_id, destination_id, fingerprints, eve
+ 
+     event_id_set = set(event.id for event in events)
+ 
+-    eventstream.unmerge(project.id, destination_id, [event.event_id for event in events])
+-
+     Event.objects.filter(
+         project_id=project.id,
+         id__in=event_id_set,
+@@ -240,7 +246,7 @@ def migrate_events(caches, project, source_id, destination_id, fingerprints, eve
+         event_id__in=event_event_id_set,
+     ).update(group=destination_id)
+ 
+-    return destination.id
++    return (destination.id, eventstream_state)
+ 
+ 
+ def truncate_denormalizations(group):
+@@ -546,7 +552,8 @@ def unmerge(
+     actor_id,
+     cursor=None,
+     batch_size=500,
+-    source_fields_reset=False
++    source_fields_reset=False,
++    eventstream_state=None,
+ ):
+     # XXX: The queryset chunking logic below is awfully similar to
+     # ``RangeQuerySetWrapper``. Ideally that could be refactored to be able to
+@@ -585,6 +592,10 @@ def unmerge(
+     if not events:
+         tagstore.update_group_tag_key_values_seen(project_id, [source_id, destination_id])
+         unlock_hashes(project_id, fingerprints)
++
++        if eventstream_state:
++            eventstream.end_unmerge(eventstream_state)
++
+         return destination_id
+ 
+     Event.objects.bind_nodes(events, 'data')
+@@ -610,7 +621,7 @@ def unmerge(
+                 source_events,
+             ))
+ 
+-    destination_id = migrate_events(
++    (destination_id, eventstream_state) = migrate_events(
+         caches,
+         project,
+         source_id,
+@@ -618,6 +629,7 @@ def unmerge(
+         fingerprints,
+         destination_events,
+         actor_id,
++        eventstream_state,
+     )
+ 
+     repair_denormalizations(
+@@ -635,4 +647,5 @@ def unmerge(
+         cursor=events[-1].id,
+         batch_size=batch_size,
+         source_fields_reset=source_fields_reset,
++        eventstream_state=eventstream_state,
+     )
+diff --git a/tests/sentry/api/endpoints/test_project_group_index.py b/tests/sentry/api/endpoints/test_project_group_index.py
+index bff511ffcb..15af6e50c9 100644
+--- a/tests/sentry/api/endpoints/test_project_group_index.py
++++ b/tests/sentry/api/endpoints/test_project_group_index.py
+@@ -1419,11 +1419,13 @@ class GroupUpdateTest(APITestCase):
+             from_object_id=group1.id,
+             to_object_id=group2.id,
+             transaction_id='abc123',
++            eventstream_state=None,
+         )
+         merge_group.delay.assert_any_call(
+             from_object_id=group3.id,
+             to_object_id=group2.id,
+             transaction_id='abc123',
++            eventstream_state=None,
+         )
+ 
+     def test_assign(self):
+diff --git a/tests/sentry/tasks/test_deletion.py b/tests/sentry/tasks/test_deletion.py
+index f6fe94815b..db9ee73ff2 100644
+--- a/tests/sentry/tasks/test_deletion.py
++++ b/tests/sentry/tasks/test_deletion.py
+@@ -18,7 +18,7 @@ from sentry.models import (
+ )
+ from sentry.plugins.providers.dummy.repository import DummyRepositoryProvider
+ from sentry.tasks.deletion import (
+-    delete_api_application, delete_group, delete_organization, delete_project, delete_repository,
++    delete_api_application, delete_groups, delete_organization, delete_project, delete_repository,
+     delete_team, generic_delete, revoke_api_tokens
+ )
+ from sentry.testutils import TestCase
+@@ -332,7 +332,7 @@ class DeleteGroupTest(TestCase):
+         )
+ 
+         with self.tasks():
+-            delete_group(object_id=group.id)
++            delete_groups(object_ids=[group.id])
+ 
+         assert not Event.objects.filter(id=event.id).exists()
+         assert not EventMapping.objects.filter(

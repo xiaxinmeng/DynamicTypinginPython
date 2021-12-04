@@ -1,0 +1,230 @@
+commit 604b275e084df4b1f84ebeeb52ef5a738c2b5657
+Author: Jan Michael Auer <jan.auer@sentry.io>
+Date:   Wed Oct 2 13:17:24 2019 +0200
+
+    feat(ingest): Run preprocess_event directly in IngestConsumer (#14863)
+    
+    Changes the ingest consumer to directly run `preprocess_event` for the following reasons:
+    
+     1. We need to emit the `event_accepted` signal. This requires the parsed event payload
+     2. Running `preprocess_event` directly in the consumer saves another roundrip via Redis. Hopefully, this shaves a few `ms` off the preprocess time.
+     3. We can get rid of the intermediate `cache_key_from_project_id_and_event_id` function. We're back to the higher-level `cache_key_for_event`, which makes less assumptions in its signature.
+
+diff --git a/src/sentry/coreapi.py b/src/sentry/coreapi.py
+index fb6c3916fc..c8e455db3b 100644
+--- a/src/sentry/coreapi.py
++++ b/src/sentry/coreapi.py
+@@ -268,11 +268,7 @@ class SecurityAuthHelper(AbstractAuthHelper):
+ 
+ 
+ def cache_key_for_event(data):
+-    return cache_key_from_project_id_and_event_id(data["project"], data["event_id"])
+-
+-
+-def cache_key_from_project_id_and_event_id(project_id, event_id):
+-    return u"e:{1}:{0}".format(project_id, event_id)
++    return u"e:{1}:{0}".format(data["project"], data["event_id"])
+ 
+ 
+ def decompress_deflate(encoded_data):
+diff --git a/src/sentry/ingest/ingest_consumer.py b/src/sentry/ingest/ingest_consumer.py
+index 1cb0eaa173..8f5b3c60de 100644
+--- a/src/sentry/ingest/ingest_consumer.py
++++ b/src/sentry/ingest/ingest_consumer.py
+@@ -6,9 +6,12 @@ import msgpack
+ from django.conf import settings
+ from django.core.cache import cache
+ 
+-from sentry.coreapi import cache_key_from_project_id_and_event_id
++from sentry.coreapi import cache_key_for_event
+ from sentry.cache import default_cache
++from sentry.models import Project
++from sentry.signals import event_accepted
+ from sentry.tasks.store import preprocess_event
++from sentry.utils import json
+ from sentry.utils.kafka import SimpleKafkaConsumer
+ 
+ logger = logging.getLogger(__name__)
+@@ -37,10 +40,11 @@ class ConsumerType(object):
+ class IngestConsumer(SimpleKafkaConsumer):
+     def process_message(self, message):
+         message = msgpack.unpackb(message.value(), use_list=False)
+-        body = message["payload"]
++        payload = message["payload"]
+         start_time = float(message["start_time"])
+         event_id = message["event_id"]
+         project_id = message["project_id"]
++        remote_addr = message.get("remote_addr")
+ 
+         # check that we haven't already processed this event (a previous instance of the forwarder
+         # died before it could commit the event queue offset)
+@@ -53,16 +57,36 @@ class IngestConsumer(SimpleKafkaConsumer):
+             )
+             return  # message already processed do not reprocess
+ 
+-        cache_key = cache_key_from_project_id_and_event_id(project_id=project_id, event_id=event_id)
++        try:
++            project = Project.objects.get_from_cache(id=project_id)
++        except Project.DoesNotExist:
++            logger.error("Project for ingested event does not exist: %s", project_id)
++            return
++
++        # Parse the JSON payload. This is required to compute the cache key and
++        # call process_event. The payload will be put into Kafka raw, to avoid
++        # serializing it again.
++        # XXX: Do not use CanonicalKeyDict here. This may break preprocess_event
++        # which assumes that data passed in is a raw dictionary.
++        data = json.loads(payload)
++
+         cache_timeout = 3600
+-        default_cache.set(cache_key, body, cache_timeout, raw=True)
++        cache_key = cache_key_for_event(data)
++        default_cache.set(cache_key, data, cache_timeout)
+ 
+-        # queue the event for processing
+-        preprocess_event.delay(cache_key=cache_key, start_time=start_time, event_id=event_id)
++        # Preprocess this event, which spawns either process_event or
++        # save_event. Pass data explicitly to avoid fetching it again from the
++        # cache.
++        preprocess_event(cache_key=cache_key, data=data, start_time=start_time, event_id=event_id)
+ 
+         # remember for an 1 hour that we saved this event (deduplication protection)
+         cache.set(deduplication_key, "", 3600)
+ 
++        # emit event_accepted once everything is done
++        event_accepted.send_robust(
++            ip=remote_addr, data=data, project=project, sender=self.process_message
++        )
++
+ 
+ def run_ingest_consumer(
+     commit_batch_size,
+diff --git a/tests/relay/__init__.py b/tests/sentry/ingest/__init__.py
+similarity index 100%
+rename from tests/relay/__init__.py
+rename to tests/sentry/ingest/__init__.py
+diff --git a/tests/sentry/ingest/ingest_utils.py b/tests/sentry/ingest/ingest_utils.py
+new file mode 100644
+index 0000000000..a1f02cf664
+--- /dev/null
++++ b/tests/sentry/ingest/ingest_utils.py
+@@ -0,0 +1,18 @@
++from __future__ import absolute_import
++
++import os
++
++import functools
++import pytest
++
++
++def requires_kafka(function):
++    @functools.wraps(function)
++    def wrapper(*args, **kwargs):
++        if "SENTRY_KAFKA_HOSTS" not in os.environ:
++            return pytest.xfail(
++                "test requires SENTRY_KAFKA_HOSTS environment variable which is not set"
++            )
++        return function(*args, **kwargs)
++
++    return wrapper
+diff --git a/tests/relay/test_ingest_consumer.py b/tests/sentry/ingest/test_ingest_consumer.py
+similarity index 96%
+rename from tests/relay/test_ingest_consumer.py
+rename to tests/sentry/ingest/test_ingest_consumer.py
+index 3915416e14..dc4b635ea7 100644
+--- a/tests/relay/test_ingest_consumer.py
++++ b/tests/sentry/ingest/test_ingest_consumer.py
+@@ -3,15 +3,18 @@ from __future__ import absolute_import
+ import datetime
+ import time
+ import logging
+-
+ import msgpack
+ import pytest
+ 
++from django.conf import settings
++
+ from sentry.event_manager import EventManager
+ from sentry.ingest.ingest_consumer import ConsumerType, run_ingest_consumer
+ from sentry.models.event import Event
++from sentry.utils import json
+ from sentry.testutils.factories import Factories
+-from django.conf import settings
++
++from .ingest_utils import requires_kafka
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -40,7 +43,7 @@ def _get_test_message(project):
+         "start_time": time.time(),
+         "event_id": event_id,
+         "project_id": 1,
+-        "payload": normalized_event,
++        "payload": json.dumps(normalized_event),
+     }
+ 
+     val = msgpack.packb(message)
+@@ -72,6 +75,7 @@ def _shutdown_requested(max_secs, num_events):
+ 
+ 
+ @pytest.mark.django_db
++@requires_kafka
+ def test_ingest_consumer_reads_from_topic_and_calls_celery_task(
+     task_runner, kafka_producer, kafka_admin
+ ):
+diff --git a/tests/relay/test_outcome_consumer.py b/tests/sentry/ingest/test_outcome_consumer.py
+similarity index 98%
+rename from tests/relay/test_outcome_consumer.py
+rename to tests/sentry/ingest/test_outcome_consumer.py
+index c7830ff03a..82576e10ce 100644
+--- a/tests/relay/test_outcome_consumer.py
++++ b/tests/sentry/ingest/test_outcome_consumer.py
+@@ -13,6 +13,8 @@ from sentry.utils.outcomes import Outcome
+ from django.conf import settings
+ from sentry.utils import json
+ 
++from .ingest_utils import requires_kafka
++
+ logger = logging.getLogger(__name__)
+ 
+ SKIP_CONSUMER_TESTS = os.environ.get("SENTRY_RUN_CONSUMER_TESTS") != "1"
+@@ -99,6 +101,7 @@ def _setup_outcome_test(kafka_producer, kafka_admin):
+     SKIP_CONSUMER_TESTS, reason="slow test, reading the first kafka message takes many seconds"
+ )
+ @pytest.mark.django_db
++@requires_kafka
+ def test_outcome_consumer_ignores_outcomes_already_handled(
+     kafka_producer, task_runner, kafka_admin
+ ):
+@@ -154,6 +157,7 @@ def test_outcome_consumer_ignores_outcomes_already_handled(
+     SKIP_CONSUMER_TESTS, reason="slow test, reading the first kafka message takes many seconds"
+ )
+ @pytest.mark.django_db
++@requires_kafka
+ def test_outcome_consumer_ignores_invalid_outcomes(kafka_producer, task_runner, kafka_admin):
+     producer, project_id, topic_name = _setup_outcome_test(kafka_producer, kafka_admin)
+ 
+@@ -205,6 +209,7 @@ def test_outcome_consumer_ignores_invalid_outcomes(kafka_producer, task_runner,
+     SKIP_CONSUMER_TESTS, reason="slow test, reading the first kafka message takes many seconds"
+ )
+ @pytest.mark.django_db
++@requires_kafka
+ def test_outcome_consumer_remembers_handled_outcomes(kafka_producer, task_runner, kafka_admin):
+     producer, project_id, topic_name = _setup_outcome_test(kafka_producer, kafka_admin)
+ 
+@@ -259,6 +264,7 @@ def test_outcome_consumer_remembers_handled_outcomes(kafka_producer, task_runner
+     SKIP_CONSUMER_TESTS, reason="slow test, reading the first kafka message takes many seconds"
+ )
+ @pytest.mark.django_db
++@requires_kafka
+ def test_outcome_consumer_handles_filtered_outcomes(kafka_producer, task_runner, kafka_admin):
+     producer, project_id, topic_name = _setup_outcome_test(kafka_producer, kafka_admin)
+ 
+@@ -311,6 +317,7 @@ def test_outcome_consumer_handles_filtered_outcomes(kafka_producer, task_runner,
+     SKIP_CONSUMER_TESTS, reason="slow test, reading the first kafka message takes many seconds"
+ )
+ @pytest.mark.django_db
++@requires_kafka
+ def test_outcome_consumer_handles_rate_limited_outcomes(kafka_producer, task_runner, kafka_admin):
+     producer, project_id, topic_name = _setup_outcome_test(kafka_producer, kafka_admin)
+ 

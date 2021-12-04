@@ -1,0 +1,410 @@
+commit ae647911d7c829f1bca1ffd1b5d88573ef9b2eeb
+Author: David Cramer <dcramer@gmail.com>
+Date:   Wed Jun 8 14:23:34 2016 -0700
+
+    Add server-side filters
+    
+    This will allow users to configure a project to automatically filter out (blacklist) events submitted in certain situations.
+    
+    @getsentry/infrastructure
+
+diff --git a/src/sentry/coreapi.py b/src/sentry/coreapi.py
+index 1353ba6ac9..96f005feac 100644
+--- a/src/sentry/coreapi.py
++++ b/src/sentry/coreapi.py
+@@ -16,6 +16,7 @@ import six
+ import uuid
+ import zlib
+ 
++from collections import MutableMapping
+ from datetime import datetime, timedelta
+ from django.utils.crypto import constant_time_compare
+ from gzip import GzipFile
+@@ -34,6 +35,8 @@ from sentry.models import EventError, Project, ProjectKey, TagKey, TagValue
+ from sentry.tasks.store import preprocess_event
+ from sentry.utils import json
+ from sentry.utils.auth import parse_auth_header
++from sentry.utils.csp import is_valid_csp_report
++from sentry.utils.http import is_valid_ip
+ from sentry.utils.strings import decompress
+ from sentry.utils.validators import is_float, is_event_id
+ 
+@@ -340,6 +343,15 @@ class ClientApiHelper(object):
+             'version': version,
+         }
+ 
++    def should_filter(self, project, data, ip_address=None):
++        # TODO(dcramer): read filters from options such as:
++        # - ignore errors from spiders/bots
++        # - ignore errors from legacy browsers
++        if ip_address and not is_valid_ip(ip_address, project):
++            return True
++
++        return False
++
+     def validate_data(self, project, data):
+         # TODO(dcramer): move project out of the data packet
+         data['project'] = project.id
+@@ -638,7 +650,6 @@ class ClientApiHelper(object):
+                     'value': data['release'],
+                 })
+                 del data['release']
+-
+         return data
+ 
+     def ensure_does_not_have_ip(self, data):
+@@ -668,6 +679,9 @@ class ClientApiHelper(object):
+             data.setdefault('sentry.interfaces.User', {})['ip_address'] = ip_address
+ 
+     def insert_data_to_database(self, data):
++        # we might be passed LazyData
++        if isinstance(data, LazyData):
++            data = dict(data.items())
+         cache_key = 'e:{1}:{0}'.format(data['project'], data['event_id'])
+         default_cache.set(cache_key, data, timeout=3600)
+         preprocess_event.delay(cache_key=cache_key, start_time=time())
+@@ -689,6 +703,11 @@ class CspApiHelper(ClientApiHelper):
+         auth.client = request.META.get('HTTP_USER_AGENT')
+         return auth
+ 
++    def should_filter(self, project, data, ip_address=None):
++        if not is_valid_csp_report(data, project):
++            return True
++        return super(CspApiHelper, self).should_filter(project, data, ip_address)
++
+     def validate_data(self, project, data):
+         # pop off our meta data used to hold Sentry specific stuff
+         meta = data.pop('_meta', {})
+@@ -740,5 +759,65 @@ class CspApiHelper(ClientApiHelper):
+                     'value': data['release'],
+                 })
+                 del data['release']
+-
+         return data
++
++
++class LazyData(MutableMapping):
++    def __init__(self, data, content_encoding, helper):
++        self._data = data
++        self._content_encoding = content_encoding
++        self._helper = helper
++        self._decoded = False
++
++    def _decode(self):
++        data = self._data
++        content_encoding = self._content_encoding
++        helper = self._helper
++
++        # TODO(dcramer): CSP is passing already decoded JSON, which sort of
++        # defeats the purpose of a lot of lazy evaluation. It needs refactored
++        # to avoid doing that.
++        if isinstance(data, six.binary_type):
++            if content_encoding == 'gzip':
++                data = helper.decompress_gzip(data)
++            elif content_encoding == 'deflate':
++                data = helper.decompress_deflate(data)
++            elif data[0] != b'{':
++                data = helper.decode_and_decompress_data(data)
++            else:
++                data = data.decode('utf-8')
++        if isinstance(data, six.text_type):
++            data = helper.safely_load_json_string(data)
++
++        self._data = data
++        self._decoded = True
++
++    def __getitem__(self, name):
++        if not self._decoded:
++            self._decode()
++        return self._data[name]
++
++    def __setitem__(self, name, value):
++        if not self._decoded:
++            self._decode()
++        self._data[name] = value
++
++    def __delitem__(self, name):
++        if not self._decoded:
++            self._decode()
++        del self._data[name]
++
++    def __contains__(self, name):
++        if not self._decoded:
++            self._decode()
++        return name in self._data
++
++    def __len__(self):
++        if not self._decoded:
++            self._decode()
++        return len(self._data)
++
++    def __iter__(self):
++        if not self._decoded:
++            self._decode()
++        return iter(self._data)
+diff --git a/src/sentry/web/api.py b/src/sentry/web/api.py
+index 53de93b125..c287761fc5 100644
+--- a/src/sentry/web/api.py
++++ b/src/sentry/web/api.py
+@@ -19,17 +19,17 @@ from raven.contrib.django.models import client as Raven
+ 
+ from sentry import app
+ from sentry.coreapi import (
+-    APIError, APIForbidden, APIRateLimited, ClientApiHelper, CspApiHelper
++    APIError, APIForbidden, APIRateLimited, ClientApiHelper, CspApiHelper,
++    LazyData
+ )
+ from sentry.event_manager import EventManager
+ from sentry.models import Project, OrganizationOption
+ from sentry.signals import event_accepted, event_received
+ from sentry.quotas.base import RateLimit
+ from sentry.utils import json, metrics
+-from sentry.utils.csp import is_valid_csp_report
+ from sentry.utils.data_scrubber import SensitiveDataFilter
+ from sentry.utils.http import (
+-    is_valid_origin, get_origins, is_same_domain, is_valid_ip,
++    is_valid_origin, get_origins, is_same_domain,
+ )
+ from sentry.utils.safe import safe_execute
+ from sentry.web.helpers import render_to_response
+@@ -116,6 +116,8 @@ class APIView(BaseView):
+                 response['Retry-After'] = six.text_type(e.retry_after)
+ 
+         except Exception as e:
++            # TODO(dcramer): test failures are not outputting the log message
++            # here
+             if settings.DEBUG:
+                 content = traceback.format_exc()
+             else:
+@@ -285,16 +287,22 @@ class StoreView(APIView):
+     def process(self, request, project, auth, helper, data, **kwargs):
+         metrics.incr('events.total')
+ 
++        if not data:
++            raise APIError('No JSON data was found')
++
++        data = LazyData(
++            data=data,
++            content_encoding=request.META.get('HTTP_CONTENT_ENCODING', ''),
++            helper=helper,
++        )
++
+         remote_addr = request.META['REMOTE_ADDR']
+         event_received.send_robust(
+             ip=remote_addr,
+             sender=type(self),
+         )
+ 
+-        if not data:
+-            raise APIError('No JSON data was found')
+-
+-        if not is_valid_ip(remote_addr, project):
++        if helper.should_filter(project, data, ip_address=remote_addr):
+             app.tsdb.incr_multi([
+                 (app.tsdb.models.project_total_received, project.id),
+                 (app.tsdb.models.project_total_blacklisted, project.id),
+@@ -302,7 +310,7 @@ class StoreView(APIView):
+                 (app.tsdb.models.organization_total_blacklisted, project.organization_id),
+             ])
+             metrics.incr('events.blacklisted')
+-            raise APIForbidden('Blacklisted IP address: %s' % (remote_addr,))
++            raise APIForbidden('Event dropped due to filter')
+ 
+         # TODO: improve this API (e.g. make RateLimit act on __ne__)
+         rate_limit = safe_execute(app.quotas.is_rate_limited, project=project,
+@@ -330,17 +338,6 @@ class StoreView(APIView):
+                 (app.tsdb.models.organization_total_received, project.organization_id),
+             ])
+ 
+-        content_encoding = request.META.get('HTTP_CONTENT_ENCODING', '')
+-
+-        if isinstance(data, (six.binary_type, six.text_type)):
+-            if content_encoding == 'gzip':
+-                data = helper.decompress_gzip(data)
+-            elif content_encoding == 'deflate':
+-                data = helper.decompress_deflate(data)
+-            elif data[0] != b'{':
+-                data = helper.decode_and_decompress_data(data)
+-            data = helper.safely_load_json_string(data)
+-
+         # mutates data
+         data = helper.validate_data(project, data)
+ 
+@@ -351,7 +348,7 @@ class StoreView(APIView):
+ 
+         # mutates data
+         manager = EventManager(data, version=auth.version)
+-        data = manager.normalize()
++        manager.normalize()
+ 
+         org_options = OrganizationOption.objects.get_all_values(project.organization_id)
+ 
+@@ -483,17 +480,6 @@ class CspReportView(StoreView):
+         if not is_valid_origin(origin, project):
+             raise APIForbidden('Invalid document-uri')
+ 
+-        # An invalid CSP report must go against quota
+-        if not is_valid_csp_report(report, project):
+-            app.tsdb.incr_multi([
+-                (app.tsdb.models.project_total_received, project.id),
+-                (app.tsdb.models.project_total_blacklisted, project.id),
+-                (app.tsdb.models.organization_total_received, project.organization_id),
+-                (app.tsdb.models.organization_total_blacklisted, project.organization_id),
+-            ])
+-            metrics.incr('events.blacklisted')
+-            raise APIForbidden('Rejected CSP report')
+-
+         # Attach on collected meta data. This data obviously isn't a part
+         # of the spec, but we need to append to the report sentry specific things.
+         report['_meta'] = {
+diff --git a/tests/integration/tests.py b/tests/integration/tests.py
+index 595fcaa452..3e33a462be 100644
+--- a/tests/integration/tests.py
++++ b/tests/integration/tests.py
+@@ -111,6 +111,8 @@ class RavenIntegrationTest(TransactionTestCase):
+     def sendRemote(self, url, data, headers={}):
+         content_type = headers.pop('Content-Type', None)
+         headers = dict(('HTTP_' + k.replace('-', '_').upper(), v) for k, v in six.iteritems(headers))
++        if isinstance(data, six.text_type):
++            data = data.encode('utf-8')
+         resp = self.client.post(
+             reverse('sentry-api-store', args=[self.pk.project_id]),
+             data=data,
+diff --git a/tests/sentry/web/api/tests.py b/tests/sentry/web/api/tests.py
+index 31bbffabbe..f42384ba4e 100644
+--- a/tests/sentry/web/api/tests.py
++++ b/tests/sentry/web/api/tests.py
+@@ -79,7 +79,7 @@ class StoreViewTest(TestCase):
+             'sentry_version': '2.0',
+         }
+         resp = self.client.options(self.path)
+-        assert resp.status_code == 200, resp.content
++        assert resp.status_code == 200, (resp.status_code, resp.content)
+         self.assertIn('Allow', resp)
+         self.assertEquals(resp['Allow'], 'GET, POST, HEAD, OPTIONS')
+         self.assertIn('Content-Length', resp)
+@@ -88,7 +88,7 @@ class StoreViewTest(TestCase):
+     @mock.patch('sentry.web.api.is_valid_origin', mock.Mock(return_value=False))
+     def test_options_response_with_invalid_origin(self):
+         resp = self.client.options(self.path, HTTP_ORIGIN='http://foo.com')
+-        assert resp.status_code == 403, resp.content
++        assert resp.status_code == 403, (resp.status_code, resp.content)
+         self.assertIn('Access-Control-Allow-Origin', resp)
+         self.assertEquals(resp['Access-Control-Allow-Origin'], '*')
+         self.assertIn('X-Sentry-Error', resp)
+@@ -98,7 +98,7 @@ class StoreViewTest(TestCase):
+     @mock.patch('sentry.web.api.is_valid_origin', mock.Mock(return_value=False))
+     def test_options_response_with_invalid_referrer(self):
+         resp = self.client.options(self.path, HTTP_REFERER='http://foo.com')
+-        assert resp.status_code == 403, resp.content
++        assert resp.status_code == 403, (resp.status_code, resp.content)
+         self.assertIn('Access-Control-Allow-Origin', resp)
+         self.assertEquals(resp['Access-Control-Allow-Origin'], '*')
+         self.assertIn('X-Sentry-Error', resp)
+@@ -108,21 +108,21 @@ class StoreViewTest(TestCase):
+     @mock.patch('sentry.web.api.is_valid_origin', mock.Mock(return_value=True))
+     def test_options_response_with_valid_origin(self):
+         resp = self.client.options(self.path, HTTP_ORIGIN='http://foo.com')
+-        assert resp.status_code == 200, resp.content
++        assert resp.status_code == 200, (resp.status_code, resp.content)
+         self.assertIn('Access-Control-Allow-Origin', resp)
+         self.assertEquals(resp['Access-Control-Allow-Origin'], 'http://foo.com')
+ 
+     @mock.patch('sentry.web.api.is_valid_origin', mock.Mock(return_value=True))
+     def test_options_response_with_valid_referrer(self):
+         resp = self.client.options(self.path, HTTP_REFERER='http://foo.com')
+-        assert resp.status_code == 200, resp.content
++        assert resp.status_code == 200, (resp.status_code, resp.content)
+         self.assertIn('Access-Control-Allow-Origin', resp)
+         self.assertEquals(resp['Access-Control-Allow-Origin'], 'http://foo.com')
+ 
+-    @mock.patch('sentry.web.api.is_valid_ip', mock.Mock(return_value=False))
++    @mock.patch('sentry.coreapi.is_valid_ip', mock.Mock(return_value=False))
+     def test_request_with_backlisted_ip(self):
+         resp = self._postWithHeader({})
+-        assert resp.status_code == 403, resp.content
++        assert resp.status_code == 403, (resp.status_code, resp.content)
+ 
+     @mock.patch('sentry.coreapi.ClientApiHelper.insert_data_to_database')
+     def test_scrubs_ip_address(self, mock_insert_data_to_database):
+@@ -137,7 +137,7 @@ class StoreViewTest(TestCase):
+             },
+         }
+         resp = self._postWithHeader(body)
+-        assert resp.status_code == 200, resp.content
++        assert resp.status_code == 200, (resp.status_code, resp.content)
+ 
+         call_data = mock_insert_data_to_database.call_args[0][0]
+         assert not call_data['sentry.interfaces.User'].get('ip_address')
+@@ -157,7 +157,7 @@ class StoreViewTest(TestCase):
+             },
+         }
+         resp = self._postWithHeader(body)
+-        assert resp.status_code == 200, resp.content
++        assert resp.status_code == 200, (resp.status_code, resp.content)
+ 
+         call_data = mock_insert_data_to_database.call_args[0][0]
+         assert not call_data['sentry.interfaces.User'].get('ip_address')
+@@ -177,7 +177,7 @@ class StoreViewTest(TestCase):
+             },
+         }
+         resp = self._postWithHeader(body)
+-        assert resp.status_code == 200, resp.content
++        assert resp.status_code == 200, (resp.status_code, resp.content)
+ 
+         call_data = mock_insert_data_to_database.call_args[0][0]
+         assert call_data['sentry.interfaces.Http']['data'] == 'password=lol&foo=1&bar=2&baz=3'
+@@ -196,7 +196,7 @@ class StoreViewTest(TestCase):
+             },
+         }
+         resp = self._postWithHeader(body)
+-        assert resp.status_code == 200, resp.content
++        assert resp.status_code == 200, (resp.status_code, resp.content)
+ 
+         call_data = mock_insert_data_to_database.call_args[0][0]
+         assert call_data['sentry.interfaces.Http']['data'] == 'password=lol&foo=1&bar=2&baz=3'
+@@ -215,7 +215,7 @@ class StoreViewTest(TestCase):
+             },
+         }
+         resp = self._postWithHeader(body)
+-        assert resp.status_code == 200, resp.content
++        assert resp.status_code == 200, (resp.status_code, resp.content)
+ 
+         call_data = mock_insert_data_to_database.call_args[0][0]
+         assert call_data['sentry.interfaces.Http']['data'] == 'password=[Filtered]&foo=1&bar=2&baz=3'
+@@ -235,7 +235,7 @@ class StoreViewTest(TestCase):
+             },
+         }
+         resp = self._postWithHeader(body)
+-        assert resp.status_code == 200, resp.content
++        assert resp.status_code == 200, (resp.status_code, resp.content)
+ 
+         call_data = mock_insert_data_to_database.call_args[0][0]
+         assert call_data['sentry.interfaces.Http']['data'] == 'password=[Filtered]&foo=[Filtered]&bar=[Filtered]&baz=3'
+@@ -256,7 +256,7 @@ class StoreViewTest(TestCase):
+             },
+         }
+         resp = self._postWithHeader(body)
+-        assert resp.status_code == 200, resp.content
++        assert resp.status_code == 200, (resp.status_code, resp.content)
+ 
+         call_data = mock_insert_data_to_database.call_args[0][0]
+         assert call_data['sentry.interfaces.Http']['data'] == 'password=[Filtered]&foo=1&bar=2&baz=3'
+@@ -277,7 +277,7 @@ class StoreViewTest(TestCase):
+             },
+         }
+         resp = self._postWithHeader(body)
+-        assert resp.status_code == 200, resp.content
++        assert resp.status_code == 200, (resp.status_code, resp.content)
+ 
+         call_data = mock_insert_data_to_database.call_args[0][0]
+         assert call_data['sentry.interfaces.Http']['data'] == 'password=[Filtered]&foo=[Filtered]&bar=[Filtered]&baz=[Filtered]'
+@@ -288,7 +288,7 @@ class StoreViewTest(TestCase):
+             "message": "foo bar",
+         }
+         resp = self._postWithHeader(body)
+-        assert resp.status_code == 200, resp.content
++        assert resp.status_code == 200, (resp.status_code, resp.content)
+ 
+         call_data = mock_insert_data_to_database.call_args[0][0]
+         assert call_data['sdk'] == {

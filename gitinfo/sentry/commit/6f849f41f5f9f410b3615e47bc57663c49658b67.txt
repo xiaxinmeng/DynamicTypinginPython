@@ -1,0 +1,288 @@
+commit 6f849f41f5f9f410b3615e47bc57663c49658b67
+Author: Armin Ronacher <armin.ronacher@active-4.com>
+Date:   Thu Dec 21 20:04:40 2017 +0100
+
+    feat(native): Provide symcache errors to user (#6822)
+    
+    This shows now to the user if debug symbols are bad. More importantly it also
+    limits how many conversion are attempted per debug symbol file (defaults to one
+    every 10 minutes).
+
+diff --git a/src/sentry/lang/native/symbolizer.py b/src/sentry/lang/native/symbolizer.py
+index 46a14ea568..8ed4de5191 100644
+--- a/src/sentry/lang/native/symbolizer.py
++++ b/src/sentry/lang/native/symbolizer.py
+@@ -111,9 +111,11 @@ class Symbolizer(object):
+             object_lookup = ObjectLookup(object_lookup)
+         self.object_lookup = object_lookup
+ 
+-        self.symcaches = ProjectDSymFile.dsymcache.get_symcaches(
+-            project, referenced_images,
+-            on_dsym_file_referenced=on_dsym_file_referenced)
++        self.symcaches, self.symcaches_conversion_errors = \
++            ProjectDSymFile.dsymcache.get_symcaches(
++                project, referenced_images,
++                on_dsym_file_referenced=on_dsym_file_referenced,
++                with_conversion_errors=True)
+ 
+     def _process_frame(self, sym, obj, package=None, addr_off=0):
+         frame = {
+@@ -204,6 +206,14 @@ class Symbolizer(object):
+     def _symbolize_app_frame(self, instruction_addr, obj, sdk_info=None):
+         symcache = self.symcaches.get(obj.uuid)
+         if symcache is None:
++            # In case we know what error happened on symcache conversion
++            # we can report it to the user now.
++            if obj.uuid in self.symcaches_conversion_errors:
++                raise SymbolicationFailed(
++                    message=self.symcaches_conversion_errors[obj.uuid],
++                    type=EventError.NATIVE_BAD_DSYM,
++                    obj=obj
++                )
+             if self._is_optional_dsym(obj, sdk_info=sdk_info):
+                 type = EventError.NATIVE_MISSING_OPTIONALLY_BUNDLED_DSYM
+             else:
+diff --git a/src/sentry/models/dsymfile.py b/src/sentry/models/dsymfile.py
+index e8184f4819..92e3683759 100644
+--- a/src/sentry/models/dsymfile.py
++++ b/src/sentry/models/dsymfile.py
+@@ -29,6 +29,7 @@ from symbolic import FatObject, SymbolicError, UnsupportedObjectFile, \
+     SymCache, SYMCACHE_LATEST_VERSION
+ 
+ from sentry import options
++from sentry.utils.cache import cache
+ from sentry.db.models import FlexibleForeignKey, Model, \
+     sane_repr, BaseManager, BoundedPositiveIntegerField
+ from sentry.models.file import File
+@@ -43,6 +44,11 @@ logger = logging.getLogger(__name__)
+ 
+ ONE_DAY = 60 * 60 * 24
+ ONE_DAY_AND_A_HALF = int(ONE_DAY * 1.5)
++
++# How long we cache a conversion failure by checksum in cache.  Currently
++# 10 minutes is assumed to be a reasonable value here.
++CONVERSION_ERROR_TTL = 60 * 10
++
+ DSYM_MIMETYPES = dict((v, k) for k, v in KNOWN_DSYM_TYPES.items())
+ 
+ _proguard_file_re = re.compile(r'/proguard/(?:mapping-)?(.*?)\.txt$')
+@@ -386,11 +392,16 @@ class DSymCache(object):
+         """
+         self._get_symcaches_impl(project, uuids)
+ 
+-    def get_symcaches(self, project, uuids, on_dsym_file_referenced=None):
++    def get_symcaches(self, project, uuids, on_dsym_file_referenced=None,
++                      with_conversion_errors=False):
+         """Given some uuids returns the symcaches loaded for these uuids."""
+-        cachefiles = self._get_symcaches_impl(project, uuids,
+-                                              on_dsym_file_referenced)
+-        return self._load_cachefiles_via_fs(project, cachefiles)
++        cachefiles, conversion_errors = self._get_symcaches_impl(
++            project, uuids, on_dsym_file_referenced)
++        symcaches = self._load_cachefiles_via_fs(project, cachefiles)
++        if with_conversion_errors:
++            return symcaches, dict((uuid.UUID(k), v)
++                                   for k, v in conversion_errors.items())
++        return symcaches
+ 
+     def fetch_dsyms(self, project, uuids):
+         """Given some uuids returns a uuid to path mapping for where the
+@@ -422,7 +433,7 @@ class DSymCache(object):
+             uuid__in=uuid_strings,
+         ).select_related('file') if x.supports_symcache]
+         if not dsym_files:
+-            return {}
++            return {}, {}
+ 
+         dsym_files_by_uuid = {}
+         for dsym_file in dsym_files:
+@@ -436,6 +447,7 @@ class DSymCache(object):
+             dsym_file_id__in=[x.id for x in dsym_files],
+         ).select_related('cache_file', 'dsym_file__uuid')
+ 
++        conversion_errors = {}
+         cachefiles = []
+         cachefiles_to_update = dict.fromkeys(x.uuid for x in dsym_files)
+         for cache_file in q:
+@@ -459,23 +471,41 @@ class DSymCache(object):
+                     cache_file, dsym_file = it
+                     cache_file.delete()
+                 to_update.append(dsym_file)
+-            cachefiles.extend(self._update_cachefiles(project, to_update))
++            updated_cachefiles, conversion_errors = self._update_cachefiles(
++                project, to_update)
++            cachefiles.extend(updated_cachefiles)
+ 
+-        return cachefiles
++        return cachefiles, conversion_errors
+ 
+     def _update_cachefiles(self, project, dsym_files):
+         rv = []
+ 
++        # Find all the known bad files we could not convert last time
++        # around
++        conversion_errors = {}
++        for dsym_file in dsym_files:
++            cache_key = 'scbe:%s:%s' % (dsym_file.uuid, dsym_file.file.checksum)
++            err = cache.get(cache_key)
++            if err is not None:
++                conversion_errors[dsym_file.uuid] = err
++
+         for dsym_file in dsym_files:
+             dsym_uuid = dsym_file.uuid
++            if dsym_uuid in conversion_errors:
++                continue
++
+             try:
+                 with dsym_file.file.getfile(as_tempfile=True) as tf:
+                     fo = FatObject.from_path(tf.name)
+                     o = fo.get_object(uuid=dsym_file.uuid)
+                     if o is None:
+                         continue
+-                    cache = o.make_symcache()
+-            except SymbolicError:
++                    symcache = o.make_symcache()
++            except SymbolicError as e:
++                cache.set('scbe:%s:%s' % (
++                    dsym_uuid, dsym_file.file.checksum), e.message,
++                    CONVERSION_ERROR_TTL)
++                conversion_errors[dsym_uuid] = e.message
+                 logger.error('dsymfile.symcache-build-error',
+                              exc_info=True, extra=dict(dsym_uuid=dsym_uuid))
+                 continue
+@@ -484,7 +514,7 @@ class DSymCache(object):
+                 name=dsym_file.uuid,
+                 type='project.symcache',
+             )
+-            file.putfile(cache.open_stream())
++            file.putfile(symcache.open_stream())
+             try:
+                 with transaction.atomic():
+                     rv.append((dsym_uuid, ProjectSymCacheFile.objects.get_or_create(
+@@ -493,7 +523,7 @@ class DSymCache(object):
+                         dsym_file=dsym_file,
+                         defaults=dict(
+                             checksum=dsym_file.file.checksum,
+-                            version=cache.file_format_version,
++                            version=symcache.file_format_version,
+                         )
+                     )[0]))
+             except IntegrityError:
+@@ -503,7 +533,7 @@ class DSymCache(object):
+                     dsym_file=dsym_file,
+                 )))
+ 
+-        return rv
++        return rv, conversion_errors
+ 
+     def _load_cachefiles_via_fs(self, project, cachefiles):
+         rv = {}
+diff --git a/tests/sentry/lang/native/test_plugin.py b/tests/sentry/lang/native/test_plugin.py
+index 795acd4e08..d6375bb059 100644
+--- a/tests/sentry/lang/native/test_plugin.py
++++ b/tests/sentry/lang/native/test_plugin.py
+@@ -12,7 +12,7 @@ from sentry.models import Event
+ from sentry.testutils import TestCase
+ from sentry.lang.native.symbolizer import Symbolizer
+ 
+-from symbolic import parse_addr
++from symbolic import parse_addr, Object, SymbolicError
+ 
+ 
+ class BasicResolvingIntegrationTest(TestCase):
+@@ -1115,3 +1115,95 @@ class RealResolvingIntegrationTest(TestCase):
+         assert frames[0].filename == 'hello.c'
+         assert frames[0].abs_path == '/tmp/hello.c'
+         assert frames[0].lineno == 1
++
++    def test_broken_conversion(self):
++        url = reverse(
++            'sentry-api-0-dsym-files',
++            kwargs={
++                'organization_slug': self.project.organization.slug,
++                'project_slug': self.project.slug,
++            }
++        )
++
++        self.login_as(user=self.user)
++
++        out = BytesIO()
++        f = zipfile.ZipFile(out, 'w')
++        f.write(os.path.join(os.path.dirname(__file__), 'fixtures', 'hello.dsym'),
++                'dSYM/hello')
++        f.close()
++
++        original_make_symcache = Object.make_symcache
++
++        def broken_make_symcache(self):
++            raise SymbolicError('shit on fire')
++        Object.make_symcache = broken_make_symcache
++        try:
++            response = self.client.post(
++                url, {
++                    'file':
++                    SimpleUploadedFile(
++                        'symbols.zip',
++                        out.getvalue(),
++                        content_type='application/zip'),
++                },
++                format='multipart'
++            )
++            assert response.status_code == 201, response.content
++            assert len(response.data) == 1
++
++            event_data = {
++                "project": self.project.id,
++                "platform": "cocoa",
++                "debug_meta": {
++                    "images": [{
++                        "type": "apple",
++                        "arch": "x86_64",
++                        "uuid": "502fc0a5-1ec1-3e47-9998-684fa139dca7",
++                        "image_vmaddr": "0x0000000100000000",
++                        "image_size": 4096,
++                        "image_addr": "0x0000000100000000",
++                        "name": "Foo.app/Contents/Foo"
++                    }],
++                    "sdk_info": {
++                        "dsym_type": "macho",
++                        "sdk_name": "macOS",
++                        "version_major": 10,
++                        "version_minor": 12,
++                        "version_patchlevel": 4,
++                    }
++                },
++                "sentry.interfaces.Exception": {
++                    "values": [
++                        {
++                            'stacktrace': {
++                                "frames": [
++                                    {
++                                        "function": "unknown",
++                                        "instruction_addr": "0x0000000100000fa0"
++                                    },
++                                ]
++                            },
++                            "type": "Fail",
++                            "value": "fail"
++                        }
++                    ]
++                },
++            }
++
++            for _ in range(3):
++                resp = self._postWithHeader(event_data)
++                assert resp.status_code == 200
++                event = Event.objects.get()
++                errors = event.data['errors']
++                assert len(errors) == 1
++                assert errors[0] == {
++                    'image_arch': u'x86_64',
++                    'image_path': u'Foo.app/Contents/Foo',
++                    'image_uuid': u'502fc0a5-1ec1-3e47-9998-684fa139dca7',
++                    'message': u'shit on fire',
++                    'type': 'native_bad_dsym'
++                }
++                event.delete()
++        finally:
++            Object.make_symcache = original_make_symcache

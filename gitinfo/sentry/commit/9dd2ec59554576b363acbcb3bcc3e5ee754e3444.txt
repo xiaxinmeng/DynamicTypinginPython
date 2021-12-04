@@ -1,0 +1,537 @@
+commit 9dd2ec59554576b363acbcb3bcc3e5ee754e3444
+Author: William Mak <william@wmak.io>
+Date:   Wed Jan 15 17:06:02 2020 -0500
+
+    feat(search) - Caching tag_keys (#16249)
+    
+    * feat(search) - Caching tag_keys
+    
+    - This query is being called often, but the results don't change often
+      so caching for 5 minutes should probably be ok
+    - cache key should return the same key suffix for a 5 minute window
+      that depends on key_hash. ie. different key hashes with the same
+      start/end values will have their keys change at different times now.
+    - Tracking hits/misses to get a ratio of both
+    - Adding a killswitch so we can turn this off entirely easily if
+      something goes wrong
+    - ref: Switching to a rng to determine whether we cache
+      - Can still use this to killswitch, if we set the rate to <=0
+    - Adding timeout jitter using the same hash
+    - Defaulting start/end if they arent passed
+
+diff --git a/src/sentry/api/endpoints/organization_tags.py b/src/sentry/api/endpoints/organization_tags.py
+index 4bc7a78aeb..97c5463006 100644
+--- a/src/sentry/api/endpoints/organization_tags.py
++++ b/src/sentry/api/endpoints/organization_tags.py
+@@ -21,5 +21,6 @@ class OrganizationTagsEndpoint(OrganizationEventsEndpointBase):
+             filter_params.get("environment"),
+             filter_params["start"],
+             filter_params["end"],
++            use_cache=request.GET.get("use_cache", "0") == "1",
+         )
+         return Response(serialize(results, request.user))
+diff --git a/src/sentry/api/utils.py b/src/sentry/api/utils.py
+index f8f12717ba..63bdeccef0 100644
+--- a/src/sentry/api/utils.py
++++ b/src/sentry/api/utils.py
+@@ -24,6 +24,12 @@ def get_datetime_from_stats_period(stats_period, now=None):
+     return now - stats_period
+ 
+ 
++def default_start_end_dates(now=None):
++    if now is None:
++        now = timezone.now()
++    return now - MAX_STATS_PERIOD, now
++
++
+ def get_date_range_from_params(params, optional=False):
+     """
+     Gets a date range from standard date range params we pass to the api.
+@@ -46,8 +52,7 @@ def get_date_range_from_params(params, optional=False):
+     """
+     now = timezone.now()
+ 
+-    end = now
+-    start = now - MAX_STATS_PERIOD
++    start, end = default_start_end_dates(now)
+ 
+     stats_period = params.get("statsPeriod")
+     stats_period_start = params.get("statsPeriodStart")
+diff --git a/src/sentry/static/sentry/app/actionCreators/tags.jsx b/src/sentry/static/sentry/app/actionCreators/tags.jsx
+index e8bf9206c7..77235ac5dc 100644
+--- a/src/sentry/static/sentry/app/actionCreators/tags.jsx
++++ b/src/sentry/static/sentry/app/actionCreators/tags.jsx
+@@ -68,7 +68,7 @@ export function fetchOrganizationTags(api, orgId, projectIds = null) {
+   TagActions.loadTags();
+ 
+   const url = `/organizations/${orgId}/tags/`;
+-  const query = projectIds ? {project: projectIds} : null;
++  const query = projectIds ? {project: projectIds, use_cache: 1} : null;
+ 
+   const promise = api
+     .requestPromise(url, {
+diff --git a/src/sentry/tagstore/snuba/backend.py b/src/sentry/tagstore/snuba/backend.py
+index 101ebc4678..472bc2b5b2 100644
+--- a/src/sentry/tagstore/snuba/backend.py
++++ b/src/sentry/tagstore/snuba/backend.py
+@@ -1,10 +1,15 @@
+ from __future__ import absolute_import
+ 
++import datetime
+ import functools
++import six
+ from collections import defaultdict, Iterable
+ from dateutil.parser import parse as parse_datetime
+-import six
+ 
++from django.core.cache import cache
++
++from sentry import options
++from sentry.api.utils import default_start_end_dates
+ from sentry.tagstore import TagKeyStatus
+ from sentry.tagstore.base import TagStorage, TOP_VALUES_DEFAULT_LIMIT
+ from sentry.tagstore.exceptions import (
+@@ -14,7 +19,8 @@ from sentry.tagstore.exceptions import (
+     TagValueNotFound,
+ )
+ from sentry.tagstore.types import TagKey, TagValue, GroupTagKey, GroupTagValue
+-from sentry.utils import snuba
++from sentry.utils import snuba, metrics
++from sentry.utils.hashlib import md5_text
+ from sentry.utils.dates import to_timestamp
+ 
+ 
+@@ -54,6 +60,39 @@ def get_project_list(project_id):
+     return project_id if isinstance(project_id, Iterable) else [project_id]
+ 
+ 
++def cache_suffix_time(time, key_hash, duration=300):
++    """ Adds jitter based on the key_hash around start/end times for caching snuba queries
++
++        Given a time and a key_hash this should result in a timestamp that remains the same for a duration
++        The end of the duration will be different per key_hash which avoids spikes in the number of queries
++        Must be based on the key_hash so they cache keys are consistent per query
++
++        For example: the time is 17:02:00, there's two queries query A has a key_hash of 30, query B has a key_hash of
++        60, we have the default duration of 300 (5 Minutes)
++        - query A will have the suffix of 17:00:30 for a timewindow from 17:00:30 until 17:05:30
++            - eg. Even when its 17:05:00 the suffix will still be 17:00:30
++        - query B will have the suffix of 17:01:00 for a timewindow from 17:01:00 until 17:06:00
++    """
++    # Use the hash so that seconds past the hour gets rounded differently per query.
++    jitter = key_hash % duration
++    seconds_past_hour = time.minute * 60 + time.second
++    # Round seconds to a multiple of duration, cause this uses "floor" division shouldn't give us a future window
++    time_window_start = seconds_past_hour // duration * duration + jitter
++    # If the time is past the rounded seconds then we want our key to be for this timewindow
++    if time_window_start < seconds_past_hour:
++        seconds_past_hour = time_window_start
++    # Otherwise we're in the previous time window, subtract duration to give us the previous timewindows start
++    else:
++        seconds_past_hour = time_window_start - duration
++    return (
++        # Since we're adding seconds past the hour, we want time but without minutes or seconds
++        time.replace(minute=0, second=0, microsecond=0)
++        +
++        # Use timedelta here so keys are consistent around hour boundaries
++        datetime.timedelta(seconds=seconds_past_hour)
++    )
++
++
+ class SnubaTagStorage(TagStorage):
+     def __get_tag_key(self, project_id, group_id, environment_id, key):
+         tag = u"tags[{}]".format(key)
+@@ -173,33 +212,86 @@ class SnubaTagStorage(TagStorage):
+         limit=1000,
+         keys=None,
+         include_values_seen=True,
++        use_cache=False,
+         **kwargs
+     ):
+-        filters = {"project_id": projects}
++        """ Query snuba for tag keys based on projects
++
++            When use_cache is passed, we'll attempt to use the cache. There's an exception if group_id was passed
++            which refines the query enough caching isn't required.
++            The cache key is based on the filters being passed so that different queries don't hit the same cache, with
++            exceptions for start and end dates. Since even a microsecond passing would result in a different caching
++            key, which means always missing the cache.
++            Instead, to keep the cache key the same for a short period we append the duration, and the end time rounded
++            with a certain jitter to the cache key.
++            This jitter is based on the hash of the key before duration/end time is added for consistency per query.
++            The jitter's intent is to avoid a dogpile effect of many queries being invalidated at the same time.
++            This is done by changing the rounding of the end key to a random offset. See cache_suffix_time for further
++            explanation of how that is done.
++        """
++        default_start, default_end = default_start_end_dates()
++        if start is None:
++            start = default_start
++        if end is None:
++            end = default_end
++
++        filters = {"project_id": sorted(projects)}
+         if environments:
+-            filters["environment"] = environments
++            filters["environment"] = sorted(environments)
+         if group_id is not None:
+             filters["group_id"] = [group_id]
+         if keys is not None:
+-            filters["tags_key"] = keys
++            filters["tags_key"] = sorted(keys)
+         aggregations = [["count()", "", "count"]]
+ 
+         if include_values_seen:
+             aggregations.append(["uniq", "tags_value", "values_seen"])
+         conditions = []
+ 
+-        result = snuba.query(
+-            start=start,
+-            end=end,
+-            groupby=["tags_key"],
+-            conditions=conditions,
+-            filter_keys=filters,
+-            aggregations=aggregations,
+-            limit=limit,
+-            orderby="-count",
+-            referrer="tagstore.__get_tag_keys",
+-            **kwargs
+-        )
++        should_cache = use_cache and group_id is None
++        result = None
++
++        if should_cache:
++            filtering_strings = [
++                u"{}={}".format(key, value) for key, value in six.iteritems(filters)
++            ]
++            cache_key = u"tagstore.__get_tag_keys:{}".format(
++                md5_text(*filtering_strings).hexdigest()
++            )
++            key_hash = hash(cache_key)
++            should_cache = (key_hash % 1000) / 1000.0 <= options.get(
++                "snuba.tagstore.cache-tagkeys-rate"
++            )
++
++        # If we want to continue attempting to cache after checking against the cache rate
++        if should_cache:
++            # Needs to happen before creating the cache suffix otherwise rounding will cause different durations
++            duration = (end - start).total_seconds()
++            # Cause there's rounding to create this cache suffix, we want to update the query end so results match
++            end = cache_suffix_time(end, key_hash)
++            cache_key += u":{}@{}".format(duration, end.isoformat())
++            result = cache.get(cache_key, None)
++            if result is not None:
++                metrics.incr("testing.tagstore.cache_tag_key.hit")
++            else:
++                metrics.incr("testing.tagstore.cache_tag_key.miss")
++
++        if result is None:
++            result = snuba.query(
++                start=start,
++                end=end,
++                groupby=["tags_key"],
++                conditions=conditions,
++                filter_keys=filters,
++                aggregations=aggregations,
++                limit=limit,
++                orderby="-count",
++                referrer="tagstore.__get_tag_keys",
++                **kwargs
++            )
++            if should_cache:
++                cache.set(cache_key, result, 300)
++                metrics.incr("testing.tagstore.cache_tag_key.len", amount=len(result))
+ 
+         if group_id is None:
+             ctor = TagKey
+@@ -260,7 +352,7 @@ class SnubaTagStorage(TagStorage):
+         return self.__get_tag_keys(project_id, None, environment_id and [environment_id])
+ 
+     def get_tag_keys_for_projects(
+-        self, projects, environments, start, end, status=TagKeyStatus.VISIBLE
++        self, projects, environments, start, end, status=TagKeyStatus.VISIBLE, use_cache=False
+     ):
+         MAX_UNSAMPLED_PROJECTS = 50
+         # We want to disable FINAL in the snuba query to reduce load.
+@@ -272,7 +364,14 @@ class SnubaTagStorage(TagStorage):
+         if len(projects) <= MAX_UNSAMPLED_PROJECTS:
+             optimize_kwargs["sample"] = 1
+         return self.__get_tag_keys_for_projects(
+-            projects, None, environments, start, end, include_values_seen=False, **optimize_kwargs
++            projects,
++            None,
++            environments,
++            start,
++            end,
++            include_values_seen=False,
++            use_cache=use_cache,
++            **optimize_kwargs
+         )
+ 
+     def get_tag_value(self, project_id, environment_id, key, value):
+diff --git a/tests/acceptance/test_issue_details.py b/tests/acceptance/test_issue_details.py
+index 37fe1a1d02..e5b97adafb 100644
+--- a/tests/acceptance/test_issue_details.py
++++ b/tests/acceptance/test_issue_details.py
+@@ -3,6 +3,7 @@ from __future__ import absolute_import
+ import json
+ import pytz
+ 
++from mock import patch
+ from datetime import datetime, timedelta
+ from django.conf import settings
+ from django.utils import timezone
+@@ -17,6 +18,9 @@ now = datetime.utcnow().replace(tzinfo=pytz.utc)
+ class IssueDetailsTest(AcceptanceTestCase, SnubaTestCase):
+     def setUp(self):
+         super(IssueDetailsTest, self).setUp()
++        patcher = patch("django.utils.timezone.now", return_value=now)
++        patcher.start()
++        self.addCleanup(patcher.stop)
+         self.user = self.create_user("foo@example.com")
+         self.org = self.create_organization(owner=self.user, name="Rowdy Tiger")
+         self.team = self.create_team(organization=self.org, name="Mariachi Band")
+diff --git a/tests/acceptance/test_project_tags_settings.py b/tests/acceptance/test_project_tags_settings.py
+index 6dfced7c9e..afe9563526 100644
+--- a/tests/acceptance/test_project_tags_settings.py
++++ b/tests/acceptance/test_project_tags_settings.py
+@@ -1,10 +1,13 @@
+ from __future__ import absolute_import
+ 
++from datetime import datetime
+ from sentry.testutils import AcceptanceTestCase, SnubaTestCase
+ from sentry.testutils.helpers.datetime import iso_format, before_now
++from mock import patch
+ import pytz
+ 
+ event_time = before_now(days=3).replace(tzinfo=pytz.utc)
++current_time = datetime.utcnow().replace(tzinfo=pytz.utc)
+ 
+ 
+ class ProjectTagsSettingsTest(AcceptanceTestCase, SnubaTestCase):
+@@ -19,7 +22,8 @@ class ProjectTagsSettingsTest(AcceptanceTestCase, SnubaTestCase):
+         self.login_as(self.user)
+         self.path = u"/settings/{}/projects/{}/tags/".format(self.org.slug, self.project.slug)
+ 
+-    def test_tags_list(self):
++    @patch("django.utils.timezone.now", return_value=current_time)
++    def test_tags_list(self, mock_timezone):
+         self.store_event(
+             data={
+                 "event_id": "a" * 32,
+diff --git a/tests/snuba/api/endpoints/test_organization_tags.py b/tests/snuba/api/endpoints/test_organization_tags.py
+index ce594b8ca5..8bd79389c7 100644
+--- a/tests/snuba/api/endpoints/test_organization_tags.py
++++ b/tests/snuba/api/endpoints/test_organization_tags.py
+@@ -1,5 +1,7 @@
+ from __future__ import absolute_import
+ 
++import mock
++
+ from django.core.urlresolvers import reverse
+ 
+ from sentry.testutils import APITestCase, SnubaTestCase
+@@ -63,3 +65,104 @@ class OrganizationTagsTest(APITestCase, SnubaTestCase):
+         response = self.client.get(url, format="json")
+         assert response.status_code == 200, response.content
+         assert response.data == []
++
++    @mock.patch("sentry.options.get", return_value=1.0)
++    @mock.patch("sentry.utils.snuba.query", return_value={})
++    def test_tag_caching(self, mock_snuba_query, mock_options):
++        user = self.create_user()
++        org = self.create_organization()
++        team = self.create_team(organization=org)
++        self.create_member(organization=org, user=user, teams=[team])
++        self.create_project(organization=org, teams=[team])
++        self.login_as(user=user)
++
++        url = reverse("sentry-api-0-organization-tags", kwargs={"organization_slug": org.slug})
++        response = self.client.get(url, {"use_cache": "1", "statsPeriod": "14d"}, format="json")
++        assert response.status_code == 200, response.content
++        assert mock_snuba_query.call_count == 1
++
++        response = self.client.get(url, {"use_cache": "1", "statsPeriod": "14d"}, format="json")
++        assert response.status_code == 200, response.content
++        # Cause we're caching, we shouldn't call snuba again
++        assert mock_snuba_query.call_count == 1
++
++    @mock.patch("sentry.options.get", return_value=1.0)
++    @mock.patch("sentry.utils.snuba.query", return_value={})
++    def test_different_statsperiod_caching(self, mock_snuba_query, mock_options):
++        user = self.create_user()
++        org = self.create_organization()
++        team = self.create_team(organization=org)
++        self.create_member(organization=org, user=user, teams=[team])
++        self.create_project(organization=org, teams=[team])
++        self.login_as(user=user)
++
++        url = reverse("sentry-api-0-organization-tags", kwargs={"organization_slug": org.slug})
++        response = self.client.get(url, {"use_cache": "1", "statsPeriod": "14d"}, format="json")
++        assert response.status_code == 200, response.content
++        # Empty cache, we should query snuba
++        assert mock_snuba_query.call_count == 1
++
++        response = self.client.get(url, {"use_cache": "1", "statsPeriod": "30d"}, format="json")
++        assert response.status_code == 200, response.content
++        # With a different statsPeriod, we shouldn't use cache and still query snuba
++        assert mock_snuba_query.call_count == 2
++
++    @mock.patch("sentry.options.get", return_value=1.0)
++    @mock.patch("sentry.utils.snuba.query", return_value={})
++    def test_different_times_caching(self, mock_snuba_query, mock_options):
++        user = self.create_user()
++        org = self.create_organization()
++        team = self.create_team(organization=org)
++        self.create_member(organization=org, user=user, teams=[team])
++        self.create_project(organization=org, teams=[team])
++        self.login_as(user=user)
++
++        start = iso_format(before_now(minutes=10))
++        end = iso_format(before_now(minutes=5))
++        url = reverse("sentry-api-0-organization-tags", kwargs={"organization_slug": org.slug})
++        response = self.client.get(
++            url, {"use_cache": "1", "start": start, "end": end}, format="json"
++        )
++        assert response.status_code == 200, response.content
++        assert mock_snuba_query.call_count == 1
++
++        # 5 minutes later, cache_key should be different
++        start = iso_format(before_now(minutes=5))
++        end = iso_format(before_now(minutes=0))
++        response = self.client.get(
++            url, {"use_cache": "1", "start": start, "end": end}, format="json"
++        )
++        assert response.status_code == 200, response.content
++        assert mock_snuba_query.call_count == 2
++
++    @mock.patch("sentry.options.get", return_value=1.0)
++    def test_different_times_retrieves_cache(self, mock_options):
++        user = self.create_user()
++        org = self.create_organization()
++        team = self.create_team(organization=org)
++        self.create_member(organization=org, user=user, teams=[team])
++        project = self.create_project(organization=org, teams=[team])
++
++        start = iso_format(before_now(minutes=10))
++        middle = iso_format(before_now(minutes=5))
++        end = iso_format(before_now(minutes=0))
++        # Throw an event in the middle of the time window, since end might get rounded down a bit
++        self.store_event(
++            data={"event_id": "a" * 32, "tags": {"fruit": "apple"}, "timestamp": middle},
++            project_id=project.id,
++        )
++        self.login_as(user=user)
++
++        url = reverse("sentry-api-0-organization-tags", kwargs={"organization_slug": org.slug})
++        response = self.client.get(
++            url, {"use_cache": "1", "start": start, "end": end}, format="json"
++        )
++        original_data = response.data
++
++        url = reverse("sentry-api-0-organization-tags", kwargs={"organization_slug": org.slug})
++        response = self.client.get(
++            url, {"use_cache": "1", "start": start, "end": end}, format="json"
++        )
++        cached_data = response.data
++
++        assert original_data == cached_data
+diff --git a/tests/snuba/tagstore/test_tagstore_backend.py b/tests/snuba/tagstore/test_tagstore_backend.py
+index 540ead64c9..9d40c113c2 100644
+--- a/tests/snuba/tagstore/test_tagstore_backend.py
++++ b/tests/snuba/tagstore/test_tagstore_backend.py
+@@ -1,7 +1,7 @@
+ from __future__ import absolute_import
+ 
+ import calendar
+-from datetime import timedelta
++from datetime import timedelta, datetime
+ import json
+ import pytest
+ import requests
+@@ -17,7 +17,7 @@ from sentry.tagstore.exceptions import (
+     TagKeyNotFound,
+     TagValueNotFound,
+ )
+-from sentry.tagstore.snuba.backend import SnubaTagStorage
++from sentry.tagstore.snuba.backend import SnubaTagStorage, cache_suffix_time
+ from sentry.testutils import SnubaTestCase, TestCase
+ 
+ 
+@@ -601,3 +601,77 @@ class TagStorageTest(TestCase, SnubaTestCase):
+             )
+             == {}
+         )
++
++    def test_cache_suffix_time(self):
++        starting_key = cache_suffix_time(self.now, 0)
++        finishing_key = cache_suffix_time(self.now + timedelta(seconds=300), 0)
++
++        assert starting_key != finishing_key
++
++    def test_cache_suffix_hour_edges(self):
++        """ a suffix should still behave correctly around the end of the hour
++
++            At a duration of 10 only one key between 0-10 should flip on the hour, the other 9
++            should flip at different times.
++        """
++        before = datetime(2019, 9, 5, 17, 59, 59)
++        on_hour = datetime(2019, 9, 5, 18, 0, 0)
++        changed_on_hour = 0
++        # Check multiple keyhashes so that this test doesn't depend on implementation
++        for key_hash in range(10):
++            before_key = cache_suffix_time(before, key_hash, duration=10)
++            on_key = cache_suffix_time(on_hour, key_hash, duration=10)
++            if before_key != on_key:
++                changed_on_hour += 1
++
++        assert changed_on_hour == 1
++
++    def test_cache_suffix_day_edges(self):
++        """ a suffix should still behave correctly around the end of a day
++
++            This test is nearly identical to test_cache_suffix_hour_edges, but is to confirm that date changes don't
++            cause a different behaviour
++        """
++        before = datetime(2019, 9, 5, 23, 59, 59)
++        next_day = datetime(2019, 9, 6, 0, 0, 0)
++        changed_on_hour = 0
++        for key_hash in range(10):
++            before_key = cache_suffix_time(before, key_hash, duration=10)
++            next_key = cache_suffix_time(next_day, key_hash, duration=10)
++            if before_key != next_key:
++                changed_on_hour += 1
++
++        assert changed_on_hour == 1
++
++    def test_cache_suffix_time_matches_duration(self):
++        """ The number of seconds between keys changing should match duration """
++        previous_key = cache_suffix_time(self.now, 0, duration=10)
++        changes = []
++        for i in range(21):
++            current_time = self.now + timedelta(seconds=i)
++            current_key = cache_suffix_time(current_time, 0, duration=10)
++            if current_key != previous_key:
++                changes.append(current_time)
++                previous_key = current_key
++
++        assert len(changes) == 2
++        assert (changes[1] - changes[0]).total_seconds() == 10
++
++    def test_cache_suffix_time_jitter(self):
++        """ Different key hashes should change keys at different times
++
++            While starting_key and other_key might begin as the same values they should change at different times
++        """
++        starting_key = cache_suffix_time(self.now, 0, duration=10)
++        for i in range(11):
++            current_key = cache_suffix_time(self.now + timedelta(seconds=i), 0, duration=10)
++            if current_key != starting_key:
++                break
++
++        other_key = cache_suffix_time(self.now, 5, duration=10)
++        for j in range(11):
++            current_key = cache_suffix_time(self.now + timedelta(seconds=j), 5, duration=10)
++            if current_key != other_key:
++                break
++
++        assert i != j

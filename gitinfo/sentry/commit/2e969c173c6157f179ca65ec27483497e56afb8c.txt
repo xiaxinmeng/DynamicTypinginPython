@@ -1,0 +1,218 @@
+commit 2e969c173c6157f179ca65ec27483497e56afb8c
+Author: Dan Fuller <dfuller@sentry.io>
+Date:   Wed May 22 16:14:11 2019 -0700
+
+    fix(api): Optimize fetching latest deploys in `ProjectSummarySerializer`
+    
+    For projects with many `ReleaseProjectEnvironment` rows we end up loading a lot of models into
+    memory. We then load the latest `Deploy` for each row, which can be thousands in extreme cases.
+    
+    Convert this to happen entirely in postgres via overuse of `OVER`. We also artificially limit the
+    number of `ReleaseProjectEnvironment` rows we check, since it's likely only recent rows will be
+    relevant.
+
+diff --git a/src/sentry/api/serializers/models/project.py b/src/sentry/api/serializers/models/project.py
+index d8829a2a5b..da3c77d3ca 100644
+--- a/src/sentry/api/serializers/models/project.py
++++ b/src/sentry/api/serializers/models/project.py
+@@ -4,6 +4,7 @@ import six
+ 
+ from collections import defaultdict
+ from datetime import timedelta
++from django.db import connection
+ from django.db.models import Q
+ from django.db.models.aggregates import Count
+ from django.utils import timezone
+@@ -18,7 +19,7 @@ from sentry.constants import StatsPeriod
+ from sentry.digests import backend as digests
+ from sentry.models import (
+     EnvironmentProject, Project, ProjectAvatar, ProjectBookmark, ProjectOption, ProjectPlatform,
+-    ProjectStatus, ProjectTeam, Release, ReleaseProjectEnvironment, Deploy, UserOption, DEFAULT_SUBJECT_TEMPLATE
++    ProjectStatus, ProjectTeam, Release, UserOption, DEFAULT_SUBJECT_TEMPLATE
+ )
+ from sentry.utils.data_filters import FilterTypes
+ from sentry.utils.db import is_postgres
+@@ -283,33 +284,47 @@ class ProjectSummarySerializer(ProjectWithTeamSerializer):
+             environments_by_project[project_env['project_id']].append(
+                 project_env['environment__name'])
+ 
+-        release_project_envs = list(ReleaseProjectEnvironment.objects.filter(
+-            project__in=item_list,
+-            last_deploy_id__isnull=False
+-        ).values('release__version', 'environment__name', 'last_deploy_id', 'project__id'))
+-
+-        deploys = dict(
+-            Deploy.objects.filter(
+-                id__in=[
+-                    rpe['last_deploy_id'] for rpe in release_project_envs]).values_list(
+-                'id',
+-                'date_finished'))
+-
++        cursor = connection.cursor()
++        cursor.execute(
++            """
++            select srpe.project_id, se.name, sr.version, date_finished
++            from (
++                select *
++                -- Finally, filter to the top row for each project/environment.
++                from (
++                    -- Next we join to deploys and rank based recency of latest deploy for each project/environment.
++                    select srpe.project_id, srpe.release_id, srpe.environment_id, sd.date_finished,
++                    row_number() OVER (partition by (srpe.project_id, srpe.environment_id) order by sd.date_finished desc) row_num
++                    from
++                    (
++                        -- First we fetch all related ReleaseProjectEnvironments, then filter to the x most recent for
++                        -- each project/environment that actually have a deploy. This cuts out a lot of data volume
++                        select *
++                        from (
++                            select *, row_number() OVER (partition by (srpe.project_id, srpe.environment_id) order by srpe.id desc) row_num
++                            from sentry_releaseprojectenvironment srpe
++                            where srpe.last_deploy_id is not null
++                            and project_id = ANY(%s)
++                        ) srpe
++                        where row_num <= %s
++                    ) srpe
++                    inner join sentry_deploy sd on sd.id = srpe.last_deploy_id
++                    where sd.date_finished is not null
++                ) srpe
++                where row_num = 1
++            ) srpe
++            inner join sentry_release sr on sr.id = srpe.release_id
++            inner join sentry_environment se on se.id = srpe.environment_id;
++            """,
++            ([p.id for p in item_list], 10),
++        )
+         deploys_by_project = defaultdict(dict)
+ 
+-        for rpe in release_project_envs:
+-            env_name = rpe['environment__name']
+-            project_id = rpe['project__id']
+-            date_finished = deploys[rpe['last_deploy_id']]
+-
+-            if (
+-                env_name not in deploys_by_project[project_id] or
+-                deploys_by_project[project_id][env_name]['dateFinished'] < date_finished
+-            ):
+-                deploys_by_project[project_id][env_name] = {
+-                    'version': rpe['release__version'],
+-                    'dateFinished': date_finished
+-                }
++        for project_id, env_name, release_version, date_finished in cursor.fetchall():
++            deploys_by_project[project_id][env_name] = {
++                'version': release_version,
++                'dateFinished': date_finished,
++            }
+ 
+         # We  just return the version key here so that we cut down on response
+         # size
+diff --git a/tests/sentry/api/serializers/test_project.py b/tests/sentry/api/serializers/test_project.py
+index 9692fbac8d..c1e4bde92b 100644
+--- a/tests/sentry/api/serializers/test_project.py
++++ b/tests/sentry/api/serializers/test_project.py
+@@ -166,20 +166,20 @@ class ProjectSummarySerializerTest(TestCase):
+ 
+         self.release = self.create_release(self.project)
+ 
+-        environment_1 = Environment.objects.create(
++        self.environment_1 = Environment.objects.create(
+             organization_id=self.organization.id,
+             name='production',
+         )
+-        environment_1.add_project(self.project)
+-        environment_1.save()
+-        environment_2 = Environment.objects.create(
++        self.environment_1.add_project(self.project)
++        self.environment_1.save()
++        self.environment_2 = Environment.objects.create(
+             organization_id=self.organization.id,
+             name='staging',
+         )
+-        environment_2.add_project(self.project)
+-        environment_2.save()
++        self.environment_2.add_project(self.project)
++        self.environment_2.save()
+         deploy = Deploy.objects.create(
+-            environment_id=environment_1.id,
++            environment_id=self.environment_1.id,
+             organization_id=self.organization.id,
+             release=self.release,
+             date_finished=self.date
+@@ -187,7 +187,7 @@ class ProjectSummarySerializerTest(TestCase):
+         ReleaseProjectEnvironment.objects.create(
+             project_id=self.project.id,
+             release_id=self.release.id,
+-            environment_id=environment_1.id,
++            environment_id=self.environment_1.id,
+             last_deploy_id=deploy.id
+         )
+ 
+@@ -259,6 +259,69 @@ class ProjectSummarySerializerTest(TestCase):
+         assert result['latestRelease'] == {'version': self.release.version}
+         assert result['environments'] == ['production', 'staging']
+ 
++    def test_multiple_environments_deploys(self):
++        env_1_release = self.create_release(self.project)
++        env_1_deploy = Deploy.objects.create(
++            environment_id=self.environment_1.id,
++            organization_id=self.organization.id,
++            release=env_1_release,
++            date_finished=self.date + timedelta(minutes=20),
++        )
++        ReleaseProjectEnvironment.objects.create(
++            project_id=self.project.id,
++            release_id=env_1_release.id,
++            environment_id=self.environment_1.id,
++            last_deploy_id=env_1_deploy.id,
++        )
++
++        env_2_release = self.create_release(self.project)
++        Deploy.objects.create(
++            environment_id=self.environment_2.id,
++            organization_id=self.organization.id,
++            release=env_2_release,
++            date_finished=self.date - timedelta(days=5),
++        )
++        env_2_deploy = Deploy.objects.create(
++            environment_id=self.environment_2.id,
++            organization_id=self.organization.id,
++            release=env_2_release,
++            date_finished=self.date,
++        )
++        ReleaseProjectEnvironment.objects.create(
++            project_id=self.project.id,
++            release_id=env_2_release.id,
++            environment_id=self.environment_2.id,
++            last_deploy_id=env_2_deploy.id,
++        )
++        other_project = self.create_project()
++        other_project_release = self.create_release(other_project)
++        other_project_deploy = Deploy.objects.create(
++            environment_id=self.environment_2.id,
++            organization_id=self.organization.id,
++            release=other_project_release,
++            date_finished=self.date - timedelta(minutes=350),
++        )
++        ReleaseProjectEnvironment.objects.create(
++            project_id=other_project.id,
++            release_id=other_project_release.id,
++            environment_id=self.environment_2.id,
++            last_deploy_id=other_project_deploy.id,
++        )
++        result = serialize(
++            [self.project, other_project],
++            self.user,
++            ProjectSummarySerializer(),
++        )
++        assert result[0]['id'] == six.text_type(self.project.id)
++        assert result[0]['latestDeploys'] == {
++            self.environment_1.name: {'version': env_1_release.version, 'dateFinished': env_1_deploy.date_finished},
++            self.environment_2.name: {'version': env_2_release.version, 'dateFinished': env_2_deploy.date_finished},
++        }
++        assert result[1]['id'] == six.text_type(other_project.id)
++        assert result[1]['latestDeploys'] == {
++            self.environment_2.name: {'version': other_project_release.version, 'dateFinished': other_project_deploy.date_finished},
++        }
++
+ 
+ class ProjectWithOrganizationSerializerTest(TestCase):
+     def test_simple(self):

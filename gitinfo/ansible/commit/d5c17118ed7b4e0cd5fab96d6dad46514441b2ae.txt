@@ -1,0 +1,1593 @@
+commit d5c17118ed7b4e0cd5fab96d6dad46514441b2ae
+Author: Mark Chappell <mchappel@redhat.com>
+Date:   Thu Feb 27 00:54:39 2020 +0100
+
+    s3_bucket - cleanup and test stabilisation. (#66778)
+    
+    * AnsibleAWSModule related cleanup - s3_bucket
+    
+    * Add extra information to s3_bucket timeout failures, it's possible the comparisons are doing something weird...
+    
+    * Move Bucket Encryption boto support logic into the pre-flight checks
+    
+    * Use the built in required_by logic
+    
+    * Rework s3_bucket integration tests
+    
+    * Add a retry around put_bucket_encryption
+    
+    s3_client.put_bucket_encryption is occasionally dropped on the floor
+    by Amazon add some logic to retry s3_client.put_bucket_encryption call
+    
+    * Catch OperationAborted and retry, it is caused by a conflicting change
+    still being in progress.   (For example an Encryption setting applying)
+    
+    * Make sure we don't explode if the botocore version's too old
+    
+    * Review tweaks
+
+diff --git a/lib/ansible/modules/cloud/amazon/s3_bucket.py b/lib/ansible/modules/cloud/amazon/s3_bucket.py
+index f35cf53b5e..b72d5c89b1 100644
+--- a/lib/ansible/modules/cloud/amazon/s3_bucket.py
++++ b/lib/ansible/modules/cloud/amazon/s3_bucket.py
+@@ -171,13 +171,13 @@ from ansible.module_utils.six.moves.urllib.parse import urlparse
+ from ansible.module_utils.six import string_types
+ from ansible.module_utils.basic import to_text
+ from ansible.module_utils.aws.core import AnsibleAWSModule, is_boto3_error_code
+-from ansible.module_utils.ec2 import compare_policies, ec2_argument_spec, boto3_tag_list_to_ansible_dict, ansible_dict_to_boto3_tag_list
++from ansible.module_utils.ec2 import compare_policies, boto3_tag_list_to_ansible_dict, ansible_dict_to_boto3_tag_list
+ from ansible.module_utils.ec2 import get_aws_connection_info, boto3_conn, AWSRetry
+ 
+ try:
+     from botocore.exceptions import BotoCoreError, ClientError, EndpointConnectionError, WaiterError
+ except ImportError:
+-    pass  # handled by AnsibleAWSModule
++    pass  # caught by AnsibleAWSModule
+ 
+ 
+ def create_or_update_bucket(s3_client, module, location):
+@@ -334,13 +334,10 @@ def create_or_update_bucket(s3_client, module, location):
+         result['tags'] = current_tags_dict
+ 
+     # Encryption
+-    if hasattr(s3_client, "get_bucket_encryption"):
+-        try:
+-            current_encryption = get_bucket_encryption(s3_client, name)
+-        except (ClientError, BotoCoreError) as e:
+-            module.fail_json_aws(e, msg="Failed to get bucket encryption")
+-    elif encryption is not None:
+-        module.fail_json(msg="Using bucket encryption requires botocore version >= 1.7.41")
++    try:
++        current_encryption = get_bucket_encryption(s3_client, name)
++    except (ClientError, BotoCoreError) as e:
++        module.fail_json_aws(e, msg="Failed to get bucket encryption")
+ 
+     if encryption is not None:
+         current_encryption_algorithm = current_encryption.get('SSEAlgorithm') if current_encryption else None
+@@ -356,11 +353,7 @@ def create_or_update_bucket(s3_client, module, location):
+             expected_encryption = {'SSEAlgorithm': encryption}
+             if encryption == 'aws:kms' and encryption_key_id is not None:
+                 expected_encryption.update({'KMSMasterKeyID': encryption_key_id})
+-            try:
+-                put_bucket_encryption(s3_client, name, expected_encryption)
+-            except (BotoCoreError, ClientError) as e:
+-                module.fail_json_aws(e, msg="Failed to set bucket encryption")
+-            current_encryption = wait_encryption_is_applied(module, s3_client, name, expected_encryption)
++            current_encryption = put_bucket_encryption_with_retry(module, s3_client, name, expected_encryption)
+             changed = True
+ 
+         result['encryption'] = current_encryption
+@@ -445,6 +438,9 @@ def put_bucket_versioning(s3_client, bucket_name, required_versioning):
+ 
+ @AWSRetry.exponential_backoff(max_delay=120, catch_extra_error_codes=['NoSuchBucket'])
+ def get_bucket_encryption(s3_client, bucket_name):
++    if not hasattr(s3_client, "get_bucket_encryption"):
++        return None
++
+     try:
+         result = s3_client.get_bucket_encryption(Bucket=bucket_name)
+         return result.get('ServerSideEncryptionConfiguration', {}).get('Rules', [])[0].get('ApplyServerSideEncryptionByDefault')
+@@ -457,6 +453,25 @@ def get_bucket_encryption(s3_client, bucket_name):
+         return None
+ 
+ 
++def put_bucket_encryption_with_retry(module, s3_client, name, expected_encryption):
++    max_retries = 3
++    for retries in range(1, max_retries + 1):
++        try:
++            put_bucket_encryption(s3_client, name, expected_encryption)
++        except (BotoCoreError, ClientError) as e:
++            module.fail_json_aws(e, msg="Failed to set bucket encryption")
++        current_encryption = wait_encryption_is_applied(module, s3_client, name, expected_encryption,
++                                                        should_fail=(retries == max_retries), retries=5)
++        if current_encryption == expected_encryption:
++            return current_encryption
++
++    # We shouldn't get here, the only time this should happen is if
++    # current_encryption != expected_encryption and retries == max_retries
++    # Which should use module.fail_json and fail out first.
++    module.fail_json(msg='Failed to apply bucket encryption',
++                     current=current_encryption, expected=expected_encryption, retries=retries)
++
++
+ @AWSRetry.exponential_backoff(max_delay=120, catch_extra_error_codes=['NoSuchBucket'])
+ def put_bucket_encryption(s3_client, bucket_name, encryption):
+     server_side_encryption_configuration = {'Rules': [{'ApplyServerSideEncryptionByDefault': encryption}]}
+@@ -473,7 +488,7 @@ def delete_bucket_encryption(s3_client, bucket_name):
+     s3_client.delete_bucket_encryption(Bucket=bucket_name)
+ 
+ 
+-@AWSRetry.exponential_backoff(max_delay=120)
++@AWSRetry.exponential_backoff(max_delay=240, catch_extra_error_codes=['OperationAborted'])
+ def delete_bucket(s3_client, bucket_name):
+     try:
+         s3_client.delete_bucket(Bucket=bucket_name)
+@@ -498,7 +513,8 @@ def wait_policy_is_applied(module, s3_client, bucket_name, expected_policy, shou
+         else:
+             return current_policy
+     if should_fail:
+-        module.fail_json(msg="Bucket policy failed to apply in the expected time")
++        module.fail_json(msg="Bucket policy failed to apply in the expected time",
++                         requested_policy=expected_policy, live_policy=current_policy)
+     else:
+         return None
+ 
+@@ -514,13 +530,14 @@ def wait_payer_is_applied(module, s3_client, bucket_name, expected_payer, should
+         else:
+             return requester_pays_status
+     if should_fail:
+-        module.fail_json(msg="Bucket request payment failed to apply in the expected time")
++        module.fail_json(msg="Bucket request payment failed to apply in the expected time",
++                         requested_status=expected_payer, live_status=requester_pays_status)
+     else:
+         return None
+ 
+ 
+-def wait_encryption_is_applied(module, s3_client, bucket_name, expected_encryption):
+-    for dummy in range(0, 12):
++def wait_encryption_is_applied(module, s3_client, bucket_name, expected_encryption, should_fail=True, retries=12):
++    for dummy in range(0, retries):
+         try:
+             encryption = get_bucket_encryption(s3_client, bucket_name)
+         except (BotoCoreError, ClientError) as e:
+@@ -529,7 +546,12 @@ def wait_encryption_is_applied(module, s3_client, bucket_name, expected_encrypti
+             time.sleep(5)
+         else:
+             return encryption
+-    module.fail_json(msg="Bucket encryption failed to apply in the expected time")
++
++    if should_fail:
++        module.fail_json(msg="Bucket encryption failed to apply in the expected time",
++                         requested_encryption=expected_encryption, live_encryption=encryption)
++
++    return encryption
+ 
+ 
+ def wait_versioning_is_applied(module, s3_client, bucket_name, required_versioning):
+@@ -542,7 +564,8 @@ def wait_versioning_is_applied(module, s3_client, bucket_name, required_versioni
+             time.sleep(8)
+         else:
+             return versioning_status
+-    module.fail_json(msg="Bucket versioning failed to apply in the expected time")
++    module.fail_json(msg="Bucket versioning failed to apply in the expected time",
++                     requested_versioning=required_versioning, live_versioning=versioning_status)
+ 
+ 
+ def wait_tags_are_applied(module, s3_client, bucket_name, expected_tags_dict):
+@@ -555,7 +578,8 @@ def wait_tags_are_applied(module, s3_client, bucket_name, expected_tags_dict):
+             time.sleep(5)
+         else:
+             return current_tags_dict
+-    module.fail_json(msg="Bucket tags failed to apply in the expected time")
++    module.fail_json(msg="Bucket tags failed to apply in the expected time",
++                     requested_tags=expected_tags_dict, live_tags=current_tags_dict)
+ 
+ 
+ def get_current_bucket_tags_dict(s3_client, bucket_name):
+@@ -668,26 +692,27 @@ def get_s3_client(module, aws_connect_kwargs, location, ceph, s3_url):
+ 
+ def main():
+ 
+-    argument_spec = ec2_argument_spec()
+-    argument_spec.update(
+-        dict(
+-            force=dict(default=False, type='bool'),
+-            policy=dict(type='json'),
+-            name=dict(required=True),
+-            requester_pays=dict(default=False, type='bool'),
+-            s3_url=dict(aliases=['S3_URL']),
+-            state=dict(default='present', choices=['present', 'absent']),
+-            tags=dict(type='dict'),
+-            purge_tags=dict(type='bool', default=True),
+-            versioning=dict(type='bool'),
+-            ceph=dict(default=False, type='bool'),
+-            encryption=dict(choices=['none', 'AES256', 'aws:kms']),
+-            encryption_key_id=dict()
+-        )
++    argument_spec = dict(
++        force=dict(default=False, type='bool'),
++        policy=dict(type='json'),
++        name=dict(required=True),
++        requester_pays=dict(default=False, type='bool'),
++        s3_url=dict(aliases=['S3_URL']),
++        state=dict(default='present', choices=['present', 'absent']),
++        tags=dict(type='dict'),
++        purge_tags=dict(type='bool', default=True),
++        versioning=dict(type='bool'),
++        ceph=dict(default=False, type='bool'),
++        encryption=dict(choices=['none', 'AES256', 'aws:kms']),
++        encryption_key_id=dict()
++    )
++
++    required_by = dict(
++        encryption_key_id=('encryption',),
+     )
+ 
+     module = AnsibleAWSModule(
+-        argument_spec=argument_spec,
++        argument_spec=argument_spec, required_by=required_by
+     )
+ 
+     region, ec2_url, aws_connect_kwargs = get_aws_connection_info(module, boto3=True)
+@@ -724,10 +749,12 @@ def main():
+     encryption = module.params.get("encryption")
+     encryption_key_id = module.params.get("encryption_key_id")
+ 
++    if not hasattr(s3_client, "get_bucket_encryption"):
++        if encryption is not None:
++            module.fail_json(msg="Using bucket encryption requires botocore version >= 1.7.41")
++
+     # Parameter validation
+-    if encryption_key_id is not None and encryption is None:
+-        module.fail_json(msg="You must specify encryption parameter along with encryption_key_id.")
+-    elif encryption_key_id is not None and encryption != 'aws:kms':
++    if encryption_key_id is not None and encryption != 'aws:kms':
+         module.fail_json(msg="Only 'aws:kms' is a valid option for encryption parameter when you specify encryption_key_id.")
+ 
+     if state == 'present':
+diff --git a/test/integration/targets/s3_bucket/aliases b/test/integration/targets/s3_bucket/aliases
+index dd849540d5..a112c3d1bb 100644
+--- a/test/integration/targets/s3_bucket/aliases
++++ b/test/integration/targets/s3_bucket/aliases
+@@ -1,3 +1,2 @@
+ cloud/aws
+ shippable/aws/group1
+-unstable
+diff --git a/test/integration/targets/s3_bucket/inventory b/test/integration/targets/s3_bucket/inventory
+new file mode 100644
+index 0000000000..2968f764cf
+--- /dev/null
++++ b/test/integration/targets/s3_bucket/inventory
+@@ -0,0 +1,12 @@
++[tests]
++missing
++simple
++complex
++dotted
++tags
++encryption_kms
++encryption_sse
++
++[all:vars]
++ansible_connection=local
++ansible_python_interpreter="{{ ansible_playbook_python }}"
+diff --git a/test/integration/targets/s3_bucket/main.yml b/test/integration/targets/s3_bucket/main.yml
+new file mode 100644
+index 0000000000..22fc0d64f7
+--- /dev/null
++++ b/test/integration/targets/s3_bucket/main.yml
+@@ -0,0 +1,12 @@
++---
++# Beware: most of our tests here are run in parallel.
++# To add new tests you'll need to add a new host to the inventory and a matching
++# '{{ inventory_hostname }}'.yml file in roles/s3_bucket/tasks/
++
++# VPC should get cleaned up once all hosts have run
++- hosts: all
++  gather_facts: no
++  strategy: free
++  #serial: 10
++  roles:
++    - s3_bucket
+diff --git a/test/integration/targets/s3_bucket/meta/main.yml b/test/integration/targets/s3_bucket/meta/main.yml
+new file mode 100644
+index 0000000000..38b31be072
+--- /dev/null
++++ b/test/integration/targets/s3_bucket/meta/main.yml
+@@ -0,0 +1,4 @@
++dependencies:
++  - prepare_tests
++  - setup_ec2
++  - setup_remote_tmp_dir
+diff --git a/test/integration/targets/s3_bucket/roles/s3_bucket/defaults/main.yml b/test/integration/targets/s3_bucket/roles/s3_bucket/defaults/main.yml
+new file mode 100644
+index 0000000000..b4fd58adfc
+--- /dev/null
++++ b/test/integration/targets/s3_bucket/roles/s3_bucket/defaults/main.yml
+@@ -0,0 +1,2 @@
++---
++bucket_name: '{{ resource_prefix }}-{{ inventory_hostname | regex_replace("_","-") }}'
+diff --git a/test/integration/targets/s3_bucket/roles/s3_bucket/meta/main.yml b/test/integration/targets/s3_bucket/roles/s3_bucket/meta/main.yml
+new file mode 100644
+index 0000000000..38b31be072
+--- /dev/null
++++ b/test/integration/targets/s3_bucket/roles/s3_bucket/meta/main.yml
+@@ -0,0 +1,4 @@
++dependencies:
++  - prepare_tests
++  - setup_ec2
++  - setup_remote_tmp_dir
+diff --git a/test/integration/targets/s3_bucket/roles/s3_bucket/tasks/complex.yml b/test/integration/targets/s3_bucket/roles/s3_bucket/tasks/complex.yml
+new file mode 100644
+index 0000000000..41a03a4a55
+--- /dev/null
++++ b/test/integration/targets/s3_bucket/roles/s3_bucket/tasks/complex.yml
+@@ -0,0 +1,146 @@
++---
++- block:
++    - name: 'Create more complex s3_bucket'
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: present
++        policy: "{{ lookup('template','policy.json') }}"
++        requester_pays: yes
++        versioning: yes
++        tags:
++          example: tag1
++          another: tag2
++      register: output
++
++    - assert:
++        that:
++          - output is changed
++          - output.name == '{{ bucket_name }}'
++          - output.requester_pays
++          - output.versioning.MfaDelete == 'Disabled'
++          - output.versioning.Versioning == 'Enabled'
++          - output.tags.example == 'tag1'
++          - output.tags.another == 'tag2'
++          - output.policy.Statement[0].Action == 's3:GetObject'
++          - output.policy.Statement[0].Effect == 'Allow'
++          - output.policy.Statement[0].Principal == '*'
++          - output.policy.Statement[0].Resource == 'arn:aws:s3:::{{ bucket_name }}/*'
++          - output.policy.Statement[0].Sid == 'AddPerm'
++
++    # ============================================================
++
++    - name: 'Pause to help with s3 bucket eventual consistency'
++      wait_for:
++        timeout: 10
++      delegate_to: localhost
++
++    - name: 'Try to update the same complex s3_bucket'
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: present
++        policy: "{{ lookup('template','policy.json') }}"
++        requester_pays: yes
++        versioning: yes
++        tags:
++          example: tag1
++          another: tag2
++      register: output
++
++    - assert:
++        that:
++          - output is not changed
++          - output.name == '{{ bucket_name }}'
++          - output.requester_pays
++          - output.versioning.MfaDelete == 'Disabled'
++          - output.versioning.Versioning == 'Enabled'
++          - output.tags.example == 'tag1'
++          - output.tags.another == 'tag2'
++          - output.policy.Statement[0].Action == 's3:GetObject'
++          - output.policy.Statement[0].Effect == 'Allow'
++          - output.policy.Statement[0].Principal == '*'
++          - output.policy.Statement[0].Resource == 'arn:aws:s3:::{{ bucket_name }}/*'
++          - output.policy.Statement[0].Sid == 'AddPerm'
++
++    # ============================================================
++    - name: 'Update bucket policy on complex bucket'
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: present
++        policy: "{{ lookup('template','policy-updated.json') }}"
++        requester_pays: yes
++        versioning: yes
++        tags:
++          example: tag1
++          another: tag2
++      register: output
++
++    - assert:
++        that:
++          - output is changed
++          - output.policy.Statement[0].Action == 's3:GetObject'
++          - output.policy.Statement[0].Effect == 'Deny'
++          - output.policy.Statement[0].Principal == '*'
++          - output.policy.Statement[0].Resource == 'arn:aws:s3:::{{ bucket_name }}/*'
++          - output.policy.Statement[0].Sid == 'AddPerm'
++
++    # ============================================================
++
++    - name: 'Pause to help with s3 bucket eventual consistency'
++      wait_for:
++        timeout: 10
++      delegate_to: localhost
++
++    - name: Update attributes for s3_bucket
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: present
++        policy: "{{ lookup('template','policy.json') }}"
++        requester_pays: no
++        versioning: no
++        tags:
++          example: tag1-udpated
++          another: tag2
++      register: output
++
++    - assert:
++        that:
++          - output is changed
++          - output.name == '{{ bucket_name }}'
++          - not output.requester_pays
++          - output.versioning.MfaDelete == 'Disabled'
++          - output.versioning.Versioning in ['Suspended', 'Disabled']
++          - output.tags.example == 'tag1-udpated'
++          - output.tags.another == 'tag2'
++          - output.policy.Statement[0].Action == 's3:GetObject'
++          - output.policy.Statement[0].Effect == 'Allow'
++          - output.policy.Statement[0].Principal == '*'
++          - output.policy.Statement[0].Resource == 'arn:aws:s3:::{{ bucket_name }}/*'
++          - output.policy.Statement[0].Sid == 'AddPerm'
++
++    - name: 'Delete complex test bucket'
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: absent
++      register: output
++
++    - assert:
++        that:
++          - output is changed
++
++    - name: 'Re-delete complex test bucket'
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: absent
++      register: output
++
++    - assert:
++        that:
++          - output is not changed
++
++  # ============================================================
++  always:
++    - name: 'Ensure all buckets are deleted'
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: absent
++      ignore_errors: yes
+diff --git a/test/integration/targets/s3_bucket/roles/s3_bucket/tasks/dotted.yml b/test/integration/targets/s3_bucket/roles/s3_bucket/tasks/dotted.yml
+new file mode 100644
+index 0000000000..7d4e0ae9ea
+--- /dev/null
++++ b/test/integration/targets/s3_bucket/roles/s3_bucket/tasks/dotted.yml
+@@ -0,0 +1,54 @@
++---
++- block:
++    - name: 'Ensure bucket_name contains a .'
++      set_fact:
++        bucket_name: '{{ bucket_name }}.something'
++
++    # ============================================================
++    #
++    - name: 'Create bucket with dot in name'
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: present
++      register: output
++
++    - assert:
++        that:
++          - output is changed
++          - output.name == '{{ bucket_name }}'
++
++
++    # ============================================================
++
++    - name: 'Pause to help with s3 bucket eventual consistency'
++      wait_for:
++        timeout: 10
++      delegate_to: localhost
++
++    - name: 'Delete s3_bucket with dot in name'
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: absent
++      register: output
++
++    - assert:
++        that:
++          - output is changed
++
++    - name: 'Re-delete s3_bucket with dot in name'
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: absent
++      register: output
++
++    - assert:
++        that:
++          - output is not changed
++
++  # ============================================================
++  always:
++    - name: 'Ensure all buckets are deleted'
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: absent
++      ignore_errors: yes
+diff --git a/test/integration/targets/s3_bucket/roles/s3_bucket/tasks/encryption_kms.yml b/test/integration/targets/s3_bucket/roles/s3_bucket/tasks/encryption_kms.yml
+new file mode 100644
+index 0000000000..869dd40236
+--- /dev/null
++++ b/test/integration/targets/s3_bucket/roles/s3_bucket/tasks/encryption_kms.yml
+@@ -0,0 +1,88 @@
++---
++- module_defaults:
++    group/aws:
++      aws_access_key: "{{ aws_access_key }}"
++      aws_secret_key: "{{ aws_secret_key }}"
++      security_token: "{{ security_token | default(omit) }}"
++      region: "{{ aws_region }}"
++  block:
++
++    # ============================================================
++
++    - name: 'Create a simple bucket'
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: present
++      register: output
++
++    - name: 'Enable aws:kms encryption with KMS master key'
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: present
++        encryption: "aws:kms"
++      register: output
++
++    - assert:
++        that:
++          - output.changed
++          - output.encryption
++          - output.encryption.SSEAlgorithm == 'aws:kms'
++
++    - name: 'Re-enable aws:kms encryption with KMS master key (idempotent)'
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: present
++        encryption: "aws:kms"
++      register: output
++
++    - assert:
++        that:
++          - not output.changed
++          - output.encryption
++          - output.encryption.SSEAlgorithm == 'aws:kms'
++
++    # ============================================================
++
++    - name: Disable encryption from bucket
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: present
++        encryption: "none"
++      register: output
++
++    - assert:
++        that:
++          - output.changed
++          - not output.encryption
++
++    - name: Disable encryption from bucket
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: present
++        encryption: "none"
++      register: output
++
++    - assert:
++        that:
++          - output is not changed
++          - not output.encryption
++
++    # ============================================================
++
++    - name: Delete encryption test s3 bucket
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: absent
++      register: output
++
++    - assert:
++        that:
++          - output.changed
++
++  # ============================================================
++  always:
++    - name: Ensure all buckets are deleted
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: absent
++      ignore_errors: yes
+diff --git a/test/integration/targets/s3_bucket/roles/s3_bucket/tasks/encryption_sse.yml b/test/integration/targets/s3_bucket/roles/s3_bucket/tasks/encryption_sse.yml
+new file mode 100644
+index 0000000000..699e8ae410
+--- /dev/null
++++ b/test/integration/targets/s3_bucket/roles/s3_bucket/tasks/encryption_sse.yml
+@@ -0,0 +1,88 @@
++---
++- module_defaults:
++    group/aws:
++      aws_access_key: "{{ aws_access_key }}"
++      aws_secret_key: "{{ aws_secret_key }}"
++      security_token: "{{ security_token | default(omit) }}"
++      region: "{{ aws_region }}"
++  block:
++
++    # ============================================================
++
++    - name: 'Create a simple bucket'
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: present
++      register: output
++
++    - name: 'Enable AES256 encryption'
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: present
++        encryption: 'AES256'
++      register: output
++
++    - assert:
++        that:
++          - output.changed
++          - output.encryption
++          - output.encryption.SSEAlgorithm == 'AES256'
++
++    - name: 'Re-enable AES256 encryption (idempotency)'
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: present
++        encryption: 'AES256'
++      register: output
++
++    - assert:
++        that:
++          - not output.changed
++          - output.encryption
++          - output.encryption.SSEAlgorithm == 'AES256'
++
++    # ============================================================
++
++    - name: Disable encryption from bucket
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: present
++        encryption: "none"
++      register: output
++
++    - assert:
++        that:
++          - output.changed
++          - not output.encryption
++
++    - name: Disable encryption from bucket
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: present
++        encryption: "none"
++      register: output
++
++    - assert:
++        that:
++          - output is not changed
++          - not output.encryption
++
++    # ============================================================
++
++    - name: Delete encryption test s3 bucket
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: absent
++      register: output
++
++    - assert:
++        that:
++          - output.changed
++
++  # ============================================================
++  always:
++    - name: Ensure all buckets are deleted
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: absent
++      ignore_errors: yes
+diff --git a/test/integration/targets/s3_bucket/roles/s3_bucket/tasks/main.yml b/test/integration/targets/s3_bucket/roles/s3_bucket/tasks/main.yml
+new file mode 100644
+index 0000000000..8eba03ba1a
+--- /dev/null
++++ b/test/integration/targets/s3_bucket/roles/s3_bucket/tasks/main.yml
+@@ -0,0 +1,20 @@
++---
++# Beware: most of our tests here are run in parallel.
++# To add new tests you'll need to add a new host to the inventory and a matching
++# '{{ inventory_hostname }}'.yml file in roles/ec2_roles/tasks/
++#
++# ###############################################################################
++
++- name: "Wrap up all tests and setup AWS credentials"
++  module_defaults:
++    group/aws:
++      aws_access_key: "{{ aws_access_key }}"
++      aws_secret_key: "{{ aws_secret_key }}"
++      security_token: "{{ security_token | default(omit) }}"
++      region: "{{ aws_region }}"
++  block:
++    - debug:
++        msg: "{{ inventory_hostname }} start: {{ lookup('pipe','date') }}"
++    - include_tasks: '{{ inventory_hostname }}.yml'
++    - debug:
++        msg: "{{ inventory_hostname }} finish: {{ lookup('pipe','date') }}"
+diff --git a/test/integration/targets/s3_bucket/roles/s3_bucket/tasks/missing.yml b/test/integration/targets/s3_bucket/roles/s3_bucket/tasks/missing.yml
+new file mode 100644
+index 0000000000..4d827680ee
+--- /dev/null
++++ b/test/integration/targets/s3_bucket/roles/s3_bucket/tasks/missing.yml
+@@ -0,0 +1,26 @@
++---
++- name: 'Attempt to delete non-existent buckets'
++  block:
++    # ============================================================
++    #
++    # While in theory the 'simple' test case covers this there are
++    # ways in which eventual-consistency could catch us out.
++    #
++    - name: 'Delete non-existstent s3_bucket (never created)'
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: absent
++      register: output
++
++    - assert:
++        that:
++          - output is success
++          - output is not changed
++
++  # ============================================================
++  always:
++    - name: 'Ensure all buckets are deleted'
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: absent
++      ignore_errors: yes
+diff --git a/test/integration/targets/s3_bucket/roles/s3_bucket/tasks/simple.yml b/test/integration/targets/s3_bucket/roles/s3_bucket/tasks/simple.yml
+new file mode 100644
+index 0000000000..3c39c5b4cb
+--- /dev/null
++++ b/test/integration/targets/s3_bucket/roles/s3_bucket/tasks/simple.yml
+@@ -0,0 +1,64 @@
++---
++- name: 'Run simple tests'
++  block:
++    # Note: s3_bucket doesn't support check_mode
++
++    # ============================================================
++    - name: 'Create a simple s3_bucket'
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: present
++      register: output
++
++    - assert:
++        that:
++          - output is success
++          - output is changed
++          - output.name == '{{ bucket_name }}'
++          - not output.requester_pays
++
++    # ============================================================
++    - name: 'Try to update the simple bucket with the same values'
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: present
++      register: output
++
++    - assert:
++        that:
++          - output is success
++          - output is not changed
++          - output.name == '{{ bucket_name }}'
++          - not output.requester_pays
++
++    # ============================================================
++    - name: 'Delete the simple s3_bucket'
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: absent
++      register: output
++
++    - assert:
++        that:
++          - output is success
++          - output is changed
++
++    # ============================================================
++    - name: 'Re-delete the simple s3_bucket (idemoptency)'
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: absent
++      register: output
++
++    - assert:
++        that:
++          - output is success
++          - output is not changed
++
++  # ============================================================
++  always:
++    - name: 'Ensure all buckets are deleted'
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: absent
++      ignore_errors: yes
+diff --git a/test/integration/targets/s3_bucket/roles/s3_bucket/tasks/tags.yml b/test/integration/targets/s3_bucket/roles/s3_bucket/tasks/tags.yml
+new file mode 100644
+index 0000000000..437dd2ca5f
+--- /dev/null
++++ b/test/integration/targets/s3_bucket/roles/s3_bucket/tasks/tags.yml
+@@ -0,0 +1,256 @@
++---
++- name: 'Run tagging tests'
++  block:
++
++    # ============================================================
++    - name: 'Create simple s3_bucket for testing tagging'
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: present
++      register: output
++
++    - assert:
++        that:
++          - output.changed
++          - output.name == '{{ bucket_name }}'
++
++    # ============================================================
++
++    - name: 'Add tags to s3 bucket'
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: present
++        tags:
++          example: tag1
++          another: tag2
++      register: output
++
++    - assert:
++        that:
++          - output.changed
++          - output.name == '{{ bucket_name }}'
++          - output.tags.example == 'tag1'
++          - output.tags.another == 'tag2'
++
++    - name: 'Re-Add tags to s3 bucket'
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: present
++        tags:
++          example: tag1
++          another: tag2
++      register: output
++
++    - assert:
++        that:
++          - output is not changed
++          - output.name == '{{ bucket_name }}'
++          - output.tags.example == 'tag1'
++          - output.tags.another == 'tag2'
++
++    # ============================================================
++
++    - name: Remove a tag from an s3_bucket
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: present
++        tags:
++          example: tag1
++      register: output
++
++    - assert:
++        that:
++          - output.changed
++          - output.name == '{{ bucket_name }}'
++          - output.tags.example == 'tag1'
++          - "'another' not in output.tags"
++
++    - name: Re-remove the tag from an s3_bucket
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: present
++        tags:
++          example: tag1
++      register: output
++
++    - assert:
++        that:
++          - output is not changed
++          - output.name == '{{ bucket_name }}'
++          - output.tags.example == 'tag1'
++          - "'another' not in output.tags"
++
++    ## ============================================================
++
++    #- name: 'Pause to help with s3 bucket eventual consistency'
++    #  wait_for:
++    #    timeout: 10
++    #  delegate_to: localhost
++
++    ## ============================================================
++
++    - name: 'Add a tag for s3_bucket with purge_tags False'
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: present
++        purge_tags: no
++        tags:
++          anewtag: here
++      register: output
++
++    - assert:
++        that:
++          - output.changed
++          - output.name == '{{ bucket_name }}'
++          - output.tags.example == 'tag1'
++          - output.tags.anewtag == 'here'
++
++    - name: 'Re-add a tag for s3_bucket with purge_tags False'
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: present
++        purge_tags: no
++        tags:
++          anewtag: here
++      register: output
++
++    - assert:
++        that:
++          - output is not changed
++          - output.name == '{{ bucket_name }}'
++          - output.tags.example == 'tag1'
++          - output.tags.anewtag == 'here'
++
++    ## ============================================================
++
++    #- name: 'Pause to help with s3 bucket eventual consistency'
++    #  wait_for:
++    #    timeout: 10
++    #  delegate_to: localhost
++
++    ## ============================================================
++
++    - name: Update a tag for s3_bucket with purge_tags False
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: present
++        purge_tags: no
++        tags:
++          anewtag: next
++      register: output
++
++    - assert:
++        that:
++          - output.changed
++          - output.name == '{{ bucket_name }}'
++          - output.tags.example == 'tag1'
++          - output.tags.anewtag == 'next'
++
++    - name: Re-update a tag for s3_bucket with purge_tags False
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: present
++        purge_tags: no
++        tags:
++          anewtag: next
++      register: output
++
++    - assert:
++        that:
++          - output is not changed
++          - output.name == '{{ bucket_name }}'
++          - output.tags.example == 'tag1'
++          - output.tags.anewtag == 'next'
++
++    ## ============================================================
++
++    #- name: 'Pause to help with s3 bucket eventual consistency'
++    #  wait_for:
++    #    timeout: 10
++    #  delegate_to: localhost
++
++    ## ============================================================
++
++    - name: Pass empty tags dict for s3_bucket with purge_tags False
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: present
++        purge_tags: no
++        tags: {}
++      register: output
++
++    - assert:
++        that:
++          - output is not changed
++          - output.name == '{{ bucket_name }}'
++          - output.tags.example == 'tag1'
++          - output.tags.anewtag == 'next'
++
++    ## ============================================================
++
++    #- name: 'Pause to help with s3 bucket eventual consistency'
++    #  wait_for:
++    #    timeout: 10
++    #  delegate_to: localhost
++
++    ## ============================================================
++
++    - name: Do not specify any tag to ensure previous tags are not removed
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: present
++      register: output
++
++    - assert:
++        that:
++          - not output.changed
++          - output.name == '{{ bucket_name }}'
++          - output.tags.example == 'tag1'
++
++    # ============================================================
++
++    - name: Remove all tags
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: present
++        tags: {}
++      register: output
++
++    - assert:
++        that:
++          - output.changed
++          - output.name == '{{ bucket_name }}'
++          - output.tags == {}
++
++    - name: Re-remove all tags
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: present
++        tags: {}
++      register: output
++
++    - assert:
++        that:
++          - output is not changed
++          - output.name == '{{ bucket_name }}'
++          - output.tags == {}
++
++    # ============================================================
++
++    - name: Delete bucket
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: absent
++      register: output
++
++    - assert:
++        that:
++          - output.changed
++
++  # ============================================================
++  always:
++    - name: Ensure all buckets are deleted
++      s3_bucket:
++        name: '{{ bucket_name }}'
++        state: absent
++      ignore_errors: yes
+diff --git a/test/integration/targets/s3_bucket/templates/policy-updated.json b/test/integration/targets/s3_bucket/roles/s3_bucket/templates/policy-updated.json
+similarity index 100%
+rename from test/integration/targets/s3_bucket/templates/policy-updated.json
+rename to test/integration/targets/s3_bucket/roles/s3_bucket/templates/policy-updated.json
+diff --git a/test/integration/targets/s3_bucket/templates/policy.json b/test/integration/targets/s3_bucket/roles/s3_bucket/templates/policy.json
+similarity index 100%
+rename from test/integration/targets/s3_bucket/templates/policy.json
+rename to test/integration/targets/s3_bucket/roles/s3_bucket/templates/policy.json
+diff --git a/test/integration/targets/s3_bucket/runme.sh b/test/integration/targets/s3_bucket/runme.sh
+new file mode 100755
+index 0000000000..aa324772bb
+--- /dev/null
++++ b/test/integration/targets/s3_bucket/runme.sh
+@@ -0,0 +1,12 @@
++#!/usr/bin/env bash
++#
++# Beware: most of our tests here are run in parallel.
++# To add new tests you'll need to add a new host to the inventory and a matching
++# '{{ inventory_hostname }}'.yml file in roles/ec2_instance/tasks/
++
++
++set -eux
++
++export ANSIBLE_ROLES_PATH=../
++
++ansible-playbook main.yml -i inventory "$@"
+diff --git a/test/integration/targets/s3_bucket/tasks/main.yml b/test/integration/targets/s3_bucket/tasks/main.yml
+deleted file mode 100644
+index 472859eca8..0000000000
+--- a/test/integration/targets/s3_bucket/tasks/main.yml
++++ /dev/null
+@@ -1,452 +0,0 @@
+----
+-
+-- block:
+-
+-    # ============================================================
+-    - name: set connection information for all tasks
+-      set_fact:
+-        aws_connection_info: &aws_connection_info
+-          aws_access_key: "{{ aws_access_key | default('') }}"
+-          aws_secret_key: "{{ aws_secret_key | default('') }}"
+-          security_token: "{{ security_token | default('') }}"
+-          region: "{{ aws_region | default('') }}"
+-      no_log: true
+-
+-    # ============================================================
+-    - name: Create simple s3_bucket
+-      s3_bucket:
+-        name: "{{ resource_prefix }}-testbucket-ansible"
+-        state: present
+-        <<: *aws_connection_info
+-      register: output
+-
+-    - assert:
+-        that:
+-          - output.changed
+-          - output.name == '{{ resource_prefix }}-testbucket-ansible'
+-          - not output.requester_pays
+-
+-    # ============================================================
+-    - name: Try to update the same bucket with the same values
+-      s3_bucket:
+-        name: "{{ resource_prefix }}-testbucket-ansible"
+-        state: present
+-        <<: *aws_connection_info
+-      register: output
+-
+-    - assert:
+-        that:
+-          - not output.changed
+-          - output.name == '{{ resource_prefix }}-testbucket-ansible'
+-          - not output.requester_pays
+-
+-    # ============================================================
+-    - name: Delete test s3_bucket
+-      s3_bucket:
+-        name: "{{ resource_prefix }}-testbucket-ansible"
+-        state: absent
+-        <<: *aws_connection_info
+-      register: output
+-
+-    - assert:
+-        that:
+-          - output.changed
+-
+-    # ============================================================
+-    - name: Set bucket_name variable to be able to use it in lookup('template')
+-      set_fact:
+-        bucket_name: "{{ resource_prefix }}-testbucket-ansible-complex"
+-
+-    - name: Create more complex s3_bucket
+-      s3_bucket:
+-        name: "{{ resource_prefix }}-testbucket-ansible-complex"
+-        state: present
+-        policy: "{{ lookup('template','policy.json') }}"
+-        requester_pays: yes
+-        versioning: yes
+-        tags:
+-          example: tag1
+-          another: tag2
+-        <<: *aws_connection_info
+-      register: output
+-
+-    - assert:
+-        that:
+-          - output.changed
+-          - output.name == '{{ resource_prefix }}-testbucket-ansible-complex'
+-          - output.requester_pays
+-          - output.versioning.MfaDelete == 'Disabled'
+-          - output.versioning.Versioning == 'Enabled'
+-          - output.tags.example == 'tag1'
+-          - output.tags.another == 'tag2'
+-          - output.policy.Statement[0].Action == 's3:GetObject'
+-          - output.policy.Statement[0].Effect == 'Allow'
+-          - output.policy.Statement[0].Principal == '*'
+-          - output.policy.Statement[0].Resource == 'arn:aws:s3:::{{ resource_prefix }}-testbucket-ansible-complex/*'
+-          - output.policy.Statement[0].Sid == 'AddPerm'
+-
+-    # ============================================================
+-    - name: Pause to help with s3 bucket eventual consistency
+-      pause:
+-        seconds: 10
+-
+-    - name: Try to update the same complex s3_bucket
+-      s3_bucket:
+-        name: "{{ resource_prefix }}-testbucket-ansible-complex"
+-        state: present
+-        policy: "{{ lookup('template','policy.json') }}"
+-        requester_pays: yes
+-        versioning: yes
+-        tags:
+-          example: tag1
+-          another: tag2
+-        <<: *aws_connection_info
+-      register: output
+-
+-    - assert:
+-        that:
+-          - not output.changed
+-
+-    # ============================================================
+-    - name: Update bucket policy on complex bucket
+-      s3_bucket:
+-        name: "{{ resource_prefix }}-testbucket-ansible-complex"
+-        state: present
+-        policy: "{{ lookup('template','policy-updated.json') }}"
+-        requester_pays: yes
+-        versioning: yes
+-        tags:
+-          example: tag1
+-          another: tag2
+-        <<: *aws_connection_info
+-      register: output
+-
+-    - assert:
+-        that:
+-          - output.changed
+-          - output.policy.Statement[0].Action == 's3:GetObject'
+-          - output.policy.Statement[0].Effect == 'Deny'
+-          - output.policy.Statement[0].Principal == '*'
+-          - output.policy.Statement[0].Resource == 'arn:aws:s3:::{{ resource_prefix }}-testbucket-ansible-complex/*'
+-          - output.policy.Statement[0].Sid == 'AddPerm'
+-
+-    # ============================================================
+-    - name: Pause to help with s3 bucket eventual consistency
+-      pause:
+-        seconds: 10
+-
+-    - name: Update attributes for s3_bucket
+-      s3_bucket:
+-        name: "{{ resource_prefix }}-testbucket-ansible-complex"
+-        state: present
+-        policy: "{{ lookup('template','policy.json') }}"
+-        requester_pays: no
+-        versioning: no
+-        tags:
+-          example: tag1-udpated
+-          another: tag2
+-        <<: *aws_connection_info
+-      register: output
+-
+-    - assert:
+-        that:
+-          - output.changed
+-          - output.name == '{{ resource_prefix }}-testbucket-ansible-complex'
+-          - not output.requester_pays
+-          - output.versioning.MfaDelete == 'Disabled'
+-          - output.versioning.Versioning in ['Suspended', 'Disabled']
+-          - output.tags.example == 'tag1-udpated'
+-          - output.tags.another == 'tag2'
+-          - output.policy.Statement[0].Action == 's3:GetObject'
+-          - output.policy.Statement[0].Effect == 'Allow'
+-          - output.policy.Statement[0].Principal == '*'
+-          - output.policy.Statement[0].Resource == 'arn:aws:s3:::{{ resource_prefix }}-testbucket-ansible-complex/*'
+-          - output.policy.Statement[0].Sid == 'AddPerm'
+-
+-    # ============================================================
+-    - name: Pause to help with s3 bucket eventual consistency
+-      pause:
+-        seconds: 10
+-
+-    - name: Remove a tag for s3_bucket
+-      s3_bucket:
+-        name: "{{ resource_prefix }}-testbucket-ansible-complex"
+-        state: present
+-        policy: "{{ lookup('template','policy.json') }}"
+-        requester_pays: no
+-        versioning: no
+-        tags:
+-          example: tag1-udpated
+-        <<: *aws_connection_info
+-      register: output
+-
+-    - assert:
+-        that:
+-          - output.changed
+-          - output.tags.example == 'tag1-udpated'
+-          - "'another' not in output.tags"
+-
+-    # ============================================================
+-    - name: Pause to help with s3 bucket eventual consistency
+-      pause:
+-        seconds: 10
+-
+-    - name: Add a tag for s3_bucket with purge_tags False
+-      s3_bucket:
+-        name: "{{ resource_prefix }}-testbucket-ansible-complex"
+-        state: present
+-        policy: "{{ lookup('template','policy.json') }}"
+-        requester_pays: no
+-        versioning: no
+-        purge_tags: no
+-        tags:
+-          anewtag: here
+-        <<: *aws_connection_info
+-      register: output
+-
+-    - assert:
+-        that:
+-          - output.changed
+-          - output.tags.example == 'tag1-udpated'
+-          - output.tags.anewtag == 'here'
+-
+-    # ============================================================
+-    - name: Pause to help with s3 bucket eventual consistency
+-      pause:
+-        seconds: 10
+-
+-    - name: Update a tag for s3_bucket with purge_tags False
+-      s3_bucket:
+-        name: "{{ resource_prefix }}-testbucket-ansible-complex"
+-        state: present
+-        policy: "{{ lookup('template','policy.json') }}"
+-        requester_pays: no
+-        versioning: no
+-        purge_tags: no
+-        tags:
+-          anewtag: next
+-        <<: *aws_connection_info
+-      register: output
+-
+-    - assert:
+-        that:
+-          - output.changed
+-          - output.tags.example == 'tag1-udpated'
+-          - output.tags.anewtag == 'next'
+-
+-    # ============================================================
+-    - name: Pause to help with s3 bucket eventual consistency
+-      pause:
+-        seconds: 10
+-
+-    - name: Pass empty tags dict for s3_bucket with purge_tags False
+-      s3_bucket:
+-        name: "{{ resource_prefix }}-testbucket-ansible-complex"
+-        state: present
+-        policy: "{{ lookup('template','policy.json') }}"
+-        requester_pays: no
+-        versioning: no
+-        purge_tags: no
+-        tags: {}
+-        <<: *aws_connection_info
+-      register: output
+-
+-    - assert:
+-        that:
+-          - not output.changed
+-          - output.tags.example == 'tag1-udpated'
+-          - output.tags.anewtag == 'next'
+-
+-    # ============================================================
+-    - name: Pause to help with s3 bucket eventual consistency
+-      pause:
+-        seconds: 10
+-
+-    - name: Do not specify any tag to ensure previous tags are not removed
+-      s3_bucket:
+-        name: "{{ resource_prefix }}-testbucket-ansible-complex"
+-        state: present
+-        policy: "{{ lookup('template','policy.json') }}"
+-        requester_pays: no
+-        versioning: no
+-        <<: *aws_connection_info
+-      register: output
+-
+-    - assert:
+-        that:
+-          - not output.changed
+-          - output.tags.example == 'tag1-udpated'
+-
+-    # ============================================================
+-    - name: Remove all tags
+-      s3_bucket:
+-        name: "{{ resource_prefix }}-testbucket-ansible-complex"
+-        state: present
+-        policy: "{{ lookup('template','policy.json') }}"
+-        requester_pays: no
+-        versioning: no
+-        tags: {}
+-        <<: *aws_connection_info
+-      register: output
+-
+-    - assert:
+-        that:
+-          - output.changed
+-          - output.tags == {}
+-
+-    # ============================================================
+-    - name: Pause to help with s3 bucket eventual consistency
+-      pause:
+-        seconds: 5
+-
+-    - name: Delete complex s3 bucket
+-      s3_bucket:
+-        name: "{{ resource_prefix }}-testbucket-ansible-complex"
+-        state: absent
+-        <<: *aws_connection_info
+-      register: output
+-
+-    - assert:
+-        that:
+-          - output.changed
+-
+-    # ============================================================
+-    - name: Create bucket with dot in name
+-      s3_bucket:
+-        name: "{{ resource_prefix }}.testbucket.ansible"
+-        state: present
+-        <<: *aws_connection_info
+-      register: output
+-
+-    - assert:
+-        that:
+-          - output.changed
+-          - output.name == '{{ resource_prefix }}.testbucket.ansible'
+-
+-
+-    # ============================================================
+-    - name: Pause to help with s3 bucket eventual consistency
+-      pause:
+-        seconds: 15
+-
+-    - name: Delete s3_bucket with dot in name
+-      s3_bucket:
+-        name: "{{ resource_prefix }}.testbucket.ansible"
+-        state: absent
+-        <<: *aws_connection_info
+-      register: output
+-
+-    - assert:
+-        that:
+-          - output.changed
+-
+-    # ============================================================
+-    - name: Try to delete a missing bucket (should not fail)
+-      s3_bucket:
+-        name: "{{ resource_prefix }}-testbucket-ansible-missing"
+-        state: absent
+-        <<: *aws_connection_info
+-      register: output
+-
+-    - assert:
+-        that:
+-          - not output.changed
+-    # ============================================================
+-    - name: Create bucket with AES256 encryption enabled
+-      s3_bucket:
+-        name: "{{ resource_prefix }}-testbucket-encrypt-ansible"
+-        state: present
+-        encryption: "AES256"
+-        <<: *aws_connection_info
+-      register: output
+-
+-    - assert:
+-        that:
+-          - output.changed
+-          - output.name == '{{ resource_prefix }}-testbucket-encrypt-ansible'
+-          - output.encryption
+-          - output.encryption.SSEAlgorithm == 'AES256'
+-
+-    - name: Update bucket with same encryption config
+-      s3_bucket:
+-        name: "{{ resource_prefix }}-testbucket-encrypt-ansible"
+-        state: present
+-        encryption: "AES256"
+-        <<: *aws_connection_info
+-      register: output
+-
+-    - assert:
+-        that:
+-          - not output.changed
+-          - output.encryption
+-          - output.encryption.SSEAlgorithm == 'AES256'
+-
+-    - name: Disable encryption from bucket
+-      s3_bucket:
+-        name: "{{ resource_prefix }}-testbucket-encrypt-ansible"
+-        state: present
+-        encryption: "none"
+-        <<: *aws_connection_info
+-      register: output
+-
+-    - assert:
+-        that:
+-          - output.changed
+-          - not output.encryption
+-
+-    - name: Enable aws:kms encryption with KMS master key
+-      s3_bucket:
+-        name: "{{ resource_prefix }}-testbucket-encrypt-ansible"
+-        state: present
+-        encryption: "aws:kms"
+-        <<: *aws_connection_info
+-      register: output
+-
+-    - assert:
+-        that:
+-          - output.changed
+-          - output.encryption
+-          - output.encryption.SSEAlgorithm == 'aws:kms'
+-
+-    - name: Enable aws:kms encryption with KMS master key (idempotent)
+-      s3_bucket:
+-        name: "{{ resource_prefix }}-testbucket-encrypt-ansible"
+-        state: present
+-        encryption: "aws:kms"
+-        <<: *aws_connection_info
+-      register: output
+-
+-    - assert:
+-        that:
+-          - not output.changed
+-          - output.encryption
+-          - output.encryption.SSEAlgorithm == 'aws:kms'
+-
+-    # ============================================================
+-    - name: Pause to help with s3 bucket eventual consistency
+-      pause:
+-        seconds: 10
+-
+-    - name: Delete encryption test s3 bucket
+-      s3_bucket:
+-        name: "{{ resource_prefix }}-testbucket-encrypt-ansible"
+-        state: absent
+-        <<: *aws_connection_info
+-      register: output
+-
+-    - assert:
+-        that:
+-          - output.changed
+-  # ============================================================
+-  always:
+-    - name: Ensure all buckets are deleted
+-      s3_bucket:
+-        name: "{{item}}"
+-        state: absent
+-        <<: *aws_connection_info
+-      ignore_errors: yes
+-      with_items:
+-        - "{{ resource_prefix }}-testbucket-ansible"
+-        - "{{ resource_prefix }}-testbucket-ansible-complex"
+-        - "{{ resource_prefix }}.testbucket.ansible"
+-        - "{{ resource_prefix }}-testbucket-encrypt-ansible"
